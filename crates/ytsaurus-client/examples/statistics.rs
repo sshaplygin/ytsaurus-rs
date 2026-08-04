@@ -13,8 +13,9 @@
 
 use std::process::ExitCode;
 
+use serde::Serialize;
 use ytsaurus_client::{Client, ClientError, MapSpec};
-use ytsaurus_yson::{YsonFormat, to_string, to_vec};
+use ytsaurus_yson::{YsonFormat, to_string};
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_statistics";
@@ -53,7 +54,7 @@ fn run() -> Result<(), ClientError> {
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
     let worker = client.upload_worker_cached(WORKER)?;
-    client.write_table(&format!("{BASE}/input"), &sample_rows())?;
+    client.write_table_rows(&format!("{BASE}/input"), sample_rows())?;
     done(&format!(
         "{} rows in, {DROPPED} of them without a key",
         KEPT + DROPPED
@@ -125,33 +126,22 @@ fn check(what: &str, passed: bool) -> Result<(), ClientError> {
 }
 
 /// Rows with a `key`, and rows without one.
-fn sample_rows() -> Vec<u8> {
-    use serde::Serialize;
+fn sample_rows() -> impl Iterator<Item = Row> {
+    let kept = (0..KEPT).map(|count| Row {
+        key: Some("alpha"),
+        count,
+    });
+    let dropped = (0..DROPPED).map(|count| Row { key: None, count });
+    kept.chain(dropped)
+}
 
-    #[derive(Serialize)]
-    struct Kept<'a> {
-        key: &'a str,
-        count: i64,
-    }
-
-    #[derive(Serialize)]
-    struct Dropped {
-        count: i64,
-    }
-
-    let mut out = Vec::new();
-    for i in 0..KEPT {
-        let row = Kept {
-            key: "alpha",
-            count: i,
-        };
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    for i in 0..DROPPED {
-        let row = Dropped { count: i };
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    out
+/// A row of the input table: a count, and a key on the rows the job keeps.
+///
+/// The job rejects a row that has no `key` column, which is not the same thing
+/// as a `key` set to null — so the field is skipped rather than written as one.
+#[derive(Serialize)]
+struct Row {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<&'static str>,
+    count: i64,
 }

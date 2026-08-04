@@ -4,6 +4,11 @@
 //! row. That is a whole category this stack could not reach before: gang jobs,
 //! side-car computation, anything that is not a transformation of a table.
 //!
+//! It then reads back what the jobs *printed*, which is the half the Go SDK's
+//! `vanilla-example` is really about: a vanilla job often has no output table
+//! to speak through, so stderr is its only voice, and the cluster keeps it for
+//! jobs that succeeded as well as for jobs that failed.
+//!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
 //! scripts/build-worker.sh shards
@@ -13,7 +18,6 @@
 use std::process::ExitCode;
 
 use ytsaurus_client::{Client, ClientError, VanillaSpec, VanillaTask, yson_build};
-use ytsaurus_yson::{Scan, YsonFormat, YsonNode, YsonValue, from_slice, scan::scan_value};
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_vanilla";
@@ -71,8 +75,39 @@ fn run() -> Result<(), ClientError> {
     client.wait_for_operation(&id)?;
     done(&format!("operation {id} completed"));
 
+    step("Reading back what the jobs printed");
+    // The other half of a vanilla operation: its jobs have no output table to
+    // speak through, so stderr is how they say anything at all. Asked for right
+    // after the operation finishes, because the controller agent forgets its
+    // jobs soon afterwards and a cluster with no job archive — a local one, for
+    // instance — then has nothing left to tell.
+    let jobs = client.list_jobs(&id, None, JOBS as u32)?;
+    check(
+        &format!("the cluster still lists all {JOBS} jobs"),
+        jobs.len() == JOBS as usize,
+    )?;
+
+    let mut spoke = 0;
+    for job in &jobs {
+        let stderr = client.get_job_stderr(&id, &job.id)?;
+        let text = String::from_utf8_lossy(&stderr);
+        let text = text.trim();
+        if !text.is_empty() {
+            // Enough of the id to tell three jobs apart, and `get` rather than
+            // a slice because nothing promises a job id is eight characters.
+            println!("   {}: {text}", job.id.get(..8).unwrap_or(&job.id));
+            spoke += 1;
+        }
+    }
+    // Stderr is kept for jobs that *succeeded* too, which is what makes this a
+    // way to read a job's own account of itself rather than only a post-mortem.
+    check(
+        &format!("all {JOBS} succeeded and their stderr survived"),
+        spoke == JOBS as usize,
+    )?;
+
     step("Checking what the jobs wrote");
-    let rows = decode(&client.read_table(&format!("{BASE}/results"))?)?;
+    let rows: Vec<Shard> = client.read_table_rows(&format!("{BASE}/results"))?;
 
     check(
         &format!("{JOBS} rows, one per job"),
@@ -101,53 +136,16 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
-/// One job's row.
+/// One job's row, named as the worker writes it.
+///
+/// The worker's own struct has a `shards` column this does not mention, and
+/// that is the point of asking for a type: the columns a reader does not name
+/// are simply not its business.
+#[derive(serde::Deserialize)]
 struct Shard {
     cookie: i64,
     sum: i64,
     counted: i64,
-}
-
-fn decode(table: &[u8]) -> Result<Vec<Shard>, ClientError> {
-    let mut rows = Vec::new();
-    let mut data = table;
-
-    loop {
-        while data.first() == Some(&b';') {
-            data = &data[1..];
-        }
-        if data.is_empty() {
-            return Ok(rows);
-        }
-
-        let len = match scan_value(data, YsonFormat::Binary) {
-            Ok(Scan::Complete { len }) => len,
-            other => {
-                return Err(ClientError::Decode {
-                    command: "read_table".to_owned(),
-                    reason: format!("the result table is not a complete fragment: {other:?}"),
-                });
-            }
-        };
-
-        let value: YsonValue =
-            from_slice(&data[..len], YsonFormat::Binary).map_err(|e| ClientError::Decode {
-                command: "read_table".to_owned(),
-                reason: e.to_string(),
-            })?;
-        data = &data[len..];
-
-        let YsonNode::Map(row) = &value.node else {
-            continue;
-        };
-        let field = |name: &str| row.get(name.as_bytes()).and_then(YsonValue::as_i64);
-
-        rows.push(Shard {
-            cookie: field("cookie").unwrap_or(-1),
-            sum: field("sum").unwrap_or(0),
-            counted: field("counted").unwrap_or(0),
-        });
-    }
 }
 
 fn step(what: &str) {

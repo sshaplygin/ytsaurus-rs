@@ -20,7 +20,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
 | `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`) plus their e2e tests. |
-| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision). |
+| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
 
@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 324 tests
+cargo test --workspace            # 331 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -269,6 +269,19 @@ per command. Cluster facts:
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
 
+### Jobs, listed and read
+
+- **Stderr is kept for jobs that succeeded**, not only failed ones, and no spec
+  option is needed. Verified with a vanilla job that echoed to stderr and
+  completed.
+- **`list_jobs` forgets.** It answers with an empty list for an operation that
+  finished a while ago: the controller agent drops its jobs, and this local
+  cluster has no job archive to fall back on (`get_job_stderr` on an old job
+  says `Job archive is unavailable`). Harvest immediately after
+  `wait_for_operation` or not at all.
+- `list_jobs(op, None, limit)` lists every state; the failure report passes
+  `Some("failed")`.
+
 ### Streaming table I/O
 
 - The proxy **accepts a chunked request body** for `write_table`, so a table can
@@ -434,7 +447,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 290 tests. Control records driven by the exact
+1. **Unit and integration** — 294 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4
@@ -505,6 +518,15 @@ of what has actually been run:
 | P1 | reduce/sort · retries and `mutation_id` · worker cache · custom statistics | `sort_reduce`, `idempotent`, `cached_upload`, `statistics` |
 | P2 | schema from a struct · transactions · Cypress and locks · `alter_table` | `schema`, `transaction`, `cypress` |
 | P3 | streaming table I/O · the pilot's decode share · token file and compression | `streaming`, `profile`, `tests/request_shape.rs` |
+
+**5. Parity with the Go SDK's examples**, mapped in
+[`docs/go-parity.md`](docs/go-parity.md). All twelve were read and classified:
+six have a Rust counterpart that runs on a cluster, six are a decision recorded
+here not to. Three asked for something the client could not do — typed rows,
+typed nodes, and a successful job's stderr — and got it. **Read that document
+before adding client API**: it also lists what the Go SDK can do and this cannot
+(no `abort_operation`, no `<append=%true>`, no public escape hatch), which is
+where the next real gap is.
 
 **What is left of the backlog is not code.** P3 #15 (tracing spans) is written
 down as "only worth doing if a user asks", and nobody has. TLS is the one part

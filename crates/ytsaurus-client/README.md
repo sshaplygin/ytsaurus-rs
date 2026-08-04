@@ -48,6 +48,7 @@ cargo run -p ytsaurus-client --example launch
 | Naming | `copy`, `move_node`, `link` — each with a `_replacing` twin that overwrites |
 | Locks | `lock`, `lock_waiting` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| Typed | `write_table_rows`, `read_table_rows`, `get_as` |
 | Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
@@ -76,6 +77,29 @@ cluster.
 `upload_worker` sets the `executable` attribute. Without it the cluster copies
 the binary and then refuses to exec it, with an error that never mentions the
 attribute.
+
+## Rows are Rust values
+
+```rust
+client.write_table_rows("//tmp/contacts", (0..100).map(contact))?;
+
+let back: Vec<Contact> = client.read_table_rows("//tmp/contacts")?;
+let root: ClusterInfo = client.get_as("//@")?;
+```
+
+An iterator rather than a slice, because the encoder runs *inside* the request
+body: rows are serialised a bufferful at a time as the connection asks for
+bytes, so a million rows cost one buffer. Reading is the launcher-shaped
+direction — owned rows, whole table — and a struct naming three of twenty
+columns is a projection rather than an error. For tables that do not fit,
+[`read_table_streaming`](#tables-bigger-than-memory) feeds
+`ytsaurus_job::JobReader`.
+
+This exists because of the Go SDK: going through its twelve examples one at a
+time showed that writing structs and scanning them back is the thing it does
+that this client made you do yourself.
+[`docs/go-parity.md`](../../docs/go-parity.md) is the whole comparison —
+what matches, what is deliberately absent, and what is still missing.
 
 ## Typed tables
 

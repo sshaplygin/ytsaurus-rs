@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Rows are Rust values
+
+- **Added** `Client::write_table_rows` and `Client::read_table_rows`. A table is
+  written from anything that yields serialisable values and read back into
+  anything that deserialises, so the encoding is this crate's problem rather
+  than every caller's.
+- **Added** `Client::get_as`, which reads a node — or one attribute — into a
+  Rust type instead of a `YsonValue` to walk.
+
+This came out of going through the **Go SDK's twelve examples** one by one and
+asking what each would need here; the answer is recorded in
+[`docs/go-parity.md`](../../docs/go-parity.md). Go writes structs to a table and
+scans structs back, and the SDK does the encoding. This client had bytes in and
+bytes out, and the consequence was measurable: **eleven of its twelve examples
+hand-rolled the same YSON encode loop**. Nine of them no longer do.
+
+```rust
+client.write_table_rows("//tmp/contacts", (0..100).map(contact))?;
+let back: Vec<Contact> = client.read_table_rows("//tmp/contacts")?;
+```
+
+An iterator rather than a slice, because the encoder runs **inside** the request
+body: rows are serialised a bufferful at a time as the connection asks for
+bytes, so a million rows cost one buffer, and the caller never has to hold them
+either. A row that will not serialise fails the write with the row's number
+rather than sending the rows before it — a short table reported as a successful
+write is the failure worth preventing.
+
+Reading is the launcher-shaped direction: owned rows, whole table. A struct
+naming three of twenty columns is a projection rather than an error, which is
+what makes it worth asking with a type at all. For tables that do not fit,
+`read_table_streaming` feeding `ytsaurus_job::JobReader` is still the answer,
+and now says so.
+
+Two cluster facts came out of the same exercise, both from the Go
+`vanilla-example`, which reads its jobs' stderr **after they succeed**:
+
+- **Stderr is kept for successful jobs**, with no spec option needed.
+- **Ask promptly.** `list_jobs` answers with an empty list for an operation that
+  finished a while ago — the controller agent forgets its jobs, and a cluster
+  with no job archive then has nothing left to say. Both examples that harvest
+  stderr do it immediately after `wait_for_operation`.
+
+`Client::list_jobs` and `Client::get_job_stderr` had no example calling either
+until now; they were reachable only through the automatic failure report.
+
 ### Reading what the scheduler recorded
 
 - **Added** `Client::job_statistics` and `Client::job_statistic_sum`, the

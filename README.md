@@ -111,6 +111,14 @@ streaming table I/O. Every item ends with an example that checks itself on a
 cluster — [`tests/e2e/README.md`](tests/e2e/README.md) is the list of what has
 actually been run, with its output.
 
+**Measured against the Go SDK.** There is no official Rust SDK, but there is an
+official Go one, and its twelve examples are what an SDK for this cluster is
+expected to do. [`docs/go-parity.md`](docs/go-parity.md) maps every one of them
+onto this workspace: six have a Rust counterpart that runs on a cluster, six are
+a recorded decision not to. Three of the twelve asked for something this client
+could not do — typed rows in and out, typed nodes, and reading a successful
+job's stderr — and it can now.
+
 What remains open needs a human: publishing, an API review, upstreaming, and
 whether to build a Skiff codec. All are described in [AGENTS.md](AGENTS.md),
 which is also the project context for contributors and coding agents.

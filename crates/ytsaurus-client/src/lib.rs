@@ -1193,6 +1193,154 @@ impl Client {
         Ok(body)
     }
 
+    /// Writes rows to a table from anything that yields them.
+    ///
+    /// The rows are Rust values; the encoding is this crate's problem, which is
+    /// the difference between this and [`Client::write_table`]:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// #[derive(serde::Serialize)]
+    /// struct Contact<'a> {
+    ///     name: &'a str,
+    ///     email: &'a str,
+    ///     age: i64,
+    /// }
+    ///
+    /// client.write_table_rows("//tmp/contacts", (0..100).map(|n| Contact {
+    ///     name: "Gordon Freeman",
+    ///     email: "gordon@black-mesa.example",
+    ///     age: 27 + n,
+    /// }))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// It takes an iterator rather than a slice because the encoder sits
+    /// *inside* the request body: rows are serialised a bufferful at a time as
+    /// the connection asks for bytes, so a million rows cost one buffer rather
+    /// than a million rows' worth of memory, and the caller never has to
+    /// materialise them either.
+    ///
+    /// Replaces the table's contents, as [`Client::write_table`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Decode`] naming the row if one cannot be
+    /// serialised — the write fails rather than sending the rows before it —
+    /// or [`ClientError`] if the request fails.
+    pub fn write_table_rows<T, I>(&self, path: &str, rows: I) -> Result<()>
+    where
+        T: serde::Serialize,
+        I: IntoIterator<Item = T>,
+    {
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("input_format", yson_build::binary_yson_format()),
+        ]);
+
+        let mut stream = stream::RowStream::new(rows.into_iter());
+        let sent = self
+            .transport
+            .upload(Method::Put, "write_table", &params, &mut stream);
+
+        // Checked first: a body that failed to encode fails the request too,
+        // and the transport's account of that is "the body ended early".
+        if let Some(reason) = stream.failed {
+            return Err(ClientError::Decode {
+                command: "write_table".to_owned(),
+                reason: format!("{path}: {reason}"),
+            });
+        }
+        sent
+    }
+
+    /// Reads a whole table as typed rows.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// #[derive(serde::Deserialize)]
+    /// struct Contact {
+    ///     name: String,
+    ///     age: i64,
+    /// }
+    ///
+    /// for contact in client.read_table_rows::<Contact>("//tmp/contacts")? {
+    ///     println!("{} is {}", contact.name, contact.age);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Rows are **owned**, and the whole table is read before any of it is
+    /// returned — this is [`Client::read_table`] with the decoding done, and it
+    /// inherits the same purpose: results a launcher inspects. For a table that
+    /// does not fit, or for rows borrowed from the buffer they arrived in,
+    /// [`Client::read_table_streaming`] feeds `ytsaurus_job::JobReader`.
+    ///
+    /// Columns the type does not mention are ignored, so a struct naming two
+    /// columns of a twenty-column table is a projection rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, the stream is truncated,
+    /// or a row does not match `T`.
+    pub fn read_table_rows<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
+        decode_rows(&self.read_table(path)?, path)
+    }
+
+    /// Reads a node, or an attribute, into a Rust type.
+    ///
+    /// [`Client::get`] hands back a [`YsonValue`] to walk; this hands back the
+    /// shape you were going to walk it into:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// #[derive(serde::Deserialize)]
+    /// struct Cluster {
+    ///     #[serde(rename = "type")]
+    ///     node_type: String,
+    ///     creation_time: String,
+    ///     account: String,
+    /// }
+    ///
+    /// let root: Cluster = client.get_as("//@")?;
+    /// println!("the cluster was created at {}", root.creation_time);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Attributes the type does not mention are ignored, which is what makes
+    /// `//@` — a node with dozens of them — worth asking about at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails or the answer does not fit
+    /// `T`.
+    pub fn get_as<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let value = self.get(path)?;
+
+        // Through the codec rather than by walking the value: the cluster's
+        // answer is a document, and serde is the thing that turns documents
+        // into types. Binary because it is the cheaper of the two to re-read.
+        let bytes =
+            ytsaurus_yson::to_vec(&value, YsonFormat::Binary).map_err(|e| ClientError::Decode {
+                command: "get".to_owned(),
+                reason: format!("{path}: could not re-encode the answer: {e}"),
+            })?;
+
+        ytsaurus_yson::from_slice(&bytes, YsonFormat::Binary).map_err(|e| ClientError::Decode {
+            command: "get".to_owned(),
+            reason: format!("{path}: the answer does not fit the type asked for: {e}"),
+        })
+    }
+
     /// Reads a table as a stream, without holding it.
     ///
     /// The same bytes [`Client::read_table`] returns — a binary YSON list
@@ -1789,6 +1937,28 @@ fn read_token_file(path: &std::path::Path) -> Option<String> {
 fn clean_token(raw: String) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Decodes a binary YSON list fragment into typed rows.
+///
+/// Shared by [`Client::read_table_rows`] and the tests that check what the row
+/// encoder produced, so the two halves of the round trip are the same code.
+fn decode_rows<T: serde::de::DeserializeOwned>(bytes: &[u8], path: &str) -> Result<Vec<T>> {
+    let mut rows = Vec::new();
+    let mut stream = ytsaurus_yson::StreamDeserializer::<T>::new(bytes, true);
+
+    loop {
+        match stream.next_item() {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => return Ok(rows),
+            Err(e) => {
+                return Err(ClientError::Decode {
+                    command: "read_table".to_owned(),
+                    reason: format!("{path}: row {}: {e}", rows.len()),
+                });
+            }
+        }
+    }
 }
 
 /// Reads the child names out of a `list` answer.

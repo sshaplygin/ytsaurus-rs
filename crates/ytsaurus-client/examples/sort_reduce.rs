@@ -16,8 +16,9 @@
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
+use serde::{Deserialize, Serialize};
 use ytsaurus_client::{Client, ClientError, ReduceSpec, SortSpec, yson_build};
-use ytsaurus_yson::{Scan, YsonFormat, YsonNode, YsonValue, from_slice, scan::scan_value, to_vec};
+use ytsaurus_yson::{YsonFormat, YsonValue};
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_sort_reduce";
@@ -64,7 +65,7 @@ fn run() -> Result<(), ClientError> {
         client.create("table", &format!("{BASE}/{table}"))?;
     }
     client.upload_worker(WORKER, &format!("{BASE}/wordcount"))?;
-    client.write_table(&format!("{BASE}/input"), &input_rows())?;
+    client.write_table_rows(&format!("{BASE}/input"), input_rows())?;
     done(&format!("{} unsorted rows", INPUT.len()));
 
     step("Sorting it");
@@ -103,7 +104,13 @@ fn run() -> Result<(), ClientError> {
     ));
 
     step("Checking the totals");
-    let counts = totals(&client.read_table(&format!("{BASE}/counts"))?)?;
+    // Keyed by word, because what is being checked is what each group came to
+    // and not the order the reduce emitted its groups in.
+    let counts: BTreeMap<String, i64> = client
+        .read_table_rows::<Total>(&format!("{BASE}/counts"))?
+        .into_iter()
+        .map(|row| (row.word, row.count))
+        .collect();
     let expected = expected_totals();
 
     for (word, count) in &expected {
@@ -149,75 +156,31 @@ fn expected_totals() -> BTreeMap<String, i64> {
 }
 
 /// Input rows, in the shape `wordcount reduce` consumes.
-fn input_rows() -> Vec<u8> {
-    use serde::Serialize;
-
-    #[derive(Serialize)]
-    struct Row<'a> {
-        #[serde(with = "serde_bytes")]
-        word: &'a [u8],
-        count: i64,
-    }
-
-    let mut out = Vec::new();
-    for (word, count) in INPUT {
-        let row = Row {
-            word: word.as_bytes(),
-            count: *count,
-        };
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    out
+fn input_rows() -> impl Iterator<Item = Row> {
+    INPUT.iter().map(|(word, count)| Row {
+        word: word.as_bytes(),
+        count: *count,
+    })
 }
 
-/// Decodes an output table into `word -> count`.
-fn totals(table: &[u8]) -> Result<BTreeMap<String, i64>, ClientError> {
-    let mut out = BTreeMap::new();
-
-    for record in records(table) {
-        let value: YsonValue =
-            from_slice(record, YsonFormat::Binary).map_err(|e| ClientError::Decode {
-                command: "read_table".to_owned(),
-                reason: e.to_string(),
-            })?;
-
-        let YsonNode::Map(row) = &value.node else {
-            continue;
-        };
-        let word = match row.get(b"word".as_slice()).map(|v| &v.node) {
-            Some(YsonNode::String(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
-            _ => continue,
-        };
-        let count = row.get(b"count".as_slice()).and_then(YsonValue::as_i64);
-        if let Some(count) = count {
-            out.insert(word, count);
-        }
-    }
-
-    Ok(out)
+/// A row of the input table: a word, and part of what it comes to.
+///
+/// `word` is bytes rather than a `&str` because that is how the worker reads
+/// it: a string column holds arbitrary bytes, and a job that insisted on UTF-8
+/// would fail on the first row that was not.
+#[derive(Serialize)]
+struct Row {
+    #[serde(with = "serde_bytes")]
+    word: &'static [u8],
+    count: i64,
 }
 
-/// Splits a binary YSON list fragment into records without decoding them.
-fn records(mut data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-
-    loop {
-        while data.first() == Some(&b';') || data.first().is_some_and(u8::is_ascii_whitespace) {
-            data = &data[1..];
-        }
-        if data.is_empty() {
-            return out;
-        }
-
-        match scan_value(data, YsonFormat::Binary) {
-            Ok(Scan::Complete { len }) => {
-                out.push(&data[..len]);
-                data = &data[len..];
-            }
-            // `read_table` already rejected a truncated stream; anything left
-            // here is not worth a second error path.
-            _ => return out,
-        }
-    }
+/// A row of the reduce's output: a word, and everything counted for it.
+///
+/// A `String` here rather than the bytes the worker wrote, because these words
+/// came from `INPUT` and the totals are compared against it by name.
+#[derive(Deserialize)]
+struct Total {
+    word: String,
+    count: i64,
 }

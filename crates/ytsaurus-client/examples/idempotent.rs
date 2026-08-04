@@ -19,14 +19,17 @@
 
 use std::process::ExitCode;
 
+use serde::Serialize;
 use ytsaurus_client::{Client, ClientError, MapSpec, MutationId, OperationType, yson_build};
-use ytsaurus_yson::{YsonFormat, to_vec};
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_idempotent";
 
 /// The worker this launches, as produced by `scripts/build-worker.sh cat`.
 const WORKER: &str = "target/x86_64-unknown-linux-musl/release-worker/cat";
+
+/// A couple of rows, so the operation has something to do.
+const SAMPLE: [Row; 2] = [Row { key: "a", count: 1 }, Row { key: "b", count: 2 }];
 
 fn main() -> ExitCode {
     match run() {
@@ -58,7 +61,7 @@ fn run() -> Result<(), ClientError> {
     client.create("table", &format!("{BASE}/output"))?;
     client.create("table", &format!("{BASE}/control_output"))?;
     client.upload_worker(WORKER, &format!("{BASE}/cat"))?;
-    client.write_table(&format!("{BASE}/input"), &sample_rows())?;
+    client.write_table_rows(&format!("{BASE}/input"), SAMPLE)?;
     done(&format!("{BASE} ready"));
 
     let spec = identity_map("output");
@@ -111,6 +114,14 @@ fn identity_map(output: &str) -> ytsaurus_yson::YsonValue {
     .to_yson()
 }
 
+/// A row of the input table. `write_table_rows` serialises these, so the
+/// example never spells out a row's bytes.
+#[derive(Serialize)]
+struct Row {
+    key: &'static str,
+    count: i64,
+}
+
 fn step(what: &str) {
     println!("\n== {what}");
 }
@@ -126,22 +137,4 @@ fn check(what: &str, passed: bool) -> Result<(), ClientError> {
     }
     eprintln!("   FAIL {what}");
     Err(ClientError::Config(format!("check failed: {what}")))
-}
-
-/// A couple of rows, so the operation has something to do.
-fn sample_rows() -> Vec<u8> {
-    use serde::Serialize;
-
-    #[derive(Serialize)]
-    struct Row<'a> {
-        key: &'a str,
-        count: i64,
-    }
-
-    let mut out = Vec::new();
-    for row in [Row { key: "a", count: 1 }, Row { key: "b", count: 2 }] {
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    out
 }

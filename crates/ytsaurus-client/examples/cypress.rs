@@ -13,6 +13,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use serde::Serialize;
 use ytsaurus_client::{Client, ClientError, LockMode};
 
 /// Where the demo keeps its tree.
@@ -44,7 +45,7 @@ fn run() -> Result<(), ClientError> {
     for (n, day) in RUNS.iter().enumerate() {
         let path = format!("{runs}/{day}");
         client.create("table", &path)?;
-        client.write_table(&path, &rows(n + 1))?;
+        client.write_table_rows(&path, rows(n + 1))?;
     }
     done(&format!("{} runs under {runs}", RUNS.len()));
 
@@ -126,12 +127,12 @@ fn run() -> Result<(), ClientError> {
     step("Publishing by moving a staging table over the live one");
     let live = format!("{BASE}/live");
     client.create("table", &live)?;
-    client.write_table(&live, &rows(1))?;
+    client.write_table_rows(&live, rows(1))?;
 
     let tx = client.start_transaction()?;
     let staging = format!("{BASE}/staging");
     tx.create("table", &staging)?;
-    tx.write_table(&staging, &rows(9))?;
+    tx.write_table_rows(&staging, rows(9))?;
     tx.move_replacing(&staging, &live)?;
     check(
         "readers still see the old table while the transaction is open",
@@ -214,6 +215,21 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
+/// A row with nothing in it but its number: the tables here are told apart by
+/// how many rows they have rather than by what is in them.
+#[derive(Serialize)]
+struct Row {
+    n: i64,
+}
+
+/// `count` rows, so a table can be told apart by its size.
+///
+/// An iterator rather than a collection: the client serialises rows as the
+/// connection asks for them, so nothing has to hold them all.
+fn rows(count: usize) -> impl Iterator<Item = Row> {
+    (0..count as i64).map(|n| Row { n })
+}
+
 fn step(what: &str) {
     println!("\n== {what}");
 }
@@ -229,23 +245,4 @@ fn check(what: &str, passed: bool) -> Result<(), ClientError> {
     }
     eprintln!("   FAIL {what}");
     Err(ClientError::Config(format!("check failed: {what}")))
-}
-
-/// `count` rows, so a table can be told apart by its size.
-fn rows(count: usize) -> Vec<u8> {
-    use serde::Serialize;
-    use ytsaurus_yson::{YsonFormat, to_vec};
-
-    #[derive(Serialize)]
-    struct Row {
-        n: i64,
-    }
-
-    let mut out = Vec::new();
-    for n in 0..count {
-        let row = Row { n: n as i64 };
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    out
 }

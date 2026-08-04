@@ -15,6 +15,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use ytsaurus_client::{Client, ClientError, MapSpec};
 
 /// Where the demo keeps its tables.
@@ -28,6 +29,28 @@ const SHORT: Duration = Duration::from_secs(2);
 
 /// How long to hold that transaction — several timeouts' worth.
 const HELD: Duration = Duration::from_secs(6);
+
+/// The rows the map reads.
+const SAMPLE: [Row; 3] = [
+    Row {
+        key: "alpha",
+        count: 1,
+    },
+    Row {
+        key: "beta",
+        count: 2,
+    },
+    Row {
+        key: "gamma",
+        count: 3,
+    },
+];
+
+/// What the output table holds before this run publishes anything.
+const PREVIOUS: [Row; 1] = [Row {
+    key: "last week",
+    count: 0,
+}];
 
 fn main() -> ExitCode {
     match run() {
@@ -58,12 +81,12 @@ fn run() -> Result<(), ClientError> {
     client.remove(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &input)?;
-    client.write_table(&input, &sample_rows())?;
+    client.write_table_rows(&input, SAMPLE)?;
     client.create("table", &output)?;
     // Stands in for last week's result: what everyone reads until the new one
     // is published, and what they must go on reading if publishing fails.
-    client.write_table(&output, &previous_result())?;
-    done(&format!("{} rows in, an old result in place", 3));
+    client.write_table_rows(&output, PREVIOUS)?;
+    done(&format!("{} rows in, an old result in place", SAMPLE.len()));
 
     step("A table that exists only inside a transaction");
     let tx = client.start_transaction()?;
@@ -166,11 +189,21 @@ fn publish_and_fail(client: &Client, path: &str) -> Result<(), ClientError> {
     let tx = client.start_transaction()?;
 
     tx.create("table", path)?;
-    tx.write_table(path, &sample_rows())?;
+    tx.write_table_rows(path, SAMPLE)?;
 
     Err(ClientError::Config(
         "the step after the write did not work out".to_owned(),
     ))
+}
+
+/// A row of the tables this publishes. `write_table_rows` serialises these, so
+/// the example never spells out a row's bytes — but it still compares the
+/// tables as raw bytes, which is the only way to say "unchanged" about a table
+/// nobody decoded.
+#[derive(Serialize)]
+struct Row {
+    key: &'static str,
+    count: i64,
 }
 
 fn step(what: &str) {
@@ -188,33 +221,4 @@ fn check(what: &str, passed: bool) -> Result<(), ClientError> {
     }
     eprintln!("   FAIL {what}");
     Err(ClientError::Config(format!("check failed: {what}")))
-}
-
-/// The rows the map reads.
-fn sample_rows() -> Vec<u8> {
-    rows(&[("alpha", 1), ("beta", 2), ("gamma", 3)])
-}
-
-/// What the output table holds before this run publishes anything.
-fn previous_result() -> Vec<u8> {
-    rows(&[("last week", 0)])
-}
-
-fn rows(pairs: &[(&str, i64)]) -> Vec<u8> {
-    use serde::Serialize;
-    use ytsaurus_yson::{YsonFormat, to_vec};
-
-    #[derive(Serialize)]
-    struct Row<'a> {
-        key: &'a str,
-        count: i64,
-    }
-
-    let mut out = Vec::new();
-    for (key, count) in pairs {
-        let row = Row { key, count: *count };
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    out
 }

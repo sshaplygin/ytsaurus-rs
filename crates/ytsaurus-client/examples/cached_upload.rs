@@ -16,14 +16,17 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
+use serde::Serialize;
 use ytsaurus_client::{CachedFile, Client, ClientError, MapSpec};
-use ytsaurus_yson::{YsonFormat, to_vec};
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_cached";
 
 /// The worker this launches, as produced by `scripts/build-worker.sh cat`.
 const WORKER: &str = "target/x86_64-unknown-linux-musl/release-worker/cat";
+
+/// A couple of rows, so the operation has something to copy.
+const SAMPLE: [Row; 2] = [Row { key: "a", count: 1 }, Row { key: "b", count: 2 }];
 
 fn main() -> ExitCode {
     match run() {
@@ -51,7 +54,7 @@ fn run() -> Result<(), ClientError> {
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
-    client.write_table(&format!("{BASE}/input"), &sample_rows())?;
+    client.write_table_rows(&format!("{BASE}/input"), SAMPLE)?;
     let size = std::fs::metadata(WORKER).map(|m| m.len()).unwrap_or(0);
     done(&format!("{BASE}, worker is {} KiB", size / 1024));
 
@@ -142,6 +145,14 @@ fn md5_of(path: &str) -> Result<String, ClientError> {
     Ok(format!("{:x}", md5::compute(&bytes)))
 }
 
+/// A row of the input table. `write_table_rows` serialises these, so the
+/// example never spells out a row's bytes.
+#[derive(Serialize)]
+struct Row {
+    key: &'static str,
+    count: i64,
+}
+
 fn step(what: &str) {
     println!("\n== {what}");
 }
@@ -157,22 +168,4 @@ fn check(what: &str, passed: bool) -> Result<(), ClientError> {
     }
     eprintln!("   FAIL {what}");
     Err(ClientError::Config(format!("check failed: {what}")))
-}
-
-/// A couple of rows, so the operation has something to copy.
-fn sample_rows() -> Vec<u8> {
-    use serde::Serialize;
-
-    #[derive(Serialize)]
-    struct Row<'a> {
-        key: &'a str,
-        count: i64,
-    }
-
-    let mut out = Vec::new();
-    for row in [Row { key: "a", count: 1 }, Row { key: "b", count: 2 }] {
-        out.extend_from_slice(&to_vec(&row, YsonFormat::Binary).expect("encodes"));
-        out.push(b';');
-    }
-    out
 }

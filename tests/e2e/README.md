@@ -59,6 +59,8 @@ cargo run -p ytsaurus-client --example cached_upload # the second upload is a ca
 cargo run -p ytsaurus-client --example statistics   # what the job counted, read back
 cargo run -p ytsaurus-client --example vanilla      # three jobs with no input table
 cargo run -p ytsaurus-client --example schema       # a derived schema the cluster enforces
+cargo run -p ytsaurus-client --example cluster_info # connect, and read a node into a type
+cargo run -p ytsaurus-client --example table_usage  # Rust values in, Rust values out
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
@@ -231,6 +233,39 @@ The last two are the ones worth keeping: a schema the cluster does not enforce
 would be decoration, and the descending refusal is checked rather than asserted
 so that the day a cluster enables it, the run says so instead of going stale.
 
+`table_usage` and `cluster_info`, same cluster — the two examples that mirror
+the Go SDK's `table-usage` and `cypress-example`. Between them they are the
+whole typed path: a schema derived from a struct, a hundred rows written as
+Rust values, the row count read out of the attribute map into a one-field
+struct, the same hundred read back and compared element for element, and a
+node read into a type that names three of its forty-eight attributes:
+
+```text
+== Writing 100 rows, as Rust values
+   ok 100 contacts written
+== Asking the cluster how many rows it has
+   ok row_count is 100
+   ok and the attribute map agrees, read into a one-field struct
+== Reading them back, as Rust values
+   ok 100 rows came back
+   ok and every one is the row that went in, in order
+== A struct naming one column is a projection
+   ok 100 names came back, the first Some("Gopher 0")
+== The same projection, in the other direction
+   ok a row missing the other three columns is refused
+   write_table: cluster error 307: Required column "email" cannot have "null" value
+
+   cluster was created at 2026-08-04T16:42:47.385970Z
+   ok the cluster offered 48 attributes, and the struct named 3
+   ok this cluster calls itself "locasaurus"
+   ok a type that does not fit is an error, not a panic
+   get: … invalid type: string "2026-08-04T16:42:47.385970Z", expected u64
+```
+
+The last two lines of each are the ones that matter. A projection reads and does
+**not** write — the columns it leaves out were promised as required — and a type
+the answer cannot fit is an error naming the path rather than a panic or a zero.
+
 `transaction`, same cluster — the same map operation as `launch`, run so that
 nothing it does exists until it commits:
 
@@ -337,11 +372,18 @@ last two are the other one — a waitable lock is `pending`, not held, and it ca
 queue for something that will never happen, which is why `lock_waiting` has a
 deadline rather than trusting the cluster to end the wait.
 
-`vanilla`, same cluster — three jobs, no input table anywhere:
+`vanilla`, same cluster — three jobs, no input table anywhere, and their stderr
+read back after they succeeded:
 
 ```text
 == Running 3 jobs with nothing to read
-   ok operation 558f9160-4157ea86-103e8-fa6cd1cf completed
+   ok operation b528b474-8714f38c-103e8-2ab7da1e completed
+== Reading back what the jobs printed
+   ok the cluster still lists all 3 jobs
+   8d297f9c: shards: job 1 of 3
+   76472094: shards: job 0 of 3
+   50c5574a: shards: job 2 of 3
+   ok all 3 succeeded and their stderr survived
 == Checking what the jobs wrote
    ok 3 rows, one per job
    ok the jobs identified themselves as {0, 1, 2}
@@ -351,6 +393,12 @@ deadline rather than trusting the cluster to end the wait.
 
 The cookies are the check that matters: the cluster hands each job a distinct
 one, which is all a vanilla job has to divide the work by.
+
+The stderr section is the Go SDK's `vanilla-example` in full, and it settles two
+things a cluster had to answer: **stderr is kept for jobs that succeeded**, with
+no spec option asked for, and it must be **asked for promptly** — `list_jobs`
+answers with an empty list for an operation that finished a while ago, because
+the controller agent forgets its jobs and this cluster has no job archive.
 
 That document is why the client does not walk `rows/rejected` as a path: the
 name is one key, and `$` → job state → job type sits below it. The operation
