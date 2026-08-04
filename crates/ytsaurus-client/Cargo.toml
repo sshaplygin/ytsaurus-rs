@@ -1,0 +1,23 @@
+[package]
+name = "ytsaurus-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Thin YTsaurus HTTP API v4 client: upload worker binaries, start operations, poll them to completion"
+readme = "README.md"
+keywords = ["ytsaurus", "mapreduce", "client", "yson"]
+categories = ["api-bindings"]
+
+[dependencies]
+ytsaurus-yson.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+ureq = "3.3"
+serde_json = "1.0"
+
+[dev-dependencies]
+serde_bytes.workspace = true

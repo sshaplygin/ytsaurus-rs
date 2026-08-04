@@ -28,6 +28,11 @@ crates/ytsaurus-yson/
     Apache License, every modification is recorded in
     crates/ytsaurus-yson/CHANGELOG.md.
 
+crates/ytsaurus-client/
+
+    Original work. Depends on ureq and serde_json, which are fetched from
+    crates.io under their own licences and are not redistributed here.
+
 crates/ytsaurus-yson/tests/fixtures/
 
     Test fixtures copied from yson-interop-tests.

@@ -25,6 +25,7 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | --- | --- |
 | [crates/ytsaurus-yson/](crates/ytsaurus-yson/) | YSON serializer/deserializer (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. |
+| [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
 | [examples/](examples/) | Worker binaries built on `ytsaurus-job`. |
 | [docs/](docs/) | Guides, including how to write and launch a job. |
 | [tests/e2e/](tests/e2e/) | End-to-end scripts against a local YTsaurus cluster. |

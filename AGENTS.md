@@ -17,6 +17,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | --- | --- |
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. |
+| `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it. No Python needed. |
 | `examples/` | Worker binaries (`cat`, `wordcount`, `hello`) plus their e2e tests. |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
@@ -32,7 +33,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Licence | **Apache-2.0** for this project. Upstream yson-rs is MIT OR Apache-2.0; we elect Apache-2.0 and keep upstream's licence files and notices. |
 | Job data format | binary YSON (`<format=binary>yson`); Skiff only after benchmarks |
 | Worker builds | `x86_64-unknown-linux-musl`, fully static; `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — the last **only** for worker binaries, never for library crates |
-| Operation launch | `yt` CLI / Python SDK. A native Rust launcher is deferred. |
+| Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
 
 ## Hard rules
@@ -254,11 +255,10 @@ locally; friction filed as issues.*
 CHANGELOGs, bump to 0.2.0. *DoD: pilot issues closed or explicitly rejected; the
 guide reflects the final API.*
 
-**3. `ytsaurus-client`, a thin launcher.** HTTP API v4: `write_file` (upload the
-worker with the `executable` attribute) → `start_operation` (map / map_reduce
-specs) → poll `get_operation`; token from `YT_TOKEN`. Testable against the Docker
-local cluster on `localhost:8000` — no real cluster needed. *DoD: an operation
-launched end to end with no Python on the machine.*
+**3. ~~`ytsaurus-client`~~ — done.** Verified against the local cluster: creates
+tables, uploads the worker, writes rows, runs a map, waits, reads back and
+compares, with nothing Python on `PATH`. Run it with
+`cargo run -p ytsaurus-client --example launch`.
 
 ### Parked — needs a human and a real cluster
 

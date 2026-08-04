@@ -1,0 +1,137 @@
+//! Small constructors for the YSON documents the API expects.
+//!
+//! Command parameters and operation specs are YSON dicts. `YsonValue` can model
+//! all of them, but building one by hand is verbose — its map keys are `Vec<u8>`
+//! and every leaf needs wrapping. These helpers keep the call sites readable.
+//!
+//! The client encodes parameters with this project's own codec rather than
+//! reaching for JSON, which keeps the dependency list short and exercises
+//! `ytsaurus-yson` against the real cluster on every request.
+
+use std::collections::BTreeMap;
+
+use ytsaurus_yson::{YsonNode, YsonValue};
+
+/// A YSON string.
+#[must_use]
+pub fn string(value: impl AsRef<[u8]>) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::String(value.as_ref().to_vec()),
+    }
+}
+
+/// A YSON int64.
+#[must_use]
+pub fn int(value: i64) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::Int64(value),
+    }
+}
+
+/// A YSON boolean.
+#[must_use]
+pub fn boolean(value: bool) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::Boolean(value),
+    }
+}
+
+/// A YSON list.
+#[must_use]
+pub fn list(items: impl IntoIterator<Item = YsonValue>) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::List(items.into_iter().collect()),
+    }
+}
+
+/// A YSON dict.
+#[must_use]
+pub fn map<K: AsRef<[u8]>>(entries: impl IntoIterator<Item = (K, YsonValue)>) -> YsonValue {
+    let mut out = BTreeMap::new();
+    for (key, value) in entries {
+        out.insert(key.as_ref().to_vec(), value);
+    }
+    YsonValue {
+        attributes: None,
+        node: YsonNode::Map(out),
+    }
+}
+
+/// Attaches attributes to a value, as in `<format=binary>yson`.
+#[must_use]
+pub fn with_attributes<K: AsRef<[u8]>>(
+    value: YsonValue,
+    attributes: impl IntoIterator<Item = (K, YsonValue)>,
+) -> YsonValue {
+    let mut attrs = BTreeMap::new();
+    for (key, v) in attributes {
+        attrs.insert(key.as_ref().to_vec(), v);
+    }
+    YsonValue {
+        attributes: if attrs.is_empty() { None } else { Some(attrs) },
+        node: value.node,
+    }
+}
+
+/// `<format=binary>yson` — the format a `ytsaurus-job` worker expects.
+#[must_use]
+pub fn binary_yson_format() -> YsonValue {
+    with_attributes(string("yson"), [("format", string("binary"))])
+}
+
+/// Inserts into a value that is known to be a dict; panics otherwise.
+///
+/// Only used on values this crate built, so the panic is unreachable in
+/// practice and a `Result` here would be noise at every call site.
+pub(crate) fn insert(target: &mut YsonValue, key: impl AsRef<[u8]>, value: YsonValue) {
+    match &mut target.node {
+        YsonNode::Map(m) => {
+            m.insert(key.as_ref().to_vec(), value);
+        }
+        other => panic!("expected a dict, got {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ytsaurus_yson::{YsonFormat, to_string};
+
+    #[test]
+    fn builds_the_documents_the_api_expects() {
+        let spec = map([
+            ("input_table_paths", list([string("//tmp/in")])),
+            ("output_table_paths", list([string("//tmp/out")])),
+            (
+                "mapper",
+                map([
+                    ("command", string("./worker")),
+                    ("memory_limit", int(536_870_912)),
+                ]),
+            ),
+        ]);
+
+        let encoded = to_string(&spec, YsonFormat::Text).expect("encodes");
+        assert!(
+            encoded.contains("input_table_paths=[\"//tmp/in\"]"),
+            "{encoded}"
+        );
+        assert!(encoded.contains("memory_limit=536870912"), "{encoded}");
+    }
+
+    #[test]
+    fn format_attributes_render_as_yson_expects() {
+        let encoded = to_string(&binary_yson_format(), YsonFormat::Text).expect("encodes");
+        assert_eq!(encoded, "<format=binary>yson");
+    }
+
+    #[test]
+    fn booleans_use_the_yson_spelling() {
+        let encoded = to_string(&map([("enable", boolean(true))]), YsonFormat::Text).unwrap();
+        assert_eq!(encoded, "{enable=%true}");
+    }
+}
