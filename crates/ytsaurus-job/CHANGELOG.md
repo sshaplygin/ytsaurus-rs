@@ -32,6 +32,17 @@ cluster's — and with one binary serving as both launcher and job, it is as
 likely to be an open socket to the cluster as to be nothing at all. Writing YSON
 into that would be worse than losing a statistic.
 
+### Knowing which job of the task this is
+
+- **Added** `job_cookie`, the job's index within its task (`YT_JOB_COOKIE`),
+  counting from zero and stable across a restart. A map job rarely needs it —
+  its share of the work arrives on fd 0 — but a **vanilla** job has no input at
+  all, so this is how it takes its own share, and how a retried job redoes that
+  share rather than someone else's.
+
+The entry point for a job with no input is the same `run`: a `JobReader` was
+never mandatory. See `ytsaurus-client`'s `VanillaSpec` for the other side.
+
 ### One binary can be both the launcher and the job
 
 - **Added** `is_inside_job`, `run_if_inside_job` and `job_id`. The cluster

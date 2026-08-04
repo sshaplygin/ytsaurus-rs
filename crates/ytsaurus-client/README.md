@@ -42,12 +42,12 @@ cargo run -p ytsaurus-client --example launch
 | Cypress | `create`, `remove`, `exists`, `get`, `row_count` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
-| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_operation`, `operation_state`, `wait_for_operation` |
+| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
 | Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum` |
 
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
-[`MapReduceSpec`], which model what launching a `ytsaurus-job` worker needs and
-expose `with_raw` for everything else.
+[`MapReduceSpec`] / [`VanillaSpec`], which model what launching a
+`ytsaurus-job` worker needs and expose `with_raw` for everything else.
 
 Two defaults exist because getting them wrong is quiet rather than loud:
 
@@ -186,4 +186,5 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](../../NOTICE).
 [`MapReduceSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.MapReduceSpec.html
 [`ReduceSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.ReduceSpec.html
 [`SortSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.SortSpec.html
+[`VanillaSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.VanillaSpec.html
 [`Client::heavy_proxy`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.Client.html#method.heavy_proxy

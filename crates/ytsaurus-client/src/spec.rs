@@ -610,6 +610,170 @@ impl SortSpec {
     }
 }
 
+/// One task of a vanilla operation: a group of identical jobs.
+///
+/// Tasks are what makes a vanilla operation a distributed process rather than
+/// one program: each task says how many jobs of its kind to run, and the
+/// scheduler keeps that many going.
+#[derive(Debug, Clone)]
+pub struct VanillaTask {
+    name: String,
+    job: UserJob,
+    job_count: i64,
+    outputs: Vec<String>,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl VanillaTask {
+    /// `job_count` jobs running `command`, under the name `name`.
+    ///
+    /// The name shows up in the web interface and in the operation's progress,
+    /// so `lowercase_with_underscores` and short is the convention.
+    #[must_use]
+    pub fn new(name: impl Into<String>, command: impl Into<String>, job_count: i64) -> Self {
+        Self {
+            name: name.into(),
+            job: UserJob::new(command),
+            job_count,
+            outputs: Vec::new(),
+            extra: Vec::new(),
+        }
+    }
+
+    /// Adds a Cypress file the jobs need — normally the worker binary.
+    #[must_use]
+    pub fn with_local_file(mut self, path: impl Into<String>) -> Self {
+        self.job.files.push(string(path.into()));
+        self
+    }
+
+    /// Adds a Cypress file under a different name in the sandbox.
+    ///
+    /// See [`MapSpec::with_local_file_named`].
+    #[must_use]
+    pub fn with_local_file_named(mut self, path: impl Into<String>, name: impl AsRef<str>) -> Self {
+        self.job.files.push(named_file(path, name));
+        self
+    }
+
+    /// Sets the tables these jobs write.
+    ///
+    /// A vanilla task has no input, but it may have output: table `k` arrives
+    /// on the same `3k + 1` descriptor as anywhere else.
+    #[must_use]
+    pub fn with_outputs<O>(mut self, paths: O) -> Self
+    where
+        O: IntoIterator,
+        O::Item: Into<String>,
+    {
+        self.outputs = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets the memory limit for these jobs, in bytes.
+    #[must_use]
+    pub fn with_memory_limit(mut self, bytes: i64) -> Self {
+        self.job.memory_limit = Some(bytes);
+        self
+    }
+
+    /// Sets an environment variable for these jobs.
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.job.environment.push((key.into(), value.into()));
+        self
+    }
+
+    /// Sets any task field this builder does not model — `gang_options` for a
+    /// coordinated distributed process, for instance.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    fn to_yson(&self) -> YsonValue {
+        let mut task = self.job.to_yson();
+        insert(&mut task, "job_count", int(self.job_count));
+        // Always sent, even when empty: the field is how the task says it has
+        // no output tables, and a task with none is perfectly ordinary.
+        insert(
+            &mut task,
+            "output_table_paths",
+            list(self.outputs.iter().map(string)),
+        );
+
+        for (key, value) in &self.extra {
+            insert(&mut task, key, value.clone());
+        }
+        task
+    }
+}
+
+/// A vanilla operation: jobs with no input tables.
+///
+/// This is the shape for work that is not a transformation of a table — a
+/// side-car computation, a distributed process, a job that fetches its own
+/// input. Coordination between the jobs is the user's problem; the cluster's
+/// side of the bargain is keeping `job_count` of them running.
+///
+/// ```
+/// use ytsaurus_client::{VanillaSpec, VanillaTask};
+///
+/// let spec = VanillaSpec::new(
+///     VanillaTask::new("worker", "./my_job", 4)
+///         .with_local_file("//tmp/my_job")
+///         .with_outputs(["//tmp/results"]),
+/// );
+/// ```
+#[derive(Debug, Clone)]
+pub struct VanillaSpec {
+    tasks: Vec<VanillaTask>,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl VanillaSpec {
+    /// An operation with one task.
+    #[must_use]
+    pub fn new(task: VanillaTask) -> Self {
+        Self {
+            tasks: vec![task],
+            extra: Vec::new(),
+        }
+    }
+
+    /// Adds another task, of a different kind.
+    #[must_use]
+    pub fn with_task(mut self, task: VanillaTask) -> Self {
+        self.tasks.push(task);
+        self
+    }
+
+    /// Sets any spec field this builder does not model.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    /// Renders the spec.
+    #[must_use]
+    pub fn to_yson(&self) -> YsonValue {
+        let mut spec = map([(
+            "tasks",
+            map(self
+                .tasks
+                .iter()
+                .map(|task| (task.name.as_str(), task.to_yson()))),
+        )]);
+
+        for (key, value) in &self.extra {
+            insert(&mut spec, key, value.clone());
+        }
+        spec
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,6 +1024,53 @@ mod tests {
             "the cluster sorts, not a job: {out}"
         );
         assert!(!out.contains("input_format"), "{out}");
+    }
+
+    #[test]
+    fn a_vanilla_spec_describes_its_tasks() {
+        let out = render(
+            &VanillaSpec::new(
+                VanillaTask::new("worker", "./my_job", 4)
+                    .with_local_file("//tmp/my_job")
+                    .with_outputs(["//tmp/results"])
+                    .with_memory_limit(1024),
+            )
+            .with_task(VanillaTask::new("master", "./my_job master", 1))
+            .with_raw("max_failed_job_count", int(1))
+            .to_yson(),
+        );
+
+        assert!(out.contains("tasks={"), "{out}");
+        assert!(out.contains("worker={"), "{out}");
+        assert!(out.contains("master={"), "{out}");
+        assert!(out.contains("job_count=4"), "{out}");
+        assert!(out.contains("job_count=1"), "{out}");
+        assert!(
+            out.contains(r#"output_table_paths=["//tmp/results"]"#),
+            "{out}"
+        );
+        assert!(out.contains("max_failed_job_count=1"), "{out}");
+        // No input: that is what makes it vanilla.
+        assert!(!out.contains("input_table_paths"), "{out}");
+    }
+
+    /// A task with no output tables still sends the field. Leaving it out is a
+    /// different statement from "there are none".
+    #[test]
+    fn a_task_without_outputs_says_so() {
+        let out = render(&VanillaSpec::new(VanillaTask::new("t", "./j", 1)).to_yson());
+        assert!(out.contains("output_table_paths=[]"), "{out}");
+    }
+
+    #[test]
+    fn gang_options_go_through_raw() {
+        let out = render(
+            &VanillaSpec::new(
+                VanillaTask::new("worker", "./j", 3).with_raw("gang_options", map::<&str>([])),
+            )
+            .to_yson(),
+        );
+        assert!(out.contains("gang_options={}"), "{out}");
     }
 
     #[test]

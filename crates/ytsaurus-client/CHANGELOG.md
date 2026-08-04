@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Operations with no input tables
+
+- **Added** `VanillaSpec`, `VanillaTask` and `Client::start_vanilla`. A vanilla
+  operation runs jobs that are not a transformation of a table — a distributed
+  process, a side-car computation, a job that fetches its own input — which is a
+  whole category this stack could not reach.
+
+A task says how many jobs of its kind to run and, optionally, which tables they
+write; the scheduler keeps that many going. Everything else — `gang_options` for
+a coordinated process, `stderr_table_path` — goes through `with_raw`.
+`output_table_paths` is always sent, even empty: not sending it is a different
+statement from "there are none".
+
+Coordination between the jobs is the user's problem, and
+[`ytsaurus_job::job_cookie`](../ytsaurus-job/CHANGELOG.md) is what to divide the
+work by.
+
+Verified on the local cluster with `cargo run -p ytsaurus-client --example
+vanilla`: three jobs with nothing to read, identifying themselves as 0, 1 and 2,
+whose slices of a sum add up to the whole and cover every number exactly once.
+
 ### Reading back what the jobs reported
 
 - **Added** `Client::custom_statistics` and `Client::statistic_sum`, the other

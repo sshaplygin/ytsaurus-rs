@@ -162,6 +162,24 @@ pub fn job_id() -> Option<String> {
     std::env::var(JOB_ID_ENV).ok().filter(|id| !id.is_empty())
 }
 
+/// Which job of its task this is, counting from zero.
+///
+/// A map job rarely cares — its share of the work arrives on fd 0. A **vanilla**
+/// job has no input at all, so this is how it knows which part of the work is
+/// its own:
+///
+/// ```no_run
+/// let shard = ytsaurus_job::job_cookie().unwrap_or(0);
+/// // ... process the shard'th slice of whatever this operation is doing
+/// ```
+///
+/// Stable across a restart: a job that fails and is retried comes back with the
+/// same cookie, which is what makes it usable as a shard number.
+#[must_use]
+pub fn job_cookie() -> Option<u64> {
+    std::env::var("YT_JOB_COOKIE").ok()?.parse().ok()
+}
+
 /// Runs `job` if this process is a job, and returns otherwise.
 ///
 /// The whole of the one-binary pattern:

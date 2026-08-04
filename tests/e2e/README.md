@@ -57,6 +57,7 @@ cargo run -p ytsaurus-client --example sort_reduce  # sort, then reduce over it
 cargo run -p ytsaurus-client --example idempotent   # a repeated start is one operation
 cargo run -p ytsaurus-client --example cached_upload # the second upload is a cache hit
 cargo run -p ytsaurus-client --example statistics   # what the job counted, read back
+cargo run -p ytsaurus-client --example vanilla      # three jobs with no input table
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -191,6 +192,21 @@ column, which the job drops:
    ok rows/read is 7
    ok rows/rejected is 3
 ```
+
+`vanilla`, same cluster — three jobs, no input table anywhere:
+
+```text
+== Running 3 jobs with nothing to read
+   ok operation 558f9160-4157ea86-103e8-fa6cd1cf completed
+== Checking what the jobs wrote
+   ok 3 rows, one per job
+   ok the jobs identified themselves as {0, 1, 2}
+   ok their slices add up to 500500
+   ok and cover every one of the 1000 numbers exactly once
+```
+
+The cookies are the check that matters: the cluster hands each job a distinct
+one, which is all a vanilla job has to divide the work by.
 
 That document is why the client does not walk `rows/rejected` as a path: the
 name is one key, and `$` → job state → job type sits below it. The operation

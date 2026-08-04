@@ -18,7 +18,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
-| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`) plus their e2e tests. |
+| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`) plus their e2e tests. |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
@@ -63,7 +63,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 272 tests
+cargo test --workspace            # 279 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -269,7 +269,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 246 tests. Control records driven by the exact
+1. **Unit and integration** — 251 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

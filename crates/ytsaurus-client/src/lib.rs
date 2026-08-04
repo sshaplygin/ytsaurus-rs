@@ -76,7 +76,9 @@ pub mod yson_build;
 pub use crate::error::{ClientError, Result};
 pub use crate::jobs::{JobFailure, JobInfo};
 pub use crate::retry::{MutationId, RetryPolicy};
-pub use crate::spec::{MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec};
+pub use crate::spec::{
+    MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec, VanillaSpec, VanillaTask,
+};
 
 use crate::http::{Method, Payload, Transport};
 use crate::retry::Repeatable;
@@ -733,6 +735,18 @@ impl Client {
     /// Returns [`ClientError`] if the request fails.
     pub fn start_sort(&self, spec: &SortSpec) -> Result<String> {
         self.start_operation(OperationType::Sort, &spec.to_yson())
+    }
+
+    /// Starts a vanilla operation, returning its ID.
+    ///
+    /// Jobs with no input tables: a distributed process, a side-car
+    /// computation, anything that is not a transformation of a table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_vanilla(&self, spec: &VanillaSpec) -> Result<String> {
+        self.start_operation(OperationType::Vanilla, &spec.to_yson())
     }
 
     /// Starts an operation from a spec built by hand.

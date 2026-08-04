@@ -433,7 +433,50 @@ yt map-reduce \
 
 See [`examples/src/bin/wordcount.rs`](../examples/src/bin/wordcount.rs).
 
-## 9. Reporting your own numbers
+## 9. Jobs with no input
+
+A **vanilla** operation runs jobs that are not a transformation of a table:
+nothing arrives on fd 0. It is the shape for a distributed process, a side-car
+computation, or a job that fetches its own input.
+
+```rust
+use ytsaurus_client::{VanillaSpec, VanillaTask};
+
+let spec = VanillaSpec::new(
+    VanillaTask::new("shards", "./my_job 3", 3)     // three jobs
+        .with_local_file_named(&worker.path, &worker.name)
+        .with_outputs(["//tmp/results"]),
+);
+client.wait_for_operation(&client.start_vanilla(&spec)?)?;
+```
+
+The job side is the same runtime minus the reader:
+
+```rust
+fn main() {
+    ytsaurus_job::run(|| {
+        let mut writer = JobWriter::descriptors(1)?;      // output still works
+        let shard = ytsaurus_job::job_cookie().unwrap_or(0);
+        // ... do this shard's work
+        writer.finish()
+    })
+}
+```
+
+**Coordination is yours.** The cluster's side of the bargain is keeping
+`job_count` jobs running; how they divide the work is not its problem.
+`job_cookie()` is what to divide by — it counts from zero and is stable across a
+restart, so a retried job redoes its own share rather than someone else's.
+
+The cluster tells a job its cookie but not how many siblings it has, so pass
+that in the command (`"./my_job 3"` above) as the spec's own parameter. A task
+may declare output tables or none at all; `gang_options` and the rest go through
+`VanillaTask::with_raw`.
+
+See [`examples/src/bin/shards.rs`](../examples/src/bin/shards.rs) and
+`cargo run -p ytsaurus-client --example vanilla`.
+
+## 10. Reporting your own numbers
 
 The cluster measures a job from the outside — CPU, memory, rows in and out.
 What it cannot see is anything about the work: how many rows failed validation,
@@ -485,7 +528,7 @@ tree if you want the per-job-type breakdown.
 See [`examples/src/bin/counted.rs`](../examples/src/bin/counted.rs) and
 `cargo run -p ytsaurus-client --example statistics`.
 
-## 10. Test without a cluster
+## 11. Test without a cluster
 
 A job is a program that reads a pipe, so you can run it as one:
 
@@ -500,7 +543,7 @@ simulates the shuffle by sorting the mapper output and inserting key switches.
 
 For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
 
-## 11. When something goes wrong
+## 12. When something goes wrong
 
 | Symptom | Likely cause |
 | --- | --- |
