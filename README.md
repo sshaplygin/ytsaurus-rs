@@ -102,11 +102,18 @@ crates — see the comment in [Cargo.toml](Cargo.toml).
 
 ## Status
 
-The codec, the job runtime and the example workers are implemented and verified,
-including against a real cluster. What remains open — an API review, and whether
-to build a Skiff codec — needs a human; both are described in
-[AGENTS.md](AGENTS.md), which is also the project context for contributors and
-coding agents.
+The codec, the job runtime, the client and the example workers are implemented
+and verified against a cluster. The ranked backlog has been worked top to bottom:
+job diagnostics, one binary that is both launcher and job, vanilla operations,
+reduce and sort, retries, the worker cache, custom statistics, schemas derived
+from a struct, transactions, the rest of Cypress with locks, `alter_table`, and
+streaming table I/O. Every item ends with an example that checks itself on a
+cluster — [`tests/e2e/README.md`](tests/e2e/README.md) is the list of what has
+actually been run, with its output.
+
+What remains open needs a human: publishing, an API review, upstreaming, and
+whether to build a Skiff codec. All are described in [AGENTS.md](AGENTS.md),
+which is also the project context for contributors and coding agents.
 
 **Verified against a real cluster.** A local YTsaurus in Docker ran the identity
 map (output table byte-identical to the input, 309 688 bytes), a two-input /
@@ -124,8 +131,12 @@ trailing semicolon inside the attribute block.
 Other verified numbers: streaming 2 GB through the reader **does not raise peak
 RSS at all** — 46.6 MiB before and after on Linux CI, 1.9 → 2.0 MiB on macOS
 (the absolute figure is the test binary's own footprint, which differs by
-platform; the invariant is that it does not grow). Fuzzing ran 6.5 M iterations
-across both YSON formats without a crash.
+platform; the invariant is that it does not grow). Streaming a 67.7 MiB table
+out of a cluster costs **1.0 MiB** of peak RSS against 70.9 MiB to read it into
+memory. Decoding YSON is **~10 %** of the pilot job's time on a cluster, against
+66 % for a job that does nothing but decode — which is why the Skiff question is
+parked rather than pressing. Fuzzing ran 6.5 M iterations across both YSON
+formats without a crash.
 
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).

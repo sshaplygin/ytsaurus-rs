@@ -495,12 +495,32 @@ tables, uploads the worker, writes rows, runs a map, waits, reads back and
 compares, with nothing Python on `PATH`. Run it with
 `cargo run -p ytsaurus-client --example launch`.
 
+**4. The ranked backlog — worked top to bottom, P0 through P3.** Each item ends
+with a cluster example that checks itself, so `tests/e2e/README.md` is the list
+of what has actually been run:
+
+| | | |
+| --- | --- | --- |
+| P0 | job diagnostics · one binary as launcher and job · vanilla | `diagnose`, `selfrun`, `vanilla` |
+| P1 | reduce/sort · retries and `mutation_id` · worker cache · custom statistics | `sort_reduce`, `idempotent`, `cached_upload`, `statistics` |
+| P2 | schema from a struct · transactions · Cypress and locks · `alter_table` | `schema`, `transaction`, `cypress` |
+| P3 | streaming table I/O · the pilot's decode share · token file and compression | `streaming`, `profile`, `tests/request_shape.rs` |
+
+**What is left of the backlog is not code.** P3 #15 (tracing spans) is written
+down as "only worth doing if a user asks", and nobody has. TLS is the one part
+of P3 #14 a local cluster cannot exercise. Everything else needs a human — see
+below.
+
 ### Parked — needs a human and a real cluster
 
 - **Skiff go/no-go.** Job-path benchmarks exist
   ([`docs/benchmarking.md`](docs/benchmarking.md)) but the decision needs a
   ≥ 10 GB table and C++/Python baselines. Decoding is 66 % of job CPU for a job
-  that does nothing else, which is the worst case for YSON, not a verdict.
+  that does nothing else, which is the worst case for YSON, not a verdict — and
+  **~10 % for the pilot**, a job that does something with its rows, measured on
+  the local cluster by `cargo run -p ytsaurus-client --example profile`. That is
+  well under the 30 % threshold, so the question has lost urgency without being
+  settled.
 - **Upstreaming** to
   [ytsaurus/ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk) —
   the maintainers' stance in ytsaurus#6 is "PRs welcome". **Do not start without
@@ -515,8 +535,10 @@ a local Docker cluster is enough for everything else.
 
 ## Non-goals
 
-RPC proxy (custom binary protocol), protobuf row format, dynamic tables, custom
-job statistics, non-Linux targets, publishing to crates.io.
+RPC proxy (custom binary protocol), protobuf row format, dynamic tables,
+non-Linux targets, publishing to crates.io. *(Custom job statistics were on this
+list until the backlog ranked them P1 #7 — a human decision, and they ship now
+as `JobStatistics`.)*
 
 ## Reference
 
