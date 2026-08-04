@@ -10,7 +10,14 @@
 
 use ytsaurus_yson::YsonValue;
 
-use crate::yson_build::{binary_yson_format, boolean, insert, int, list, map, string};
+use crate::yson_build::{
+    binary_yson_format, boolean, insert, int, list, map, string, with_attributes,
+};
+
+/// A `file_paths` entry that lands in the sandbox under `name`.
+fn named_file(path: impl Into<String>, name: impl AsRef<str>) -> YsonValue {
+    with_attributes(string(path.into()), [("file_name", string(name.as_ref()))])
+}
 
 /// The kind of operation to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +52,11 @@ impl OperationType {
 #[derive(Debug, Clone)]
 struct UserJob {
     command: String,
-    files: Vec<String>,
+    /// Rendered `file_paths` entries. A YSON value rather than a string
+    /// because a path may carry attributes — `<file_name="cat">//tmp/…` is how
+    /// a file whose Cypress name is an MD5 hash appears in the sandbox under a
+    /// name the command can actually run.
+    files: Vec<YsonValue>,
     memory_limit: Option<i64>,
     environment: Vec<(String, String)>,
 }
@@ -70,7 +81,7 @@ impl UserJob {
         ]);
 
         if !self.files.is_empty() {
-            insert(&mut job, "file_paths", list(self.files.iter().map(string)));
+            insert(&mut job, "file_paths", list(self.files.iter().cloned()));
         }
         if let Some(limit) = self.memory_limit {
             insert(&mut job, "memory_limit", int(limit));
@@ -131,7 +142,17 @@ impl MapSpec {
     /// Adds a Cypress file the job needs — normally the worker binary.
     #[must_use]
     pub fn with_local_file(mut self, path: impl Into<String>) -> Self {
-        self.mapper.files.push(path.into());
+        self.mapper.files.push(string(path.into()));
+        self
+    }
+
+    /// Adds a Cypress file under a different name in the job's sandbox.
+    ///
+    /// The name matters because the job runs a *command*: a file cached under
+    /// its MD5 hash arrives as `4c8f…`, and `./my_job` would not find it.
+    #[must_use]
+    pub fn with_local_file_named(mut self, path: impl Into<String>, name: impl AsRef<str>) -> Self {
+        self.mapper.files.push(named_file(path, name));
         self
     }
 
@@ -250,12 +271,23 @@ impl MapReduceSpec {
     /// One binary usually serves both, dispatching on `argv[1]`, so attaching
     /// it to each phase separately would only be a way to forget one.
     #[must_use]
-    pub fn with_local_file(mut self, path: impl Into<String>) -> Self {
-        let path = path.into();
+    pub fn with_local_file(self, path: impl Into<String>) -> Self {
+        self.attach(string(path.into()))
+    }
+
+    /// Adds a Cypress file to both phases under a different sandbox name.
+    ///
+    /// See [`MapSpec::with_local_file_named`] for why the name matters.
+    #[must_use]
+    pub fn with_local_file_named(self, path: impl Into<String>, name: impl AsRef<str>) -> Self {
+        self.attach(named_file(path, name))
+    }
+
+    fn attach(mut self, file: YsonValue) -> Self {
         if let Some(mapper) = &mut self.mapper {
-            mapper.files.push(path.clone());
+            mapper.files.push(file.clone());
         }
-        self.reducer.files.push(path);
+        self.reducer.files.push(file);
         self
     }
 
@@ -396,7 +428,16 @@ impl ReduceSpec {
     /// Adds a Cypress file the job needs — normally the worker binary.
     #[must_use]
     pub fn with_local_file(mut self, path: impl Into<String>) -> Self {
-        self.reducer.files.push(path.into());
+        self.reducer.files.push(string(path.into()));
+        self
+    }
+
+    /// Adds a Cypress file under a different name in the job's sandbox.
+    ///
+    /// See [`MapSpec::with_local_file_named`] for why the name matters.
+    #[must_use]
+    pub fn with_local_file_named(mut self, path: impl Into<String>, name: impl AsRef<str>) -> Self {
+        self.reducer.files.push(named_file(path, name));
         self
     }
 
@@ -676,6 +717,46 @@ mod tests {
             2,
             "the binary must be attached to both phases: {out}"
         );
+    }
+
+    /// A cached file is named after its hash, so the sandbox name has to come
+    /// from an attribute or the job's command finds nothing to run.
+    #[test]
+    fn a_named_file_carries_its_sandbox_name() {
+        let cached = "//tmp/yt_wrapper/file_storage/new_cache/da/2c76e46b90e8b9d5ec25397e14c043da";
+        let out = render(
+            &MapSpec::new("./cat", ["//i"], ["//o"])
+                .with_local_file_named(cached, "cat")
+                .to_yson(),
+        );
+
+        assert!(out.contains("file_name=cat"), "{out}");
+        assert!(out.contains(cached), "{out}");
+    }
+
+    #[test]
+    fn a_named_file_reaches_both_map_reduce_phases() {
+        let out = render(
+            &MapReduceSpec::new("./w reduce", ["//in"], ["//out"], ["k"])
+                .with_mapper("./w map")
+                .with_local_file_named("//tmp/cache/ab/cd", "w")
+                .to_yson(),
+        );
+        assert_eq!(
+            out.matches("file_name=w").count(),
+            2,
+            "the binary must be attached to both phases: {out}"
+        );
+    }
+
+    #[test]
+    fn a_plain_file_gets_no_attributes() {
+        let out = render(
+            &MapSpec::new("./cat", ["//i"], ["//o"])
+                .with_local_file("//tmp/cat")
+                .to_yson(),
+        );
+        assert!(out.contains(r#"file_paths=["//tmp/cat"]"#), "{out}");
     }
 
     #[test]

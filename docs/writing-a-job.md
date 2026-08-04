@@ -232,6 +232,22 @@ On Linux x86-64, run the musl build itself and `upload_current_exe` needs no
 help. [`examples/src/bin/selfrun.rs`](../examples/src/bin/selfrun.rs) is the
 runnable version of all of this.
 
+### Uploading it only when it changed
+
+A worker is tens of megabytes, and re-sending it on every launch is the slowest
+part of a loop that changes only the spec. The cluster's file cache is keyed by
+MD5, so an unchanged binary is found rather than uploaded:
+
+```rust
+let worker = client.upload_worker_cached("target/…/my_job")?;
+let spec = MapSpec::new("./my_job", ["//tmp/in"], ["//tmp/out"])
+    .with_local_file_named(&worker.path, &worker.name);
+```
+
+The name has to be passed along: a cached node is named after its hash, and
+`./my_job` would find nothing to run without it. `worker.uploaded` says whether
+this call was a miss.
+
 ### What the cluster puts in a job's environment
 
 Captured from a job on a local cluster, not from documentation:

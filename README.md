@@ -82,7 +82,7 @@ walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 ## Build and test
 
 ```sh
-cargo test --workspace          # 253 tests
+cargo test --workspace          # 257 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```

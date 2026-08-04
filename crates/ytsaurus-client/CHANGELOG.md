@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### The worker is uploaded once, not once per launch
+
+- **Added** `Client::upload_worker_cached`, `Client::file_from_cache`,
+  `Client::put_file_to_cache` and `Client::with_file_cache`. The cluster keeps a
+  file cache keyed by MD5; an unchanged binary is now found there instead of
+  being re-sent, which is the slowest part of a dev loop that changes only the
+  spec.
+- **Added** `with_local_file_named` to all three spec builders. A cached node is
+  named after its hash, so `./my_job` would find nothing to run without a
+  `file_name` attribute on the path. `file_paths` entries are YSON values now
+  rather than plain strings, which is what makes such attributes expressible.
+- **Added** a dependency on `md5` (0.8), chosen for having no dependencies of
+  its own: this crate is linked into worker binaries that cross-compile to musl
+  with nothing but the Rust toolchain.
+
+The cache defaults to `//tmp/yt_wrapper/file_storage/new_cache`, the path the
+Python wrapper uses, so an installation that already expires entries there
+expires ours too.
+
+Two things the cluster settled, both now handled: `get_file_from_cache` and
+`put_file_to_cache` answer with a **bare string** rather than the usual
+`{path=…}` envelope, and a cache miss is an **empty string**, not an error or an
+entity.
+
+Verified on the local cluster with `cargo run -p ytsaurus-client --example
+cached_upload`: first call uploads (166 ms), second is a hit (32 ms) on the same
+path, and the cached binary runs as a job — so both the `executable` attribute
+and the sandbox name survive the trip through the cache.
+
 ### A transient failure no longer kills the run
 
 A shared cluster produces failures that pass on their own — a restarting proxy,

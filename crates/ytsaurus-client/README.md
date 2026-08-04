@@ -40,7 +40,8 @@ cargo run -p ytsaurus-client --example launch
 | | |
 | --- | --- |
 | Cypress | `create`, `remove`, `exists`, `get`, `row_count` |
-| Data | `upload_worker`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_operation`, `operation_state`, `wait_for_operation` |
 | Jobs | `list_jobs`, `get_job_stderr` |
 
@@ -115,6 +116,24 @@ report off. Failing to collect it never replaces the failure being reported.
 
 [`examples/diagnose.rs`](examples/diagnose.rs) runs the whole path against a
 local cluster.
+
+## Upload the worker once
+
+Re-sending tens of megabytes on every launch is the slowest part of a dev loop
+that changes only the spec. The cluster's file cache is keyed by MD5:
+
+```rust
+let worker = client.upload_worker_cached("target/…/my_job")?;   // uploaded, or found
+
+let spec = MapSpec::new("./my_job", ["//tmp/in"], ["//tmp/out"])
+    .with_local_file_named(&worker.path, &worker.name);
+```
+
+`worker.uploaded` says which it was. The name has to be passed along because the
+cached node is named after the hash — `./my_job` would find nothing to run
+otherwise. The cache defaults to the path the Python wrapper uses, so it is
+shared with everything else on the installation;
+`Client::with_file_cache` moves it.
 
 ## Retries
 

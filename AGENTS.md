@@ -62,7 +62,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 253 tests
+cargo test --workspace            # 257 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -160,6 +160,12 @@ These cost time once. They are recorded so they do not cost it again.
 - **A duplicate mutation must admit to being one.** Re-sending a `mutation_id`
   without `retry=%true` is refused with `Duplicate request is not marked as
   "retry"`, not deduplicated. The flag is not inferred from the ID being known.
+- **The file-cache commands answer with a bare string**, not the `{path=…}`
+  envelope the rest of API v4 uses, and a **miss is an empty string** rather
+  than an error or an entity.
+- **A cached file keeps its name from the hash, not from the upload.** Reference
+  it in `file_paths` as `<file_name="my_job">//tmp/.../ab/cdef…` or the job's
+  command finds nothing to run.
 - **Two operations writing one output table serialise on an exclusive lock**,
   and the loser fails to prepare rather than waiting. Give concurrent
   operations their own outputs.
@@ -239,7 +245,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 229 tests. Control records driven by the exact
+1. **Unit and integration** — 232 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

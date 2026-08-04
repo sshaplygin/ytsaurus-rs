@@ -55,6 +55,7 @@ cargo run -p ytsaurus-client --example launch       # the happy path
 cargo run -p ytsaurus-client --example diagnose     # the failure path
 cargo run -p ytsaurus-client --example sort_reduce  # sort, then reduce over it
 cargo run -p ytsaurus-client --example idempotent   # a repeated start is one operation
+cargo run -p ytsaurus-client --example cached_upload # the second upload is a cache hit
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -159,6 +160,24 @@ The first attempt at this example failed, and usefully: sending the same
 `mutation_id` twice **without** the `retry` flag is refused with `Duplicate
 request is not marked as "retry"`. The cluster does not infer a replay from
 recognising the ID, which is why `MutationId::as_retry()` exists.
+
+`cached_upload`, same cluster (a 491 KiB worker — the gap grows with the
+binary):
+
+```text
+== First upload
+   uploaded in 166 ms -> //tmp/yt_wrapper/file_storage/new_cache/da/2c76e46b...
+== Second upload of the same binary
+   cache hit in 32 ms -> //tmp/yt_wrapper/file_storage/new_cache/da/2c76e46b...
+   ok the second call skipped the upload
+   ok and found the same file
+== Running the cached binary
+   ok the identity map reproduced its input
+```
+
+The last check is the one that matters beyond the timing: the cached node keeps
+its `executable` attribute and reaches the sandbox under the name the command
+expects, so a cached binary really runs.
 
 ## Refreshing the golden fixtures
 

@@ -100,12 +100,35 @@ const REPORTED_JOBS: u32 = 3;
 /// terminal wants the tail of it, not all of it.
 const STDERR_EXCERPT: usize = 4096;
 
+/// Where the cluster's file cache lives.
+///
+/// The path the Python wrapper uses, so a cache an installation already
+/// maintains — and already expires entries from — is the one this client uses
+/// too.
+const DEFAULT_FILE_CACHE: &str = "//tmp/yt_wrapper/file_storage/new_cache";
+
+/// A worker binary on the cluster, as [`Client::upload_worker_cached`] left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedFile {
+    /// Cypress path to reference from a spec.
+    pub path: String,
+    /// The name to give it in the job's sandbox.
+    ///
+    /// The cached node is named after the file's hash, so a command like
+    /// `./my_job` needs this passed to
+    /// [`MapSpec::with_local_file_named`].
+    pub name: String,
+    /// Whether this call had to upload it. `false` is a cache hit.
+    pub uploaded: bool,
+}
+
 /// A connection to one YTsaurus cluster.
 #[derive(Debug, Clone)]
 pub struct Client {
     transport: Transport,
     poll_interval: Duration,
     job_diagnostics: bool,
+    file_cache: String,
 }
 
 impl Client {
@@ -119,6 +142,7 @@ impl Client {
             transport: Transport::new(proxy, None, DEFAULT_TIMEOUT),
             poll_interval: DEFAULT_POLL_INTERVAL,
             job_diagnostics: true,
+            file_cache: DEFAULT_FILE_CACHE.to_owned(),
         }
     }
 
@@ -129,6 +153,7 @@ impl Client {
             transport: Transport::new(proxy, Some(token.into()), DEFAULT_TIMEOUT),
             poll_interval: DEFAULT_POLL_INTERVAL,
             job_diagnostics: true,
+            file_cache: DEFAULT_FILE_CACHE.to_owned(),
         }
     }
 
@@ -175,6 +200,17 @@ impl Client {
     #[must_use]
     pub fn with_retries(mut self, policy: RetryPolicy) -> Self {
         self.transport.set_retries(policy);
+        self
+    }
+
+    /// Overrides where [`Client::upload_worker_cached`] keeps its files.
+    ///
+    /// Defaults to the path the Python wrapper uses, so the cache is shared
+    /// with whatever else the installation runs — and whatever expiry its
+    /// administrators have set applies here too.
+    #[must_use]
+    pub fn with_file_cache(mut self, path: impl Into<String>) -> Self {
+        self.file_cache = path.into();
         self
     }
 
@@ -383,6 +419,158 @@ impl Client {
         self.upload_executable(remote, &bytes)
     }
 
+    /// Uploads a worker, or finds it already on the cluster.
+    ///
+    /// Keyed by the file's MD5, so an unchanged binary is uploaded once and
+    /// every later launch reuses it. That is the difference between a dev loop
+    /// that re-sends tens of megabytes on every run and one that does not.
+    ///
+    /// The cached node is named after the hash, so the returned
+    /// [`CachedFile::name`] is the name to give it in the sandbox — see
+    /// [`MapSpec::with_local_file_named`]:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, MapSpec};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let worker = client.upload_worker_cached("target/.../my_job")?;
+    /// let spec = MapSpec::new("./my_job", ["//tmp/in"], ["//tmp/out"])
+    ///     .with_local_file_named(&worker.path, &worker.name);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The cache is shared: [`Client::with_file_cache`] defaults to the path
+    /// the Python wrapper uses, so an installation that already expires old
+    /// entries there expires these too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the file cannot be read or the upload fails.
+    pub fn upload_worker_cached(&self, local: impl AsRef<std::path::Path>) -> Result<CachedFile> {
+        let local = local.as_ref();
+        let bytes = std::fs::read(local).map_err(|source| ClientError::Io {
+            path: local.display().to_string(),
+            source,
+        })?;
+
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "worker".to_owned());
+        let digest = format!("{:x}", md5::compute(&bytes));
+
+        if let Some(path) = self.file_from_cache(&digest)? {
+            return Ok(CachedFile {
+                path,
+                name,
+                uploaded: false,
+            });
+        }
+
+        // Staged inside the cache node, so a cluster that expires the cache
+        // expires an interrupted upload with it.
+        let staging = format!("{}/staged_{digest}", self.file_cache);
+        self.create("file", &staging)?;
+        self.write_file_computing_md5(&staging, &bytes)?;
+        self.set_attribute(&staging, "executable", yson_build::boolean(true))?;
+
+        let path = self.put_file_to_cache(&staging, &digest)?;
+        // The cache may keep the node itself rather than a copy of it, so this
+        // is `force`-removing something that may already be gone. `remove`
+        // tolerates that.
+        self.remove(&staging)?;
+        // Set on the cached path too: whether the attribute survives the move
+        // decides whether the job can exec at all, and it is cheap to be sure.
+        self.set_attribute(&path, "executable", yson_build::boolean(true))?;
+
+        Ok(CachedFile {
+            path,
+            name,
+            uploaded: true,
+        })
+    }
+
+    /// Looks up a file in the cluster's file cache by its MD5.
+    ///
+    /// `None` means nothing is cached under that hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn file_from_cache(&self, md5: &str) -> Result<Option<String>> {
+        self.create("map_node", &self.file_cache)?;
+
+        let params = yson_build::map([
+            ("md5", yson_build::string(md5)),
+            ("cache_path", yson_build::string(&self.file_cache)),
+        ]);
+        let body = self.transport.call(
+            Method::Get,
+            "get_file_from_cache",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        self.cached_path(&body, "get_file_from_cache")
+    }
+
+    /// Hands a file already written to Cypress to the file cache.
+    ///
+    /// The cluster verifies that the node's MD5 is the one given, which is why
+    /// it must have been written with `compute_md5`. Returns the path the file
+    /// now lives at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn put_file_to_cache(&self, path: &str, md5: &str) -> Result<String> {
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("md5", yson_build::string(md5)),
+            ("cache_path", yson_build::string(&self.file_cache)),
+        ]);
+        let body = self.transport.call(
+            Method::Post,
+            "put_file_to_cache",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+
+        self.cached_path(&body, "put_file_to_cache")?
+            .ok_or_else(|| ClientError::Decode {
+                command: "put_file_to_cache".to_owned(),
+                reason: "the cluster returned no path for the cached file".to_owned(),
+            })
+    }
+
+    /// Reads the path out of a file-cache response.
+    ///
+    /// These two commands answer with a **bare string**, not the `{path=…}`
+    /// envelope the rest of API v4 uses, and a cache miss is an *empty* string
+    /// rather than an error or an entity. Both shapes are accepted so that a
+    /// cluster that grows an envelope later does not break this.
+    fn cached_path(&self, body: &[u8], command: &str) -> Result<Option<String>> {
+        let value = self.strip_envelope(body, command)?;
+        let value = match &value.node {
+            YsonNode::Map(_) => self.field_of(&value, "path")?,
+            _ => value,
+        };
+
+        match &value.node {
+            YsonNode::String(bytes) if !bytes.is_empty() => {
+                Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+            }
+            YsonNode::String(_) | YsonNode::Entity => Ok(None),
+            other => Err(ClientError::Decode {
+                command: command.to_owned(),
+                reason: format!("the cached path is not a string: {other:?}"),
+            }),
+        }
+    }
+
     /// Writes `bytes` to `remote` as a file a node is allowed to run.
     fn upload_executable(&self, remote: &str, bytes: &[u8]) -> Result<()> {
         self.create("file", remote)?;
@@ -396,7 +584,21 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
-        let params = yson_build::map([("path", yson_build::string(path))]);
+        self.write_file_inner(path, contents, false)
+    }
+
+    /// As `write_file`, asking the cluster to record the file's MD5 — which is
+    /// what `put_file_to_cache` then checks against.
+    fn write_file_computing_md5(&self, path: &str, contents: &[u8]) -> Result<()> {
+        self.write_file_inner(path, contents, true)
+    }
+
+    fn write_file_inner(&self, path: &str, contents: &[u8], compute_md5: bool) -> Result<()> {
+        let mut params = yson_build::map([("path", yson_build::string(path))]);
+        if compute_md5 {
+            yson_build::insert(&mut params, "compute_md5", yson_build::boolean(true));
+        }
+
         self.transport.call(
             Method::Put,
             "write_file",
