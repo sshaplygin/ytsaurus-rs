@@ -1,5 +1,10 @@
 # ytsaurus-job
 
+[![crates.io](https://img.shields.io/crates/v/ytsaurus-job.svg)](https://crates.io/crates/ytsaurus-job)
+[![docs.rs](https://img.shields.io/docsrs/ytsaurus-job)](https://docs.rs/ytsaurus-job)
+[![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 Runtime for writing [YTsaurus](https://ytsaurus.tech) MapReduce jobs in Rust.
 
 A job is an executable: rows arrive on fd 0 as binary

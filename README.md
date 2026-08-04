@@ -1,10 +1,14 @@
 # ytsaurus-rs
 
 [![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
-[![ytsaurus-job](https://img.shields.io/crates/v/ytsaurus-job.svg?label=ytsaurus-job)](https://crates.io/crates/ytsaurus-job)
-[![ytsaurus-yson](https://img.shields.io/crates/v/ytsaurus-yson.svg?label=ytsaurus-yson)](https://crates.io/crates/ytsaurus-yson)
-[![docs.rs](https://img.shields.io/docsrs/ytsaurus-job?label=docs.rs)](https://docs.rs/ytsaurus-job)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+[![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
+
+| Crate | Version | Docs | What it is |
+| --- | --- | --- | --- |
+| [`ytsaurus-yson`](crates/ytsaurus-yson/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-yson.svg)](https://crates.io/crates/ytsaurus-yson) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-yson)](https://docs.rs/ytsaurus-yson) | YSON codec, text and binary |
+| [`ytsaurus-job`](crates/ytsaurus-job/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-job.svg)](https://crates.io/crates/ytsaurus-job) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-job)](https://docs.rs/ytsaurus-job) | Job runtime |
+| [`ytsaurus-client`](crates/ytsaurus-client/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-client.svg)](https://crates.io/crates/ytsaurus-client) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-client)](https://docs.rs/ytsaurus-client) | HTTP API v4 launcher |
 
 Write [YTsaurus](https://ytsaurus.tech) MapReduce workers in Rust instead of C++.
 
@@ -124,8 +128,9 @@ across both YSON formats without a crash.
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).
 
-Nothing here is published to crates.io, and nothing will be without explicit human
-approval. In particular the `yson-rs` name belongs to its upstream author.
+All three crates are on crates.io, and **no further release happens without
+explicit human approval** — versions, yanks and new crates alike. In particular
+the `yson-rs` name belongs to its upstream author and will never be claimed here.
 
 Every protocol fact in this repository is taken from the official YTsaurus
 documentation and cited at the point of use, then checked against a real cluster.

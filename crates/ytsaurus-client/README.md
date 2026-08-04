@@ -1,5 +1,10 @@
 # ytsaurus-client
 
+[![crates.io](https://img.shields.io/crates/v/ytsaurus-client.svg)](https://crates.io/crates/ytsaurus-client)
+[![docs.rs](https://img.shields.io/docsrs/ytsaurus-client)](https://docs.rs/ytsaurus-client)
+[![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 A thin [YTsaurus](https://ytsaurus.tech) HTTP API v4 client: enough to run a Rust
 worker **without a Python installation**.
 
