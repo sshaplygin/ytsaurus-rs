@@ -30,10 +30,13 @@ Add a binary to `examples/` (or your own crate):
 
 ```toml
 [dependencies]
-ytsaurus-job = { path = "../crates/ytsaurus-job" }
+ytsaurus-job = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 ```
+
+`ytsaurus-job` re-exports the codec as `ytsaurus_job::yson`, so you only need a
+direct dependency on `ytsaurus-yson` if you use it without the job runtime.
 
 ## 2. Write a mapper
 

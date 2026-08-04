@@ -1,6 +1,17 @@
 # ytsaurus-rs
 
+[![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![ytsaurus-job](https://img.shields.io/crates/v/ytsaurus-job.svg?label=ytsaurus-job)](https://crates.io/crates/ytsaurus-job)
+[![ytsaurus-yson](https://img.shields.io/crates/v/ytsaurus-yson.svg?label=ytsaurus-yson)](https://crates.io/crates/ytsaurus-yson)
+[![docs.rs](https://img.shields.io/docsrs/ytsaurus-job?label=docs.rs)](https://docs.rs/ytsaurus-job)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 Write [YTsaurus](https://ytsaurus.tech) MapReduce workers in Rust instead of C++.
+
+```toml
+[dependencies]
+ytsaurus-job = "0.1"
+```
 
 A YTsaurus job is just an executable: it reads input rows from fd 0 and writes output
 tables to fds 1, 4, 7… in binary [YSON](https://ytsaurus.tech/docs/en/user-guide/storage/yson).
