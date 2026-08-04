@@ -9,6 +9,7 @@
 | [`ytsaurus-yson`](crates/ytsaurus-yson/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-yson.svg)](https://crates.io/crates/ytsaurus-yson) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-yson)](https://docs.rs/ytsaurus-yson) | YSON codec, text and binary |
 | [`ytsaurus-job`](crates/ytsaurus-job/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-job.svg)](https://crates.io/crates/ytsaurus-job) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-job)](https://docs.rs/ytsaurus-job) | Job runtime |
 | [`ytsaurus-client`](crates/ytsaurus-client/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-client.svg)](https://crates.io/crates/ytsaurus-client) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-client)](https://docs.rs/ytsaurus-client) | HTTP API v4 launcher |
+| [`ytsaurus-helpers`](crates/ytsaurus-helpers/) | unpublished | — | `#[derive(TableRow)]` for schemas |
 
 Write [YTsaurus](https://ytsaurus.tech) MapReduce workers in Rust instead of C++.
 
@@ -30,6 +31,7 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-yson/](crates/ytsaurus-yson/) | YSON serializer/deserializer (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. |
 | [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
+| [crates/ytsaurus-helpers/](crates/ytsaurus-helpers/) | Derive macros: a table schema read off the struct the rows have. |
 | [examples/](examples/) | Worker binaries built on `ytsaurus-job`. |
 | [docs/](docs/) | Guides, including how to write and launch a job. |
 | [tests/e2e/](tests/e2e/) | End-to-end scripts against a local YTsaurus cluster. |
@@ -86,7 +88,7 @@ walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 ## Build and test
 
 ```sh
-cargo test --workspace          # 279 tests
+cargo test --workspace          # 301 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```

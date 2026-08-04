@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### A table can be told what its rows look like
+
+- **Added** the `schema` module — `TableSchema`, `Column`, `ColumnType`,
+  `SortOrder` and the `TableRow` trait — plus `Client::create_table` and
+  `Client::table_schema`.
+- **Added** the `derive` feature, which re-exports `#[derive(TableRow)]` from
+  the new [`ytsaurus-helpers`](../ytsaurus-helpers/) crate. Off by default: it
+  is a compiler plugin, and a crate that only launches operations should not pay
+  to build one.
+
+A schematised table is checked on every write. The example run against a local
+cluster ends with the cluster refusing a row that left a required column out —
+`Required column "size" cannot have "null" value` — which is the whole point of
+saying what the rows look like.
+
+`TableSchema::validate` catches locally what the cluster answers with error 314
+a round trip later: key columns that are not a prefix, duplicate names, names
+starting with `@`, `unique_keys` without a key, and a required `any`. Each
+becomes one sentence naming the column.
+
+Four protocol facts behind this, all watched on a cluster rather than taken from
+the documentation:
+
+- **A schema passed as a top-level `schema` on `create` is silently ignored.**
+  The request returns 200 and a node id, and the table comes back with an empty
+  weak schema. It has to go inside `attributes`. This is the single worst
+  mistake the command allows, and it is why `create_table` exists rather than a
+  `schema` argument on `create`.
+- `create_table` deliberately **fails if the path exists**: the cluster ignores
+  the attributes of a create it skips, so an `ignore_existing` version would
+  quietly leave the old schema in place and report success.
+- **`boolean`/`any` are the `type` spellings; `bool`/`yson` are the `type_v3`
+  ones.** Those two names are the only ones that differ between the
+  vocabularies, and mixing them is refused —
+  `Error parsing ESimpleLogicalValueType value "bool"`.
+- **Three types can never be required** — `any`, `null` and `void`. Each already
+  means "there may be nothing here".
+
+All 26 column types the crate can name were created on a local cluster and
+accepted. Descending sort order was *not*: `Descending sort order is not
+available in this context yet`, so `SortOrder::Descending` says as much on
+itself and the example checks it rather than asserting it, so the day a cluster
+enables it the run says so.
+
 ### Operations with no input tables
 
 - **Added** `VanillaSpec`, `VanillaTask` and `Client::start_vanilla`. A vanilla

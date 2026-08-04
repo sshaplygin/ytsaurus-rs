@@ -293,6 +293,36 @@ export YT_PROXY=http://localhost:8000
 cargo run -p ytsaurus-examples --bin my_job
 ```
 
+### Typed output tables
+
+An output table with no schema takes whatever the job writes and finds out
+later. Giving it one makes the cluster check every row, and the schema is
+already written — it is the struct the job serialises:
+
+```rust
+use ytsaurus_client::TableRow;
+
+#[derive(TableRow)]
+struct Output<'a> {
+    #[yt(key)]
+    host: &'a str,               // utf8, required, and the table comes out sorted
+    size: i64,                   // int64, required
+    referrer: Option<&'a str>,   // optional, because the Rust type says so
+}
+
+client.create_table("//tmp/output", &Output::table_schema())?;
+```
+
+Needs `ytsaurus-client` with `features = ["derive"]`. A row that leaves out a
+required column is then refused by the cluster —
+`Required column "size" cannot have "null" value` — instead of quietly landing
+in the table.
+
+`String` becomes `utf8` and `Vec<u8>` becomes `string`, which is the same
+distinction §2 makes about text and bytes. A Rust type the derive cannot place
+is a compile error rather than a guess; name the column type yourself with
+`#[yt(column_type = "timestamp")]` for the ones no Rust type implies.
+
 ### Or with the `yt` CLI
 
 The CLI needs **two** packages — `ytsaurus-client` alone fails on binary YSON

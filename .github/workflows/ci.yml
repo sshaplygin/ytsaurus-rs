@@ -34,6 +34,11 @@ jobs:
       - name: cargo clippy (client without TLS)
         run: cargo clippy -p ytsaurus-client --no-default-features --all-targets -- -D warnings
 
+      # `derive` is off by default, so the workspace build never compiles the
+      # re-export or the macro against the client's own types.
+      - name: cargo test (client with every feature)
+        run: cargo test -p ytsaurus-client --all-features
+
       - name: cargo test
         run: cargo test --workspace --all-targets
 

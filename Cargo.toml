@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/ytsaurus-yson", "crates/ytsaurus-job", "crates/ytsaurus-client", "examples"]
+members = [
+    "crates/ytsaurus-yson",
+    "crates/ytsaurus-job",
+    "crates/ytsaurus-client",
+    "crates/ytsaurus-helpers",
+    "examples",
+]
 
 [workspace.package]
 version = "0.2.0"
@@ -15,6 +21,7 @@ authors = ["Sam Shaplygin <semyuon@gmail.com>"]
 ytsaurus-yson = { path = "crates/ytsaurus-yson", version = "0.2.0" }
 ytsaurus-job = { path = "crates/ytsaurus-job", version = "0.2.0" }
 ytsaurus-client = { path = "crates/ytsaurus-client", version = "0.2.0" }
+ytsaurus-helpers = { path = "crates/ytsaurus-helpers", version = "0.2.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"

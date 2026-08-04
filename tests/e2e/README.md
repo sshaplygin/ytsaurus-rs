@@ -58,6 +58,7 @@ cargo run -p ytsaurus-client --example idempotent   # a repeated start is one op
 cargo run -p ytsaurus-client --example cached_upload # the second upload is a cache hit
 cargo run -p ytsaurus-client --example statistics   # what the job counted, read back
 cargo run -p ytsaurus-client --example vanilla      # three jobs with no input table
+cargo run -p ytsaurus-client --example schema       # a derived schema the cluster enforces
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -192,6 +193,27 @@ column, which the job drops:
    ok rows/read is 7
    ok rows/rejected is 3
 ```
+
+`schema`, same cluster — the schema comes from `#[derive(TableRow)]` on the
+struct the rows have, and nothing is written out by hand:
+
+```text
+== Creating a table from the struct its rows have
+   <strict=%true;unique_keys=%false>[{name=host;required=%true;sort_order=ascending;type=utf8};…]
+   ok the cluster kept the columns as given
+   ok and marked the table sorted
+== Every column type the crate can name
+   ok 26 column types accepted
+== The schema is a promise the cluster keeps
+   ok a row missing a required column is refused
+   write_table: cluster error 307: Required column "size" cannot have "null" value
+== And the one order this cluster will not take
+   as documented: create: cluster error 314: Descending sort order is not available in this context yet
+```
+
+The last two are the ones worth keeping: a schema the cluster does not enforce
+would be decoration, and the descending refusal is checked rather than asserted
+so that the day a cluster enables it, the run says so instead of going stale.
 
 `vanilla`, same cluster — three jobs, no input table anywhere:
 

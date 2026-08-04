@@ -68,6 +68,8 @@ pub mod error;
 mod http;
 mod jobs;
 mod retry;
+/// Table schemas.
+pub mod schema;
 mod spec;
 mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
@@ -76,9 +78,14 @@ pub mod yson_build;
 pub use crate::error::{ClientError, Result};
 pub use crate::jobs::{JobFailure, JobInfo};
 pub use crate::retry::{MutationId, RetryPolicy};
+pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
+// The derive and the trait share a name, as `serde::Serialize` does: they live
+// in different namespaces, and a user wants both under one import.
 pub use crate::spec::{
     MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec, VanillaSpec, VanillaTask,
 };
+#[cfg(feature = "derive")]
+pub use ytsaurus_helpers::TableRow;
 
 use crate::http::{Method, Payload, Transport};
 use crate::retry::Repeatable;
@@ -303,6 +310,79 @@ impl Client {
             Repeatable::WithMutationId,
         )?;
         Ok(())
+    }
+
+    /// Creates a table with a schema.
+    ///
+    /// A schematised table is checked on every write, stores its columns in
+    /// their own types, and can be sorted and merged; an unschematised one
+    /// takes anything and finds out later.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let schema = TableSchema::new([
+    ///     Column::new("host", ColumnType::Utf8).required().key(),
+    ///     Column::new("size", ColumnType::Int64).required(),
+    /// ]);
+    /// client.create_table("//tmp/visits", &schema)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Unlike [`Client::create`], this **fails if the path already exists**.
+    /// That is deliberate: the cluster ignores the attributes of a create it
+    /// skips, so an `ignore_existing` version of this would quietly leave the
+    /// old table with the old schema and report success. Changing the schema of
+    /// a table that exists is `alter_table`'s job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if the schema is one the cluster would
+    /// refuse, or [`ClientError`] if the request fails.
+    pub fn create_table(&self, path: &str, schema: &TableSchema) -> Result<()> {
+        // Locally first: the same rules, but as one sentence naming the column
+        // rather than a nested error document from the cluster.
+        schema
+            .validate()
+            .map_err(|reason| ClientError::Config(format!("{path}: {reason}")))?;
+
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("type", yson_build::string("table")),
+            ("recursive", yson_build::boolean(true)),
+            // The schema goes *inside* `attributes`. A top-level `schema` here
+            // is accepted, answered with 200 and a node id, and silently
+            // ignored — the table comes back with an empty weak schema. This
+            // is the single worst mistake available in this command.
+            (
+                "attributes",
+                yson_build::map([("schema", schema.to_yson())]),
+            ),
+        ]);
+
+        self.transport.call(
+            Method::Post,
+            "create",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// The schema of a table, as the cluster stores it.
+    ///
+    /// Returns the raw YSON: the cluster answers with more than it was given —
+    /// every column carries `required`, `type` *and* `type_v3` whichever was
+    /// written, and the keys come back in alphabetical order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn table_schema(&self, path: &str) -> Result<YsonValue> {
+        self.get(&format!("{path}/@schema"))
     }
 
     /// Removes a Cypress node. Succeeds if it is already absent.

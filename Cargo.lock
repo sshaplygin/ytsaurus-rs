@@ -1172,6 +1172,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "ureq",
+ "ytsaurus-helpers",
  "ytsaurus-yson",
 ]
 
@@ -1183,6 +1184,17 @@ dependencies = [
  "serde_bytes",
  "ytsaurus-client",
  "ytsaurus-job",
+ "ytsaurus-yson",
+]
+
+[[package]]
+name = "ytsaurus-helpers"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "ytsaurus-client",
  "ytsaurus-yson",
 ]
 

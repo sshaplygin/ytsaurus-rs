@@ -18,6 +18,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
+| `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
 | `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`) plus their e2e tests. |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
@@ -63,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 279 tests
+cargo test --workspace            # 301 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -151,6 +152,41 @@ aborted job's work is redone by its replacement, so counting it would double.
 `JobStatistics` refuses to touch fd 5 unless `is_inside_job()`. With one binary
 serving as both launcher and job, fd 5 in the launcher is as likely to be an
 open socket to the cluster as to be nothing.
+
+### Table schemas
+
+A schema is a YSON **list** of column dicts with `strict` and `unique_keys` as
+attributes **on the list**:
+
+```text
+<strict=%true;unique_keys=%false>[{name=host;required=%true;sort_order=ascending;type=utf8};…]
+```
+
+Cluster facts, all watched rather than read:
+
+- **On `create`, the schema goes inside `attributes`.** A top-level `schema` is
+  answered with 200 and a node id and then **silently ignored** — the table comes
+  back with an empty weak schema. `alter_table` inverts this: there `schema` is a
+  top-level parameter. `set //table/@schema` is refused outright.
+- `create` with `ignore_existing` ignores the attributes too, so `create_table`
+  fails on an existing path rather than reporting success with the old schema.
+- **`boolean`/`any` are the `type` spelling; `bool`/`yson` are `type_v3`.** Those
+  two are the only names that differ; mixing them is refused
+  (`Error parsing ESimpleLogicalValueType value "bool"`).
+- **`any`, `null` and `void` can never be required.**
+- `required` **defaults to `%false`**, so a column dict without it is optional.
+- A read-back always carries `required`, `type` *and* `type_v3` on every column,
+  with the keys in **alphabetical** order. Unknown keys in a column dict are
+  silently dropped.
+- Key columns must be a **contiguous prefix**; `unique_keys=%true` needs at least
+  one key column; names must be non-empty, ≤256 bytes, not start with `@`, and
+  be unique.
+- **`sort_order=descending` is refused** on this build: `Descending sort order is
+  not available in this context yet`, gated by
+  `//sys/@config/enable_descending_sort_order`.
+
+`TableSchema::validate` mirrors these so the error arrives as a sentence naming
+the column rather than as error 314 from a create.
 
 ### Control records
 
@@ -269,7 +305,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 251 tests. Control records driven by the exact
+1. **Unit and integration** — 272 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

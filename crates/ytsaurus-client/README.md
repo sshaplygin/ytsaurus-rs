@@ -44,7 +44,7 @@ cargo run -p ytsaurus-client --example launch
 
 | | |
 | --- | --- |
-| Cypress | `create`, `remove`, `exists`, `get`, `row_count` |
+| Cypress | `create`, `create_table`, `remove`, `exists`, `get`, `row_count`, `table_schema` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
@@ -72,6 +72,38 @@ cluster.
 `upload_worker` sets the `executable` attribute. Without it the cluster copies
 the binary and then refuses to exec it, with an error that never mentions the
 attribute.
+
+## Typed tables
+
+A table with no schema takes whatever a job writes and finds out later. The
+schema is already written, though — it is the struct the rows have:
+
+```rust
+use ytsaurus_client::TableRow;
+
+#[derive(TableRow)]
+struct Visit<'a> {
+    #[yt(key)]
+    host: &'a str,               // utf8, required, and the table comes out sorted
+    size: i64,                   // int64, required
+    referrer: Option<&'a str>,   // optional, because the Rust type says so
+}
+
+client.create_table("//tmp/visits", &Visit::table_schema())?;
+```
+
+Needs `features = ["derive"]`, which re-exports the macro from
+[`ytsaurus-helpers`](../ytsaurus-helpers/). The cluster then refuses a row that
+leaves out a required column — `Required column "size" cannot have "null"
+value` — which is the whole point of saying what the rows look like.
+
+`TableSchema::validate` catches locally what the cluster answers with error 314
+a round trip later: key columns that are not a prefix, duplicate names, a
+required `any`, `unique_keys` with no key.
+
+**`create_table` fails if the path exists.** The cluster ignores the attributes
+of a create it skips, so a version that tolerated an existing table would
+quietly leave the old schema in place and report success.
 
 ## One binary, two roles
 

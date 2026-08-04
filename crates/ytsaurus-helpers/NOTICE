@@ -1,0 +1,9 @@
+ytsaurus-helpers
+Copyright 2026 The ytsaurus-rs Authors
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file distributed
+alongside this one.
+
+This crate is original work. It is a procedural-macro crate: it generates code
+that refers to types in ytsaurus-client, and contributes nothing to the compiled
+binary itself.
