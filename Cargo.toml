@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/ytsaurus-yson", "crates/ytsaurus-job", "examples"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/sshaplygin/ytsaurus-rs"
+homepage = "https://github.com/sshaplygin/ytsaurus-rs"
+authors = ["Sam Shaplygin <semyuon@gmail.com>"]
+
+[workspace.dependencies]
+ytsaurus-yson = { path = "crates/ytsaurus-yson", version = "0.1.0" }
+ytsaurus-job = { path = "crates/ytsaurus-job", version = "0.1.0" }
+
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+ryu = "1.0"
+itoa = "1.0"
+memchr = "2.8"
+
+serde_bytes = "0.11"
+criterion = "0.8.2"
+proptest = "1.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+incremental = false
+
+# Worker profile for job binaries shipped to a YTsaurus cluster.
+#
+# `panic = "abort"` lives HERE and only here: it is a whole-graph profile
+# setting, so putting it in `[profile.release]` would force it on the library
+# crates and on anyone who depends on them. Build workers with:
+#
+#     cargo build -p ytsaurus-examples --profile release-worker \
+#         --target x86_64-unknown-linux-musl
+[profile.release-worker]
+inherits = "release"
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

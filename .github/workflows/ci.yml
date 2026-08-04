@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel, components and targets.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+      # `--all-targets` skips doctests, and the mapper example in the
+      # ytsaurus-job docs must keep compiling (phase 2 DoD).
+      - name: cargo test --doc
+        run: cargo test --workspace --doc
+
+  musl:
+    name: static musl worker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build worker binaries
+        run: |
+          cargo build -p ytsaurus-examples \
+            --profile release-worker \
+            --target x86_64-unknown-linux-musl
+
+      - name: Assert binaries are statically linked
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(target/x86_64-unknown-linux-musl/release-worker/*)
+          found=0
+          for f in "${bins[@]}"; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            case "$f" in *.d|*.rlib) continue;; esac
+            echo "--- $f"
+            file "$f"
+            # rustc emits static-pie for musl; both spellings mean "no libc.so".
+            file "$f" | grep -Eq 'statically linked|static-pie linked'
+            # A dynamically linked binary would list shared objects here.
+            ! ldd "$f" 2>&1 | grep -q '=> /' || {
+              echo "ERROR: $f has dynamic dependencies"; exit 1; }
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "ERROR: no worker binaries were produced"; exit 1
+          fi
+          echo "OK: $found statically linked worker binaries"

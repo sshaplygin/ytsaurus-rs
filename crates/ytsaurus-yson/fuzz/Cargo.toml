@@ -1,0 +1,33 @@
+[package]
+name = "ytsaurus-yson-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Not a member of the root workspace: cargo-fuzz builds it standalone with its
+# own lockfile and nightly-only sanitizer flags.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = "1.0.228"
+
+[dependencies.ytsaurus-yson]
+path = ".."
+
+[[bin]]
+name = "fuzz_target_1"
+path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_target_2"
+path = "fuzz_targets/fuzz_target_2.rs"
+test = false
+doc = false
+bench = false

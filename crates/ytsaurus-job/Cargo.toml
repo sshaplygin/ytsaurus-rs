@@ -1,0 +1,26 @@
+[package]
+name = "ytsaurus-job"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Runtime for writing YTsaurus MapReduce jobs in Rust: streaming YSON row reader, control records, multi-table output"
+readme = "README.md"
+keywords = ["ytsaurus", "mapreduce", "yson", "job"]
+categories = ["encoding"]
+
+[dependencies]
+ytsaurus-yson.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_bytes.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "job_throughput"
+harness = false

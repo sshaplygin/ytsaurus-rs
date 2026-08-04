@@ -1,0 +1,51 @@
+ytsaurus-yson
+Copyright 2026 The ytsaurus-rs Authors
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file distributed
+alongside this one.
+
+--------------------------------------------------------------------------------
+
+This crate is a vendored and modified copy of yson-rs.
+
+    Source:   https://github.com/ss123she/yson-rs
+    Revision: ba2044c711cefa65259e25122fea21c36f451093 (2026-04-01, v0.1.3)
+    Author:   ss123she
+
+The great majority of the code in src/ is the original author's work.
+
+LICENSING
+---------
+
+yson-rs is offered by its author under the terms of either the MIT license or
+the Apache License, Version 2.0, at the recipient's option. This project
+exercises that option and takes the code under the Apache License, Version 2.0.
+
+Three licence files are shipped with this crate:
+
+    LICENSE          the licence this crate is distributed under: Apache-2.0,
+                     carrying this project's copyright line
+    LICENSE-APACHE   upstream's copy of the Apache-2.0 text, as received
+    LICENSE-MIT      upstream's copy of the MIT text: the alternative the author
+                     also offered, retained as a received notice. It is NOT the
+                     licence of this distribution.
+
+The two LICENSE-* files are upstream's unfilled templates — neither carries a
+completed copyright line. They are kept verbatim rather than edited, because
+they are notices received with the code and are not ours to rewrite.
+
+MODIFICATIONS
+-------------
+
+The vendored files have been modified. Section 4(b) of the Apache License
+requires that such changes be stated; every one of them is recorded in
+CHANGELOG.md, including three upstream defects fixed here.
+
+TEST FIXTURES
+-------------
+
+tests/fixtures/ contains data files copied from yson-interop-tests.
+
+    Source:   https://github.com/ss123she/yson-interop-tests
+    Revision: 175fc418d38a60d3b5c45ad71b5244424e43ef2e
+    Author:   ss123she

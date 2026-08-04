@@ -1,0 +1,33 @@
+[package]
+name = "ytsaurus-yson"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "YSON serializer and deserializer for YTsaurus (text and binary). Fork of ss123she/yson-rs @ ba2044c"
+readme = "README.md"
+keywords = ["yson", "ytsaurus", "serde", "serialization", "encoding"]
+categories = ["encoding", "parsing"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+ryu.workspace = true
+itoa.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+serde_bytes.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "yson_benchmark"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
