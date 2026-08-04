@@ -82,6 +82,8 @@ mod retry;
 /// Table schemas.
 pub mod schema;
 mod spec;
+/// Streaming table I/O.
+pub mod stream;
 mod transaction;
 mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
@@ -97,6 +99,7 @@ pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
 pub use crate::spec::{
     MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec, VanillaSpec, VanillaTask,
 };
+pub use crate::stream::TableReader;
 pub use crate::transaction::Transaction;
 #[cfg(feature = "derive")]
 pub use ytsaurus_helpers::TableRow;
@@ -1175,6 +1178,85 @@ impl Client {
         })?;
 
         Ok(body)
+    }
+
+    /// Reads a table as a stream, without holding it.
+    ///
+    /// The same bytes [`Client::read_table`] returns — a binary YSON list
+    /// fragment — arriving as they come off the connection, so the table's size
+    /// stops being the program's memory ceiling.
+    ///
+    /// What comes out is what a job reads on fd 0, so the same decoder handles
+    /// both:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::from_env()?;
+    /// let mut reader = ytsaurus_job::JobReader::binary(client.read_table_streaming("//tmp/big")?);
+    ///
+    /// let mut rows = 0_u64;
+    /// while let Some(event) = reader.next_event()? {
+    ///     if matches!(event, ytsaurus_job::Event::Row(_)) {
+    ///         rows += 1;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`Client::read_table`] checks that what came back is a complete
+    /// fragment; this cannot, because it never has the whole thing. A fragment
+    /// cut short instead leaves a record that does not parse, and the decoder
+    /// fails on it — see [`TableReader`] for why that is the same protection
+    /// rather than none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails. Failures *during* the read
+    /// arrive from the reader, not from here.
+    pub fn read_table_streaming(&self, path: &str) -> Result<TableReader> {
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("output_format", yson_build::binary_yson_format()),
+        ]);
+        let body = self.transport.open(Method::Get, "read_table", &params)?;
+        Ok(TableReader::new(body))
+    }
+
+    /// Writes a table from a stream, without holding it.
+    ///
+    /// `rows` is read to its end and sent as it is read, so the rows can come
+    /// from a file, a pipe, or something that generates them — anything that is
+    /// a `Read`. The bytes are a binary YSON list fragment, exactly as
+    /// [`Client::write_table`] expects them.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::from_env()?;
+    /// client.create("table", "//tmp/big")?;
+    /// client.write_table_streaming("//tmp/big", std::fs::File::open("rows.yson")?)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// This is one attempt and can never be more: a reader that has been
+    /// consumed cannot be sent again. That agrees with the retry rules — heavy
+    /// commands are not repeated — and a transaction is what makes such a write
+    /// safe to fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, including when `rows`
+    /// itself fails to read.
+    pub fn write_table_streaming(&self, path: &str, mut rows: impl std::io::Read) -> Result<()> {
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("input_format", yson_build::binary_yson_format()),
+        ]);
+        self.transport
+            .upload(Method::Put, "write_table", &params, &mut rows)
     }
 
     // ---------------------------------------------------------- operations

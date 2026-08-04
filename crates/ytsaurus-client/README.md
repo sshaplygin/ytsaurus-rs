@@ -48,6 +48,7 @@ cargo run -p ytsaurus-client --example launch
 | Naming | `copy`, `move_node`, `link` — each with a `_replacing` twin that overwrites |
 | Locks | `lock`, `lock_waiting` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
 | Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum` |
@@ -255,6 +256,39 @@ report off. Failing to collect it never replaces the failure being reported.
 [`examples/diagnose.rs`](examples/diagnose.rs) runs the whole path against a
 local cluster.
 
+## Tables bigger than memory
+
+`read_table` and `write_table` hold a whole table at once. The streaming pair
+moves the same bytes without ever holding more than a buffer of them:
+
+```rust
+let mut reader = JobReader::binary(client.read_table_streaming("//tmp/big")?);
+while let Some(event) = reader.next_event()? { /* … */ }
+
+client.write_table_streaming("//tmp/big", File::open("rows.yson")?)?;
+```
+
+The bytes are the same binary YSON list fragment a job reads on fd 0, so the
+same decoder handles a table read on a laptop and a table read inside a job.
+Measured on a local cluster by
+[`examples/streaming.rs`](examples/streaming.rs), which writes a table from a
+generator and then reads it back both ways:
+
+```text
+Writing about 64 MiB from a generator     1242757 rows, peak RSS 2.9 MiB
+Reading it back as a stream               1242757 rows counted, peak RSS 3.8 MiB
+The same table, read into memory          67.7 MiB in hand, peak RSS 74.7 MiB
+```
+
+Two things streaming gives up, on purpose:
+
+- **No completeness check.** `read_table` verifies the response is a whole YSON
+  list fragment — the only defence against a mid-stream failure this client
+  cannot see. Streaming has no whole thing to check, so the defence moves to the
+  decoder, which fails on the record that was cut in half.
+- **No retry, ever.** A reader that has been consumed cannot be sent again, so a
+  streaming write is one attempt in principle rather than by policy.
+
 ## Upload the worker once
 
 Re-sending tens of megabytes on every launch is the slowest part of a dev loop
@@ -302,13 +336,14 @@ light and heavy proxies and answer an upload on a light proxy with 503. Use
 cluster needs none of this.
 
 **Trailers are not read.** The proxy reports a failure discovered mid-stream in
-an `X-YT-Error` trailer, and `ureq` 3.3 exposes none. `read_table` compensates by
-checking the response is a complete YSON list fragment, so a truncated read is
-caught; a mid-stream failure that still yields well-formed output would not be.
-This is a launcher, not a bulk export tool — for that, use the `yt` CLI.
+an `X-YT-Error` trailer, and `ureq` 3.3 exposes none — rechecked against its
+source, where the word does not appear. `read_table` compensates by checking the
+response is a complete YSON list fragment, so a truncated read is caught; a
+mid-stream failure that still yields well-formed output would not be.
 
-**Tables are read into memory.** `read_table` is for results a launcher
-inspects.
+**`read_table` and `write_table` hold the whole table.** They are for results a
+launcher inspects; `read_table_streaming` and `write_table_streaming` are for
+everything larger.
 
 ## Why not JSON
 

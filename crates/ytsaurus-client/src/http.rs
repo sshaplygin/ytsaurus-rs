@@ -17,17 +17,21 @@
 //! 200 response, and reports those in an `X-YT-Error` **trailer** rather than a
 //! header. `ureq` 3.3 exposes no trailers, so this client cannot read them.
 //!
+//! Rechecked against `ureq` 3.3's own source rather than carried forward as an
+//! assumption: the string "trailer" does not appear in it.
+//!
 //! Rather than pretend the gap does not exist, the client checks what it can:
 //! a truncated data stream is caught by validating that the response is a
-//! complete YSON list fragment (see `Client::read_table`). A mid-stream failure
-//! that still produces well-formed output would go unnoticed — in practice that
-//! means a partial read reported as success. For a launcher driving modest
-//! amounts of data this is acceptable; for bulk export it is not, and the `yt`
-//! CLI remains the right tool there.
+//! complete YSON list fragment (see `Client::read_table`), and on the streaming
+//! path — which never has the whole thing to validate — by the decoder failing
+//! on the record that was cut in half. A mid-stream failure that still produces
+//! well-formed output would go unnoticed either way: in practice a partial read
+//! reported as success.
 
 use std::time::Duration;
 
 use ureq::http::HeaderMap;
+use ureq::{AsSendBody, SendBody};
 use ytsaurus_yson::{YsonFormat, YsonValue, to_string};
 
 use crate::error::{ClientError, Result, truncate};
@@ -206,7 +210,7 @@ impl Transport {
         Some(tagged)
     }
 
-    /// One attempt.
+    /// One attempt, read into memory.
     fn send(
         &self,
         method: Method,
@@ -214,54 +218,13 @@ impl Transport {
         parameters: &YsonValue,
         payload: &Payload<'_>,
     ) -> Result<Vec<u8>> {
-        if let Some(error) = tls_unavailable(&self.base) {
-            return Err(error);
-        }
-
-        let url = format!("{}/api/v4/{command}", self.base);
-
-        let encoded = to_string(parameters, YsonFormat::Text).map_err(|e| ClientError::Decode {
-            command: command.to_owned(),
-            reason: format!("could not encode parameters: {e}"),
-        })?;
-
-        let mut headers: Vec<(&str, String)> = vec![
-            (HEADER_FORMAT, "<format=text>yson".to_owned()),
-            (PARAMETERS, encoded),
-            ("X-YT-Output-Format", "<format=text>yson".to_owned()),
-        ];
-        if let Some(token) = &self.token {
-            headers.push(("Authorization", format!("OAuth {token}")));
-        }
-
-        let sent = match (method, payload) {
-            (Method::Get, _) => with_headers!(self.agent.get(&url), &headers).call(),
-            (Method::Post, Payload::None) => {
-                with_headers!(self.agent.post(&url), &headers).send_empty()
-            }
-            (Method::Post, Payload::Bytes(bytes)) => with_headers!(self.agent.post(&url), &headers)
-                .header("Content-Type", "application/octet-stream")
-                .send(*bytes),
-            (Method::Put, Payload::None) => {
-                with_headers!(self.agent.put(&url), &headers).send_empty()
-            }
-            (Method::Put, Payload::Bytes(bytes)) => with_headers!(self.agent.put(&url), &headers)
-                .header("Content-Type", "application/octet-stream")
-                .send(*bytes),
+        let mut bytes: &[u8] = match payload {
+            Payload::None => &[],
+            Payload::Bytes(bytes) => bytes,
         };
-
-        let mut response = sent.map_err(|e| ClientError::Transport {
-            command: command.to_owned(),
-            source: Box::new(e),
-        })?;
+        let mut response = self.dispatch(method, command, parameters, bytes.as_body())?;
 
         let status = response.status().as_u16();
-
-        // The cluster's own error, which is far more useful than the status.
-        if let Some(raw) = header_value(response.headers(), ERROR) {
-            return Err(ClientError::from_yt_error(command, status, &raw));
-        }
-
         let body = response
             .body_mut()
             .with_config()
@@ -284,6 +247,126 @@ impl Transport {
         }
 
         Ok(body)
+    }
+
+    /// Sends a command and hands back the response body **unread**.
+    ///
+    /// For `read_table`, whose response is the data: reading it into a `Vec`
+    /// first would put a whole table in memory, which is the thing this avoids.
+    ///
+    /// Sent once, never retried — this is a heavy command, and the retry rules
+    /// say so.
+    pub(crate) fn open(
+        &self,
+        method: Method,
+        command: &str,
+        parameters: &YsonValue,
+    ) -> Result<ureq::Body> {
+        let stamped = self.in_transaction(parameters);
+        let parameters = stamped.as_ref().unwrap_or(parameters);
+
+        let response = self.dispatch(method, command, parameters, SendBody::none())?;
+        let status = response.status().as_u16();
+
+        if !(200..300).contains(&status) {
+            let mut response = response;
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            return Err(ClientError::Http {
+                command: command.to_owned(),
+                status,
+                body: truncate(&body, 400),
+            });
+        }
+
+        Ok(response.into_body())
+    }
+
+    /// Sends a command whose request body is read as it goes.
+    ///
+    /// For `write_table` from something larger than memory. `rows` is read
+    /// once, so this cannot be retried even in principle: a reader that has
+    /// been consumed cannot be sent again.
+    pub(crate) fn upload(
+        &self,
+        method: Method,
+        command: &str,
+        parameters: &YsonValue,
+        rows: &mut dyn std::io::Read,
+    ) -> Result<()> {
+        let stamped = self.in_transaction(parameters);
+        let parameters = stamped.as_ref().unwrap_or(parameters);
+
+        let mut response =
+            self.dispatch(method, command, parameters, SendBody::from_reader(rows))?;
+        let status = response.status().as_u16();
+
+        if !(200..300).contains(&status) {
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            return Err(ClientError::Http {
+                command: command.to_owned(),
+                status,
+                body: truncate(&body, 400),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Builds and sends one request, and checks the cluster's own error header.
+    ///
+    /// Everything past this point differs only in how the response body is
+    /// consumed.
+    fn dispatch(
+        &self,
+        method: Method,
+        command: &str,
+        parameters: &YsonValue,
+        body: SendBody<'_>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        if let Some(error) = tls_unavailable(&self.base) {
+            return Err(error);
+        }
+
+        let url = format!("{}/api/v4/{command}", self.base);
+
+        let encoded = to_string(parameters, YsonFormat::Text).map_err(|e| ClientError::Decode {
+            command: command.to_owned(),
+            reason: format!("could not encode parameters: {e}"),
+        })?;
+
+        let mut headers: Vec<(&str, String)> = vec![
+            (HEADER_FORMAT, "<format=text>yson".to_owned()),
+            (PARAMETERS, encoded),
+            ("X-YT-Output-Format", "<format=text>yson".to_owned()),
+            ("Content-Type", "application/octet-stream".to_owned()),
+        ];
+        if let Some(token) = &self.token {
+            headers.push(("Authorization", format!("OAuth {token}")));
+        }
+
+        let sent = match method {
+            // A GET carries no body in `ureq`'s type system, which is also true
+            // of every command this client sends as one.
+            Method::Get => with_headers!(self.agent.get(&url), &headers).call(),
+            Method::Post => with_headers!(self.agent.post(&url), &headers).send(body),
+            Method::Put => with_headers!(self.agent.put(&url), &headers).send(body),
+        };
+
+        let response = sent.map_err(|e| ClientError::Transport {
+            command: command.to_owned(),
+            source: Box::new(e),
+        })?;
+
+        // The cluster's own error, which is far more useful than the status.
+        if let Some(raw) = header_value(response.headers(), ERROR) {
+            return Err(ClientError::from_yt_error(
+                command,
+                response.status().as_u16(),
+                &raw,
+            ));
+        }
+
+        Ok(response)
     }
 }
 

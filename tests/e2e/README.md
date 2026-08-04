@@ -61,6 +61,7 @@ cargo run -p ytsaurus-client --example vanilla      # three jobs with no input t
 cargo run -p ytsaurus-client --example schema       # a derived schema the cluster enforces
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
+cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -263,6 +264,26 @@ event rather than two. And the last section holds a transaction three timeouts
 past its expiry: without the ping thread the cluster would have aborted it four
 seconds earlier, so it is the one check that fails if the keep-alive stops
 working.
+
+`streaming`, same cluster — the same 64 MiB table written from a generator and
+then read back both ways, with peak RSS watched throughout:
+
+```text
+== Writing about 64 MiB from a generator
+   ok 1242757 rows, 53.5 MiB on the cluster, peak RSS 2.9 MiB
+== Reading it back as a stream
+   ok 1242757 rows counted, peak RSS 3.8 MiB
+   ok and their values add up to what was written
+== The same table, read into memory
+   ok 67.7 MiB in hand, peak RSS 74.7 MiB
+
+Streaming the 67.7 MiB table cost 1.0 MiB of peak RSS; reading it in cost 70.9 MiB.
+```
+
+`ru_maxrss` is a high-water mark, so the streaming figures are not an average
+that a spike could hide behind. The last line is the whole point of the item:
+the buffered pair charges the table's size to the program, and the streaming
+pair charges a buffer.
 
 `cypress`, same cluster — a small tree of dated runs, a `latest` link over it,
 and three transactions competing for one lock:

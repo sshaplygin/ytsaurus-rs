@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 314 tests
+cargo test --workspace            # 319 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -245,6 +245,22 @@ per command. Cluster facts:
 - `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
   handle pings its own transaction.
 
+### Streaming table I/O
+
+- The proxy **accepts a chunked request body** for `write_table`, so a table can
+  be written from a `Read` that never has all of it.
+- `ureq` 3.3 caps `read_to_vec` at 10 MB unless told otherwise but leaves a
+  **reader uncapped**, which is the right way round: the buffered path passes an
+  explicit limit, the streaming path passes none.
+- **`ureq` 3.3 still exposes no trailers** — rechecked in its source, where the
+  word does not appear. So the `X-YT-Error` trailer a proxy uses to report a
+  mid-stream failure remains unreadable, and the completeness check on
+  `read_table` remains the only compensation. On the streaming path there is
+  nothing to check up front; a fragment cut short fails in the decoder instead.
+- Measured on a local cluster: writing 64 MiB from a generator and streaming it
+  back cost **1.0 MiB** of peak RSS; `read_table` on the same table cost
+  **70.9 MiB**.
+
 ### Cypress: naming and locks
 
 - **`list` is not sorted.** Three dated tables came back as the second, the third
@@ -394,7 +410,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 282 tests. Control records driven by the exact
+1. **Unit and integration** — 285 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

@@ -40,6 +40,11 @@ ytsaurus-helpers = { workspace = true, optional = true }
 serde_bytes.workspace = true
 # The examples derive schemas; users get the same through the `derive` feature.
 ytsaurus-helpers.workspace = true
+# Not a dependency: the client sends bytes and the job runtime decodes them, and
+# keeping that direction one-way is deliberate. It is here because a streamed
+# table is exactly what a job reads, and the example that says so should be
+# compiled rather than asserted.
+ytsaurus-job.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

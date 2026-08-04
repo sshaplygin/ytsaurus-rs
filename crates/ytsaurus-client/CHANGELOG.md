@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### A table bigger than the program that moves it
+
+- **Added** `Client::read_table_streaming` and `Client::write_table_streaming`,
+  with the `TableReader` the first returns. The buffered pair holds a whole
+  table at once, which is right for a launcher inspecting a result and wrong
+  for anything the size of the data.
+
+Both carry the same bytes as the buffered pair — a binary YSON list fragment —
+so a streamed table is exactly what a job reads on fd 0, and
+`ytsaurus_job::JobReader::binary` decodes it unchanged. The client sends bytes
+and the job runtime decodes them; that direction stays one-way (`ytsaurus-job`
+is a dev-dependency here, so the example that says so is compiled rather than
+asserted).
+
+Measured on the local cluster with `cargo run --release -p ytsaurus-client
+--example streaming`, which writes a table from a generator and reads it back
+both ways:
+
+```text
+Writing about 64 MiB from a generator     1242757 rows, peak RSS 2.9 MiB
+Reading it back as a stream               1242757 rows counted, peak RSS 3.8 MiB
+The same table, read into memory          67.7 MiB in hand, peak RSS 74.7 MiB
+
+Streaming the 67.7 MiB table cost 1.0 MiB of peak RSS; reading it in cost 70.9 MiB.
+```
+
+Two things this gives up, both deliberate:
+
+- **No completeness check on the streaming read.** `read_table` verifies the
+  response is a whole YSON list fragment, which is the client's only defence
+  against a mid-stream failure it cannot see. Streaming cannot: the point is
+  not to have the whole thing. The defence moves to the decoder, where a
+  fragment cut short leaves a record that does not parse — the same protection,
+  applied where it still can be.
+- **No retry, ever.** A reader that has been consumed cannot be sent again, so
+  a streaming write is one attempt in principle and not just by policy. That
+  agrees with the documented rule for heavy commands, and a transaction is what
+  makes such a write safe to fail.
+
+The `X-YT-Error` trailer question the backlog attached to this item was
+rechecked rather than assumed: **`ureq` 3.3 still exposes no trailers** — the
+word does not appear in its source — so the gap documented in the `http` module
+stands.
+
+Internally the transport now builds a request in one place and differs only in
+how the response is consumed: into a `Vec`, as a reader, or with a reader as
+the request body.
+
 ### A schema can change after the table exists
 
 - **Added** `Client::alter_table`, the other half of `create_table`. A table
