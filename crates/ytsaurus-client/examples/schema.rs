@@ -99,6 +99,44 @@ fn run() -> Result<(), ClientError> {
         }
     }
 
+    step("Evolving the schema of a table that already has rows");
+    // Its own table rather than the one above: the refused write left an upload
+    // transaction holding an exclusive lock for a moment, and this example
+    // should demonstrate schema evolution rather than wait out a lock.
+    let visits_path = format!("{BASE}/evolving");
+    client.create_table(&visits_path, &Visit::table_schema())?;
+    client.write_table(&visits_path, &two_visits()?)?;
+    done(&format!("{} rows written", client.row_count(&visits_path)?));
+
+    // The struct gained a field, so the table does. Nothing is written out by
+    // hand here either: this is `VisitV2`'s own fields.
+    client.alter_table(&visits_path, &VisitV2::table_schema())?;
+    check(
+        "an optional column can be added to a table with rows in it",
+        column_names(&client.table_schema(&visits_path)?) == ["host", "size", "referrer", "note"],
+    )?;
+
+    // Everything else asks more of the rows already written than they promised.
+    for (what, schema) in incompatible_changes() {
+        match client.alter_table(&visits_path, &schema) {
+            Ok(()) => {
+                eprintln!("   FAIL {what} was accepted");
+                return Err(ClientError::Config(format!("{what} was accepted")));
+            }
+            Err(e) => println!("   ok {what}: {}", first_line(&e.to_string())),
+        }
+    }
+
+    // The same change, on a table with nothing in it, is allowed. Which is why
+    // trying a migration out on an empty table proves nothing.
+    let empty = format!("{BASE}/empty_visits");
+    client.create_table(&empty, &Visit::table_schema())?;
+    client.alter_table(&empty, &incompatible_changes().swap_remove(0).1)?;
+    check(
+        "and an empty table accepts what a full one refuses",
+        column_names(&client.table_schema(&empty)?) == ["host"],
+    )?;
+
     step("What the client refuses before asking");
     // The same rules, caught locally: one sentence naming the column instead of
     // a round trip and a nested error document.
@@ -144,6 +182,71 @@ struct Visit<'a> {
     size: i64,
     /// Optional, because the Rust type says so.
     referrer: Option<&'a str>,
+}
+
+/// The same rows, a release later: the struct gained a field.
+///
+/// Optional, because the rows already in the table do not have it — which is
+/// also the only kind of column a table with rows will accept.
+#[derive(ytsaurus_helpers::TableRow)]
+#[allow(dead_code)]
+struct VisitV2<'a> {
+    #[yt(key)]
+    host: &'a str,
+    size: i64,
+    referrer: Option<&'a str>,
+    note: Option<&'a str>,
+}
+
+/// Two rows the schema is happy with, in key order because the table is sorted.
+fn two_visits() -> Result<Vec<u8>, ClientError> {
+    let mut rows = Vec::new();
+    for (host, size) in [("a.example", 1_i64), ("b.example", 2)] {
+        let row = yson_build::map([
+            ("host", yson_build::string(host)),
+            ("size", yson_build::int(size)),
+        ]);
+        rows.extend_from_slice(&to_vec(&row, YsonFormat::Binary).map_err(|e| {
+            ClientError::Decode {
+                command: "write_table".to_owned(),
+                reason: e.to_string(),
+            }
+        })?);
+        rows.push(b';');
+    }
+    Ok(rows)
+}
+
+/// Schema changes a table with rows in it will not take.
+///
+/// The first is used twice: once here, and once against an empty table, where
+/// the cluster allows it.
+fn incompatible_changes() -> Vec<(&'static str, TableSchema)> {
+    vec![
+        (
+            "dropping a column",
+            TableSchema::new([Column::new("host", ColumnType::Utf8).required().key()]),
+        ),
+        (
+            "adding a required column",
+            TableSchema::new([
+                Column::new("host", ColumnType::Utf8).required().key(),
+                Column::new("size", ColumnType::Int64).required(),
+                Column::new("referrer", ColumnType::Utf8),
+                Column::new("note", ColumnType::Utf8),
+                Column::new("must", ColumnType::Utf8).required(),
+            ]),
+        ),
+        (
+            "changing a column's type",
+            TableSchema::new([
+                Column::new("host", ColumnType::Utf8).required().key(),
+                Column::new("size", ColumnType::String).required(),
+                Column::new("referrer", ColumnType::Utf8),
+                Column::new("note", ColumnType::Utf8),
+            ]),
+        ),
+    ]
 }
 
 /// Every type the crate can name, in one table.

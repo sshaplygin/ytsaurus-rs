@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### A schema can change after the table exists
+
+- **Added** `Client::alter_table`, the other half of `create_table`. A table
+  outlives the program that made it, and the struct its rows have gains fields.
+
+**A table with rows accepts only changes that ask less of the rows already
+written.** Watched on a cluster, on a table holding two rows:
+
+| Change | |
+| --- | --- |
+| add an **optional** column, anywhere in the order | allowed |
+| make a required column optional | allowed |
+| `strict` → non-strict | allowed |
+| add a **required** column | `Cannot insert a new required column "must" into a non-empty table` |
+| remove a column | `Cannot remove column "size" from a strict schema` |
+| change a column's type | `Type … is modified in non backward compatible manner` |
+| rename a column | read as a removal, and refused as one |
+| make the table sorted | `Cannot change schema from unsorted to sorted` |
+| non-strict → `strict` | `Changing "strict" from "false" to "true" is not allowed` |
+
+Two of those deserve to be known before either becomes permanent:
+
+- **An empty table accepts all of it.** Dropping columns, changing types,
+  becoming sorted — all fine while there is nothing to break. So a migration
+  rehearsed on an empty table has proved nothing about the real one.
+- **A non-strict schema can never gain a named column** —
+  `Cannot insert a new column "note" into non-strict schema`. Relaxing `strict`
+  is a one-way door out of schema evolution.
+
+Here the schema is a **top-level parameter**, where `create` wants it inside
+`attributes`. The two commands are exact opposites on this, and only one of them
+says so: `create` ignores the top-level spelling in silence.
+
+No local compatibility checking, deliberately: error 316 carries an inner error
+naming the column and the reason, and the client's error flattening — written
+for failed jobs — surfaces it as one sentence. A local rule set could only add a
+way to refuse something the cluster would have allowed.
+
+Verified on the local cluster in `cargo run -p ytsaurus-client --example
+schema`, which now writes rows, widens the table by deriving the schema from a
+struct that gained a field, and watches the cluster refuse each incompatible
+change in turn — then make the same change on an empty table.
+
 ### The rest of the Cypress tree
 
 - **Added** `Client::list`, `copy` / `copy_replacing`, `move_node` /

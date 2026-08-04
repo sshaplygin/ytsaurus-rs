@@ -323,6 +323,12 @@ distinction §2 makes about text and bytes. A Rust type the derive cannot place
 is a compile error rather than a guess; name the column type yourself with
 `#[yt(column_type = "timestamp")]` for the ones no Rust type implies.
 
+When the struct later gains a field, `client.alter_table(path, &Output::table_schema())?`
+widens the table to match. A table that already holds rows accepts only changes
+that ask less of them: a new **optional** column is fine, dropping one or adding
+a required one is refused by name. An *empty* table accepts anything, so trying
+the migration out on one proves nothing about the real table.
+
 ### Publishing the result all at once
 
 A launch that fails partway through has already done some of its work: the

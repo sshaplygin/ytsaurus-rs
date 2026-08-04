@@ -44,7 +44,7 @@ cargo run -p ytsaurus-client --example launch
 
 | | |
 | --- | --- |
-| Cypress | `create`, `create_table`, `remove`, `exists`, `get`, `list`, `row_count`, `table_schema` |
+| Cypress | `create`, `create_table`, `alter_table`, `remove`, `exists`, `get`, `list`, `row_count`, `table_schema` |
 | Naming | `copy`, `move_node`, `link` — each with a `_replacing` twin that overwrites |
 | Locks | `lock`, `lock_waiting` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
@@ -107,6 +107,25 @@ required `any`, `unique_keys` with no key.
 **`create_table` fails if the path exists.** The cluster ignores the attributes
 of a create it skips, so a version that tolerated an existing table would
 quietly leave the old schema in place and report success.
+
+### Changing it afterwards
+
+The struct gains a field; `alter_table` widens the table to match. **A table
+with rows takes only changes that ask less of the rows already written**: an
+optional column may be added, a required one may be relaxed, `strict` may be
+dropped. Removing a column, adding a required one, changing a type or making the
+table sorted are each refused, by name — `Cannot insert a new required column
+"must" into a non-empty table`.
+
+Two things to know before either becomes permanent:
+
+- **An empty table accepts all of it**, so a migration rehearsed on an empty
+  table has proved nothing about the real one.
+- **A non-strict schema can never gain a named column.** Relaxing `strict` is a
+  one-way door out of schema evolution.
+
+The schema is a top-level parameter here and an attribute in `create` — the two
+commands are opposites, and only `alter_table` complains when you get it wrong.
 
 ## All at once, or not at all
 

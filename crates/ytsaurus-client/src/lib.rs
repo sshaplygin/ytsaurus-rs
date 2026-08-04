@@ -458,6 +458,80 @@ impl Client {
         Ok(())
     }
 
+    /// Changes the schema of a table that already exists.
+    ///
+    /// The other half of [`Client::create_table`]: a table outlives the program
+    /// that made it, and the rows it holds gain columns.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let wider = TableSchema::new([
+    ///     Column::new("host", ColumnType::Utf8).required().key(),
+    ///     Column::new("size", ColumnType::Int64).required(),
+    ///     Column::new("referrer", ColumnType::Utf8), // new, and optional
+    /// ]);
+    /// client.alter_table("//tmp/visits", &wider)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// **A table with rows in it accepts only changes that ask less of the
+    /// rows already written.** Watched on a cluster, on a table holding two
+    /// rows — and each refusal says which column and why:
+    ///
+    /// | Change | |
+    /// | --- | --- |
+    /// | add an **optional** column, anywhere in the order | allowed |
+    /// | make a required column optional | allowed |
+    /// | `strict` → non-strict | allowed |
+    /// | add a **required** column | `Cannot insert a new required column "must" into a non-empty table` |
+    /// | remove a column | `Cannot remove column "size" from a strict schema` |
+    /// | change a column's type | `Type … is modified in non backward compatible manner` |
+    /// | rename a column | read as a removal, and refused as one |
+    /// | make the table sorted | `Cannot change schema from unsorted to sorted` |
+    /// | non-strict → `strict` | `Changing "strict" from "false" to "true" is not allowed` |
+    ///
+    /// Two consequences worth knowing before either becomes permanent:
+    ///
+    /// - **An empty table accepts all of it** — dropping columns, changing types,
+    ///   becoming sorted. So a schema change tried out on an empty table proves
+    ///   nothing about the same change on a full one.
+    /// - **A non-strict schema can never gain a named column**:
+    ///   `Cannot insert a new column "note" into non-strict schema`. Relaxing
+    ///   `strict` is a one-way door out of schema evolution.
+    ///
+    /// Unlike `create`, the schema here is a **top-level parameter** rather than
+    /// an attribute — the two commands are exact opposites on this, and `create`
+    /// silently ignores the spelling `alter_table` requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if the schema is one the cluster would
+    /// refuse outright, or [`ClientError`] if the change is rejected as
+    /// incompatible.
+    pub fn alter_table(&self, path: &str, schema: &TableSchema) -> Result<()> {
+        schema
+            .validate()
+            .map_err(|reason| ClientError::Config(format!("{path}: {reason}")))?;
+
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            // Top-level, where `create` wants it inside `attributes`. Getting
+            // this the wrong way round fails loudly here and silently there.
+            ("schema", schema.to_yson()),
+        ]);
+        self.transport.call(
+            Method::Post,
+            "alter_table",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
     /// The schema of a table, as the cluster stores it.
     ///
     /// Returns the raw YSON: the cluster answers with more than it was given —

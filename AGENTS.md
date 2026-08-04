@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 313 tests
+cargo test --workspace            # 314 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -187,6 +187,34 @@ Cluster facts, all watched rather than read:
 
 `TableSchema::validate` mirrors these so the error arrives as a sentence naming
 the column rather than as error 314 from a create.
+
+#### Changing one afterwards
+
+`alter_table` takes `schema` as a **top-level** parameter. A table **with rows**
+takes only changes that ask less of the rows already written — error 316,
+`Table schemas are incompatible`, with an inner error naming the column:
+
+| Change | On a table with rows |
+| --- | --- |
+| add an **optional** column, at any position | allowed |
+| required → optional | allowed |
+| strict → non-strict | allowed |
+| add a **required** column | `Cannot insert a new required column "must" into a non-empty table` |
+| remove (or rename) a column | `Cannot remove column "size" from a strict schema` |
+| change a type | `Type of "" field is modified in non backward compatible manner` |
+| unsorted → sorted | `Cannot change schema from unsorted to sorted` |
+| non-strict → strict | `Changing "strict" from "false" to "true" is not allowed` |
+
+- **An empty table accepts every one of them.** A migration rehearsed on an
+  empty table proves nothing about the real one.
+- **A non-strict schema can never gain a named column**: `Cannot insert a new
+  column "note" into non-strict schema`. Relaxing `strict` is a one-way door.
+- No local compatibility rules in the client: the cluster's inner error already
+  names the column, and a local rule set could only refuse what the cluster
+  would allow.
+- A **failed** `write_table` leaves its upload transaction holding an exclusive
+  lock on the table for a moment; the next command on that path fails with the
+  concurrent-transaction error until it clears.
 
 ### Transactions
 

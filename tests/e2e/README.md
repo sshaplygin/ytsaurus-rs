@@ -209,9 +209,21 @@ struct the rows have, and nothing is written out by hand:
 == The schema is a promise the cluster keeps
    ok a row missing a required column is refused
    write_table: cluster error 307: Required column "size" cannot have "null" value
+== Evolving the schema of a table that already has rows
+   ok 2 rows written
+   ok an optional column can be added to a table with rows in it
+   ok dropping a column: cluster error 316: … Cannot remove column "size" from a strict schema
+   ok adding a required column: … Cannot insert a new required column "must" into a non-empty table
+   ok changing a column's type: … Type of "" field is modified in non backward compatible manner
+   ok and an empty table accepts what a full one refuses
 == And the one order this cluster will not take
    as documented: create: cluster error 314: Descending sort order is not available in this context yet
 ```
+
+The last line of the evolution section is the one to remember: **an empty table
+accepts every change a full one refuses**, so a migration rehearsed on an empty
+table has proved nothing. The widening itself comes from a struct that gained a
+field — the schema is still never written out by hand.
 
 The last two are the ones worth keeping: a schema the cluster does not enforce
 would be decoration, and the descending refusal is checked rather than asserted
