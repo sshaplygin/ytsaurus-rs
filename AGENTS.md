@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 331 tests
+cargo test --workspace            # 343 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -269,6 +269,56 @@ per command. Cluster facts:
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
 
+### Stopping an operation
+
+- `abort_operation` takes `operation_id` and an optional `abort_message`, and
+  answers `{}`. The message is folded into the operation's **error document**,
+  under the cluster's own `Operation aborted by user request`.
+- **It is not idempotent.** Once the scheduler has let go of an operation it
+  answers code 200, `No such operation` — where `abort_transaction` forgives
+  exactly that. It lets go as soon as the first abort is accepted, so even an
+  operation that was running a moment ago refuses the second one. The rule is
+  "the scheduler has dropped it", not "it is terminal": an operation that
+  finished *by itself* can still be aborted for the short while it is kept.
+- **Never send it under a mutation ID.** The master's mutation cache does not
+  cover a scheduler command: a resend of the same ID, flagged as a retry, is
+  answered `No such operation` rather than with the first response, so a retry
+  turns an abort that worked into an error the caller believes. `Repeatable::Never`.
+- The call is acknowledged in ~350 ms and the operation is **already `aborted`**
+  by then. The `aborting` state exists but the request outlives it.
+- `suspend_operation`, `resume_operation`, `complete_operation` and
+  `update_operation_parameters` exist in the API and are not modelled.
+
+### Appending to a table
+
+- **`<append=%true>` is an attribute on the path**, not a parameter beside it:
+  `{path=<append=%true>"//tmp/t"}`. Sent as a sibling parameter it is ignored
+  and the table is **replaced**, with a 200 — silent data loss, which is why
+  `TablePath` exists and why a wire-level test pins the shape.
+- A bare path replaces; `<append=%false>` also replaces.
+- **The table must exist.** Otherwise `Error getting basic attributes of user
+  objects`.
+- **A sorted table stays sorted and the cluster enforces it**: a key smaller
+  than the last is refused with error 301, `Sort order violation: [0#9] > [0#1]`.
+- Rewriting a table in `k` pieces sends `(k+1)/2` times the rows; measured at
+  6.5× for 12 pieces in [`docs/benchmarking.md`](docs/benchmarking.md).
+- **Appends take a *shared* lock; replaces take an exclusive one.** Four
+  concurrent appends to one table all land; four concurrent replaces leave one
+  winner and three `Cannot take "exclusive" lock` failures. This is most of why
+  append is worth having, beyond the wire saving.
+- **Zero rows is asymmetric**: an append of nothing is a no-op, a *write* of
+  nothing truncates the table.
+- A reader never sees a partial append — `@row_count` holds its old value until
+  the upload transaction commits.
+
+### Connections
+
+- **A response body must be read or the connection is not pooled.** `ureq` only
+  returns a connection it knows is finished, so a command that ignored its
+  answer opened a fresh one every time: a few seconds of table writes left
+  11 623 sockets in `TIME_WAIT`. Reading and discarding took 23 % off a small
+  write. Any new command must consume its response.
+
 ### Jobs, listed and read
 
 - **Stderr is kept for jobs that succeeded**, not only failed ones, and no spec
@@ -447,7 +497,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 294 tests. Control records driven by the exact
+1. **Unit and integration** — 305 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

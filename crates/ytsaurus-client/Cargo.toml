@@ -45,6 +45,11 @@ ytsaurus-helpers.workspace = true
 # table is exactly what a job reads, and the example that says so should be
 # compiled rather than asserted.
 ytsaurus-job.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "rows"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

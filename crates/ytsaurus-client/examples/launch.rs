@@ -93,7 +93,7 @@ fn run() -> Result<(), ytsaurus_client::ClientError> {
     done(&format!("{BASE}/cat (executable)"));
 
     step("Writing input rows");
-    client.write_table_rows(&format!("{BASE}/input"), SAMPLE)?;
+    client.write_table_rows(format!("{BASE}/input"), SAMPLE)?;
     done(&format!(
         "{} rows",
         client.row_count(&format!("{BASE}/input"))?

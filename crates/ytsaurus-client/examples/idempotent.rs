@@ -61,7 +61,7 @@ fn run() -> Result<(), ClientError> {
     client.create("table", &format!("{BASE}/output"))?;
     client.create("table", &format!("{BASE}/control_output"))?;
     client.upload_worker(WORKER, &format!("{BASE}/cat"))?;
-    client.write_table_rows(&format!("{BASE}/input"), SAMPLE)?;
+    client.write_table_rows(format!("{BASE}/input"), SAMPLE)?;
     done(&format!("{BASE} ready"));
 
     let spec = identity_map("output");

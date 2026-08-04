@@ -80,6 +80,8 @@ mod http;
 mod jobs;
 /// Cypress locks.
 pub mod lock;
+/// Table paths that carry attributes.
+pub mod path;
 mod retry;
 /// Table schemas.
 pub mod schema;
@@ -94,6 +96,7 @@ pub mod yson_build;
 pub use crate::error::{ClientError, Result};
 pub use crate::jobs::{JobFailure, JobInfo};
 pub use crate::lock::{Lock, LockMode};
+pub use crate::path::TablePath;
 pub use crate::retry::{MutationId, RetryPolicy};
 pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
 // The derive and the trait share a name, as `serde::Serialize` does: they live
@@ -1143,9 +1146,9 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails.
-    pub fn write_table(&self, path: &str, rows: &[u8]) -> Result<()> {
+    pub fn write_table(&self, path: impl Into<TablePath>, rows: &[u8]) -> Result<()> {
         let params = yson_build::map([
-            ("path", yson_build::string(path)),
+            ("path", path.into().to_yson()),
             ("input_format", yson_build::binary_yson_format()),
         ]);
         self.transport.call(
@@ -1231,13 +1234,14 @@ impl Client {
     /// Returns [`ClientError::Decode`] naming the row if one cannot be
     /// serialised — the write fails rather than sending the rows before it —
     /// or [`ClientError`] if the request fails.
-    pub fn write_table_rows<T, I>(&self, path: &str, rows: I) -> Result<()>
+    pub fn write_table_rows<T, I>(&self, path: impl Into<TablePath>, rows: I) -> Result<()>
     where
         T: serde::Serialize,
         I: IntoIterator<Item = T>,
     {
+        let path = path.into();
         let params = yson_build::map([
-            ("path", yson_build::string(path)),
+            ("path", path.to_yson()),
             ("input_format", yson_build::binary_yson_format()),
         ]);
 
@@ -1411,9 +1415,13 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails, including when `rows`
     /// itself fails to read.
-    pub fn write_table_streaming(&self, path: &str, mut rows: impl std::io::Read) -> Result<()> {
+    pub fn write_table_streaming(
+        &self,
+        path: impl Into<TablePath>,
+        mut rows: impl std::io::Read,
+    ) -> Result<()> {
         let params = yson_build::map([
-            ("path", yson_build::string(path)),
+            ("path", path.into().to_yson()),
             ("input_format", yson_build::binary_yson_format()),
         ]);
         self.transport
@@ -1536,6 +1544,63 @@ impl Client {
                 reason: format!("operation_id is not a string: {other:?}"),
             }),
         }
+    }
+
+    /// Stops an operation that is still running.
+    ///
+    /// The counterpart to starting one, and the reason it is worth having: a
+    /// launcher that gives up — an interrupted `wait_for_operation`, a failed
+    /// step further down the script — otherwise leaves the operation running on
+    /// the cluster, spending quota on a result nobody will read.
+    ///
+    /// `reason` is put in the operation's error document, under the cluster's
+    /// own `Operation aborted by user request`, so whoever finds the aborted
+    /// operation later is told who stopped it and why. Pass `None` to say
+    /// nothing.
+    ///
+    /// By the time this returns the operation is already `aborted`: the call
+    /// takes a few hundred milliseconds, and the state has changed within it.
+    /// The `aborting` state exists but no caller of this can observe it.
+    ///
+    /// **This is not idempotent, unlike [`Transaction::abort`].** Once the
+    /// scheduler has let go of an operation it answers `No such operation`, and
+    /// it lets go as soon as the first abort is accepted — so a second abort is
+    /// an error rather than a shrug, even for an operation that was still
+    /// running a moment ago. An operation that finished *by itself* can still
+    /// be aborted for the short while the scheduler keeps it, so this is not a
+    /// reliable way to ask whether one has finished either.
+    ///
+    /// **Sent once, and never retried**, which is the other side of the same
+    /// coin. `abort_operation` is a scheduler command and the master's mutation
+    /// cache does not cover it: a retry after a lost answer would be told `No
+    /// such operation` and would report a successful abort as a failed one.
+    /// A transport error here means the request may or may not have arrived,
+    /// and the honest thing is to say so rather than to guess.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, including when the
+    /// scheduler no longer has the operation.
+    pub fn abort_operation(&self, id: &str, reason: Option<&str>) -> Result<()> {
+        let mut params = yson_build::map([("operation_id", yson_build::string(id))]);
+        if let Some(reason) = reason {
+            yson_build::insert(&mut params, "abort_message", yson_build::string(reason));
+        }
+
+        self.transport.call(
+            Method::Post,
+            "abort_operation",
+            &params,
+            Payload::None,
+            // Not `WithMutationId`, though this is a mutating command: that
+            // deduplication lives in the master and this request goes to the
+            // scheduler. Verified — a second send of the same mutation ID,
+            // flagged as a retry, is answered `No such operation` rather than
+            // with the first response. A retry would turn an abort that worked
+            // into an error the caller believes.
+            Repeatable::Never,
+        )?;
+        Ok(())
     }
 
     /// Fetches an operation's current state, e.g. `running` or `completed`.
@@ -1719,10 +1784,66 @@ impl Client {
         }
     }
 
+    /// Why an operation ended as it did, in the cluster's words.
+    ///
+    /// `None` for one that succeeded, and for one that has not finished. This
+    /// is what [`ClientError::OperationFailed`] carries, and what reads back
+    /// the `reason` given to [`Client::abort_operation`]: the reason is folded
+    /// into the operation's error document rather than kept beside it, so this
+    /// is how to find out who stopped an operation and why.
+    ///
+    /// Flattened to the outer message plus the innermost one, because the outer
+    /// message of a YTsaurus error is a category and the cause is at the bottom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the operation cannot be looked up, or if its
+    /// answer cannot be decoded.
+    pub fn operation_result_error(&self, id: &str) -> Result<Option<String>> {
+        // Asked for through `get_operation`, not through Cypress: an operation
+        // is not a node under //sys/operations on every cluster, and a local
+        // one answers `has no child with key` for an id that certainly exists.
+        let params = yson_build::map([
+            ("operation_id", yson_build::string(id)),
+            (
+                "attributes",
+                yson_build::list([yson_build::string("result")]),
+            ),
+        ]);
+        let body = self.transport.call(
+            Method::Get,
+            "get_operation",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "get_operation")?;
+        let Some(error) = jobs::field(&envelope, "result").and_then(|r| jobs::field(r, "error"))
+        else {
+            return Ok(None);
+        };
+
+        // An operation that succeeded still has an error document — code 0 with
+        // an empty message. Reporting that as `Some("")` would make
+        // `if let Some(why)` fire on every success and print nothing, which is
+        // the shape of bug that survives review because it looks like it works.
+        if jobs::field(error, "code").and_then(YsonValue::as_i64) == Some(0) {
+            return Ok(None);
+        }
+
+        Ok(jobs::error_summary(error))
+    }
+
     /// Best-effort fetch of a failed operation's error document.
     ///
     /// Prefers the flattened message. Falls back to the raw document, because a
     /// clumsy error still beats an empty one if the response shape ever moves.
+    ///
+    /// Used while building [`ClientError::OperationFailed`], where a failure to
+    /// fetch must never replace the failure being reported — which is why this
+    /// swallows errors and [`Client::operation_result_error`], which has a
+    /// caller to answer to, does not.
     fn operation_error(&self, id: &str) -> Option<String> {
         let params = yson_build::map([
             ("operation_id", yson_build::string(id)),

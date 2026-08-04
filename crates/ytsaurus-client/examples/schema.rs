@@ -82,7 +82,7 @@ fn run() -> Result<(), ClientError> {
     })?;
     rows.push(b';');
 
-    match client.write_table(&format!("{BASE}/visits"), &rows) {
+    match client.write_table(format!("{BASE}/visits"), &rows) {
         Ok(()) => {
             eprintln!("   FAIL the cluster accepted a row with no `size`");
             return Err(ClientError::Config(

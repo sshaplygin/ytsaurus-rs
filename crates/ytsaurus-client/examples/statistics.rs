@@ -54,7 +54,7 @@ fn run() -> Result<(), ClientError> {
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
     let worker = client.upload_worker_cached(WORKER)?;
-    client.write_table_rows(&format!("{BASE}/input"), sample_rows())?;
+    client.write_table_rows(format!("{BASE}/input"), sample_rows())?;
     done(&format!(
         "{} rows in, {DROPPED} of them without a key",
         KEPT + DROPPED

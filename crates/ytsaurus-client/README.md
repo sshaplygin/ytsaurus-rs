@@ -51,7 +51,7 @@ cargo run -p ytsaurus-client --example launch
 | Typed | `write_table_rows`, `read_table_rows`, `get_as` |
 | Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
-| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
+| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation`, `abort_operation`, `operation_result_error` |
 | Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum`, `job_statistics`, `job_statistic_sum` |
 | Transactions | `start_transaction`, `with_transaction`, `Transaction::{commit, abort, ping}` |
 
@@ -293,6 +293,51 @@ report off. Failing to collect it never replaces the failure being reported.
 
 [`examples/diagnose.rs`](examples/diagnose.rs) runs the whole path against a
 local cluster.
+
+## Adding rows instead of replacing them
+
+A YTsaurus path is a YSON value, not a string, and `<append=%true>` is an
+attribute on it:
+
+```rust
+client.write_table_rows(TablePath::new("//tmp/log").append(), entries)?;
+```
+
+Every write replaces the table unless the path says otherwise, which is the
+cluster's own default. Two things worth knowing before relying on it:
+
+- **A sorted table stays sorted, and the cluster checks.** A key smaller than
+  the last is refused with `Sort order violation: [0#9] > [0#1]`, so an append
+  to a sorted table is a continuation of it rather than an addition to it.
+- **The table has to exist.** Appending to a path that does not is refused with
+  `Error getting basic attributes of user objects`.
+- **Appends do not fight each other.** An append takes a *shared* lock where a
+  replace takes an exclusive one: four concurrent appends all land, where four
+  concurrent replaces leave one winner and three failures.
+- **Appending nothing is a no-op; writing nothing truncates.** One `.append()`
+  apart.
+
+Worth it because the alternative is quadratic: writing a table in twelve pieces
+by rewriting it each time sends 6.5× the rows.
+[`examples/append.rs`](examples/append.rs) measures exactly that.
+
+## Stopping an operation
+
+```rust
+client.abort_operation(&id, Some("the input turned out to be yesterday's"))?;
+```
+
+The reason is folded into the operation's error document, where
+`operation_result_error` reads it back, so whoever finds the aborted operation
+tomorrow is told who stopped it. By the time the call returns — about 350 ms —
+the operation is **already** `aborted`.
+
+**This is not idempotent**, unlike `Transaction::abort`. The scheduler lets go of
+an operation as soon as the first abort is accepted, and then answers `No such
+operation`, so a defensive second abort is an error rather than a no-op. It is
+sent once and never retried for the same reason: the master's mutation cache does
+not cover a scheduler command, so a retry after a lost answer would report a
+successful abort as a failed one.
 
 ## Tables bigger than memory
 

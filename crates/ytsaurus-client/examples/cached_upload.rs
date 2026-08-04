@@ -54,7 +54,7 @@ fn run() -> Result<(), ClientError> {
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
-    client.write_table_rows(&format!("{BASE}/input"), SAMPLE)?;
+    client.write_table_rows(format!("{BASE}/input"), SAMPLE)?;
     let size = std::fs::metadata(WORKER).map(|m| m.len()).unwrap_or(0);
     done(&format!("{BASE}, worker is {} KiB", size / 1024));
 

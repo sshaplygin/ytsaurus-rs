@@ -59,7 +59,7 @@ fn run() -> Result<(), ClientError> {
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
     client.upload_worker(WORKER, &format!("{BASE}/boom"))?;
-    client.write_table_rows(&format!("{BASE}/input"), SAMPLE)?;
+    client.write_table_rows(format!("{BASE}/input"), SAMPLE)?;
     done(&format!("{BASE} ready, worker uploaded"));
 
     step("Starting an operation that will fail");

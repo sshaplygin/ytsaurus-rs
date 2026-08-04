@@ -65,7 +65,7 @@ fn run() -> Result<(), ClientError> {
         client.create("table", &format!("{BASE}/{table}"))?;
     }
     client.upload_worker(WORKER, &format!("{BASE}/wordcount"))?;
-    client.write_table_rows(&format!("{BASE}/input"), input_rows())?;
+    client.write_table_rows(format!("{BASE}/input"), input_rows())?;
     done(&format!("{} unsorted rows", INPUT.len()));
 
     step("Sorting it");

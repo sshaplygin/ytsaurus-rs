@@ -193,12 +193,87 @@ If the answer is no, the cheaper wins are worth doing first:
 - avoid `YsonValue` on hot paths (`parse_dynamic` shows what it costs),
 - raise the read buffer for wide rows.
 
+## A different question: what the client costs
+
+Everything above is about a **job**, and about whether YSON is the wrong format
+for one. This section is about the **launcher**, and it answers a question with
+no bearing on Skiff: when a launcher moves rows to and from a cluster, how much
+of the time is this crate's doing rather than the cluster's?
+
+```sh
+cargo bench -p ytsaurus-client --bench rows
+```
+
+The benchmark serves the requests itself, from a socket on loopback that reads
+the body and discards it, so what is timed is serialisation, HTTP framing and
+one loopback round trip. Apple M1 Max, `--release`, with the Docker cluster
+running on the same machine — which is the caveat for every number here.
+
+**Writing.** `write_table_rows` encodes inside the request body, a bufferful at
+a time. The alternative — the shape every example in this repository used
+before it existed — is to encode the whole table into a `Vec` and send that:
+
+| rows | `write_table_rows` | encode, then `write_table` | |
+| ---: | ---: | ---: | --- |
+| 1 000 | 275 µs | 338 µs | 1.23× |
+| 10 000 | 1.96 ms | 2.29 ms | 1.17× |
+| 100 000 | 18.5 ms | 22.8 ms | 1.24× |
+
+The streaming encoder is about **20 % faster**, not merely no worse: it avoids a
+`Vec` per row and the copy of the whole table that follows. Bounded memory was
+the reason it was written that way; being quicker as well settles the question
+of whether it costs anything.
+
+**Reading.** Asking for a type costs about **2–2.6×** taking the bytes:
+
+| rows | `read_table_rows` | `read_table` | |
+| ---: | ---: | ---: | --- |
+| 1 000 | 606 µs | 317 µs | 1.9× |
+| 10 000 | 4.65 ms | 1.81 ms | 2.6× |
+| 100 000 | 46.6 ms | 19.2 ms | 2.4× |
+
+That is the honest reason `read_table_streaming` exists for anything large.
+
+**What the benchmark found in the crate.** The first version of it opened a
+connection per iteration, and the reason turned out not to be the benchmark: a
+table write never read its response body, so `ureq` could not return the
+connection to its pool. A few seconds of writing left **11 623** sockets in
+`TIME_WAIT`. Reading and discarding the answer fixed it — 46 for the whole suite
+afterwards — and took **23 %** off `write_table_rows` at a thousand rows, which
+had been paying for a TCP handshake it did not need. Every table write against a
+real cluster was doing the same.
+
+**Appending, against the real cluster.** `examples/append.rs` writes the same
+rows in the same number of pieces, both ways. 60 000 rows in 12 pieces on the
+local cluster:
+
+```text
+appending     0.60s       60000 rows sent
+rewriting     1.03s      390000 rows sent   (6.5× the data)
+```
+
+The data ratio is arithmetic rather than measurement — rewriting `k` pieces
+sends `(k+1)/2` times the rows — and the clock only says whether the cluster
+charges for it. On this one it does, at roughly half the ratio, since a write
+is not purely bytes on the wire.
+
+**Aborting.** `examples/abort.rs` measures the one number there is: the
+scheduler accepted the abort in **321–405 ms**, and the operation was *already*
+`aborted` when it did. There is an `aborting` state in between, but the HTTP call
+outlives it, so no caller of `abort_operation` can observe it.
+
 ## Reproducing the local numbers
 
 ```sh
 cargo bench -p ytsaurus-yson     # codec
 cargo bench -p ytsaurus-job      # job path
+cargo bench -p ytsaurus-client   # the launcher's own cost, over loopback
 
 # Streaming memory behaviour: 2 GB through the reader.
 cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocapture
+
+# Against a cluster:
+export YT_PROXY=http://localhost:8000
+cargo run --release -p ytsaurus-client --example append   # append against rewrite
+cargo run -p ytsaurus-client --example abort              # how long stopping takes
 ```

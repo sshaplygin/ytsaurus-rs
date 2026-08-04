@@ -61,6 +61,8 @@ cargo run -p ytsaurus-client --example vanilla      # three jobs with no input t
 cargo run -p ytsaurus-client --example schema       # a derived schema the cluster enforces
 cargo run -p ytsaurus-client --example cluster_info # connect, and read a node into a type
 cargo run -p ytsaurus-client --example table_usage  # Rust values in, Rust values out
+cargo run -p ytsaurus-client --example abort        # stopping an operation, and what it costs
+cargo run --release -p ytsaurus-client --example append  # adding rows, against rewriting them
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
@@ -232,6 +234,41 @@ field — the schema is still never written out by hand.
 The last two are the ones worth keeping: a schema the cluster does not enforce
 would be decoration, and the descending refusal is checked rather than asserted
 so that the day a cluster enables it, the run says so instead of going stale.
+
+`append` and `abort`, same cluster — the two gaps the Go SDK comparison found:
+
+```text
+== Three writes to the same table
+   ok a plain write puts 3 rows there
+   ok a second plain write replaces them: 2 rows
+   ok an appending write adds to them: 6 rows
+== Appending to a table that is sorted
+   ok 6 rows, and the table is still sorted
+   ok and a key smaller than the last is refused
+   write_table: cluster error 301: Sort order violation: [0#15] > [0#0]
+== Appending to a table that does not exist
+   ok refused: the table has to exist first
+== Writing 60000 rows in 12 pieces, both ways
+   appending     0.60s       60000 rows sent
+   rewriting     1.03s      390000 rows sent   (6.5× the data)
+
+== Aborting it, with a reason
+   ok the scheduler took the request in 399 ms
+   ok and it was already `aborted` — 0.0s of waiting
+   ok and no job is still running (0 left in the list)
+== Reading back why it stopped
+   Operation aborted by user request: stopped by the abort example
+   ok and kept the reason given: "stopped by the abort example"
+== Aborting it again
+   ok is refused, because the scheduler has let go of it
+   abort_operation: cluster error 200: No such operation 675da9d0-…
+```
+
+Two of those lines are the ones that would not have been guessed. Appending to a
+**sorted** table is a checked operation — the cluster refuses a key that arrives
+out of order, so an append there is a continuation rather than an addition. And
+**aborting is not idempotent**: an operation the scheduler has finished with is
+gone from it, where a transaction would have forgiven the second abort.
 
 `table_usage` and `cluster_info`, same cluster — the two examples that mirror
 the Go SDK's `table-usage` and `cypress-example`. Between them they are the

@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+### Stopping an operation, and adding to a table
+
+The two gaps [`docs/go-parity.md`](../../docs/go-parity.md) found by going
+through the Go SDK's examples, and the two it said were worth a decision.
+
+- **Added** `Client::abort_operation`. A launcher can now say never mind. Until
+  this, interrupting a wait left the operation running on the cluster, spending
+  quota on a result nobody would read.
+- **Added** `Client::operation_result_error`, promoted from a private helper:
+  the `reason` an abort carries is folded into the operation's error document
+  rather than kept beside it, so reading it back is what makes passing it worth
+  anything.
+- **Added** `TablePath`, and **changed** `write_table`, `write_table_rows` and
+  `write_table_streaming` to take `impl Into<TablePath>`. Existing call sites
+  pass `&str` and are unaffected; `TablePath::new(p).append()` adds rows instead
+  of replacing them.
+
+A YTsaurus path is a YSON value, not a string, and `<append=%true>` is an
+**attribute on the path**. That is why the type exists rather than an
+`append: bool` parameter: the attribute has to travel on the path itself, and a
+client that sent it beside the path would have the cluster replace the table and
+report success. A wire-level test pins the distinction.
+
+```rust
+client.write_table_rows(TablePath::new("//tmp/log").append(), entries)?;
+client.abort_operation(&id, Some("the input turned out to be yesterday's"))?;
+```
+
+Six cluster facts, each from probing before writing anything:
+
+- **Aborting is not idempotent, and never carries a mutation ID.** The scheduler
+  lets go of an operation as soon as the first abort lands and then answers `No
+  such operation`. That also rules out the usual retry protection: the master's
+  mutation cache does not cover a scheduler command, so a resend of the same ID
+  is refused rather than deduplicated, and a retry would report a successful
+  abort as a failed one. Sent once, `Repeatable::Never`.
+- **The operation is already aborted when the call returns**, ~350 ms later.
+  There is an `aborting` state; the request outlives it.
+- **Appends take a shared lock, replaces an exclusive one.** Four concurrent
+  appends to one table all land; four concurrent replaces leave one winner and
+  three `Cannot take "exclusive" lock` failures. Beyond the wire saving, this is
+  most of why append is worth having.
+- **Appending nothing is a no-op; *writing* nothing truncates the table.**
+- **Appending to a sorted table is checked.** The table stays sorted and a key
+  smaller than the last is refused with `Sort order violation: [0#9] > [0#1]`.
+  An append to a sorted table is a continuation of it, not an addition to it.
+- **Appending does not create the table.** A path that does not exist is refused
+  with `Error getting basic attributes of user objects`, which is the cluster
+  saying there was nothing to append to.
+
+Measured, in [`docs/benchmarking.md`](../../docs/benchmarking.md). Against the
+cluster, 60 000 rows in 12 pieces: appending takes 0.60 s and sends 60 000 rows;
+rewriting the table each time takes 1.03 s and sends 390 000 — 6.5× the data,
+because rewriting `k` pieces sends `(k+1)/2` times the rows. A new criterion
+benchmark, `cargo bench -p ytsaurus-client`, runs the write and read paths
+against a loopback socket and settles a claim the last release only asserted:
+the streaming row encoder is **about 20 % faster** than encoding into a `Vec`
+first, at 1 000, 10 000 and 100 000 rows alike. Bounded memory was the reason it
+was written that way; being quicker as well means it costs nothing.
+
+- **Fixed** a table write leaving its connection unusable. `ureq` returns a
+  connection to its pool only once the response body has been read, and the
+  upload path never read one, so **every** `write_table_rows` and
+  `write_table_streaming` opened a fresh connection — a few seconds of writing
+  left 11 623 sockets in `TIME_WAIT`. Reading and discarding the answer took
+  **23 %** off a thousand-row write. The benchmark found this; no test could
+  have, because every request still succeeded.
+
 ### Rows are Rust values
 
 - **Added** `Client::write_table_rows` and `Client::read_table_rows`. A table is

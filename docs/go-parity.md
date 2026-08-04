@@ -124,18 +124,15 @@ HTTP API v4 and would fit this transport unchanged.
 Found while checking the twelve programs against the API. None of these blocks
 an example, which is exactly why they had not been noticed.
 
-1. **No `abort_operation`.** A launcher can start an operation and wait for it,
-   but cannot cancel one: interrupting `wait_for_operation` leaves the operation
-   running on the cluster and spending its quota. Note the asymmetry — a
-   `Transaction` aborts itself when dropped, so the crate takes cleanup
-   seriously for transactions and not for operations. `suspend`, `resume` and
-   `list_operations` are absent with it.
-2. **No append.** `write_table`, `read_table` and their streaming forms take a
-   `&str` path and send it as a bare YSON string, so `<append=%true>` — an
-   attributed path — cannot be expressed at all, and every write replaces the
-   table. Go's `ypath.Rich` carries `Append`, `Columns` and `Ranges` as a matter
-   of course. Incremental append is an ordinary pipeline shape, and the word
-   appears nowhere in this repository.
+1. ~~**No `abort_operation`.**~~ **Built.** `Client::abort_operation(id, reason)`
+   stops an operation and puts the reason in its error document, where
+   `Client::operation_result_error` reads it back. `suspend`, `resume`,
+   `complete_operation` and `list_operations` are still absent.
+2. ~~**No append.**~~ **Built.** `TablePath::new(p).append()` carries the
+   `<append=%true>` attribute a path can have, and the three write methods take
+   `impl Into<TablePath>` so a `&str` still means what it always did. Go's
+   `ypath.Rich` also carries `Columns` and `Ranges`; those are read-side and are
+   not modelled, which is why the type exists rather than a second write method.
 3. **No escape hatch.** `Transport::call` is `pub(crate)`, so a command this
    crate does not model cannot be sent at all: the answer to "can I do X" is
    "fork it". `Client::start_operation` taking a raw spec already sets the
@@ -146,8 +143,13 @@ an example, which is exactly why they had not been noticed.
    between asking the caller for something they would have to look up and
    printing a link that might be wrong.
 
-Items 1 and 2 are worth a decision. The rest is noted so that the next person
-reading the Go SDK does not have to find them again.
+The first two were the ones worth doing, and doing them turned up two things
+neither Go example mentions: **aborting is not idempotent** — an operation the
+scheduler has finished with answers `No such operation`, where
+`abort_transaction` would shrug — and **appending to a sorted table is a checked
+operation**, refused with `Sort order violation` if a key arrives out of order.
+The remaining two are noted so the next person reading the Go SDK does not have
+to find them again.
 
 ## Running the Rust side
 

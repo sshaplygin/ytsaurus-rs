@@ -300,8 +300,14 @@ impl Transport {
             self.dispatch(method, command, parameters, SendBody::from_reader(rows))?;
         let status = response.status().as_u16();
 
+        // Read whichever way it went. A body left unread keeps the connection
+        // out of the pool — `ureq` can only reuse one it knows is finished — so
+        // an upload that ignored its answer would open a fresh connection for
+        // every table write, and leave the old one in TIME_WAIT. The benchmark
+        // is what noticed: 11 623 of them after a few seconds of writing.
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+
         if !(200..300).contains(&status) {
-            let body = response.body_mut().read_to_string().unwrap_or_default();
             return Err(ClientError::Http {
                 command: command.to_owned(),
                 status,

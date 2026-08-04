@@ -103,7 +103,7 @@ fn launch() -> Result<(), ClientError> {
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
-    client.write_table(&format!("{BASE}/input"), &sample_rows())?;
+    client.write_table(format!("{BASE}/input"), &sample_rows())?;
     done(&format!(
         "{BASE}, {} rows",
         client.row_count(&format!("{BASE}/input"))?
