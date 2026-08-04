@@ -30,6 +30,7 @@
 //! # see tests/e2e/run_pilot.sh for the full operation invocation
 //! ```
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -79,11 +80,16 @@ struct CleanEvent<'a> {
 }
 
 /// A row that failed validation, kept for inspection rather than dropped.
+///
+/// Borrows the offending row rather than copying it. The rejects path exists to
+/// be cheap when a fraction of a huge input is corrupt, and `raw: Vec<u8>` would
+/// copy every bad row for no reason — the value is serialized before the borrow
+/// ends.
 #[derive(Serialize)]
-struct Reject {
+struct Reject<'a> {
     #[serde(with = "serde_bytes")]
-    raw: Vec<u8>,
-    reason: String,
+    raw: &'a [u8],
+    reason: &'a str,
     row_index: Option<i64>,
 }
 
@@ -160,14 +166,17 @@ fn map() -> Result<(), JobError> {
 
         // FRICTION 1: "row did not parse" and "row parsed but is invalid" call
         // for identical handling, but they arrive as different error types --
-        // `JobError` from the runtime, our own reason from `validate`. There is
-        // no way to fold them without stringifying, which loses the structure of
-        // `JobError` and allocates on every bad row.
-        let outcome: Result<CleanEvent, String> = row
+        // `JobError` from the runtime, our own reason from `validate`. Folding
+        // them means stringifying, which loses the structure of `JobError`.
+        //
+        // `Cow` keeps the cost off the common path at least: a validation
+        // failure borrows a `&'static str` and allocates nothing; only a decode
+        // failure, which should be rare, pays for a `String`.
+        let outcome: Result<CleanEvent, Cow<'static, str>> = row
             .parse::<RawEvent>()
-            .map_err(|e| e.to_string())
+            .map_err(|e| Cow::Owned(e.to_string()))
             .and_then(|event| {
-                validate(&event).map_err(str::to_owned)?;
+                validate(&event).map_err(Cow::Borrowed)?;
                 Ok(CleanEvent {
                     is_external: event
                         .referer
@@ -189,7 +198,7 @@ fn map() -> Result<(), JobError> {
                 kept += 1;
             }
             Err(reason) => {
-                quarantine(&mut writer, &row, reason)?;
+                quarantine(&mut writer, &row, &reason)?;
                 rejected += 1;
             }
         }
@@ -201,11 +210,11 @@ fn map() -> Result<(), JobError> {
 }
 
 /// Writes a bad row to the rejects table, preserving the original bytes.
-fn quarantine(writer: &mut JobWriter, row: &Row<'_>, reason: String) -> Result<(), JobError> {
+fn quarantine(writer: &mut JobWriter, row: &Row<'_>, reason: &str) -> Result<(), JobError> {
     writer.write(
         1,
         &Reject {
-            raw: row.raw().to_vec(),
+            raw: row.raw(),
             reason,
             row_index: row.row_index,
         },
