@@ -148,11 +148,15 @@ fn peak_rss_bytes() -> Option<u64> {
 
 /// The headline requirement: 2 GB in, bounded memory throughout.
 ///
-/// Ignored by default because it moves 2 GB and takes a while; CI runs it
-/// explicitly. Run locally with:
+/// `#[ignore]`d so it stays out of the default run, which means `--all-targets`
+/// skips it too. CI therefore gives it a dedicated step — see the
+/// "2 GB streaming memory test" step in `.github/workflows/ci.yml`. If that step
+/// is ever removed, nothing checks that the reader still streams.
+///
+/// Run locally with:
 ///
 /// ```sh
-/// cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocapture
+/// cargo test -p ytsaurus-job --test memory_tests -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "moves 2 GB; run explicitly"]

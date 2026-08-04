@@ -33,9 +33,16 @@ jobs:
         run: cargo test --workspace --all-targets
 
       # `--all-targets` skips doctests, and the mapper example in the
-      # the mapper example in the ytsaurus-job docs must keep compiling.
+      # ytsaurus-job docs must keep compiling.
       - name: cargo test --doc
         run: cargo test --workspace --doc
+
+      # `--all-targets` also skips `#[ignore]`d tests, so the 2 GB streaming
+      # test needs its own step or it never runs. It is the only guard against
+      # the reader silently starting to accumulate input: ~10 s in debug, and
+      # it asserts peak RSS stays far below the budget.
+      - name: cargo test (2 GB streaming memory test)
+        run: cargo test -p ytsaurus-job --test memory_tests -- --ignored --nocapture
 
   musl:
     name: static musl worker build
