@@ -60,6 +60,7 @@ cargo run -p ytsaurus-client --example statistics   # what the job counted, read
 cargo run -p ytsaurus-client --example vanilla      # three jobs with no input table
 cargo run -p ytsaurus-client --example schema       # a derived schema the cluster enforces
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
+cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -250,6 +251,37 @@ event rather than two. And the last section holds a transaction three timeouts
 past its expiry: without the ping thread the cluster would have aborted it four
 seconds earlier, so it is the one check that fails if the keep-alive stops
 working.
+
+`cypress`, same cluster — a small tree of dated runs, a `latest` link over it,
+and three transactions competing for one lock:
+
+```text
+== Listing what is there
+   as the cluster gives them: ["2026-08-02", "2026-08-03", "2026-08-01"]
+   ok the three runs are there: ["2026-08-01", "2026-08-02", "2026-08-03"]
+   ok and listing a table is an error: list: cluster error 103: "List" method is not supported
+== Copying and moving
+   ok a second copy is refused: copy: cluster error 501: Node … already exists
+   ok copy_replacing overwrites it
+   ok a move leaves nothing behind
+== A link, and the trap in reading one
+   ok latest&/@target_path is "…/runs/2026-08-01", while latest/@type is "table" — the target's
+== Publishing by moving a staging table over the live one
+   ok readers still see the old table while the transaction is open
+   ok and the new one the moment it commits
+== A lock, and what it refuses
+   ok the second is refused, and told who won: lock: cluster error 402: Cannot take
+      "exclusive" lock … since "exclusive" lock is taken by concurrent transaction …
+   ok but it can pin the version it is reading
+== Waiting for a lock
+   ok a wait that could never end, ended: still pending after 2s
+   ok granted as 4-1d5ab-100c8-57bfbc50 once the holder went away, 3s in
+```
+
+The first line is the finding that matters most: **`list` is not sorted**. The
+last two are the other one — a waitable lock is `pending`, not held, and it can
+queue for something that will never happen, which is why `lock_waiting` has a
+deadline rather than trusting the cluster to end the wait.
 
 `vanilla`, same cluster — three jobs, no input table anywhere:
 

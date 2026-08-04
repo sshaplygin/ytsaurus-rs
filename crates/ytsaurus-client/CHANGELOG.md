@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### The rest of the Cypress tree
+
+- **Added** `Client::list`, `copy` / `copy_replacing`, `move_node` /
+  `move_replacing`, `link` / `link_replacing`, and `lock` / `lock_waiting` with
+  `LockMode` and `Lock`. Between them these are what a pipeline needs to *name*
+  its results: yesterday's run beside today's, a `latest` link pointing at the
+  newest, and a lock so two launchers do not publish over each other.
+
+The `_replacing` half of each pair overwrites the destination and the plain one
+refuses it, which is the cluster's own default. `move_node` carries the odd name
+because `move` is a Rust keyword and `client.r#move` at every call site would
+cost more than four characters do.
+
+What the cluster taught us here:
+
+- **`list` is not sorted.** Three dated tables came back as the second, the
+  third and then the first. The order is the cluster's own and means nothing.
+- **A truncated listing is an attribute, not an error.** The answer comes back
+  as `<incomplete=%true>[…]`, so a caller who does not look gets a listing
+  quietly missing entries. `list` refuses one instead of returning it.
+- **Listing a table is an error** — `"List" method is not supported` — rather
+  than an empty list.
+- **A link resolves to its target, including for attributes.** `latest/@type`
+  answers `table`; `latest&/@type` answers `link`. The `&` is the whole
+  difference between asking about the link and asking through it.
+- **A lock needs a transaction**, so `lock` refuses locally rather than sending
+  a request the cluster answers with `A valid master transaction is required`.
+- **A waitable lock is granted later, or never.** It comes back `pending`, and
+  treating that as held is the mistake the command invites; `lock_waiting` polls
+  until the cluster says `acquired`. The deadline is not a nicety: a transaction
+  that already holds a *snapshot* lock on the node is refused an exclusive one
+  outright, but the waitable version of that request queues behind a lock only
+  that transaction's own end will release. It waits forever, silently.
+
+Verified on the local cluster with `cargo run -p ytsaurus-client --example
+cypress`, which builds a small tree of dated runs, publishes over the live table
+by moving a staging one across inside a transaction, and finishes with three
+transactions competing for one lock.
+
 ### Published all at once, or not at all
 
 - **Added** `Transaction`, `Client::start_transaction`,

@@ -76,6 +76,8 @@ use std::time::{Duration, Instant};
 pub mod error;
 mod http;
 mod jobs;
+/// Cypress locks.
+pub mod lock;
 mod retry;
 /// Table schemas.
 pub mod schema;
@@ -87,6 +89,7 @@ pub mod yson_build;
 
 pub use crate::error::{ClientError, Result};
 pub use crate::jobs::{JobFailure, JobInfo};
+pub use crate::lock::{Lock, LockMode};
 pub use crate::retry::{MutationId, RetryPolicy};
 pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
 // The derive and the trait share a name, as `serde::Serialize` does: they live
@@ -487,6 +490,248 @@ impl Client {
             Repeatable::WithMutationId,
         )?;
         Ok(())
+    }
+
+    /// The names of a node's children.
+    ///
+    /// **Not sorted.** The order is the cluster's own and has no meaning; a
+    /// listing of three dated tables came back as the second, the third and
+    /// then the first. Sort it if the order matters.
+    ///
+    /// A path that is not a map node is an error rather than an empty list —
+    /// `"List" method is not supported` — and so is a path that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, or if the cluster marks
+    /// the answer `incomplete`: a listing that is silently short is worse than
+    /// no listing.
+    pub fn list(&self, path: &str) -> Result<Vec<String>> {
+        let params = yson_build::map([("path", yson_build::string(path))]);
+        let body = self.transport.call(
+            Method::Get,
+            "list",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        child_names(&self.value_field(&body, "value")?, path)
+    }
+
+    /// Copies a node, creating missing parents.
+    ///
+    /// Fails if `destination` exists; [`Client::copy_replacing`] is the one that
+    /// overwrites.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn copy(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("copy", source, destination, false)
+    }
+
+    /// Copies a node over whatever is at `destination`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn copy_replacing(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("copy", source, destination, true)
+    }
+
+    /// Moves a node, creating missing parents.
+    ///
+    /// Fails if `destination` exists; [`Client::move_replacing`] is the one that
+    /// overwrites, and the pair is how a result is published: write a staging
+    /// table, then move it over the live one.
+    ///
+    /// Named `move_node` because `move` is a Rust keyword, and `client.r#move`
+    /// at every call site would be a worse tax than the four extra characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn move_node(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("move", source, destination, false)
+    }
+
+    /// Moves a node over whatever is at `destination`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn move_replacing(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("move", source, destination, true)
+    }
+
+    fn transfer(&self, command: &str, source: &str, destination: &str, force: bool) -> Result<()> {
+        let params = yson_build::map([
+            ("source_path", yson_build::string(source)),
+            ("destination_path", yson_build::string(destination)),
+            ("recursive", yson_build::boolean(true)),
+            ("force", yson_build::boolean(force)),
+        ]);
+        self.transport.call(
+            Method::Post,
+            command,
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// Creates a link at `link_path` pointing at `target`.
+    ///
+    /// A link resolves to its target, so `//tmp/latest/@row_count` reads the
+    /// target's row count. To ask about the link itself, put `&` after its path:
+    /// `//tmp/latest&/@target_path`. Without the `&` the question goes through
+    /// to the target and is answered as if the link were not there.
+    ///
+    /// Fails if `link_path` exists; [`Client::link_replacing`] is what points an
+    /// existing link somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn link(&self, target: &str, link_path: &str) -> Result<()> {
+        self.link_inner(target, link_path, false)
+    }
+
+    /// Points a link at `target`, replacing whatever is at `link_path`.
+    ///
+    /// The `//tmp/thing/latest` pattern: publish under a dated name, then move
+    /// the link. Readers that follow the link see the old version until this
+    /// call and the new one after it, and never a half-written table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn link_replacing(&self, target: &str, link_path: &str) -> Result<()> {
+        self.link_inner(target, link_path, true)
+    }
+
+    fn link_inner(&self, target: &str, link_path: &str, force: bool) -> Result<()> {
+        let params = yson_build::map([
+            ("target_path", yson_build::string(target)),
+            ("link_path", yson_build::string(link_path)),
+            ("recursive", yson_build::boolean(true)),
+            ("force", yson_build::boolean(force)),
+        ]);
+        self.transport.call(
+            Method::Post,
+            "link",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// Takes a lock, or fails because somebody else holds one.
+    ///
+    /// Only inside a transaction: a lock lives as long as the transaction that
+    /// took it, and there is nothing else for it to belong to. A client that is
+    /// not in one is told so here rather than by the cluster.
+    ///
+    /// The failure is worth reading — it names the transaction that won:
+    ///
+    /// ```text
+    /// Cannot take "exclusive" lock for node //tmp/live since "exclusive" lock
+    /// is taken by concurrent transaction 4-dac2-10001-eb1b
+    /// ```
+    ///
+    /// [`Client::lock_waiting`] queues for it instead of failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if this client is not in a transaction,
+    /// or [`ClientError`] if the lock is refused.
+    pub fn lock(&self, path: &str, mode: LockMode) -> Result<Lock> {
+        self.lock_inner(path, mode, false)
+    }
+
+    /// Queues for a lock, and waits until it is held.
+    ///
+    /// A waitable lock is **granted later, or never** — the cluster answers
+    /// immediately with a lock that is `pending`, and it becomes `acquired` when
+    /// the transactions ahead of it end. Returning that lock as though it were
+    /// held is the mistake this command exists to make impossible: this polls
+    /// until the cluster says `acquired`, and gives up after `wait_for`.
+    ///
+    /// The deadline is not a nicety. A request can queue for something that will
+    /// never happen and the cluster will not say so: a transaction that already
+    /// holds a snapshot lock on the node is refused an exclusive one outright,
+    /// but the *waitable* version of the same request is queued behind a lock
+    /// only that transaction's own end will release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if this client is not in a transaction or
+    /// the wait ran out, or [`ClientError`] if a request fails. A lock that is
+    /// still queued when the wait runs out stays queued until the transaction
+    /// ends.
+    pub fn lock_waiting(&self, path: &str, mode: LockMode, wait_for: Duration) -> Result<Lock> {
+        let lock = self.lock_inner(path, mode, true)?;
+        let deadline = Instant::now() + wait_for;
+
+        loop {
+            let state = self.get(&format!("#{}/@state", lock.id))?;
+            if state.as_str() == Some("acquired") {
+                return Ok(lock);
+            }
+
+            if Instant::now() >= deadline {
+                return Err(ClientError::Config(format!(
+                    "lock on {path}: still {} after {:.0}s — the locks ahead of it are \
+                     still held, which can include a snapshot lock this same \
+                     transaction took. It stays queued until this transaction ends.",
+                    state.as_str().unwrap_or("queued"),
+                    wait_for.as_secs_f64()
+                )));
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+    }
+
+    fn lock_inner(&self, path: &str, mode: LockMode, waitable: bool) -> Result<Lock> {
+        if self.transaction_id().is_none() {
+            return Err(ClientError::Config(format!(
+                "lock {path}: a lock belongs to a transaction, and this client is not in \
+                 one — take it through a Client::start_transaction handle. The cluster \
+                 answers this with `A valid master transaction is required`."
+            )));
+        }
+
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("mode", yson_build::string(mode.as_str())),
+            ("waitable", yson_build::boolean(waitable)),
+        ]);
+        let body = self.transport.call(
+            Method::Post,
+            "lock",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "lock")?;
+        let text = |key: &str| -> Result<String> {
+            match &self.field_of(&envelope, key)?.node {
+                YsonNode::String(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+                other => Err(ClientError::Decode {
+                    command: "lock".to_owned(),
+                    reason: format!("{key} is not a string: {other:?}"),
+                }),
+            }
+        };
+
+        Ok(Lock {
+            id: text("lock_id")?,
+            node_id: text("node_id")?,
+        })
     }
 
     /// Reads a node attribute, such as `@row_count`.
@@ -1287,6 +1532,44 @@ impl Client {
     }
 }
 
+/// Reads the child names out of a `list` answer.
+///
+/// A truncated answer is an error rather than a short list. The cluster says so
+/// with `<incomplete=%true>` — an *attribute* on the list, not an error — and a
+/// caller who does not look gets a listing that is quietly missing entries.
+fn child_names(value: &YsonValue, path: &str) -> Result<Vec<String>> {
+    if matches!(
+        value.attr("incomplete").map(|v| &v.node),
+        Some(YsonNode::Boolean(true))
+    ) {
+        return Err(ClientError::Decode {
+            command: "list".to_owned(),
+            reason: format!(
+                "{path} has more children than the cluster would list at once, so the \
+                 answer it gave is not all of them"
+            ),
+        });
+    }
+
+    let YsonNode::List(items) = &value.node else {
+        return Err(ClientError::Decode {
+            command: "list".to_owned(),
+            reason: format!("{path}: the answer is not a list: {:?}", value.node),
+        });
+    };
+
+    items
+        .iter()
+        .map(|item| match &item.node {
+            YsonNode::String(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+            other => Err(ClientError::Decode {
+                command: "list".to_owned(),
+                reason: format!("{path}: a child name is not a string: {other:?}"),
+            }),
+        })
+        .collect()
+}
+
 /// Totals one custom statistic over the jobs that completed.
 ///
 /// The cluster files a statistic as `$` → job state → job type → the
@@ -1393,6 +1676,24 @@ mod tests {
 
         let err = check_complete_fragment(&data).expect_err("must reject");
         assert!(err.contains("cut short"), "{err}");
+    }
+
+    #[test]
+    fn a_listing_is_the_names_in_the_order_given() {
+        let value = from_slice(br#"["t1";"t2";]"#, YsonFormat::Text).expect("valid YSON");
+        assert_eq!(child_names(&value, "//tmp/x").unwrap(), ["t1", "t2"]);
+    }
+
+    #[test]
+    fn a_truncated_listing_is_an_error_rather_than_a_short_list() {
+        // What `max_size` produces, and what a node with too many children
+        // produces on its own. The marker is an attribute on the list, so a
+        // caller who does not look gets a listing quietly missing entries.
+        let value =
+            from_slice(br#"<"incomplete"=%true;>["t1";]"#, YsonFormat::Text).expect("valid YSON");
+
+        let err = child_names(&value, "//tmp/x").expect_err("must not pass as a listing");
+        assert!(err.to_string().contains("not all of them"), "{err}");
     }
 
     /// What a local cluster answers `exists` with, captured verbatim.

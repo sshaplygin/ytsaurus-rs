@@ -44,7 +44,9 @@ cargo run -p ytsaurus-client --example launch
 
 | | |
 | --- | --- |
-| Cypress | `create`, `create_table`, `remove`, `exists`, `get`, `row_count`, `table_schema` |
+| Cypress | `create`, `create_table`, `remove`, `exists`, `get`, `list`, `row_count`, `table_schema` |
+| Naming | `copy`, `move_node`, `link` — each with a `_replacing` twin that overwrites |
+| Locks | `lock`, `lock_waiting` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
@@ -143,6 +145,47 @@ Two things the cluster insists on, and one the client does about them:
 
 [`examples/transaction.rs`](examples/transaction.rs) watches all of it on a
 cluster, including a launcher that fails halfway and leaves nothing behind.
+
+## Naming what you produced
+
+A pipeline's results need names — yesterday's run beside today's, and something
+that always points at the newest:
+
+```rust
+client.move_replacing(&staging, &format!("//tmp/runs/{today}"))?;
+client.link_replacing(&format!("//tmp/runs/{today}"), "//tmp/runs/latest")?;
+```
+
+Readers following `latest` see the previous run until that second line and the
+new one after it, and never a half-written table. Three things about this that
+are easy to get wrong, all watched on a cluster:
+
+- **`list` is not sorted.** Three dated tables came back as the second, the third
+  and then the first.
+- **A truncated listing is an attribute, not an error**: `<incomplete=%true>[…]`.
+  `list` refuses one rather than handing back a listing quietly missing entries.
+- **A link resolves to its target, attributes included.** `latest/@type` answers
+  `table`; `latest&/@type` answers `link`. The `&` is the difference between
+  asking *about* the link and asking *through* it.
+
+Locks are the other half — a lock belongs to a transaction, so `lock` refuses
+before sending anything if the client is not in one:
+
+```rust
+let tx = client.start_transaction()?;
+tx.lock("//tmp/runs/latest", LockMode::Exclusive)?;   // or wait: lock_waiting
+```
+
+**A waitable lock is granted later, or never.** The cluster answers immediately
+with a lock that is `pending`, and treating that as held is the mistake the
+command invites; `lock_waiting` returns only when the cluster says `acquired`.
+Its deadline is not a nicety: a transaction that already holds a snapshot lock
+on the node is *refused* an exclusive one, but the waitable version of that same
+request queues behind a lock only that transaction's end will release, and
+waits forever without a word.
+
+[`examples/cypress.rs`](examples/cypress.rs) runs all of it, ending with three
+transactions competing for one lock.
 
 ## One binary, two roles
 

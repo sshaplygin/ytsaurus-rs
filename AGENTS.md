@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 310 tests
+cargo test --workspace            # 313 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -217,6 +217,34 @@ per command. Cluster facts:
 - `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
   handle pings its own transaction.
 
+### Cypress: naming and locks
+
+- **`list` is not sorted.** Three dated tables came back as the second, the third
+  and then the first. The order is the cluster's own.
+- **A truncated listing is `<incomplete=%true>[…]`** — an attribute on the list,
+  not an error. `Client::list` refuses one rather than returning a short list.
+  `max_size` produces the same marker.
+- **Listing a non-map node is error 103**, `"List" method is not supported`, not
+  an empty list.
+- **`copy`/`move` need `force` to overwrite** (else error 501 `already exists`)
+  and `recursive` to create parents. Both are `source_path`/`destination_path`;
+  `link` is `target_path`/`link_path`.
+- **A link resolves to its target, attributes included.** `latest/@type` is
+  `table`; `latest&/@type` is `link`. The `&` suffix asks about the link itself.
+- **`lock` requires a transaction**: `A valid master transaction is required`.
+  It answers `{lock_id, node_id, revision}`.
+- **A conflicting lock names the winner**: error 402, `… since "exclusive" lock is
+  taken by concurrent transaction 4-dac2-10001-eb1b`, with a `winner_transaction`
+  attribute.
+- **`waitable=%true` returns a `pending` lock, not a held one**, with
+  `revision=0`; `#<lock_id>/@state` becomes `acquired` when the queue clears.
+- **A waitable lock can wait for something that will never happen.** A
+  transaction holding a *snapshot* lock is refused an exclusive lock on the same
+  node (error 400, `already taken by same transaction`) — but the waitable form
+  of that request queues forever instead. Hence the deadline on `lock_waiting`.
+- `unlock` exists and is not modelled: its rules about a transaction that has
+  already modified the node were not verified here.
+
 ### Control records
 
 Attributed **entities** interleaved with the data: `table_index`, `row_index`,
@@ -338,7 +366,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 279 tests. Control records driven by the exact
+1. **Unit and integration** — 282 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4
