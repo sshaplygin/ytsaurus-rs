@@ -40,6 +40,18 @@ writer.finish()
   `<table_index=N>#` switch records.
 - **Failing usefully.** Truncated input, corrupt records and write errors are all
   fatal and explain themselves on stderr, where the operation UI shows them.
+- **Knowing it is a job.** The cluster sets `YT_JOB_ID`, so `is_inside_job()` and
+  `run_if_inside_job()` let one binary be both the launcher and the job it runs:
+
+  ```rust
+  fn main() {
+      ytsaurus_job::run_if_inside_job(mapper);   // never returns inside a job
+      launch();                                  // only your machine gets here
+  }
+  ```
+
+  With `ytsaurus-client`'s `upload_current_exe`, the binary uploads itself —
+  there is no second artifact to forget to rebuild.
 
 ## Design notes
 

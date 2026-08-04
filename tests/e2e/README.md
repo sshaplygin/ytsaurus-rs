@@ -43,6 +43,30 @@ against the uploaded file. **The cluster re-encodes rows on ingest** — 309 676
 bytes uploaded came back as 309 688 — so comparing against the upload would fail
 for reasons that have nothing to do with the job.
 
+### Without the `yt` CLI
+
+Two examples drive a cluster through `ytsaurus-client` alone, with nothing
+Python on `PATH`:
+
+```sh
+export YT_PROXY=http://localhost:8000
+scripts/build-worker.sh cat boom selfrun wordcount
+cargo run -p ytsaurus-client --example launch       # the happy path
+cargo run -p ytsaurus-client --example diagnose     # the failure path
+cargo run -p ytsaurus-client --example sort_reduce  # sort, then reduce over it
+cargo run -p ytsaurus-client --example idempotent   # a repeated start is one operation
+
+# One binary that is both launcher and job. On macOS the launcher cannot be the
+# uploaded file, so point it at the musl build of the same source.
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun
+```
+
+`diagnose` runs the `boom` worker, which panics on its first row, and checks
+that the failed job's stderr came back in the error rather than only in the web
+UI. It exits non-zero if the operation *succeeds* — that would mean it is no
+longer testing anything.
+
 ### Last run
 
 All checks passed against `ghcr.io/ytsaurus/local:stable` on 2026-08-04
@@ -57,6 +81,84 @@ All checks passed against `ghcr.io/ytsaurus/local:stable` on 2026-08-04
 == Wordcount map-reduce
    ok wordcount matches the reference (9 words)
 ```
+
+`diagnose` on the same cluster, same day:
+
+```text
+operation 1ba94195-3142e068-103e8-ffe93efc finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
+  job 24c164af-a273b7fd-10384-1000001 on localhost:24403: User job failed: Process terminated by signal 6
+  stderr:
+    boom: started, reading input
+    ytsaurus-job: the job panicked and will fail.
+    thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+    boom: this job fails on purpose (row 1, 23 bytes)
+   ok a failed job was reported
+   ok the job's stderr came back
+   ok the stderr is the job's own panic
+   ok the job error explains the exit
+```
+
+`selfrun` too, from both sides. On the macOS host the launcher is Mach-O and is
+refused before it can be uploaded:
+
+```text
+/…/target/debug/selfrun cannot run on a cluster node: it is not an ELF binary,
+so a Linux node cannot exec it. Build the worker with scripts/build-worker.sh …
+```
+
+and the real one-binary path — the binary uploading *itself* — was verified by
+running the musl build as the launcher inside Linux, which is what a Linux
+developer's machine would do:
+
+```sh
+docker cp target/x86_64-unknown-linux-musl/release-worker/selfrun yt.backend:/tmp/selfrun
+docker exec -e YT_PROXY=http://localhost:80 yt.backend /tmp/selfrun
+```
+
+```text
+== Uploading this very binary
+   ok /tmp/selfrun -> //tmp/ytsaurus_rs_selfrun/selfrun
+== Waiting for it
+   ok completed
+== Reading the result back
+   ok 3 rows, 104 bytes
+```
+
+`sort_reduce`, same cluster:
+
+```text
+== Sorting it
+   ok the table is now sorted by [word]
+== Reducing over the sorted table
+   ok 4 rows
+== Checking the totals
+   ok alpha = 6
+   ok beta = 6
+   ok delta = 1
+   ok gamma = 7
+   ok no extra groups
+```
+
+Four rows rather than one is the check that matters: it means `key_switch`
+reached the reducer. In the plain `job_io` section, because a reduce has one job
+type — the map-reduce trap in the other direction.
+
+`idempotent`, same cluster:
+
+```text
+== Starting the operation twice under one mutation ID
+   mutation_id fcbe6ca-c0358138-dd69c16e-9e2ac0aa
+   ok first  -> 5a49b501-3620e60c-103e8-8cac5f56
+   ok second -> 5a49b501-3620e60c-103e8-8cac5f56
+   ok both calls returned the same operation
+== And a different ID really does start another one
+   ok a fresh mutation ID starts a second operation
+```
+
+The first attempt at this example failed, and usefully: sending the same
+`mutation_id` twice **without** the `retry` flag is refused with `Duplicate
+request is not marked as "retry"`. The cluster does not infer a replay from
+recognising the ID, which is why `MutationId::as_retry()` exists.
 
 ## Refreshing the golden fixtures
 

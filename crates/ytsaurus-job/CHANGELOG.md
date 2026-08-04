@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### One binary can be both the launcher and the job
+
+- **Added** `is_inside_job`, `run_if_inside_job` and `job_id`. The cluster
+  starts a job with `YT_JOB_ID` in its environment, so a program can tell which
+  role it is playing:
+
+  ```rust
+  fn main() {
+      ytsaurus_job::run_if_inside_job(mapper);   // never returns inside a job
+      launch();                                  // only your machine gets here
+  }
+  ```
+
+  With `Client::upload_current_exe` on the other side, the binary uploads
+  itself, and "the cluster is running last week's worker" stops being possible.
+  This is the shape of Go's `mapreduce.InsideJob` / `JobMain`.
+
+  Verified on a cluster rather than assumed: a job printed its environment, and
+  `YT_JOB_ID` was in it, alongside `YT_OPERATION_ID`, `YT_JOB_COOKIE`,
+  `YT_JOB_INDEX`, `YT_START_ROW_INDEX` and `YT_FIRST_OUTPUT_TABLE_FD=1` — the
+  `3k + 1` descriptor rule from the cluster's own mouth. The full list is in
+  [`docs/writing-a-job.md`](../../docs/writing-a-job.md) §3.
+
+  An empty `YT_JOB_ID` does not count as a job. `YT_JOB_ID=` in a shell would
+  otherwise run the job body on a developer's machine, reading their terminal as
+  an input stream.
+
 ## 0.2.0
 
 Everything here came from writing a production-shaped pilot

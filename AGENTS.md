@@ -17,8 +17,8 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | --- | --- |
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. |
-| `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it. No Python needed. |
-| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`) plus their e2e tests. |
+| `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
+| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`) plus their e2e tests. |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
@@ -62,7 +62,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 202 tests
+cargo test --workspace            # 253 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -84,6 +84,14 @@ cross-toolchain or Docker needed.
 crate. It lives in the workspace `release-worker` profile so library crates never
 inherit it.
 
+`ytsaurus-client`'s **`tls` feature is on by default and off in `examples/`**.
+TLS means `rustls`, which means `ring`, which needs a C cross-compiler to reach
+musl — and `examples/` is what `build-worker.sh` cross-compiles. Turning it off
+there is what keeps that script working with nothing but the Rust toolchain,
+even for a worker that contains the whole client. The dependency is spelled out
+in `examples/Cargo.toml` rather than inherited, because cargo does not let an
+inherited dependency disable default features.
+
 ## Protocol reference
 
 Verified against the docs **and** against a live cluster.
@@ -103,6 +111,22 @@ Verified against the docs **and** against a live cluster.
 ### Descriptors
 
 Output table `k` is fd `3k + 1`: table 0 → fd 1, table 1 → fd 4, table 2 → fd 7.
+The cluster agrees in writing: a job's environment carries
+`YT_FIRST_OUTPUT_TABLE_FD=1`.
+
+### The job environment
+
+Captured from a job on a local cluster:
+
+`YT_JOB_ID` · `YT_OPERATION_ID` · `YT_JOB_COOKIE` · `YT_JOB_INDEX` ·
+`YT_TASK_JOB_INDEX` · `YT_START_ROW_INDEX` · `YT_FIRST_OUTPUT_TABLE_FD` ·
+`YT_NODE_HOST` · `YT_POOL_TREE` · `YT_COLLECTIVE_ID` / `YT_COLLECTIVE_MEMBER_RANK`
+· `YT_JOB_PROXY_{GRPC,HTTP}_SOCKET_PATH`
+
+`YT_JOB_ID` is what `is_inside_job()` tests, matching Go's
+`mapreduce.InsideJob`. argv is exactly the spec's command — `["./selfrun"]` —
+so argv-based role dispatch (`wordcount map`) also works, but has to be
+remembered at the call site.
 
 ### Control records
 
@@ -133,10 +157,26 @@ These cost time once. They are recorded so they do not cost it again.
   `--local-file`.
 - **Binary YSON needs two pip packages**: `ytsaurus-client` *and* `ytsaurus-yson`.
   Without the second: `YSON bindings required`.
+- **A duplicate mutation must admit to being one.** Re-sending a `mutation_id`
+  without `retry=%true` is refused with `Duplicate request is not marked as
+  "retry"`, not deduplicated. The flag is not inferred from the ID being known.
+- **Two operations writing one output table serialise on an exclusive lock**,
+  and the loser fails to prepare rather than waiting. Give concurrent
+  operations their own outputs.
 - **A column value cannot carry attributes.** YTsaurus rejects it on write with
   `Table values cannot have top-level attributes`, so a job can never receive one.
 - **The cluster re-encodes rows on ingest.** 309 676 bytes uploaded came back as
   309 688. Compare read-back against read-back, never against the uploaded file.
+- **`stderr_size` from `list_jobs` is a hint, not a length.** A job whose stderr
+  was several hundred bytes was reported as `1`. Never use it to decide whether
+  there is stderr to fetch.
+- **A Rust panic reaches the cluster as `Process terminated by signal 6`.**
+  Worker binaries are built with `panic = "abort"`, so a panic aborts. The
+  message itself is only in the job's stderr, which is why
+  `wait_for_operation` fetches it.
+- **A job error's outer message is a category.** `User job failed` says nothing;
+  the cause is at the bottom of `inner_errors`. Both `ClientError` paths flatten
+  outer-plus-innermost.
 
 ## Architecture
 
@@ -199,7 +239,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 158 tests. Control records driven by the exact
+1. **Unit and integration** — 229 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

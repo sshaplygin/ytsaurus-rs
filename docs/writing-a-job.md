@@ -1,7 +1,12 @@
 # Writing a YTsaurus job in Rust
 
-From an empty file to a running operation. Assumes you can already reach a
-cluster with the `yt` CLI.
+From an empty file to a running operation. Assumes you can reach a cluster —
+`export YT_PROXY=http://localhost:8000` for the local one in
+[`tests/e2e/README.md`](../tests/e2e/README.md).
+
+The shape this guide builds towards is **one binary that is both the launcher
+and the job**: it uploads itself, starts the operation, and is what the cluster
+runs. The `yt` CLI can do the launching instead, and §5 covers that too.
 
 ## 0. What a job actually is
 
@@ -33,7 +38,16 @@ Add a binary to `examples/` (or your own crate):
 ytsaurus-job = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+
+# Only if the same binary should also launch the operation — see §3.
+ytsaurus-client = { version = "0.2", default-features = false }
 ```
+
+`default-features = false` drops TLS. A binary that runs on a node is
+cross-compiled to musl, and the TLS stack needs a C toolchain to get there; a
+local cluster is plain HTTP and needs none of it. Turn the `tls` feature back on
+for an `https://` cluster, and build the worker on Linux or with a musl
+cross-compiler.
 
 `ytsaurus-job` re-exports the codec as `ytsaurus_job::yson`, so you only need a
 direct dependency on `ytsaurus-yson` if you use it without the job runtime.
@@ -57,27 +71,30 @@ struct Output<'a> {
     size: i64,
 }
 
+fn mapper() -> ytsaurus_job::Result<()> {
+    let mut reader = JobReader::from_stdin();
+    let mut writer = JobWriter::descriptors(1)?;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+        let input: Input = row.parse()?;
+        let host = input.url.split('/').next().unwrap_or("");
+        writer.write(0, &Output { host, size: input.size })?;
+    }
+
+    // Buffered rows that are never flushed are rows missing from the output
+    // table. `finish` is not optional.
+    writer.finish()
+}
+
 fn main() {
-    ytsaurus_job::run(|| {
-        let mut reader = JobReader::from_stdin();
-        let mut writer = JobWriter::descriptors(1)?;
-
-        while let Some(event) = reader.next_event()? {
-            let Event::Row(row) = event else { continue };
-            let input: Input = row.parse()?;
-            let host = input.url.split('/').next().unwrap_or("");
-            writer.write(0, &Output { host, size: input.size })?;
-        }
-
-        // Buffered rows that are never flushed are rows missing from the
-        // output table. `finish` is not optional.
-        writer.finish()
-    })
+    ytsaurus_job::run(mapper)
 }
 ```
 
 `run` installs a panic hook and turns any error into a non-zero exit with the
-message on stderr, which is what makes a failure diagnosable in the UI.
+message on stderr, which is what makes a failure diagnosable in the UI. §3
+replaces that `main` with one that also launches the operation.
 
 ### Choosing column types
 
@@ -142,7 +159,99 @@ let outcome: Result<Clean, &'static str> = match row.parse::<Raw>() {
 Formatting the error instead would allocate per bad row and produce a message
 that can change between versions — awkward for a column you intend to group by.
 
-## 3. Build it for the cluster
+## 3. One binary, two roles
+
+The cluster starts a job by exec'ing the uploaded binary with `YT_JOB_ID` in its
+environment. So a program can ask which role it is playing, and be both the
+launcher and the job:
+
+```rust
+fn main() {
+    // Inside a job this never returns: it runs the mapper and exits with the
+    // status YTsaurus reads.
+    ytsaurus_job::run_if_inside_job(mapper);
+
+    // Only your machine gets here.
+    if let Err(e) = launch() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+fn launch() -> Result<(), ytsaurus_client::ClientError> {
+    let client = ytsaurus_client::Client::from_env()?;
+
+    // Uploads *this very binary*, so what runs on the cluster is what you
+    // just built.
+    client.upload_current_exe("//tmp/my_job")?;
+
+    let spec = ytsaurus_client::MapSpec::new("./my_job", ["//tmp/input"], ["//tmp/output"])
+        .with_local_file("//tmp/my_job")
+        .with_memory_limit(512 * 1024 * 1024);
+
+    let id = client.start_map(&spec)?;
+    client.wait_for_operation(&id)
+}
+```
+
+That is the whole pattern, and it removes a whole class of bug: there is no
+second artifact to forget to rebuild, so "the cluster is running last week's
+worker" cannot happen.
+
+`upload_current_exe` checks the running executable's ELF header before
+uploading — Linux, x86-64, statically linked — because everything it rejects
+would otherwise fail on the node minutes later with an error that names no
+cause:
+
+```text
+/…/target/debug/selfrun cannot run on a cluster node: it is not an ELF binary,
+so a Linux node cannot exec it. Build the worker with scripts/build-worker.sh …
+```
+
+**On macOS the launcher cannot be the uploaded file.** A Mach-O binary is not
+something a node can exec, and a Linux binary is not something macOS can run.
+The source stays one file; you build it twice and point the launcher at the musl
+build:
+
+```sh
+scripts/build-worker.sh my_job
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/my_job \
+    cargo run -p ytsaurus-examples --bin my_job
+```
+
+where the launcher chooses:
+
+```rust
+match std::env::var("YT_WORKER_BINARY") {
+    Ok(path) if !path.trim().is_empty() => client.upload_worker(&path, remote)?,
+    _ => client.upload_current_exe(remote)?,
+}
+```
+
+On Linux x86-64, run the musl build itself and `upload_current_exe` needs no
+help. [`examples/src/bin/selfrun.rs`](../examples/src/bin/selfrun.rs) is the
+runnable version of all of this.
+
+### What the cluster puts in a job's environment
+
+Captured from a job on a local cluster, not from documentation:
+
+| Variable | Example | |
+| --- | --- | --- |
+| `YT_JOB_ID` | `f5627254-f0da1b44-10384-1000001` | what `is_inside_job` tests; `job_id()` returns it |
+| `YT_OPERATION_ID` | `94709bab-331f4beb-103e8-609dd076` | the operation this job belongs to |
+| `YT_JOB_COOKIE` | `0` | stable across a restart of the same job — how vanilla jobs identify themselves |
+| `YT_JOB_INDEX`, `YT_TASK_JOB_INDEX` | `0` | position within the operation and within its task |
+| `YT_START_ROW_INDEX` | `0` | first input row index this job was given |
+| `YT_FIRST_OUTPUT_TABLE_FD` | `1` | the `3k + 1` descriptor rule, from the cluster's own mouth |
+| `YT_NODE_HOST`, `YT_POOL_TREE` | `localhost`, `default` | where it ran |
+
+The job's argv is exactly the spec's command (`["./selfrun"]`), so a binary can
+also be told its role by an argument — `wordcount map` / `wordcount reduce` does
+this to serve both phases of a map-reduce. `YT_JOB_ID` is the better signal for
+launcher-versus-job, because you do not have to remember to pass it.
+
+## 4. Build it for the cluster
 
 Jobs run on Linux x86_64 nodes that may not have your libc. Build a fully static
 musl binary:
@@ -159,7 +268,16 @@ Rust toolchain, so there is no cross-toolchain to install).
 `static-pie linked` with no interpreter is what you want. A dynamically linked
 binary will fail on the node with a missing-loader error that is hard to read.
 
-## 4. Run it
+## 5. Run it
+
+With the `main` from §3, that is just the binary:
+
+```sh
+export YT_PROXY=http://localhost:8000
+cargo run -p ytsaurus-examples --bin my_job
+```
+
+### Or with the `yt` CLI
 
 The CLI needs **two** packages — `ytsaurus-client` alone fails on binary YSON
 with `YSON bindings required`:
@@ -187,7 +305,7 @@ Two CLI details that are easy to get wrong:
 - **`map-reduce` uses `--map-local-file` and `--reduce-local-file`**, not
   `--local-file`.
 
-## 5. Multiple output tables
+## 6. Multiple output tables
 
 Declare them by name and address them by handle:
 
@@ -211,7 +329,7 @@ descriptor, `JobWriter::table_switches(n)` writes `<table_index=N>#` records
 instead. Do not mix the two: YTsaurus does not define the order of rows reaching
 one table through two descriptors.
 
-## 6. Knowing which input table a row came from
+## 7. Knowing which input table a row came from
 
 Ask for it in the spec, then read `row.table_index`:
 
@@ -224,7 +342,7 @@ Ask for it in the spec, then read `row.table_index`:
 these the fields stay at their defaults — `table_index` is `0` and the others
 are `None`.
 
-## 7. Reduce
+## 8. Reduce
 
 A reducer's input is grouped by the `--reduce-by` columns, with a
 `<key_switch=%true>#` record between groups. **You must enable it**, or the whole
@@ -240,6 +358,28 @@ input arrives as one group and every key is silently summed together:
 
 Getting this wrong is quiet, not loud: `job_io` on a map-reduce is simply
 ignored, the reducer sees no key switches, and every key is summed into one row.
+
+`ReduceSpec` and `MapReduceSpec` each put it in their own right place, and have
+it on by default:
+
+```rust
+use ytsaurus_client::{ReduceSpec, SortSpec};
+
+// A reduce needs sorted input, so sort first — once. The sorted table can then
+// be reduced as often as you like, without paying for a shuffle each time.
+let sort = SortSpec::new(["//tmp/lines"], "//tmp/sorted", ["word"]);
+client.wait_for_operation(&client.start_sort(&sort)?)?;
+
+let reduce = ReduceSpec::new("./wordcount reduce", ["//tmp/sorted"], ["//tmp/counts"], ["word"])
+    .with_local_file("//tmp/wordcount");
+client.wait_for_operation(&client.start_reduce(&reduce)?)?;
+```
+
+Reach for map-reduce when the data is *not* already sorted and one pass is all
+you want; reach for sort-then-reduce when it is, or when you will reduce the
+same data more than once. The cluster refuses a reduce whose input is not sorted
+by a column set beginning with `reduce_by`, so the mistake is loud rather than
+quiet.
 
 ```rust
 // Pass the same columns the operation was given as `reduce_by`.
@@ -277,7 +417,7 @@ yt map-reduce \
 
 See [`examples/src/bin/wordcount.rs`](../examples/src/bin/wordcount.rs).
 
-## 8. Test without a cluster
+## 9. Test without a cluster
 
 A job is a program that reads a pipe, so you can run it as one:
 
@@ -292,7 +432,7 @@ simulates the shuffle by sorting the mapper output and inserting key switches.
 
 For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
 
-## 9. When something goes wrong
+## 10. When something goes wrong
 
 | Symptom | Likely cause |
 | --- | --- |
@@ -307,6 +447,8 @@ For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
 | `Unexpected token ":"` from `--spec` | the spec is JSON; it must be YSON |
 | `Table values cannot have top-level attributes` on write | a column value carries `<...>` attributes; tables cannot store those |
 | output differs from input in an identity job | you decoded and re-encoded — map keys come back sorted. Use `Row::raw()` |
+| `cannot run on a cluster node` from `upload_current_exe` | the launcher is not a Linux x86-64 static binary; build the worker separately and point `YT_WORKER_BINARY` at it — §3 |
+| the job re-runs the launcher on the node | `run_if_inside_job` is not the first thing `main` does, or the uploaded binary is a different build |
 
 Job stderr appears in the operation UI. Set `RUST_BACKTRACE` through the spec to
 get backtraces from a panicking job:
@@ -314,6 +456,35 @@ get backtraces from a panicking job:
 ```sh
 --spec '{mapper={environment={RUST_BACKTRACE="1"}}}'
 ```
+
+### Reading the failure without the UI
+
+If you launch with [`ytsaurus-client`](../crates/ytsaurus-client/), you do not
+need the UI at all: when an operation fails, `wait_for_operation` asks the
+cluster which jobs failed and what they printed, and puts that in the error.
+
+```text
+operation 1ba94195-3142e068-103e8-ffe93efc finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
+  job 24c164af-a273b7fd-10384-1000001 on localhost:24403: User job failed: Process terminated by signal 6
+  stderr:
+    boom: started, reading input
+    ytsaurus-job: the job panicked and will fail.
+    thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+    boom: this job fails on purpose (row 1, 23 bytes)
+```
+
+`Process terminated by signal 6` is what a Rust panic looks like from the
+cluster's side: worker binaries are built with `panic = "abort"`, so the panic
+aborts rather than unwinds. The message itself is in the stderr above it.
+
+Only the tail of each job's stderr is included, up to a few kilobytes; for the
+whole thing, or for a job that succeeded, use `Client::get_job_stderr`. The
+report costs one `list_jobs` and a few `get_job_stderr` calls per failed
+operation — `Client::with_job_diagnostics(false)` turns it off on installations
+where `list_jobs` is not welcome.
+
+Run `cargo run -p ytsaurus-client --example diagnose` against a local cluster to
+see the whole path, using the `boom` worker, which fails on purpose.
 
 ## Reference
 

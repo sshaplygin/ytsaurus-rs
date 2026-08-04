@@ -29,6 +29,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The client without TLS is what a worker binary links against, and the
+      # `https://` refusal only exists in that build. Nothing else compiles it.
+      - name: cargo clippy (client without TLS)
+        run: cargo clippy -p ytsaurus-client --no-default-features --all-targets -- -D warnings
+
       - name: cargo test
         run: cargo test --workspace --all-targets
 

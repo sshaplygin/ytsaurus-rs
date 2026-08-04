@@ -31,6 +31,8 @@ use ureq::http::HeaderMap;
 use ytsaurus_yson::{YsonFormat, YsonValue, to_string};
 
 use crate::error::{ClientError, Result, truncate};
+use crate::retry::{MutationId, Repeatable, RetryPolicy};
+use crate::yson_build::{boolean, insert, string};
 
 const HEADER_FORMAT: &str = "X-YT-Header-Format";
 const PARAMETERS: &str = "X-YT-Parameters";
@@ -64,6 +66,7 @@ pub(crate) struct Transport {
     agent: ureq::Agent,
     base: String,
     token: Option<String>,
+    retries: RetryPolicy,
 }
 
 impl std::fmt::Debug for Transport {
@@ -95,21 +98,84 @@ impl Transport {
             .build()
             .into();
 
-        Self { agent, base, token }
+        Self {
+            agent,
+            base,
+            token,
+            retries: RetryPolicy::default(),
+        }
     }
 
     pub(crate) fn base(&self) -> &str {
         &self.base
     }
 
-    /// Executes a command, returning the raw response body.
+    pub(crate) fn set_retries(&mut self, policy: RetryPolicy) {
+        self.retries = policy;
+    }
+
+    /// Executes a command, repeating it when the failure looks transient.
+    ///
+    /// `repeatable` says what the command allows: a read is simply re-sent, a
+    /// light mutation is re-sent under a `mutation_id` the cluster
+    /// deduplicates, and a heavy command is sent once whatever the policy says.
     pub(crate) fn call(
         &self,
         method: Method,
         command: &str,
         parameters: &YsonValue,
         payload: Payload<'_>,
+        repeatable: Repeatable,
     ) -> Result<Vec<u8>> {
+        self.call_with(method, command, parameters, payload, repeatable, None)
+    }
+
+    /// As [`Transport::call`], with a caller-supplied mutation ID.
+    pub(crate) fn call_with(
+        &self,
+        method: Method,
+        command: &str,
+        parameters: &YsonValue,
+        payload: Payload<'_>,
+        repeatable: Repeatable,
+        mutation_id: Option<&MutationId>,
+    ) -> Result<Vec<u8>> {
+        let mutation_id = match (repeatable, mutation_id) {
+            (_, Some(given)) => Some(given.clone()),
+            (Repeatable::WithMutationId, None) => Some(MutationId::new()),
+            _ => None,
+        };
+
+        crate::retry::run(self.retries, repeatable, command, |is_retry| {
+            match &mutation_id {
+                Some(id) => {
+                    // The ID stays the same across attempts — that is what the
+                    // cluster deduplicates by — and only the flag changes. A
+                    // caller-supplied ID may already be marked as a replay,
+                    // which is how a restarted process resumes; the cluster
+                    // refuses a duplicate that does not say so.
+                    let mut tagged = parameters.clone();
+                    insert(&mut tagged, "mutation_id", string(id.as_str()));
+                    insert(&mut tagged, "retry", boolean(is_retry || id.is_retry()));
+                    self.send(method, command, &tagged, &payload)
+                }
+                None => self.send(method, command, parameters, &payload),
+            }
+        })
+    }
+
+    /// One attempt.
+    fn send(
+        &self,
+        method: Method,
+        command: &str,
+        parameters: &YsonValue,
+        payload: &Payload<'_>,
+    ) -> Result<Vec<u8>> {
+        if let Some(error) = tls_unavailable(&self.base) {
+            return Err(error);
+        }
+
         let url = format!("{}/api/v4/{command}", self.base);
 
         let encoded = to_string(parameters, YsonFormat::Text).map_err(|e| ClientError::Decode {
@@ -133,13 +199,13 @@ impl Transport {
             }
             (Method::Post, Payload::Bytes(bytes)) => with_headers!(self.agent.post(&url), &headers)
                 .header("Content-Type", "application/octet-stream")
-                .send(bytes),
+                .send(*bytes),
             (Method::Put, Payload::None) => {
                 with_headers!(self.agent.put(&url), &headers).send_empty()
             }
             (Method::Put, Payload::Bytes(bytes)) => with_headers!(self.agent.put(&url), &headers)
                 .header("Content-Type", "application/octet-stream")
-                .send(bytes),
+                .send(*bytes),
         };
 
         let mut response = sent.map_err(|e| ClientError::Transport {
@@ -177,6 +243,27 @@ impl Transport {
 
         Ok(body)
     }
+}
+
+/// Refuses an `https://` proxy when the crate was built without TLS.
+///
+/// Without this the failure surfaces as a connection error from `ureq`, which
+/// says nothing about the missing feature. See the `tls` feature: it is off in
+/// worker builds so that a binary which both launches and runs jobs can be
+/// cross-compiled to musl without a C toolchain.
+#[cfg(not(feature = "tls"))]
+fn tls_unavailable(base: &str) -> Option<ClientError> {
+    base.starts_with("https://").then(|| {
+        ClientError::Config(format!(
+            "{base} needs TLS, and this build has none: the `tls` feature of \
+             ytsaurus-client is off. Enable it, or use an http:// proxy."
+        ))
+    })
+}
+
+#[cfg(feature = "tls")]
+fn tls_unavailable(_base: &str) -> Option<ClientError> {
+    None
 }
 
 #[derive(Clone, Copy)]

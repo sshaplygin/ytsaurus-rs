@@ -59,12 +59,30 @@ yt map './my_job' --src //tmp/in --dst //tmp/out \
     --local-file target/x86_64-unknown-linux-musl/release-worker/my_job
 ```
 
-The full walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
+## Or let the binary launch itself
+
+The cluster starts a job with `YT_JOB_ID` in its environment, so one binary can
+be both the launcher and the job — and upload *itself*, which means the cluster
+can never be running a stale worker:
+
+```rust
+fn main() {
+    ytsaurus_job::run_if_inside_job(mapper);   // never returns inside a job
+
+    let client = ytsaurus_client::Client::from_env().unwrap();
+    client.upload_current_exe("//tmp/my_job").unwrap();
+    // ...start the operation and wait for it
+}
+```
+
+If it fails, the error carries the job's own stderr rather than a state string.
+See [examples/src/bin/selfrun.rs](examples/src/bin/selfrun.rs); the full
+walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 
 ## Build and test
 
 ```sh
-cargo test --workspace          # 202 tests
+cargo test --workspace          # 253 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```

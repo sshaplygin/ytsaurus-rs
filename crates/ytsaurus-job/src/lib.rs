@@ -122,3 +122,104 @@ where
         }
     }
 }
+
+/// The variable YTsaurus sets in every job's environment.
+///
+/// Verified on a cluster, not assumed: a job printed its environment and this
+/// was in it. The Go SDK's `mapreduce.InsideJob` tests the same variable.
+const JOB_ID_ENV: &str = "YT_JOB_ID";
+
+/// Whether this process is running as a job on a cluster.
+///
+/// This is what lets one binary be both the launcher and the job: the cluster
+/// starts the same executable with `YT_JOB_ID` set, so the program can tell
+/// which role it is playing.
+///
+/// ```no_run
+/// fn main() {
+///     // Inside a job this never returns.
+///     ytsaurus_job::run_if_inside_job(my_mapper);
+///
+///     // Only reached on your machine: upload this binary and start the
+///     // operation that will run it.
+/// }
+/// # fn my_mapper() -> ytsaurus_job::Result<()> { Ok(()) }
+/// ```
+#[must_use]
+pub fn is_inside_job() -> bool {
+    inside_job(std::env::var_os(JOB_ID_ENV))
+}
+
+/// The job's ID, when running inside one.
+///
+/// Worth putting in a log line: it is how a message on stderr is tied back to a
+/// job in the operation's UI.
+#[must_use]
+pub fn job_id() -> Option<String> {
+    std::env::var(JOB_ID_ENV).ok().filter(|id| !id.is_empty())
+}
+
+/// Runs `job` if this process is a job, and returns otherwise.
+///
+/// The whole of the one-binary pattern:
+///
+/// ```no_run
+/// use ytsaurus_job::{Event, JobReader, JobWriter};
+///
+/// fn main() {
+///     ytsaurus_job::run_if_inside_job(mapper);
+///     launch();   // only your machine gets here
+/// }
+///
+/// fn mapper() -> ytsaurus_job::Result<()> {
+///     let mut reader = JobReader::from_stdin();
+///     let mut writer = JobWriter::descriptors(1)?;
+///     while let Some(event) = reader.next_event()? {
+///         let Event::Row(row) = event else { continue };
+///         writer.write_raw(0, row.raw())?;
+///     }
+///     writer.finish()
+/// }
+/// # fn launch() {}
+/// ```
+///
+/// Inside a job this behaves exactly like [`run`] and never returns; the
+/// process exits with the job's status.
+pub fn run_if_inside_job<F, E>(job: F)
+where
+    F: FnOnce() -> std::result::Result<(), E>,
+    E: std::fmt::Display,
+{
+    if is_inside_job() {
+        run(job);
+    }
+}
+
+/// The decision itself, split out so it can be tested without touching the
+/// process environment — which is global, and in edition 2024 unsafe to write.
+fn inside_job(job_id: Option<std::ffi::OsString>) -> bool {
+    job_id.is_some_and(|id| !id.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_id_means_we_are_inside_a_job() {
+        assert!(inside_job(Some("55aff293-7ef14284-3fe0384-3e07".into())));
+    }
+
+    #[test]
+    fn no_job_id_means_we_are_not() {
+        assert!(!inside_job(None));
+    }
+
+    #[test]
+    fn an_empty_job_id_does_not_count() {
+        // `YT_JOB_ID=` in a shell is not a job. Treating it as one would run
+        // the job body on a developer's machine, reading their terminal as if
+        // it were an input stream.
+        assert!(!inside_job(Some(std::ffi::OsString::new())));
+    }
+}

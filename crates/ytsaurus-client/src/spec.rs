@@ -340,6 +340,235 @@ impl MapReduceSpec {
     }
 }
 
+/// A reduce operation over already-sorted input.
+///
+/// Every input table must already be sorted by a column set that *starts with*
+/// `reduce_by` — [`SortSpec`] is how a table gets that way. When it is,
+/// this is the operation to reach for: a map-reduce over the same data would
+/// pay for a shuffle that has already been done.
+///
+/// ```
+/// use ytsaurus_client::ReduceSpec;
+///
+/// let spec = ReduceSpec::new("./wordcount reduce", ["//tmp/sorted"], ["//tmp/counts"], ["word"])
+///     .with_local_file("//tmp/wordcount");
+/// ```
+#[derive(Debug, Clone)]
+pub struct ReduceSpec {
+    reducer: UserJob,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    reduce_by: Vec<String>,
+    sort_by: Vec<String>,
+    job_count: Option<i64>,
+    key_switch: bool,
+    input_table_index: bool,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl ReduceSpec {
+    /// A reduce running `command` over `inputs`, grouped by `reduce_by`.
+    #[must_use]
+    pub fn new<I, O, K>(command: impl Into<String>, inputs: I, outputs: O, reduce_by: K) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+        O: IntoIterator,
+        O::Item: Into<String>,
+        K: IntoIterator,
+        K::Item: Into<String>,
+    {
+        Self {
+            reducer: UserJob::new(command),
+            inputs: inputs.into_iter().map(Into::into).collect(),
+            outputs: outputs.into_iter().map(Into::into).collect(),
+            reduce_by: reduce_by.into_iter().map(Into::into).collect(),
+            sort_by: Vec::new(),
+            job_count: None,
+            // As for map-reduce: a reducer built on `JobReader::groups` is
+            // wrong without it, and silently so.
+            key_switch: true,
+            input_table_index: false,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Adds a Cypress file the job needs — normally the worker binary.
+    #[must_use]
+    pub fn with_local_file(mut self, path: impl Into<String>) -> Self {
+        self.reducer.files.push(path.into());
+        self
+    }
+
+    /// Sets the reducer's memory limit, in bytes.
+    #[must_use]
+    pub fn with_memory_limit(mut self, bytes: i64) -> Self {
+        self.reducer.memory_limit = Some(bytes);
+        self
+    }
+
+    /// Sets an environment variable for the job, e.g. `RUST_BACKTRACE`.
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.reducer.environment.push((key.into(), value.into()));
+        self
+    }
+
+    /// Sets the columns the input is sorted by, when they differ from
+    /// `reduce_by`.
+    ///
+    /// `reduce_by` must be a prefix of them. Saying so asks the cluster to
+    /// check the input really is sorted that way, and guarantees the order rows
+    /// arrive in within a group.
+    #[must_use]
+    pub fn with_sort_by<K>(mut self, columns: K) -> Self
+    where
+        K: IntoIterator,
+        K::Item: Into<String>,
+    {
+        self.sort_by = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Requests a specific job count.
+    #[must_use]
+    pub fn with_job_count(mut self, count: i64) -> Self {
+        self.job_count = Some(count);
+        self
+    }
+
+    /// Asks for the input table index to be delivered with each row.
+    ///
+    /// Reduce merges several sorted tables into one stream, so this is how a
+    /// job tells which table a row came from.
+    #[must_use]
+    pub fn with_input_table_index(mut self) -> Self {
+        self.input_table_index = true;
+        self
+    }
+
+    /// Turns off `key_switch` delivery to the reducer.
+    #[must_use]
+    pub fn without_key_switch(mut self) -> Self {
+        self.key_switch = false;
+        self
+    }
+
+    /// Sets any spec field this builder does not model.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    /// Renders the spec.
+    #[must_use]
+    pub fn to_yson(&self) -> YsonValue {
+        let mut reducer = self.reducer.to_yson();
+        if self.input_table_index {
+            insert(&mut reducer, "enable_input_table_index", boolean(true));
+        }
+
+        let mut spec = map([
+            ("reducer", reducer),
+            ("input_table_paths", list(self.inputs.iter().map(string))),
+            ("output_table_paths", list(self.outputs.iter().map(string))),
+            ("reduce_by", list(self.reduce_by.iter().map(string))),
+        ]);
+
+        if !self.sort_by.is_empty() {
+            insert(&mut spec, "sort_by", list(self.sort_by.iter().map(string)));
+        }
+        if let Some(count) = self.job_count {
+            insert(&mut spec, "job_count", int(count));
+        }
+
+        if self.key_switch {
+            // `job_io`, not `reduce_job_io`: a reduce has one job type, so it
+            // has one I/O section. This is the same trap as on map-reduce, in
+            // the other direction — the wrong spelling is accepted and ignored,
+            // and the reducer then sees the whole input as a single group.
+            insert(
+                &mut spec,
+                "job_io",
+                map([(
+                    "control_attributes",
+                    map([("enable_key_switch", boolean(true))]),
+                )]),
+            );
+        }
+
+        for (key, value) in &self.extra {
+            insert(&mut spec, key, value.clone());
+        }
+        spec
+    }
+}
+
+/// A sort operation.
+///
+/// There is no user job: the cluster does the sorting. Its result is a sorted
+/// table, which is what [`ReduceSpec`] needs.
+///
+/// ```
+/// use ytsaurus_client::SortSpec;
+///
+/// let spec = SortSpec::new(["//tmp/unsorted"], "//tmp/sorted", ["word"]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct SortSpec {
+    inputs: Vec<String>,
+    output: String,
+    sort_by: Vec<String>,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl SortSpec {
+    /// Sorts `inputs` into `output`, ordered by `sort_by`.
+    ///
+    /// Note the single output: sort writes one table, however many it reads.
+    #[must_use]
+    pub fn new<I, K>(inputs: I, output: impl Into<String>, sort_by: K) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+        K: IntoIterator,
+        K::Item: Into<String>,
+    {
+        Self {
+            inputs: inputs.into_iter().map(Into::into).collect(),
+            output: output.into(),
+            sort_by: sort_by.into_iter().map(Into::into).collect(),
+            extra: Vec::new(),
+        }
+    }
+
+    /// Sets any spec field this builder does not model — `partition_count`,
+    /// `data_size_per_partition_job` and the rest of the sort tuning knobs.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    /// Renders the spec.
+    #[must_use]
+    pub fn to_yson(&self) -> YsonValue {
+        let mut spec = map([
+            ("input_table_paths", list(self.inputs.iter().map(string))),
+            // Singular, and a string rather than a list: sort has exactly one
+            // output. `output_table_paths` here is rejected by the cluster.
+            ("output_table_path", string(&self.output)),
+            ("sort_by", list(self.sort_by.iter().map(string))),
+        ]);
+
+        for (key, value) in &self.extra {
+            insert(&mut spec, key, value.clone());
+        }
+        spec
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +693,101 @@ mod tests {
         assert_eq!(OperationType::Map.as_str(), "map");
         assert_eq!(OperationType::MapReduce.as_str(), "map_reduce");
         assert_eq!(OperationType::Reduce.as_str(), "reduce");
+        assert_eq!(OperationType::Sort.as_str(), "sort");
+        assert_eq!(OperationType::Vanilla.as_str(), "vanilla");
+    }
+
+    /// The mirror of the map-reduce trap: a reduce has one job type, so its
+    /// section is the plain `job_io`.
+    #[test]
+    fn reduce_puts_key_switch_under_job_io() {
+        let out =
+            render(&ReduceSpec::new("./wc reduce", ["//sorted"], ["//out"], ["word"]).to_yson());
+
+        assert!(
+            out.contains("job_io={control_attributes={enable_key_switch=%true}}"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("reduce_job_io"),
+            "reduce_job_io belongs to map-reduce, not to reduce: {out}"
+        );
+    }
+
+    #[test]
+    fn a_reduce_spec_carries_what_the_operation_needs() {
+        let spec = ReduceSpec::new("./wc reduce", ["//tmp/sorted"], ["//tmp/counts"], ["word"])
+            .with_local_file("//tmp/wc")
+            .with_memory_limit(1024)
+            .with_job_count(2);
+        let out = render(&spec.to_yson());
+
+        assert!(out.contains(r#"command="./wc reduce""#), "{out}");
+        assert!(out.contains(r#"file_paths=["//tmp/wc"]"#), "{out}");
+        assert!(out.contains("memory_limit=1024"), "{out}");
+        assert!(out.contains("reduce_by=[word]"), "{out}");
+        assert!(out.contains("job_count=2"), "{out}");
+        assert!(out.contains("input_format=<format=binary>yson"), "{out}");
+    }
+
+    /// Unlike map-reduce, `sort_by` is omitted when it was not asked for: the
+    /// cluster defaults it to `reduce_by`, and stating it turns on a
+    /// sortedness check the caller did not request.
+    #[test]
+    fn reduce_sort_by_is_only_sent_when_set() {
+        let plain = render(&ReduceSpec::new("./r", ["//in"], ["//out"], ["k"]).to_yson());
+        assert!(!plain.contains("sort_by"), "{plain}");
+
+        let asked = render(
+            &ReduceSpec::new("./r", ["//in"], ["//out"], ["k"])
+                .with_sort_by(["k", "ts"])
+                .to_yson(),
+        );
+        assert!(asked.contains("sort_by=[k;ts]"), "{asked}");
+    }
+
+    #[test]
+    fn reduce_table_index_is_off_unless_asked_for() {
+        let plain = render(&ReduceSpec::new("./r", ["//a", "//b"], ["//o"], ["k"]).to_yson());
+        assert!(!plain.contains("enable_input_table_index"), "{plain}");
+
+        let asked = render(
+            &ReduceSpec::new("./r", ["//a", "//b"], ["//o"], ["k"])
+                .with_input_table_index()
+                .to_yson(),
+        );
+        assert!(asked.contains("enable_input_table_index=%true"), "{asked}");
+    }
+
+    /// Sort's output is one table and the field is singular. Spelling it like
+    /// every other operation is the obvious mistake.
+    #[test]
+    fn sort_writes_one_table_through_a_singular_field() {
+        let out = render(&SortSpec::new(["//a", "//b"], "//sorted", ["key", "sub"]).to_yson());
+
+        assert!(out.contains(r#"output_table_path="//sorted""#), "{out}");
+        assert!(!out.contains("output_table_paths"), "{out}");
+        assert!(out.contains(r#"input_table_paths=["//a";"//b"]"#), "{out}");
+        assert!(out.contains("sort_by=[key;sub]"), "{out}");
+    }
+
+    #[test]
+    fn a_sort_spec_has_no_user_job() {
+        let out = render(&SortSpec::new(["//a"], "//sorted", ["key"]).to_yson());
+        assert!(
+            !out.contains("command"),
+            "the cluster sorts, not a job: {out}"
+        );
+        assert!(!out.contains("input_format"), "{out}");
+    }
+
+    #[test]
+    fn sort_tuning_goes_through_raw() {
+        let out = render(
+            &SortSpec::new(["//a"], "//sorted", ["key"])
+                .with_raw("partition_count", int(4))
+                .to_yson(),
+        );
+        assert!(out.contains("partition_count=4"), "{out}");
     }
 }

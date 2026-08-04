@@ -33,6 +33,24 @@
 //! for the token, matching the `yt` CLI. A bare host is assumed to be HTTPS; a
 //! local cluster is reached as `http://localhost:8000`.
 //!
+//! # When an operation fails
+//!
+//! [`Client::wait_for_operation`] does not stop at the state. It asks the
+//! cluster which jobs failed and what they wrote to stderr, and carries both in
+//! [`ClientError::OperationFailed`], so a failure explains itself without a
+//! trip to the web UI:
+//!
+//! ```text
+//! operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
+//!   job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
+//!   stderr:
+//!     thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+//!     boom: this job fails on purpose (row 1, 23 bytes)
+//! ```
+//!
+//! That costs one [`Client::list_jobs`] and a few [`Client::get_job_stderr`]
+//! calls per failed operation; [`Client::with_job_diagnostics`] turns it off.
+//!
 //! # What this does not do
 //!
 //! Heavy commands are documented to require asking `/hosts` for a dedicated
@@ -48,14 +66,20 @@ use std::time::{Duration, Instant};
 /// Errors.
 pub mod error;
 mod http;
+mod jobs;
+mod retry;
 mod spec;
+mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
 pub mod yson_build;
 
 pub use crate::error::{ClientError, Result};
-pub use crate::spec::{MapReduceSpec, MapSpec, OperationType};
+pub use crate::jobs::{JobFailure, JobInfo};
+pub use crate::retry::{MutationId, RetryPolicy};
+pub use crate::spec::{MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec};
 
 use crate::http::{Method, Payload, Transport};
+use crate::retry::Repeatable;
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
 /// Default request timeout.
@@ -64,11 +88,24 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often [`Client::wait_for_operation`] asks the cluster for progress.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How many failed jobs a failed operation reports.
+///
+/// Jobs of one operation usually fail the same way, so the first few explain
+/// the failure and the rest only make the message longer.
+const REPORTED_JOBS: u32 = 3;
+
+/// How much of a job's stderr goes into the error message.
+///
+/// The cluster caps saved stderr at megabytes; an error a user reads in a
+/// terminal wants the tail of it, not all of it.
+const STDERR_EXCERPT: usize = 4096;
+
 /// A connection to one YTsaurus cluster.
 #[derive(Debug, Clone)]
 pub struct Client {
     transport: Transport,
     poll_interval: Duration,
+    job_diagnostics: bool,
 }
 
 impl Client {
@@ -81,6 +118,7 @@ impl Client {
         Self {
             transport: Transport::new(proxy, None, DEFAULT_TIMEOUT),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            job_diagnostics: true,
         }
     }
 
@@ -90,6 +128,7 @@ impl Client {
         Self {
             transport: Transport::new(proxy, Some(token.into()), DEFAULT_TIMEOUT),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            job_diagnostics: true,
         }
     }
 
@@ -120,6 +159,36 @@ impl Client {
     #[must_use]
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Overrides how a failed request is repeated.
+    ///
+    /// The default is five attempts with a doubling delay, which covers the
+    /// transient failures a shared cluster produces — a restarting proxy, a
+    /// scheduler that has lost the master. [`RetryPolicy::none`] turns it off.
+    ///
+    /// This applies to light commands only. Heavy ones — table and file I/O —
+    /// are sent once whatever the policy says, because the documentation is
+    /// explicit that they cannot be retried; a transaction is the way to make
+    /// one atomic.
+    #[must_use]
+    pub fn with_retries(mut self, policy: RetryPolicy) -> Self {
+        self.transport.set_retries(policy);
+        self
+    }
+
+    /// Turns the failed-job report in [`Client::wait_for_operation`] on or off.
+    ///
+    /// On by default: when an operation fails, the client asks the cluster
+    /// which jobs failed and what they printed, and puts that in the error.
+    /// That costs one `list_jobs` and a few `get_job_stderr` calls per failed
+    /// operation. The YTsaurus documentation asks that `list_jobs` not be used
+    /// without an administrator's approval, so this is the way to switch it
+    /// off on an installation where that approval was not given.
+    #[must_use]
+    pub fn with_job_diagnostics(mut self, enabled: bool) -> Self {
+        self.job_diagnostics = enabled;
         self
     }
 
@@ -161,9 +230,13 @@ impl Client {
     /// Returns [`ClientError`] if the request fails.
     pub fn exists(&self, path: &str) -> Result<bool> {
         let params = yson_build::map([("path", yson_build::string(path))]);
-        let body = self
-            .transport
-            .call(Method::Get, "exists", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "exists",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
         Ok(matches!(
             self.value_field(&body, "exists")?.node,
             YsonNode::Boolean(true)
@@ -184,8 +257,13 @@ impl Client {
             ("recursive", yson_build::boolean(true)),
             ("ignore_existing", yson_build::boolean(true)),
         ]);
-        self.transport
-            .call(Method::Post, "create", &params, Payload::None)?;
+        self.transport.call(
+            Method::Post,
+            "create",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
         Ok(())
     }
 
@@ -200,8 +278,13 @@ impl Client {
             ("recursive", yson_build::boolean(true)),
             ("force", yson_build::boolean(true)),
         ]);
-        self.transport
-            .call(Method::Post, "remove", &params, Payload::None)?;
+        self.transport.call(
+            Method::Post,
+            "remove",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
         Ok(())
     }
 
@@ -212,9 +295,13 @@ impl Client {
     /// Returns [`ClientError`] if the request fails.
     pub fn get(&self, path: &str) -> Result<YsonValue> {
         let params = yson_build::map([("path", yson_build::string(path))]);
-        let body = self
-            .transport
-            .call(Method::Get, "get", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "get",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
         self.value_field(&body, "value")
     }
 
@@ -249,8 +336,57 @@ impl Client {
             source,
         })?;
 
+        self.upload_executable(remote, &bytes)
+    }
+
+    /// Uploads the **running executable** to Cypress, marked executable.
+    ///
+    /// This is the one-binary pattern: the same program launches the operation
+    /// and runs as its job, telling the two apart with
+    /// [`ytsaurus_job::is_inside_job`]. The binary on the cluster is then by
+    /// construction the one you just built — the whole "I uploaded a stale
+    /// worker" class of bug disappears.
+    ///
+    /// The running executable has to be something a node can exec, so its ELF
+    /// header is checked before the upload: Linux, x86-64, statically linked.
+    /// Launching from macOS, or from a Linux host where the launcher is
+    /// dynamically linked, it is not — this returns
+    /// [`ClientError::NotAWorker`] naming the reason, instead of uploading a
+    /// binary that fails on the node minutes later. Build the worker with
+    /// `scripts/build-worker.sh` and upload it with [`Client::upload_worker`]
+    /// in that case.
+    ///
+    /// [`ytsaurus_job::is_inside_job`]: https://docs.rs/ytsaurus-job/latest/ytsaurus_job/fn.is_inside_job.html
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::NotAWorker`] if the running executable cannot run
+    /// on a node, or [`ClientError`] if the upload fails.
+    pub fn upload_current_exe(&self, remote: &str) -> Result<()> {
+        let exe = std::env::current_exe().map_err(|source| ClientError::Io {
+            path: "the running executable".to_owned(),
+            source,
+        })?;
+
+        let bytes = std::fs::read(&exe).map_err(|source| ClientError::Io {
+            path: exe.display().to_string(),
+            source,
+        })?;
+
+        if let Err(reason) = worker::check_worker_binary(&bytes) {
+            return Err(ClientError::NotAWorker {
+                path: exe.display().to_string(),
+                reason,
+            });
+        }
+
+        self.upload_executable(remote, &bytes)
+    }
+
+    /// Writes `bytes` to `remote` as a file a node is allowed to run.
+    fn upload_executable(&self, remote: &str, bytes: &[u8]) -> Result<()> {
         self.create("file", remote)?;
-        self.write_file(remote, &bytes)?;
+        self.write_file(remote, bytes)?;
         self.set_attribute(remote, "executable", yson_build::boolean(true))
     }
 
@@ -261,8 +397,13 @@ impl Client {
     /// Returns [`ClientError`] if the request fails.
     pub fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
         let params = yson_build::map([("path", yson_build::string(path))]);
-        self.transport
-            .call(Method::Put, "write_file", &params, Payload::Bytes(contents))?;
+        self.transport.call(
+            Method::Put,
+            "write_file",
+            &params,
+            Payload::Bytes(contents),
+            Repeatable::Never,
+        )?;
         Ok(())
     }
 
@@ -282,8 +423,13 @@ impl Client {
             ("path", yson_build::string(format!("{path}/@{name}"))),
             ("input_format", yson_build::binary_yson_format()),
         ]);
-        self.transport
-            .call(Method::Put, "set", &params, Payload::Bytes(&encoded))?;
+        self.transport.call(
+            Method::Put,
+            "set",
+            &params,
+            Payload::Bytes(&encoded),
+            Repeatable::WithMutationId,
+        )?;
         Ok(())
     }
 
@@ -300,8 +446,13 @@ impl Client {
             ("path", yson_build::string(path)),
             ("input_format", yson_build::binary_yson_format()),
         ]);
-        self.transport
-            .call(Method::Put, "write_table", &params, Payload::Bytes(rows))?;
+        self.transport.call(
+            Method::Put,
+            "write_table",
+            &params,
+            Payload::Bytes(rows),
+            Repeatable::Never,
+        )?;
         Ok(())
     }
 
@@ -324,9 +475,13 @@ impl Client {
             ("path", yson_build::string(path)),
             ("output_format", yson_build::binary_yson_format()),
         ]);
-        let body = self
-            .transport
-            .call(Method::Get, "read_table", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "read_table",
+            &params,
+            Payload::None,
+            Repeatable::Never,
+        )?;
 
         check_complete_fragment(&body).map_err(|reason| ClientError::Decode {
             command: "read_table".to_owned(),
@@ -356,6 +511,28 @@ impl Client {
         self.start_operation(OperationType::MapReduce, &spec.to_yson())
     }
 
+    /// Starts a reduce operation over sorted input, returning its ID.
+    ///
+    /// The input tables must already be sorted by a column set beginning with
+    /// the spec's `reduce_by`; the cluster refuses the operation otherwise.
+    /// [`Client::start_sort`] is how they get that way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_reduce(&self, spec: &ReduceSpec) -> Result<String> {
+        self.start_operation(OperationType::Reduce, &spec.to_yson())
+    }
+
+    /// Starts a sort operation, returning its ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_sort(&self, spec: &SortSpec) -> Result<String> {
+        self.start_operation(OperationType::Sort, &spec.to_yson())
+    }
+
     /// Starts an operation from a spec built by hand.
     ///
     /// The escape hatch for anything [`MapSpec`] and [`MapReduceSpec`] do not
@@ -365,13 +542,50 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_operation(&self, kind: OperationType, spec: &YsonValue) -> Result<String> {
+        self.start_operation_inner(kind, spec, None)
+    }
+
+    /// Starts an operation under a mutation ID you control.
+    ///
+    /// `start_operation` already tags its own retries with a fresh
+    /// [`MutationId`], so a retried start never leaves two operations running.
+    /// This is for the guarantee a single process cannot give itself: persist
+    /// the ID, and after a crash the same call returns the operation that was
+    /// already started instead of starting a second one.
+    ///
+    /// The cluster remembers a mutation ID for five to ten minutes, so this is
+    /// a guard against a crash-and-restart, not a permanent key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_operation_with(
+        &self,
+        kind: OperationType,
+        spec: &YsonValue,
+        mutation_id: &MutationId,
+    ) -> Result<String> {
+        self.start_operation_inner(kind, spec, Some(mutation_id))
+    }
+
+    fn start_operation_inner(
+        &self,
+        kind: OperationType,
+        spec: &YsonValue,
+        mutation_id: Option<&MutationId>,
+    ) -> Result<String> {
         let params = yson_build::map([
             ("operation_type", yson_build::string(kind.as_str())),
             ("spec", spec.clone()),
         ]);
-        let body = self
-            .transport
-            .call(Method::Post, "start_operation", &params, Payload::None)?;
+        let body = self.transport.call_with(
+            Method::Post,
+            "start_operation",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+            mutation_id,
+        )?;
 
         let value = self.value_field(&body, "operation_id")?;
         match &value.node {
@@ -396,9 +610,13 @@ impl Client {
                 yson_build::list([yson_build::string("state")]),
             ),
         ]);
-        let body = self
-            .transport
-            .call(Method::Get, "get_operation", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "get_operation",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
 
         let value = self.field_of(&self.strip_envelope(&body, "get_operation")?, "state")?;
         match &value.node {
@@ -438,6 +656,7 @@ impl Client {
                         id: id.to_owned(),
                         state,
                         error: self.operation_error(id),
+                        jobs: self.failed_jobs(id),
                     });
                 }
                 _ => std::thread::sleep(self.poll_interval),
@@ -446,6 +665,9 @@ impl Client {
     }
 
     /// Best-effort fetch of a failed operation's error document.
+    ///
+    /// Prefers the flattened message. Falls back to the raw document, because a
+    /// clumsy error still beats an empty one if the response shape ever moves.
     fn operation_error(&self, id: &str) -> Option<String> {
         let params = yson_build::map([
             ("operation_id", yson_build::string(id)),
@@ -456,9 +678,133 @@ impl Client {
         ]);
         let body = self
             .transport
-            .call(Method::Get, "get_operation", &params, Payload::None)
+            .call(
+                Method::Get,
+                "get_operation",
+                &params,
+                Payload::None,
+                Repeatable::Freely,
+            )
             .ok()?;
-        Some(crate::error::truncate(&String::from_utf8_lossy(&body), 600))
+
+        let summary = self
+            .strip_envelope(&body, "get_operation")
+            .ok()
+            .and_then(|envelope| {
+                let result = jobs::field(&envelope, "result")?;
+                jobs::error_summary(jobs::field(result, "error")?)
+            });
+
+        summary.or_else(|| Some(crate::error::truncate(&String::from_utf8_lossy(&body), 600)))
+    }
+
+    // ---------------------------------------------------------------- jobs
+
+    /// Lists an operation's jobs.
+    ///
+    /// `state` filters by job state — `failed`, `completed`, `running`, … — and
+    /// `limit` caps how many come back.
+    ///
+    /// The YTsaurus documentation warns that `list_jobs` can put significant
+    /// load on a cluster and asks that it not be part of a workflow without an
+    /// administrator's approval. This client calls it once per failed
+    /// operation, with a small limit; keep to that shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails or the response is not the
+    /// documented `{jobs=[…]}`.
+    pub fn list_jobs(
+        &self,
+        operation_id: &str,
+        state: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<JobInfo>> {
+        let mut params = yson_build::map([
+            ("operation_id", yson_build::string(operation_id)),
+            ("limit", yson_build::int(i64::from(limit))),
+        ]);
+        if let Some(state) = state {
+            yson_build::insert(&mut params, "state", yson_build::string(state));
+        }
+
+        let body = self.transport.call(
+            Method::Get,
+            "list_jobs",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "list_jobs")?;
+        Ok(jobs::parse_jobs(&self.field_of(&envelope, "jobs")?))
+    }
+
+    /// Fetches what a job wrote to stderr.
+    ///
+    /// Returns raw bytes: stderr is whatever the process wrote, not necessarily
+    /// UTF-8. Empty if the cluster saved nothing — stderr is kept for failed
+    /// jobs and, when the spec asks for it, for successful ones.
+    ///
+    /// This is a *heavy* command, so an installation that separates light and
+    /// heavy proxies may want it sent to [`Client::heavy_proxy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn get_job_stderr(&self, operation_id: &str, job_id: &str) -> Result<Vec<u8>> {
+        let params = yson_build::map([
+            ("operation_id", yson_build::string(operation_id)),
+            ("job_id", yson_build::string(job_id)),
+        ]);
+        self.transport.call(
+            Method::Get,
+            "get_job_stderr",
+            &params,
+            Payload::None,
+            Repeatable::Never,
+        )
+    }
+
+    /// Best-effort report of why an operation's jobs failed.
+    ///
+    /// Every step here may fail quietly. This runs while an error is being
+    /// built, and a diagnostic that replaces the failure it was explaining is
+    /// worse than no diagnostic at all.
+    fn failed_jobs(&self, operation_id: &str) -> Vec<JobFailure> {
+        if !self.job_diagnostics {
+            return Vec::new();
+        }
+
+        self.list_jobs(operation_id, Some("failed"), REPORTED_JOBS)
+            .unwrap_or_default()
+            .iter()
+            .take(REPORTED_JOBS as usize)
+            .map(|job| JobFailure {
+                id: job.id.clone(),
+                address: job.address.clone(),
+                error: job.error.clone(),
+                stderr: self.stderr_excerpt(operation_id, job),
+            })
+            .collect()
+    }
+
+    /// The tail of a job's stderr, bounded and decoded lossily.
+    ///
+    /// Asks unconditionally rather than skipping jobs whose `stderr_size` is
+    /// zero: the local cluster reported `1` for a job whose stderr was several
+    /// hundred bytes, so the field cannot be trusted to mean "nothing to
+    /// fetch". One request against losing the whole diagnostic is a good trade
+    /// on a path that only runs when an operation has already failed.
+    fn stderr_excerpt(&self, operation_id: &str, job: &JobInfo) -> Option<String> {
+        let raw = self.get_job_stderr(operation_id, &job.id).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(crate::error::tail(
+            &String::from_utf8_lossy(&raw),
+            STDERR_EXCERPT,
+        ))
     }
 
     // -------------------------------------------------------------- helpers

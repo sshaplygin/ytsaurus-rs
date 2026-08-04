@@ -40,24 +40,102 @@ cargo run -p ytsaurus-client --example launch
 | | |
 | --- | --- |
 | Cypress | `create`, `remove`, `exists`, `get`, `row_count` |
-| Data | `upload_worker`, `write_file`, `write_table`, `read_table`, `set_attribute` |
-| Operations | `start_map`, `start_map_reduce`, `start_operation`, `operation_state`, `wait_for_operation` |
+| Data | `upload_worker`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_operation`, `operation_state`, `wait_for_operation` |
+| Jobs | `list_jobs`, `get_job_stderr` |
 
-Specs are built with [`MapSpec`] / [`MapReduceSpec`], which model what launching
-a `ytsaurus-job` worker needs and expose `with_raw` for everything else.
+Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
+[`MapReduceSpec`], which model what launching a `ytsaurus-job` worker needs and
+expose `with_raw` for everything else.
 
 Two defaults exist because getting them wrong is quiet rather than loud:
 
 - **both formats are binary YSON**, which is what `JobReader` and `JobWriter`
   expect;
-- **`key_switch` is on** for map-reduce, and goes under `reduce_job_io` — an
-  operation with several job types gives each type its own I/O section, and the
-  plain `job_io` spelling is accepted and then ignored, leaving the reducer to
-  fold every key into one group.
+- **`key_switch` is on** for both grouping operations, and lands in the right
+  section for each: `reduce_job_io` for map-reduce, which has several job types
+  and so an I/O section per type, and plain `job_io` for reduce, which has one.
+  The wrong spelling is accepted and then ignored, leaving the reducer to fold
+  every key into one group.
+
+Reduce needs sorted input; `SortSpec` is what produces it, and its
+`output_table_path` is singular — sort writes one table however many it reads.
+[`examples/sort_reduce.rs`](examples/sort_reduce.rs) runs both against a
+cluster.
 
 `upload_worker` sets the `executable` attribute. Without it the cluster copies
 the binary and then refuses to exec it, with an error that never mentions the
 attribute.
+
+## One binary, two roles
+
+`upload_current_exe` uploads the *running* executable, so the same program can
+launch the operation and be the job it runs:
+
+```rust
+fn main() {
+    ytsaurus_job::run_if_inside_job(mapper);   // never returns inside a job
+    launch().unwrap();                         // only your machine gets here
+}
+```
+
+There is no second artifact to forget to rebuild. The running executable has to
+be something a node can exec, so its ELF header is checked first — Linux,
+x86-64, statically linked — and refused with `ClientError::NotAWorker` when it
+is not, rather than failing on the node minutes later. On macOS the launcher is
+Mach-O and cannot be the uploaded file: build the worker with
+`scripts/build-worker.sh` and upload that with `upload_worker`. The source is
+still one file — see
+[`examples/src/bin/selfrun.rs`](../../examples/src/bin/selfrun.rs).
+
+## Features
+
+`tls` (default) brings in `rustls`, and with it `https://` proxies. Turning it
+off leaves a client that speaks plain HTTP and needs no C toolchain — which is
+how a binary that is both launcher and job gets cross-compiled to musl. Without
+it, an `https://` proxy fails with an error naming the feature.
+
+## When an operation fails
+
+`wait_for_operation` does not stop at the state. It asks which jobs failed and
+what they printed, so the error carries the job's own words:
+
+```text
+operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
+  job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
+  stderr:
+    thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+    boom: this job fails on purpose (row 1, 23 bytes)
+```
+
+That costs one `list_jobs` and a few `get_job_stderr` calls, on failure only.
+The YTsaurus documentation asks that `list_jobs` not be used without an
+administrator's approval, so `Client::with_job_diagnostics(false)` turns the
+report off. Failing to collect it never replaces the failure being reported.
+
+[`examples/diagnose.rs`](examples/diagnose.rs) runs the whole path against a
+local cluster.
+
+## Retries
+
+A shared cluster produces failures that pass on their own. Light commands are
+repeated — five attempts by default, with a delay doubling from one second to
+ten; `Client::with_retries(RetryPolicy::none())` turns that off.
+
+Mutating commands carry a `mutation_id`, so a repeated request is deduplicated
+by the cluster instead of being applied twice. Two things follow from how the
+cluster implements that:
+
+- a replay must be **marked** as one. Re-sending a known ID without the `retry`
+  flag is refused — `Duplicate request is not marked as "retry"` — so
+  `MutationId::as_retry()` is what a restarted process uses with a persisted ID
+  (`Client::start_operation_with`);
+- IDs are remembered for five to ten minutes, so this guards against a crash and
+  restart, not forever.
+
+**Heavy commands are not retried**, whatever the policy says: the documentation
+is explicit that they cannot be, and a transaction is the way to make an upload
+atomic.
 
 ## Limits worth knowing
 
@@ -87,4 +165,6 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](../../NOTICE).
 
 [`MapSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.MapSpec.html
 [`MapReduceSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.MapReduceSpec.html
+[`ReduceSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.ReduceSpec.html
+[`SortSpec`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.SortSpec.html
 [`Client::heavy_proxy`]: https://docs.rs/ytsaurus-client/latest/ytsaurus_client/struct.Client.html#method.heavy_proxy
