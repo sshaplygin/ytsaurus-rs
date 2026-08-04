@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 301 tests
+cargo test --workspace            # 310 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -188,6 +188,35 @@ Cluster facts, all watched rather than read:
 `TableSchema::validate` mirrors these so the error arrives as a sentence naming
 the column rather than as error 314 from a create.
 
+### Transactions
+
+Commands: `start_transaction`, `commit_transaction`, `abort_transaction`,
+`ping_transaction` — the v4 names; `start_tx` and friends are **not registered**.
+`start_transaction` answers `{transaction_id="3-5bc70-10001-387a"}`; the other
+three take `transaction_id` and answer with `{}` or a commit timestamp.
+
+Every other command joins a transaction through a `transaction_id` parameter,
+which the client stamps in one place (`Transport::in_transaction`) rather than
+per command. Cluster facts:
+
+- **A transaction expires 30 000 ms after its last ping** — that is the default
+  `@timeout`, and asking for one is how `Transaction` knows how often to ping.
+  Verified: 2 s timeout, left 4 s, `Transaction … has expired or was aborted`.
+- **A commit is not idempotent.** The second commit fails with
+  `No such transaction`, which reads like the *first* one failed. Hence the
+  mutation ID on commit.
+- **An abort is forgiving**: aborting a committed transaction, or one that never
+  existed, answers `{}`. So aborting from `Drop` is always safe.
+- **`get_operation`, `list_jobs`, `get_job_stderr` and the file-cache commands
+  accept `transaction_id`** and ignore it, so the blanket stamp needs no
+  exception list. A command that names a transaction itself keeps its own.
+- `start_transaction` under a transaction makes a **nested** one, which is what a
+  bound client naturally does.
+- Using an aborted or expired transaction fails with `No such transaction` nested
+  inside `Error resolving path …`.
+- `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
+  handle pings its own transaction.
+
 ### Control records
 
 Attributed **entities** interleaved with the data: `table_index`, `row_index`,
@@ -243,6 +272,10 @@ These cost time once. They are recorded so they do not cost it again.
 - **A job error's outer message is a category.** `User job failed` says nothing;
   the cause is at the bottom of `inner_errors`. Both `ClientError` paths flatten
   outer-plus-innermost.
+- **A v4 answer is an envelope keyed by what it returns, and for `exists` that
+  key is `value`, not `exists`.** Reading the wrong key failed every call for two
+  releases, because nothing in the crate called `exists` until transactions did.
+  Every command whose result is read needs a call site, or the shape is a guess.
 
 ## Architecture
 
@@ -305,7 +338,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 272 tests. Control records driven by the exact
+1. **Unit and integration** — 279 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

@@ -51,6 +51,15 @@
 //! That costs one [`Client::list_jobs`] and a few [`Client::get_job_stderr`]
 //! calls per failed operation; [`Client::with_job_diagnostics`] turns it off.
 //!
+//! # All at once, or not at all
+//!
+//! Each step above can fail halfway and leave something behind — an empty
+//! table, a stale worker, an output table holding neither the old result nor
+//! the new one. [`Client::start_transaction`] makes the whole sequence one
+//! event: nothing it does is visible until [`Transaction::commit`], and
+//! dropping the handle aborts it, so a `?` on any line leaves the cluster as it
+//! was.
+//!
 //! # What this does not do
 //!
 //! Heavy commands are documented to require asking `/hosts` for a dedicated
@@ -71,6 +80,7 @@ mod retry;
 /// Table schemas.
 pub mod schema;
 mod spec;
+mod transaction;
 mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
 pub mod yson_build;
@@ -84,6 +94,7 @@ pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
 pub use crate::spec::{
     MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec, VanillaSpec, VanillaTask,
 };
+pub use crate::transaction::Transaction;
 #[cfg(feature = "derive")]
 pub use ytsaurus_helpers::TableRow;
 
@@ -237,6 +248,74 @@ impl Client {
         self
     }
 
+    /// Binds this client to an existing transaction.
+    ///
+    /// Every command it then sends happens inside that transaction. This is the
+    /// low-level door: [`Client::start_transaction`] is the one that starts a
+    /// transaction, keeps it alive and aborts it if the work does not finish.
+    /// Use this to rejoin a transaction whose ID came from somewhere else — a
+    /// parent process, or a previous run.
+    ///
+    /// Nothing pings the transaction on this path, so it expires on the
+    /// cluster's schedule unless its owner is pinging it.
+    #[must_use]
+    pub fn with_transaction(mut self, id: impl Into<String>) -> Self {
+        self.transport.set_transaction(Some(id.into()));
+        self
+    }
+
+    /// The transaction this client is bound to, if any.
+    #[must_use]
+    pub fn transaction_id(&self) -> Option<&str> {
+        self.transport.transaction()
+    }
+
+    /// Starts a transaction, and keeps it alive while the handle lives.
+    ///
+    /// Everything sent through the returned [`Transaction`] is invisible to
+    /// everything else until it commits, and is discarded if it does not:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// # let rows: Vec<u8> = Vec::new();
+    /// let tx = client.start_transaction()?;
+    ///
+    /// tx.create("table", "//tmp/out")?;   // no one else can see it yet
+    /// tx.write_table("//tmp/out", &rows)?;
+    ///
+    /// tx.commit()?;                       // and now everyone can
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The transaction lasts 30 seconds without a ping — the cluster's own
+    /// default — and the handle pings it every ten, so an operation that runs
+    /// for an hour is fine. [`Client::start_transaction_with`] changes the
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the transaction cannot be started.
+    pub fn start_transaction(&self) -> Result<Transaction> {
+        Transaction::start(self, transaction::DEFAULT_TRANSACTION_TIMEOUT)
+    }
+
+    /// Starts a transaction that expires `timeout` after its last ping.
+    ///
+    /// The handle pings three times per timeout, so this is about what happens
+    /// when the handle is *gone*: how long the transaction holds its locks
+    /// after the process holding it dies without aborting. Shorter frees them
+    /// sooner; longer survives a longer pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the transaction cannot be started.
+    pub fn start_transaction_with(&self, timeout: Duration) -> Result<Transaction> {
+        Transaction::start(self, timeout)
+    }
+
     /// Returns the least-loaded heavy proxy the cluster reports, if any.
     ///
     /// Large installations separate light and heavy proxies and answer heavy
@@ -282,8 +361,12 @@ impl Client {
             Payload::None,
             Repeatable::Freely,
         )?;
+        // `{"value"=%false;}` — the envelope key is `value`, as it is for
+        // `get`, not the command's own name. Asking for `exists` here failed
+        // every call with a decode error, and nothing in the crate called this
+        // until transactions needed to ask whether a node had survived one.
         Ok(matches!(
-            self.value_field(&body, "exists")?.node,
+            self.value_field(&body, "value")?.node,
             YsonNode::Boolean(true)
         ))
     }
@@ -1310,6 +1393,24 @@ mod tests {
 
         let err = check_complete_fragment(&data).expect_err("must reject");
         assert!(err.contains("cut short"), "{err}");
+    }
+
+    /// What a local cluster answers `exists` with, captured verbatim.
+    const EXISTS_RESPONSE: &[u8] = br#"{"value"=%false;}"#;
+
+    #[test]
+    fn an_exists_answer_is_read_out_of_the_value_key() {
+        let client = Client::new("http://localhost:8000");
+
+        let value = client
+            .value_field(EXISTS_RESPONSE, "value")
+            .expect("the answer is an envelope around `value`");
+        assert!(matches!(value.node, YsonNode::Boolean(false)));
+
+        // The command's own name is not a key in its answer. Looking for it
+        // there failed every call to `exists` with a decode error, for as long
+        // as nothing in the crate called `exists`.
+        assert!(client.value_field(EXISTS_RESPONSE, "exists").is_err());
     }
 
     /// The exact document a local cluster returned for a job that reported

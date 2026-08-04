@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### Published all at once, or not at all
+
+- **Added** `Transaction`, `Client::start_transaction`,
+  `Client::start_transaction_with` and `Client::with_transaction`. Everything
+  sent through a transaction is invisible to everything else until it commits,
+  and is discarded if it does not — so a launcher that dies halfway leaves no
+  empty table, no stale worker and no half-replaced result.
+- **Fixed** `Client::exists`, which read the answer out of an `exists` key the
+  cluster does not send and so failed **every** call with a decode error. It
+  reads `value`, as `get` does. Nothing in the crate called it until now, which
+  is how it survived two releases; a captured response is a test now.
+
+`Transaction` derefs to a `Client` bound to it, so `tx.write_table(…)` writes
+inside the transaction and `tx.start_map(…)` runs the operation inside it. The
+transaction ID is stamped onto every command in one place — the transport —
+because a command that forgot it would quietly do its work outside the
+transaction, which is the failure a transaction exists to prevent. A command
+that names a transaction itself keeps the one it named, so committing a nested
+transaction commits the one meant.
+
+**Dropping the handle aborts it.** That is what makes `?` safe inside a
+transaction: a failure returns from the function, the handle drops on the way
+out, and the cluster is left as it was. Only `commit` publishes.
+
+Two facts about the cluster, both watched rather than assumed:
+
+- **A transaction expires 30 seconds after its last ping.** Verified: one with a
+  two-second timeout, left alone for four, answers a ping with `Transaction …
+  has expired or was aborted`. So the handle keeps a thread pinging three times
+  per timeout for as long as it lives, which is what makes a transaction usable
+  around an operation that runs for an hour. Without it the feature would work
+  in an example and fail on anything real.
+- **Committing twice is an error**, not a no-op: `No such transaction`, which
+  reads like the commit failed when it succeeded. The commit therefore carries a
+  mutation ID, so a retry after a lost answer is the same commit rather than a
+  second one.
+
+Verified on the local cluster with `cargo run -p ytsaurus-client --example
+transaction`: a table visible only inside its transaction and gone after the
+abort; a launcher that fails halfway and leaves nothing, with no cleanup code in
+it; a map operation whose worker upload *and* output table appear only at the
+commit; a command in an aborted transaction refused with `No such transaction`;
+and a two-second transaction committed six seconds in, which only the ping
+thread makes possible.
+
 ### A table can be told what its rows look like
 
 - **Added** the `schema` module — `TableSchema`, `Column`, `ColumnType`,

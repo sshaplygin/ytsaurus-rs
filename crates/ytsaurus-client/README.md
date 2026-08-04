@@ -49,6 +49,7 @@ cargo run -p ytsaurus-client --example launch
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
 | Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum` |
+| Transactions | `start_transaction`, `with_transaction`, `Transaction::{commit, abort, ping}` |
 
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
 [`MapReduceSpec`] / [`VanillaSpec`], which model what launching a
@@ -104,6 +105,44 @@ required `any`, `unique_keys` with no key.
 **`create_table` fails if the path exists.** The cluster ignores the attributes
 of a create it skips, so a version that tolerated an existing table would
 quietly leave the old schema in place and report success.
+
+## All at once, or not at all
+
+A launcher creates a table, uploads a worker and runs an operation. Each of
+those is a chance to fail halfway, and each failure leaves something behind: an
+empty table, a stale binary, an output table holding neither the old result nor
+the new one. A transaction makes the whole sequence one event:
+
+```rust
+fn publish(client: &Client) -> Result<(), ClientError> {
+    let tx = client.start_transaction()?;
+
+    tx.upload_worker(WORKER, "//tmp/my_job")?;
+    let id = tx.start_map(&spec)?;
+    tx.wait_for_operation(&id)?;
+
+    tx.commit()                       // and only now does any of it exist
+}
+```
+
+`Transaction` derefs to a `Client` bound to it, so every command above happens
+inside the transaction. **Dropping it aborts it** — which is what makes those
+`?`s safe: a failure returns from the function, the handle drops on the way out,
+and the cluster is left exactly as it was. There is no cleanup code to write and
+none to forget.
+
+Two things the cluster insists on, and one the client does about them:
+
+- **A transaction expires 30 seconds after its last ping.** The handle keeps a
+  thread pinging it three times per timeout for as long as it lives, so a
+  transaction wrapped around an hour-long operation survives. Without that the
+  scheduler would abort the operation halfway.
+- **Nothing outside the transaction sees its work** — that is the point, and also
+  the trap. A `read_table` from a client that is not in the transaction reads
+  what was there before, and a second writer blocks on the lock the first took.
+
+[`examples/transaction.rs`](examples/transaction.rs) watches all of it on a
+cluster, including a launcher that fails halfway and leaves nothing behind.
 
 ## One binary, two roles
 
@@ -190,8 +229,8 @@ cluster implements that:
   restart, not forever.
 
 **Heavy commands are not retried**, whatever the policy says: the documentation
-is explicit that they cannot be, and a transaction is the way to make an upload
-atomic.
+is explicit that they cannot be, and [a transaction](#all-at-once-or-not-at-all)
+is the way to make an upload atomic.
 
 ## Limits worth knowing
 

@@ -323,6 +323,30 @@ distinction §2 makes about text and bytes. A Rust type the derive cannot place
 is a compile error rather than a guess; name the column type yourself with
 `#[yt(column_type = "timestamp")]` for the ones no Rust type implies.
 
+### Publishing the result all at once
+
+A launch that fails partway through has already done some of its work: the
+output table exists, the worker is uploaded, half the rows are replaced. Run the
+launch inside a transaction and it is one event instead of several:
+
+```rust
+let tx = client.start_transaction()?;
+
+tx.upload_worker(WORKER, "//tmp/my_job")?;
+let id = tx.start_map(&spec)?;
+tx.wait_for_operation(&id)?;
+
+tx.commit()?;                     // until this line, none of it exists
+```
+
+Nothing outside the transaction sees any of that until the commit — the upload
+included — and **dropping the handle aborts it**, so each `?` above leaves the
+cluster as it was. Note the missing cleanup code: there is none to write.
+
+The transaction is pinged for as long as the handle lives, which is what lets it
+wrap an operation that runs for an hour; the cluster would otherwise drop it
+after 30 seconds.
+
 ### Or with the `yt` CLI
 
 The CLI needs **two** packages — `ytsaurus-client` alone fails on binary YSON

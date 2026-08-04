@@ -59,6 +59,7 @@ cargo run -p ytsaurus-client --example cached_upload # the second upload is a ca
 cargo run -p ytsaurus-client --example statistics   # what the job counted, read back
 cargo run -p ytsaurus-client --example vanilla      # three jobs with no input table
 cargo run -p ytsaurus-client --example schema       # a derived schema the cluster enforces
+cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -214,6 +215,41 @@ struct the rows have, and nothing is written out by hand:
 The last two are the ones worth keeping: a schema the cluster does not enforce
 would be decoration, and the descending refusal is checked rather than asserted
 so that the day a cluster enables it, the run says so instead of going stale.
+
+`transaction`, same cluster — the same map operation as `launch`, run so that
+nothing it does exists until it commits:
+
+```text
+== A table that exists only inside a transaction
+   transaction 4-29da-10001-6f45
+   ok the transaction sees it
+   ok and nothing outside does
+== Aborting it
+   ok nothing was left behind
+== A launcher that fails halfway
+   the launcher failed: the step after the write did not work out
+   ok the half-written table is gone with it
+== Publishing an operation's output atomically
+   ok operation d202198d-95866cce-103e8-91b8ab44 completed
+   ok outside the transaction the old result is still the result
+   ok and the worker is not in Cypress at all
+== Committing
+   ok the output is the operation's, all at once
+   ok and the upload came with it
+== What a transaction that is gone looks like
+   ok as expected: create: cluster error 500: Error resolving path
+      //tmp/ytsaurus_rs_transaction/never: No such transaction 4-2c2e-10001-6b6e
+== Holding a 2s transaction for 6s
+   ok committed 6s in
+```
+
+Three of those checks are the ones worth keeping. The failing launcher contains
+no cleanup code at all — the abort is the handle being dropped by the `?`. The
+operation's *upload* is as invisible as its output, so the publish really is one
+event rather than two. And the last section holds a transaction three timeouts
+past its expiry: without the ping thread the cluster would have aborted it four
+seconds earlier, so it is the one check that fails if the keep-alive stops
+working.
 
 `vanilla`, same cluster — three jobs, no input table anywhere:
 

@@ -38,6 +38,9 @@ const HEADER_FORMAT: &str = "X-YT-Header-Format";
 const PARAMETERS: &str = "X-YT-Parameters";
 const ERROR: &str = "X-YT-Error";
 
+/// The parameter that puts a command inside a transaction.
+const TRANSACTION_ID: &str = "transaction_id";
+
 /// Applies a header list to either builder flavour.
 ///
 /// `ureq` gives requests with and without a body distinct builder types, so a
@@ -67,6 +70,8 @@ pub(crate) struct Transport {
     base: String,
     token: Option<String>,
     retries: RetryPolicy,
+    /// Stamped onto every command, when the client is bound to a transaction.
+    transaction: Option<String>,
 }
 
 impl std::fmt::Debug for Transport {
@@ -103,6 +108,7 @@ impl Transport {
             base,
             token,
             retries: RetryPolicy::default(),
+            transaction: None,
         }
     }
 
@@ -112,6 +118,14 @@ impl Transport {
 
     pub(crate) fn set_retries(&mut self, policy: RetryPolicy) {
         self.retries = policy;
+    }
+
+    pub(crate) fn set_transaction(&mut self, id: Option<String>) {
+        self.transaction = id;
+    }
+
+    pub(crate) fn transaction(&self) -> Option<&str> {
+        self.transaction.as_deref()
     }
 
     /// Executes a command, repeating it when the failure looks transient.
@@ -146,6 +160,9 @@ impl Transport {
             _ => None,
         };
 
+        let stamped = self.in_transaction(parameters);
+        let parameters = stamped.as_ref().unwrap_or(parameters);
+
         crate::retry::run(self.retries, repeatable, command, |is_retry| {
             match &mutation_id {
                 Some(id) => {
@@ -162,6 +179,31 @@ impl Transport {
                 None => self.send(method, command, parameters, &payload),
             }
         })
+    }
+
+    /// Puts the client's transaction into a command's parameters.
+    ///
+    /// `None` when there is nothing to add, so the common case does not copy
+    /// the parameters. One place rather than one per command: the cluster
+    /// applies `transaction_id` to everything a transaction can contain, and a
+    /// command this client forgot to stamp would silently do its work outside
+    /// the transaction — the failure a transaction exists to prevent.
+    ///
+    /// A command that already names a transaction keeps the one it named:
+    /// `commit_transaction` and its siblings mean a specific transaction, and
+    /// that is exactly the one they are given.
+    fn in_transaction(&self, parameters: &YsonValue) -> Option<YsonValue> {
+        let id = self.transaction.as_ref()?;
+
+        if let ytsaurus_yson::YsonNode::Map(m) = &parameters.node
+            && m.contains_key(TRANSACTION_ID.as_bytes())
+        {
+            return None;
+        }
+
+        let mut tagged = parameters.clone();
+        insert(&mut tagged, TRANSACTION_ID, string(id));
+        Some(tagged)
     }
 
     /// One attempt.
@@ -278,4 +320,54 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::yson_build::map;
+
+    fn transport(transaction: Option<&str>) -> Transport {
+        let mut transport = Transport::new("http://localhost:8000", None, Duration::from_secs(1));
+        transport.set_transaction(transaction.map(str::to_owned));
+        transport
+    }
+
+    fn rendered(value: &YsonValue) -> String {
+        to_string(value, YsonFormat::Text).expect("encodes")
+    }
+
+    #[test]
+    fn a_bound_client_puts_every_command_in_its_transaction() {
+        let params = map([("path", string("//tmp/out"))]);
+        let stamped = transport(Some("3-5d231-10001-db88"))
+            .in_transaction(&params)
+            .expect("stamped");
+
+        assert_eq!(
+            rendered(&stamped),
+            r#"{path="//tmp/out";transaction_id="3-5d231-10001-db88"}"#
+        );
+    }
+
+    #[test]
+    fn an_unbound_client_leaves_the_parameters_alone() {
+        // `None` rather than a copy: this is every command's hot path.
+        let params = map([("path", string("//tmp/out"))]);
+        assert!(transport(None).in_transaction(&params).is_none());
+    }
+
+    #[test]
+    fn a_command_that_names_a_transaction_keeps_the_one_it_named() {
+        // `Transaction::commit` sends `commit_transaction` through a client
+        // bound to that same transaction. Overwriting the parameter here would
+        // still work — but on a *nested* transaction it would commit the child
+        // instead of the parent the caller asked for.
+        let params = map([("transaction_id", string("the-one-i-meant"))]);
+        assert!(
+            transport(Some("some-other-one"))
+                .in_transaction(&params)
+                .is_none()
+        );
+    }
 }
