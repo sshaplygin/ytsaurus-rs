@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Reading back what the jobs reported
+
+- **Added** `Client::custom_statistics` and `Client::statistic_sum`, the other
+  half of [`JobStatistics`](../ytsaurus-job/CHANGELOG.md).
+
+The tree the cluster files them in is deeper than the name suggests, and the
+shape was taken from a live cluster rather than guessed:
+
+```text
+{"rows/rejected"={"$"={completed={map={count=1;max=3;min=3;sum=3}}}}}
+```
+
+The statistic's name keeps its slash as **one key** — it does not nest, so a
+path-walking lookup finds nothing. Below it sit `$`, the job state, and the job
+type. `statistic_sum` totals `completed` jobs across job types: a map-reduce
+reporting one name from both phases gives the operation's total, while an
+aborted job's work is redone by its replacement and counting it would double.
+
+Verified on the local cluster with `cargo run -p ytsaurus-client --example
+statistics`: a job that drops rows without a `key` column reports having read
+seven and rejected three, and the operation — which succeeded, with a shorter
+output table and no other sign anything was dropped — reports the same.
+
 ### The worker is uploaded once, not once per launch
 
 - **Added** `Client::upload_worker_cached`, `Client::file_from_cache`,

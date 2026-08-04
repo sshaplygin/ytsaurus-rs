@@ -56,6 +56,7 @@ cargo run -p ytsaurus-client --example diagnose     # the failure path
 cargo run -p ytsaurus-client --example sort_reduce  # sort, then reduce over it
 cargo run -p ytsaurus-client --example idempotent   # a repeated start is one operation
 cargo run -p ytsaurus-client --example cached_upload # the second upload is a cache hit
+cargo run -p ytsaurus-client --example statistics   # what the job counted, read back
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -178,6 +179,22 @@ binary):
 The last check is the one that matters beyond the timing: the cached node keeps
 its `executable` attribute and reaches the sandbox under the name the command
 expects, so a cached binary really runs.
+
+`statistics`, same cluster — seven rows in, three of them without a `key`
+column, which the job drops:
+
+```text
+== What the job reported
+   {"bytes/read"={"$"={completed={map={count=1;max=147;min=147;sum=147}}}};
+    "rows/read"={"$"={completed={map={count=1;max=7;min=7;sum=7}}}};
+    "rows/rejected"={"$"={completed={map={count=1;max=3;min=3;sum=3}}}}}
+   ok rows/read is 7
+   ok rows/rejected is 3
+```
+
+That document is why the client does not walk `rows/rejected` as a path: the
+name is one key, and `$` → job state → job type sits below it. The operation
+*succeeded* — the only sign three rows went missing is the statistic.
 
 ## Refreshing the golden fixtures
 

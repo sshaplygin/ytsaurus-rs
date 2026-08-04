@@ -433,7 +433,59 @@ yt map-reduce \
 
 See [`examples/src/bin/wordcount.rs`](../examples/src/bin/wordcount.rs).
 
-## 9. Test without a cluster
+## 9. Reporting your own numbers
+
+The cluster measures a job from the outside — CPU, memory, rows in and out.
+What it cannot see is anything about the work: how many rows failed validation,
+how long loading a dictionary took, how often a lookup missed. Those are
+**custom statistics**, and a job that drops rows should report them, because
+nothing else will say it happened — the operation succeeds and the output table
+is simply shorter.
+
+```rust
+use ytsaurus_job::JobStatistics;
+
+let mut stats = JobStatistics::new();
+
+while let Some(event) = reader.next_event()? {
+    let Event::Row(row) = event else { continue };
+    stats.add("rows/read", 1)?;
+
+    if !valid(&row) {
+        stats.add("rows/rejected", 1)?;
+        continue;
+    }
+    // ...
+}
+
+writer.finish()?;
+stats.finish()?;      // nothing is sent until this
+```
+
+They go to **fd 5**, which YTsaurus reserves for the purpose. A job may report
+at most **128 distinct names**; adding to one already recorded is always fine,
+and the 129th name is refused locally rather than by the cluster rejecting all
+of them.
+
+Nothing is written unless the process really is a job: outside one, fd 5 belongs
+to whoever opened it, and with the one-binary pattern from §3 that may be the
+launcher's connection to the cluster.
+
+Reading them back:
+
+```rust
+let rejected = client.statistic_sum(&operation_id, "rows/rejected")?;   // Some(3)
+```
+
+The name keeps its slash — the cluster stores `rows/rejected` as one key rather
+than nesting it — and the total is over `completed` jobs, since an aborted job's
+work is redone by its replacement. `Client::custom_statistics` returns the whole
+tree if you want the per-job-type breakdown.
+
+See [`examples/src/bin/counted.rs`](../examples/src/bin/counted.rs) and
+`cargo run -p ytsaurus-client --example statistics`.
+
+## 10. Test without a cluster
 
 A job is a program that reads a pipe, so you can run it as one:
 
@@ -448,7 +500,7 @@ simulates the shuffle by sorting the mapper output and inserting key switches.
 
 For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
 
-## 10. When something goes wrong
+## 11. When something goes wrong
 
 | Symptom | Likely cause |
 | --- | --- |
@@ -465,6 +517,8 @@ For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
 | output differs from input in an identity job | you decoded and re-encoded — map keys come back sorted. Use `Row::raw()` |
 | `cannot run on a cluster node` from `upload_current_exe` | the launcher is not a Linux x86-64 static binary; build the worker separately and point `YT_WORKER_BINARY` at it — §3 |
 | the job re-runs the launcher on the node | `run_if_inside_job` is not the first thing `main` does, or the uploaded binary is a different build |
+| rows vanish and the operation still succeeds | a mapper is dropping them; count them with a custom statistic — §9 |
+| `not running as a job, so N statistic(s) were not sent` | `JobStatistics::finish` was called outside a job, where fd 5 is not the cluster's |
 
 Job stderr appears in the operation UI. Set `RUST_BACKTRACE` through the spec to
 get backtraces from a panicking job:

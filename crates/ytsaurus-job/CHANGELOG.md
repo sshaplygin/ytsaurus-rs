@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### A job can report its own numbers
+
+- **Added** `JobStatistics`. The cluster measures a job from the outside — CPU,
+  memory, rows in and out — but nothing tells you how many rows a job *rejected*
+  unless the job says so. Statistics go to the descriptor YTsaurus reserves for
+  them (fd 5) as a YSON list fragment, matching the Python wrapper's
+  `write_statistics`, and the operation aggregates them across jobs.
+
+  ```rust
+  let mut stats = JobStatistics::new();
+  stats.add("rows/rejected", 1)?;
+  stats.finish()?;
+  ```
+
+  Values accumulate and are sent once, by `finish` — the cluster has no defined
+  behaviour for one name arriving twice. `Drop` makes a last-ditch attempt and
+  complains on stderr, as with `JobWriter`.
+
+- **Added** `JobError::TooManyStatistics` and `JobError::Statistics`. A job may
+  report at most 128 distinct names, so the 129th is refused locally rather than
+  by the cluster rejecting the lot. The second is separate from `JobError::Write`
+  because fd 5 is not an output table, and reporting it as "output table 5"
+  would send the reader looking for a table that does not exist. **Breaking**
+  for anyone matching `JobError` exhaustively; add `..` or a `_` arm.
+
+**Nothing is written unless `is_inside_job()`.** Outside a job, fd 5 is not the
+cluster's — and with one binary serving as both launcher and job, it is as
+likely to be an open socket to the cluster as to be nothing at all. Writing YSON
+into that would be worse than losing a statistic.
+
 ### One binary can be both the launcher and the job
 
 - **Added** `is_inside_job`, `run_if_inside_job` and `job_id`. The cluster

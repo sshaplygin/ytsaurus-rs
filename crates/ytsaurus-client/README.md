@@ -43,7 +43,7 @@ cargo run -p ytsaurus-client --example launch
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_operation`, `operation_state`, `wait_for_operation` |
-| Jobs | `list_jobs`, `get_job_stderr` |
+| Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum` |
 
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
 [`MapReduceSpec`], which model what launching a `ytsaurus-job` worker needs and

@@ -103,6 +103,32 @@ pub enum JobError {
         #[source]
         source: YsonError,
     },
+
+    /// More custom statistics than a job is allowed to report.
+    ///
+    /// The limit is on distinct names, not on writes: adding to one already
+    /// recorded is always fine.
+    #[error(
+        "this job already reports {limit} custom statistics, which is the limit; \
+         {name:?} would be one too many"
+    )]
+    TooManyStatistics {
+        /// The cluster's limit.
+        limit: usize,
+        /// The name that did not fit.
+        name: String,
+    },
+
+    /// Sending custom statistics failed.
+    ///
+    /// Separate from [`JobError::Write`] because descriptor 5 is not an output
+    /// table, and reporting it as "output table 5" would send the reader
+    /// looking for a table that does not exist.
+    #[error("sending custom job statistics: {reason}")]
+    Statistics {
+        /// What went wrong.
+        reason: String,
+    },
 }
 
 impl JobError {
@@ -131,6 +157,8 @@ impl JobError {
             JobError::BadControlRecord { .. } => "bad_control_record",
             JobError::UnknownTable { .. } => "unknown_table",
             JobError::Serialize { .. } => "serialize_failed",
+            JobError::TooManyStatistics { .. } => "too_many_statistics",
+            JobError::Statistics { .. } => "statistics_failed",
         }
     }
 
@@ -160,7 +188,12 @@ impl JobError {
             | JobError::TruncatedRecord { .. }
             | JobError::RecordTooLarge { .. }
             | JobError::BadControlRecord { .. }
-            | JobError::UnknownTable { .. } => false,
+            | JobError::UnknownTable { .. }
+            // Neither is about a row: one says the job asked for more
+            // statistics than it may have, the other that reporting them
+            // failed. Quarantining a row would not help either.
+            | JobError::TooManyStatistics { .. }
+            | JobError::Statistics { .. } => false,
         }
     }
 }

@@ -40,6 +40,18 @@ writer.finish()
   `<table_index=N>#` switch records.
 - **Failing usefully.** Truncated input, corrupt records and write errors are all
   fatal and explain themselves on stderr, where the operation UI shows them.
+- **Reporting its own numbers.** `JobStatistics` sends custom statistics on the
+  descriptor YTsaurus reserves for them, and the operation aggregates them
+  across jobs:
+
+  ```rust
+  let mut stats = JobStatistics::new();
+  stats.add("rows/rejected", 1)?;
+  stats.finish()?;
+  ```
+
+  Nothing else would tell you a mapper dropped rows: the operation succeeds and
+  the output table is simply shorter.
 - **Knowing it is a job.** The cluster sets `YT_JOB_ID`, so `is_inside_job()` and
   `run_if_inside_job()` let one binary be both the launcher and the job it runs:
 

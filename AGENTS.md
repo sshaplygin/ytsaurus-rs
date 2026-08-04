@@ -18,7 +18,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
-| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`) plus their e2e tests. |
+| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`) plus their e2e tests. |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
@@ -55,14 +55,15 @@ repository builds the minimal stack — a YSON codec and a job runtime.
    then change the code. Cite the doc at the point of use.
 4. Every change ends with green CI: `cargo fmt --check`, `cargo clippy
    --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
-5. **No scope creep.** RPC proxy, protobuf row format, dynamic tables, custom job
-   statistics, non-Linux targets are out of scope until a human decides
-   otherwise.
+5. **No scope creep.** RPC proxy, protobuf row format, dynamic tables, non-Linux
+   targets are out of scope until a human decides otherwise. *(Custom job
+   statistics were on this list until the backlog ranked them P1 #7; that is the
+   human decision, and they now ship as `JobStatistics`.)*
 
 ## Commands
 
 ```sh
-cargo test --workspace            # 257 tests
+cargo test --workspace            # 272 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -127,6 +128,29 @@ Captured from a job on a local cluster:
 `mapreduce.InsideJob`. argv is exactly the spec's command — `["./selfrun"]` —
 so argv-based role dispatch (`wordcount map`) also works, but has to be
 remembered at the call site.
+
+### Custom job statistics
+
+A job writes them to **fd 5** as a YSON list fragment holding one map —
+`{"rows/read"=7};` — matching the Python wrapper's `write_statistics`. At most
+**128 names** per job.
+
+The cluster files them under `progress/job_statistics/custom`, and the shape is
+deeper than it looks. Captured from a local cluster:
+
+```text
+{"rows/rejected"={"$"={completed={map={count=1;max=3;min=3;sum=3}}}}}
+```
+
+- the name keeps its slash as **one key**; it does not nest;
+- `$` → job **state** → job **type** → the aggregate.
+
+`Client::statistic_sum` totals the `completed` state across job types: an
+aborted job's work is redone by its replacement, so counting it would double.
+
+`JobStatistics` refuses to touch fd 5 unless `is_inside_job()`. With one binary
+serving as both launcher and job, fd 5 in the launcher is as likely to be an
+open socket to the cluster as to be nothing.
 
 ### Control records
 
@@ -245,7 +269,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 232 tests. Control records driven by the exact
+1. **Unit and integration** — 246 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

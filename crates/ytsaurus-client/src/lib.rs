@@ -830,6 +830,67 @@ impl Client {
         }
     }
 
+    /// The custom statistics an operation's jobs reported.
+    ///
+    /// Returns the `custom` subtree of the operation's job statistics, keyed by
+    /// the names the jobs used. Each leaf is an aggregate — `sum`, `count`,
+    /// `min`, `max` — over the jobs that reported it, so a per-row counter
+    /// comes back as one number for the whole operation.
+    /// [`Client::statistic_sum`] pulls a single total out of it.
+    ///
+    /// Empty if no job reported anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn custom_statistics(&self, operation_id: &str) -> Result<YsonValue> {
+        let params = yson_build::map([
+            ("operation_id", yson_build::string(operation_id)),
+            (
+                "attributes",
+                yson_build::list([yson_build::string("progress")]),
+            ),
+        ]);
+        let body = self.transport.call(
+            Method::Get,
+            "get_operation",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "get_operation")?;
+        let custom = jobs::field(&envelope, "progress")
+            .and_then(|p| jobs::field(p, "job_statistics"))
+            .and_then(|s| jobs::field(s, "custom"))
+            .cloned();
+
+        Ok(custom.unwrap_or(YsonValue {
+            attributes: None,
+            node: YsonNode::Map(std::collections::BTreeMap::new()),
+        }))
+    }
+
+    /// The total of one custom statistic over an operation's completed jobs.
+    ///
+    /// `name` is exactly what the job called it, slashes included: the cluster
+    /// keeps `rows/rejected` as one key rather than nesting it.
+    ///
+    /// Only `completed` jobs are counted. An aborted job's work is done again
+    /// by its replacement, so including it would count the same rows twice.
+    /// Job *types* are summed together, so a map-reduce reporting one name from
+    /// both phases gives the operation's total.
+    ///
+    /// `None` means no job reported that name — which is not the same as zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn statistic_sum(&self, operation_id: &str, name: &str) -> Result<Option<i64>> {
+        let statistics = self.custom_statistics(operation_id)?;
+        Ok(jobs::field(&statistics, name).and_then(completed_total))
+    }
+
     /// Polls until the operation reaches a terminal state.
     ///
     /// # Errors
@@ -1049,6 +1110,38 @@ impl Client {
     }
 }
 
+/// Totals one custom statistic over the jobs that completed.
+///
+/// The cluster files a statistic as `$` → job state → job type → the
+/// aggregate, so the number a user means by "how many rows did we reject" is
+/// the `sum` of the `completed` jobs, added across job types. Captured from a
+/// local cluster:
+///
+/// ```text
+/// {"rows/rejected"={"$"={completed={map={count=1;max=3;min=3;sum=3}}}}}
+/// ```
+///
+/// A flatter shape is accepted too, so a cluster that reports a bare aggregate
+/// still yields a number rather than nothing.
+fn completed_total(statistic: &YsonValue) -> Option<i64> {
+    let Some(by_state) = jobs::field(statistic, "$") else {
+        return jobs::field(statistic, "sum").and_then(YsonValue::as_i64);
+    };
+
+    let completed = jobs::field(by_state, "completed")?;
+    let YsonNode::Map(by_type) = &completed.node else {
+        return None;
+    };
+
+    let mut total: Option<i64> = None;
+    for per_type in by_type.values() {
+        if let Some(sum) = jobs::field(per_type, "sum").and_then(YsonValue::as_i64) {
+            total = Some(total.unwrap_or(0) + sum);
+        }
+    }
+    total
+}
+
 /// Verifies that `data` is a whole binary YSON list fragment.
 ///
 /// Walks record boundaries without decoding, so the cost is a scan rather than
@@ -1123,6 +1216,65 @@ mod tests {
 
         let err = check_complete_fragment(&data).expect_err("must reject");
         assert!(err.contains("cut short"), "{err}");
+    }
+
+    /// The exact document a local cluster returned for a job that reported
+    /// three statistics.
+    const CUSTOM_STATISTICS: &str = r#"{
+        "bytes/read" = {"$" = {completed = {map = {count=1;max=147;min=147;sum=147}}}};
+        "rows/read" = {"$" = {completed = {map = {count=1;max=7;min=7;sum=7}}}};
+        "rows/rejected" = {"$" = {completed = {map = {count=1;max=3;min=3;sum=3}}}};
+    }"#;
+
+    fn statistics() -> YsonValue {
+        from_slice(CUSTOM_STATISTICS.as_bytes(), YsonFormat::Text).expect("valid YSON")
+    }
+
+    #[test]
+    fn a_statistic_totals_over_completed_jobs() {
+        let all = statistics();
+
+        // The name keeps its slash: the cluster stores it as one key rather
+        // than nesting it, which a path-walking lookup would miss entirely.
+        assert_eq!(
+            jobs::field(&all, "rows/rejected").and_then(completed_total),
+            Some(3)
+        );
+        assert_eq!(
+            jobs::field(&all, "bytes/read").and_then(completed_total),
+            Some(147)
+        );
+        assert_eq!(jobs::field(&all, "rows").and_then(completed_total), None);
+    }
+
+    #[test]
+    fn job_types_are_summed_and_other_states_are_not() {
+        // A map-reduce reports one name from both phases; an aborted job's
+        // work is redone by its replacement, so counting it would double.
+        let value = from_slice(
+            br#"{"$" = {
+                    completed = {map = {sum=10}; partition_reduce = {sum=5}};
+                    aborted   = {map = {sum=99}};
+                }}"#,
+            YsonFormat::Text,
+        )
+        .expect("valid YSON");
+
+        assert_eq!(completed_total(&value), Some(15));
+    }
+
+    #[test]
+    fn a_flat_aggregate_still_yields_a_number() {
+        let value =
+            from_slice(b"{count=1;max=7;min=7;sum=7}", YsonFormat::Text).expect("valid YSON");
+        assert_eq!(completed_total(&value), Some(7));
+    }
+
+    #[test]
+    fn an_operation_whose_jobs_all_failed_totals_nothing() {
+        let value = from_slice(br#"{"$" = {failed = {map = {sum=4}}}}"#, YsonFormat::Text)
+            .expect("valid YSON");
+        assert_eq!(completed_total(&value), None);
     }
 
     #[test]
