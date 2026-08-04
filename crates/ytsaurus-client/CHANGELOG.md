@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Pointing it at a real installation
+
+- **Changed** `Client::from_env` to find a token the way the `yt` CLI does:
+  `YT_TOKEN`, then the file named by `YT_TOKEN_PATH`, then `~/.yt/token`. A
+  machine where the CLI already works now needs nothing else. The token is
+  **trimmed**: `echo token > ~/.yt/token` leaves a newline, and sending that
+  fails authentication with an error that never mentions a newline. An
+  unreadable file means no token rather than an error — which is what it means
+  on a cluster that wants none.
+
+**Responses were already compressed** and nothing said so. `ureq`'s `gzip`
+feature is on in this crate, so every request carries `Accept-Encoding: gzip`
+and every answer is decompressed on the way in; the proxy honours it, including
+for a streamed table read — 67.7 MiB of table arrived as 400 KiB on the wire.
+Nothing in the crate would have noticed if that feature were dropped, because a
+cluster answers the same either way, just larger. A new test serves one request
+from a socket in-process and reads what the client actually sent, which also
+pins the token header, the absence of one when there is no token, and that
+parameters travel in `X-YT-Parameters` rather than a query string.
+
+**The proxy also accepts a gzipped request body** (`Content-Encoding: gzip`),
+verified on the local cluster. Compressing uploads is not implemented: it costs
+a compression dependency in a crate that is linked into worker binaries and
+cross-compiled to musl, and that is a trade worth making deliberately rather
+than in passing.
+
+TLS remains the one part of this that a local cluster cannot exercise: the `tls`
+feature is there, on by default, and only an `https://` installation will prove
+it.
+
 ### A table bigger than the program that moves it
 
 - **Added** `Client::read_table_streaming` and `Client::write_table_streaming`,

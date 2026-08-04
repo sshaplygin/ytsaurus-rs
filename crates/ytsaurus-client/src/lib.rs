@@ -29,9 +29,11 @@
 //!
 //! # Configuration
 //!
-//! [`Client::from_env`] reads `YT_PROXY` for the cluster address and `YT_TOKEN`
-//! for the token, matching the `yt` CLI. A bare host is assumed to be HTTPS; a
-//! local cluster is reached as `http://localhost:8000`.
+//! [`Client::from_env`] reads `YT_PROXY` for the cluster address, and finds a
+//! token the way the `yt` CLI does: `YT_TOKEN`, then the file named by
+//! `YT_TOKEN_PATH`, then `~/.yt/token`. A machine where the CLI already works
+//! needs nothing else. A bare host is assumed to be HTTPS; a local cluster is
+//! reached as `http://localhost:8000`.
 //!
 //! # When an operation fails
 //!
@@ -183,7 +185,21 @@ impl Client {
         }
     }
 
-    /// Connects using `YT_PROXY` and, if set, `YT_TOKEN`.
+    /// Connects using `YT_PROXY`, and whatever token the environment offers.
+    ///
+    /// The token is looked for the way the `yt` CLI looks for it, and stops at
+    /// the first that has one:
+    ///
+    /// 1. `YT_TOKEN`;
+    /// 2. the file named by `YT_TOKEN_PATH`;
+    /// 3. `~/.yt/token`.
+    ///
+    /// So a machine where the CLI already works needs no extra setup. A token
+    /// read from a file is **trimmed**: one written with `echo` ends in a
+    /// newline, and sending that produces an authentication failure that says
+    /// nothing about a newline. An unreadable file is treated as no token
+    /// rather than as an error, because that is what it means on a cluster that
+    /// wants none.
     ///
     /// # Errors
     ///
@@ -197,10 +213,7 @@ impl Client {
             )
         })?;
 
-        let token = std::env::var("YT_TOKEN")
-            .ok()
-            .filter(|t| !t.trim().is_empty());
-        Ok(match token {
+        Ok(match token_from_environment() {
             Some(token) => Self::with_token(&proxy, token),
             None => Self::new(&proxy),
         })
@@ -1688,6 +1701,43 @@ impl Client {
     }
 }
 
+/// Finds a token the way the `yt` CLI finds one.
+///
+/// `YT_TOKEN`, then `YT_TOKEN_PATH`, then `~/.yt/token` — first one that has
+/// something in it wins. Nothing here fails: a cluster that wants no token is
+/// ordinary, and so is a home directory with no `.yt` in it.
+fn token_from_environment() -> Option<String> {
+    if let Some(token) = std::env::var("YT_TOKEN").ok().and_then(clean_token) {
+        return Some(token);
+    }
+
+    if let Ok(path) = std::env::var("YT_TOKEN_PATH")
+        && let Some(token) = read_token_file(std::path::Path::new(&path))
+    {
+        return Some(token);
+    }
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    read_token_file(&std::path::Path::new(&home).join(".yt").join("token"))
+}
+
+/// Reads a token out of a file, if there is one to read.
+fn read_token_file(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().and_then(clean_token)
+}
+
+/// A token with the whitespace taken off, or nothing if that leaves nothing.
+///
+/// The trailing newline is the point: `echo token > ~/.yt/token` writes one,
+/// and a header carrying it fails authentication with an error that never
+/// mentions the newline.
+fn clean_token(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 /// Reads the child names out of a `list` answer.
 ///
 /// A truncated answer is an error rather than a short list. The cluster says so
@@ -1832,6 +1882,31 @@ mod tests {
 
         let err = check_complete_fragment(&data).expect_err("must reject");
         assert!(err.contains("cut short"), "{err}");
+    }
+
+    #[test]
+    fn a_token_file_written_with_echo_still_works() {
+        // `echo token > ~/.yt/token` is how these files get written, and the
+        // newline it leaves would fail authentication with an error that never
+        // mentions a newline.
+        let path = std::env::temp_dir().join(format!(
+            "ytsaurus-rs-token-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "  secret-token\n").expect("writes");
+
+        assert_eq!(read_token_file(&path).as_deref(), Some("secret-token"));
+
+        std::fs::write(&path, "\n \n").expect("writes");
+        assert_eq!(read_token_file(&path), None, "whitespace is not a token");
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            read_token_file(&path),
+            None,
+            "a missing file is no token, not an error"
+        );
     }
 
     #[test]

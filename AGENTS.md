@@ -64,7 +64,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 319 tests
+cargo test --workspace            # 324 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -245,6 +245,23 @@ per command. Cluster facts:
 - `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
   handle pings its own transaction.
 
+### Authentication and compression
+
+- The token is looked for as the `yt` CLI looks for it: **`YT_TOKEN`, then
+  `YT_TOKEN_PATH`, then `~/.yt/token`**, and it is **trimmed** — `echo token >
+  ~/.yt/token` leaves a newline that fails authentication with an error saying
+  nothing about newlines.
+- **Responses are already compressed**: `ureq`'s `gzip` feature is on, so every
+  request carries `Accept-Encoding: gzip` and every answer is decompressed on
+  arrival. A 67.7 MiB table read came back as **400 KiB** on the wire. Nothing
+  but `tests/request_shape.rs` would notice if the feature were dropped — a
+  cluster answers the same either way, just larger.
+- **The proxy accepts a gzipped request body** (`Content-Encoding: gzip`),
+  verified. Uploads are *not* compressed: that costs a compression dependency in
+  a crate linked into musl worker binaries, which is a human's call.
+- A local cluster **accepts any token**, so the file lookup is unit-tested and
+  whether a real installation likes the token cannot be checked here.
+
 ### Streaming table I/O
 
 - The proxy **accepts a chunked request body** for `write_table`, so a table can
@@ -410,7 +427,7 @@ a denial of service in any text-mode parser and the fixes are small.
 
 Three layers:
 
-1. **Unit and integration** — 285 tests. Control records driven by the exact
+1. **Unit and integration** — 290 tests. Control records driven by the exact
    stream from the docs; chunked readers down to **one byte per `read`**, which
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4

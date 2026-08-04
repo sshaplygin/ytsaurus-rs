@@ -17,7 +17,7 @@ ytsaurus-client = "0.2"
 use ytsaurus_client::{Client, MapSpec};
 
 # fn demo() -> Result<(), ytsaurus_client::ClientError> {
-let client = Client::from_env()?;                  // YT_PROXY, YT_TOKEN
+let client = Client::from_env()?;                  // YT_PROXY, and the CLI's token
 
 client.upload_worker("target/…/my_job", "//tmp/my_job")?;
 
@@ -227,6 +227,20 @@ Mach-O and cannot be the uploaded file: build the worker with
 `scripts/build-worker.sh` and upload that with `upload_worker`. The source is
 still one file — see
 [`examples/src/bin/selfrun.rs`](../../examples/src/bin/selfrun.rs).
+
+## Talking to a real installation
+
+`Client::from_env` reads `YT_PROXY`, and finds a token the way the `yt` CLI
+does: `YT_TOKEN`, then the file named by `YT_TOKEN_PATH`, then `~/.yt/token`. A
+machine where the CLI already works needs nothing else. A token read from a file
+is trimmed — `echo token > ~/.yt/token` leaves a newline, and sending it fails
+authentication with an error that never mentions a newline.
+
+**Responses are compressed.** Every request carries `Accept-Encoding: gzip` and
+every answer is decompressed on the way in, including a streamed table read: on
+a local cluster 67.7 MiB of table arrived as 400 KiB. Uploads are not
+compressed, though the proxy would accept it — that costs a compression
+dependency in a crate that gets cross-compiled to musl.
 
 ## Features
 
