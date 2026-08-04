@@ -70,8 +70,8 @@ pub mod reader;
 pub mod writer;
 
 pub use crate::error::{JobError, Result};
-pub use crate::reader::{Event, Group, Groups, JobReader, Row};
-pub use crate::writer::{JobWriter, table_descriptor};
+pub use crate::reader::{Event, Group, GroupKey, Groups, JobReader, Row};
+pub use crate::writer::{JobWriter, TableId, table_descriptor};
 
 pub use ytsaurus_yson as yson;
 

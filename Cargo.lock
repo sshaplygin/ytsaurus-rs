@@ -1158,7 +1158,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "ytsaurus-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-examples"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-job"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "serde",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-yson"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "itoa",

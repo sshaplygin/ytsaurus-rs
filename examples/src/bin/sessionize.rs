@@ -30,11 +30,10 @@
 //! # see tests/e2e/run_pilot.sh for the full operation invocation
 //! ```
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use ytsaurus_job::{Event, JobError, JobReader, JobWriter, Row};
+use ytsaurus_job::{Event, JobError, JobReader, JobWriter, Row, TableId};
 
 /// Inactivity gap that starts a new session, in microseconds.
 const SESSION_GAP_US: i64 = 30 * 60 * 1_000_000;
@@ -156,7 +155,7 @@ fn validate(event: &RawEvent<'_>) -> Result<(), &'static str> {
 
 fn map() -> Result<(), JobError> {
     let mut reader = JobReader::from_stdin();
-    let mut writer = JobWriter::descriptors(2)?;
+    let (mut writer, [events, rejects]) = JobWriter::named(["events", "rejects"])?;
 
     let mut kept = 0u64;
     let mut rejected = 0u64;
@@ -164,19 +163,19 @@ fn map() -> Result<(), JobError> {
     while let Some(event) = reader.next_event()? {
         let Event::Row(row) = event else { continue };
 
-        // FRICTION 1: "row did not parse" and "row parsed but is invalid" call
-        // for identical handling, but they arrive as different error types --
-        // `JobError` from the runtime, our own reason from `validate`. Folding
-        // them means stringifying, which loses the structure of `JobError`.
+        // Both failure modes now yield a cheap, stable `&'static str`:
+        // `JobError::kind` for a decode failure, our own reason for an invalid
+        // row. Nothing is formatted and nothing is allocated per bad row, and
+        // the values are stable enough to group a rejects table by.
         //
-        // `Cow` keeps the cost off the common path at least: a validation
-        // failure borrows a `&'static str` and allocates nothing; only a decode
-        // failure, which should be rare, pays for a `String`.
-        let outcome: Result<CleanEvent, Cow<'static, str>> = row
-            .parse::<RawEvent>()
-            .map_err(|e| Cow::Owned(e.to_string()))
-            .and_then(|event| {
-                validate(&event).map_err(Cow::Borrowed)?;
+        // `is_row_local` decides whether to carry on: a bad row is quarantined,
+        // but a truncated stream or a failed write means every later row is
+        // suspect, so the job stops.
+        let outcome: Result<CleanEvent, &'static str> = match row.parse::<RawEvent>() {
+            Err(e) if !e.is_row_local() => return Err(e),
+            Err(e) => Err(e.kind()),
+            Ok(event) => (|| {
+                validate(&event)?;
                 Ok(CleanEvent {
                     is_external: event
                         .referer
@@ -190,15 +189,16 @@ fn map() -> Result<(), JobError> {
                     is_mobile: event.is_mobile,
                     latency_ms: event.latency_ms,
                 })
-            });
+            })(),
+        };
 
         match outcome {
             Ok(clean) => {
-                writer.write(0, &clean)?;
+                writer.write(events, &clean)?;
                 kept += 1;
             }
             Err(reason) => {
-                quarantine(&mut writer, &row, &reason)?;
+                quarantine(&mut writer, rejects, &row, reason)?;
                 rejected += 1;
             }
         }
@@ -210,9 +210,14 @@ fn map() -> Result<(), JobError> {
 }
 
 /// Writes a bad row to the rejects table, preserving the original bytes.
-fn quarantine(writer: &mut JobWriter, row: &Row<'_>, reason: &str) -> Result<(), JobError> {
+fn quarantine(
+    writer: &mut JobWriter,
+    rejects: TableId,
+    row: &Row<'_>,
+    reason: &str,
+) -> Result<(), JobError> {
     writer.write(
-        1,
+        rejects,
         &Reject {
             raw: row.raw(),
             reason,
@@ -223,28 +228,22 @@ fn quarantine(writer: &mut JobWriter, row: &Row<'_>, reason: &str) -> Result<(),
 
 fn reduce() -> Result<(), JobError> {
     let mut reader = JobReader::from_stdin();
-    let mut writer = JobWriter::descriptors(2)?;
+    let (mut writer, [sessions_table, users_table]) = JobWriter::named(["sessions", "users"])?;
 
-    let mut groups = reader.groups();
+    let mut groups = reader.groups_by(["user_id"]);
     let mut users = 0u64;
     let mut sessions_emitted = 0u64;
 
     while let Some(mut group) = groups.next_group()? {
-        // FRICTION 2: the reduce key is only discoverable by parsing the first
-        // row of the group. `Group` knows a boundary was crossed but carries no
-        // key, so every reducer re-derives it and must handle the "no rows yet"
-        // case that cannot actually happen.
-        let mut user_id: Option<Vec<u8>> = None;
+        // The reduce key comes from the group rather than being re-derived
+        // from the first row.
+        let user_id = group.key().bytes("user_id").unwrap_or_default().to_vec();
 
         let mut current: Option<SessionAcc> = None;
         let mut finished: Vec<Session> = Vec::new();
 
         while let Some(row) = group.next_row()? {
             let event: CleanEvent = row.parse()?;
-
-            if user_id.is_none() {
-                user_id = Some(event.user_id.to_vec());
-            }
 
             // A gap longer than the threshold closes the current session.
             let starts_new_session = match &current {
@@ -262,7 +261,6 @@ fn reduce() -> Result<(), JobError> {
             }
         }
 
-        let Some(user_id) = user_id else { continue };
         if let Some(acc) = current {
             finished.push(acc.finish(finished.len() as i64));
         }
@@ -281,11 +279,11 @@ fn reduce() -> Result<(), JobError> {
             summary.bytes_sent += session.bytes_sent;
             summary.errors += session.errors;
             summary.total_duration_us += session.duration_us;
-            writer.write(0, session)?;
+            writer.write(sessions_table, session)?;
             sessions_emitted += 1;
         }
 
-        writer.write(1, &summary)?;
+        writer.write(users_table, &summary)?;
         users += 1;
     }
 

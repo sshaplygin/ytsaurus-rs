@@ -6,6 +6,11 @@ All notable changes to this fork are recorded here.
 Recording modifications is a condition of the Apache-2.0 licence (section 4b), and the
 list below is that record: everything that differs from upstream `ba2044c`.
 
+## 0.2.0
+
+No changes to this crate beyond the version, which tracks the workspace. The
+fork modifications below are unchanged and still apply.
+
 ## [Unreleased]
 
 ### Forked

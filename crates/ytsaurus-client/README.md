@@ -5,7 +5,7 @@ worker **without a Python installation**.
 
 ```toml
 [dependencies]
-ytsaurus-client = "0.1"
+ytsaurus-client = "0.2"
 ```
 
 ```rust

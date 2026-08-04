@@ -30,7 +30,7 @@ Add a binary to `examples/` (or your own crate):
 
 ```toml
 [dependencies]
-ytsaurus-job = "0.1"
+ytsaurus-job = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 ```
@@ -98,6 +98,50 @@ Because borrowed fields point into the reader's buffer, they cannot outlive the
 row. If you need to accumulate across rows, copy what you keep — the compiler
 will tell you exactly where.
 
+### Output rows can borrow too
+
+The same applies on the way out, and it is easy to miss. A row is serialized
+before the borrow ends, so an output struct may hold references to the input:
+
+```rust
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Reject<'a> {
+    #[serde(with = "serde_bytes")]
+    raw: &'a [u8],          // borrows the input row — no copy
+    reason: &'a str,
+}
+
+// writer.write(rejects, &Reject { raw: row.raw(), reason })?;
+```
+
+The obvious first attempt uses `raw: Vec<u8>` and `row.raw().to_vec()`, which
+compiles, is correct, and copies every row it touches. On a rejects table — the
+place this pattern shows up — that is a copy on a path whose whole purpose is to
+stay cheap when a fraction of a huge input is corrupt.
+
+### Reporting why a row was rejected
+
+A validating mapper has two kinds of failure to describe: the row did not decode
+(`JobError`) and the row decoded but is invalid (your own rule). Both want the
+same treatment, so fold them into one cheap `&'static str`:
+
+```rust
+let outcome: Result<Clean, &'static str> = match row.parse::<Raw>() {
+    // Not this row's fault: a truncated stream or a failed write means every
+    // later row is suspect, so stop rather than quarantine.
+    Err(e) if !e.is_row_local() => return Err(e),
+    // A bad row: `kind()` is allocation-free and stable enough to group by.
+    Err(e) => Err(e.kind()),
+    Ok(raw) => validate(&raw).map(|()| Clean::from(raw)),
+};
+```
+
+`JobError::kind()` returns values like `invalid_yson` and `truncated_record`.
+Formatting the error instead would allocate per bad row and produce a message
+that can change between versions — awkward for a column you intend to group by.
+
 ## 3. Build it for the cluster
 
 Jobs run on Linux x86_64 nodes that may not have your libc. Build a fully static
@@ -145,13 +189,18 @@ Two CLI details that are easy to get wrong:
 
 ## 5. Multiple output tables
 
-Declare the count and address tables by index:
+Declare them by name and address them by handle:
 
 ```rust
-let mut writer = JobWriter::descriptors(2)?;
-writer.write(0, &kept)?;
-writer.write(1, &rejected)?;
+let (mut writer, [good, bad]) = JobWriter::named(["good", "bad"])?;
+writer.write(good, &kept)?;
+writer.write(bad, &rejected)?;
 ```
+
+`JobWriter::descriptors(2)` and `writer.write(0, …)` still work. Prefer the named
+form: a job with two output tables of different meaning is exactly where
+transposing `0` and `1` produces something that runs happily and fills each table
+with the other's rows, and nothing looks wrong until someone reads them.
 
 ```sh
 yt map './my_job' --src //tmp/in --dst //tmp/good --dst //tmp/bad ...
@@ -193,25 +242,25 @@ Getting this wrong is quiet, not loud: `job_io` on a map-reduce is simply
 ignored, the reducer sees no key switches, and every key is summed into one row.
 
 ```rust
-let mut groups = reader.groups();
+// Pass the same columns the operation was given as `reduce_by`.
+let mut groups = reader.groups_by(["word"]);
+
 while let Some(mut group) = groups.next_group()? {
+    let word = group.key().bytes("word").unwrap_or_default().to_vec();
+
     let mut total = 0i64;
-    let mut key = None;
-
     while let Some(row) = group.next_row()? {
-        let entry: Entry = row.parse()?;
-        // Every row in a group shares the reduce key.
-        if key.is_none() {
-            key = Some(entry.word.to_vec());
-        }
-        total += entry.count;
+        total += row.parse::<Entry>()?.count;
     }
 
-    if let Some(key) = key {
-        writer.write(0, &Total { word: key, count: total })?;
-    }
+    writer.write(totals, &Total { word, count: total })?;
 }
 ```
+
+`groups()` without columns still works and leaves `group.key()` empty; you then
+have to re-derive the key from the first row yourself. YTsaurus does not transmit
+the key — `key_switch` carries no payload — so `groups_by` reads it from the
+group's first row, which is the same work done once instead of in every reducer.
 
 A full map-reduce, with one binary serving both the map and reduce phases:
 

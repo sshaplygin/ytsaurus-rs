@@ -80,13 +80,18 @@ pub enum JobError {
 
     /// A row was written to an output table the job does not have.
     #[error(
-        "output table {index} does not exist; this job was created with {count} output table(s)"
+        "output table {index} does not exist; this job has {count} output table(s){}",
+        known_tables(.names)
     )]
     UnknownTable {
         /// The index that was asked for.
         index: usize,
         /// How many output tables the job actually has.
         count: usize,
+        /// Declared table names, when the writer was built with
+        /// [`crate::JobWriter::named`]. Turns a bare index into something the
+        /// reader of the error can act on.
+        names: Vec<String>,
     },
 
     /// Serializing a row failed.
@@ -98,4 +103,73 @@ pub enum JobError {
         #[source]
         source: YsonError,
     },
+}
+
+impl JobError {
+    /// A short, stable name for what went wrong.
+    ///
+    /// Formatting a `JobError` allocates and produces a message that may change
+    /// between versions. A job that quarantines bad rows wants neither: it wants
+    /// a cheap, stable value to put in a `reason` column so the rejects table
+    /// can be grouped and counted.
+    ///
+    /// ```
+    /// # use ytsaurus_job::JobError;
+    /// # fn demo(e: &JobError) {
+    /// // Cheap and stable — safe to write into an output table.
+    /// let reason: &'static str = e.kind();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            JobError::Read(_) => "read_failed",
+            JobError::Write { .. } => "write_failed",
+            JobError::Yson { .. } => "invalid_yson",
+            JobError::TruncatedRecord { .. } => "truncated_record",
+            JobError::RecordTooLarge { .. } => "record_too_large",
+            JobError::BadControlRecord { .. } => "bad_control_record",
+            JobError::UnknownTable { .. } => "unknown_table",
+            JobError::Serialize { .. } => "serialize_failed",
+        }
+    }
+
+    /// Whether this error is about one bad row rather than the stream itself.
+    ///
+    /// A job that quarantines bad rows should keep going for these and stop for
+    /// the rest: a truncated stream or a failed write means every subsequent row
+    /// is suspect, and carrying on would quietly produce a short output table.
+    ///
+    /// ```
+    /// # use ytsaurus_job::JobError;
+    /// # fn demo(e: JobError) -> Result<(), JobError> {
+    /// if e.is_row_local() {
+    ///     // quarantine the row and continue
+    /// } else {
+    ///     return Err(e);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn is_row_local(&self) -> bool {
+        match self {
+            JobError::Yson { .. } | JobError::Serialize { .. } => true,
+            JobError::Read(_)
+            | JobError::Write { .. }
+            | JobError::TruncatedRecord { .. }
+            | JobError::RecordTooLarge { .. }
+            | JobError::BadControlRecord { .. }
+            | JobError::UnknownTable { .. } => false,
+        }
+    }
+}
+
+/// Renders declared table names for [`JobError::UnknownTable`].
+fn known_tables(names: &[String]) -> String {
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", names.join(", "))
+    }
 }

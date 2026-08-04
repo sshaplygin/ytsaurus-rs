@@ -62,7 +62,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 158 tests
+cargo test --workspace            # 202 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 

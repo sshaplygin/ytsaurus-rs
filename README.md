@@ -10,7 +10,7 @@ Write [YTsaurus](https://ytsaurus.tech) MapReduce workers in Rust instead of C++
 
 ```toml
 [dependencies]
-ytsaurus-job = "0.1"
+ytsaurus-job = "0.2"
 ```
 
 A YTsaurus job is just an executable: it reads input rows from fd 0 and writes output
@@ -64,7 +64,7 @@ The full walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 ## Build and test
 
 ```sh
-cargo test --workspace          # 158 tests
+cargo test --workspace          # 202 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```

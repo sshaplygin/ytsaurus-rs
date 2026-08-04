@@ -22,6 +22,39 @@ pub fn table_descriptor(index: usize) -> i32 {
     (3 * index + 1) as i32
 }
 
+/// A handle to one of a job's output tables.
+///
+/// Obtained from [`JobWriter::named`], which hands out exactly one per declared
+/// table, so a handle is always in range. Naming them at the call site is the
+/// point: `writer.write(rejects, &row)` says what it does, where
+/// `writer.write(1, &row)` needs a comment and survives being transposed with
+/// `write(0, …)` — a job that then runs happily and fills each table with the
+/// other's rows.
+///
+/// A `usize` still converts, so existing code keeps working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TableId(usize);
+
+impl TableId {
+    /// The table's index.
+    #[must_use]
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for TableId {
+    fn from(index: usize) -> Self {
+        TableId(index)
+    }
+}
+
+impl std::fmt::Display for TableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// How rows reach their destination table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Routing {
@@ -63,6 +96,9 @@ pub struct JobWriter {
     /// Reused across rows so serializing does not allocate per row.
     scratch: Vec<u8>,
     finished: bool,
+    /// Declared table names, when built with [`JobWriter::named`]. Empty
+    /// otherwise; used to make an out-of-range write explain itself.
+    names: Vec<String>,
 }
 
 impl std::fmt::Debug for JobWriter {
@@ -97,6 +133,67 @@ impl JobWriter {
             .collect();
 
         Ok(Self::from_writers(tables, YsonFormat::Binary))
+    }
+
+    /// Declares output tables by name, returning a handle for each.
+    ///
+    /// The names are for the reader, not the cluster — YTsaurus knows tables by
+    /// position. What they buy is a call site that says which table it means:
+    ///
+    /// ```no_run
+    /// # use serde::Serialize;
+    /// # use ytsaurus_job::JobWriter;
+    /// # #[derive(Serialize)] struct Row { a: i64 }
+    /// # let row = Row { a: 1 };
+    /// let (mut writer, [events, rejects]) = JobWriter::named(["events", "rejects"])?;
+    ///
+    /// writer.write(events, &row)?;
+    /// writer.write(rejects, &row)?;
+    /// writer.finish()?;
+    /// # Ok::<(), ytsaurus_job::JobError>(())
+    /// ```
+    ///
+    /// Handles come out in the order declared, so table 0 is the first name.
+    /// Because they are the only way to get a [`TableId`] other than converting
+    /// a `usize`, an out-of-range write is impossible when using this
+    /// constructor.
+    ///
+    /// # Errors
+    ///
+    /// See [`JobWriter::descriptors`].
+    #[cfg(unix)]
+    pub fn named<const N: usize>(names: [&str; N]) -> Result<(Self, [TableId; N])> {
+        let mut writer = Self::descriptors(N)?;
+        writer.names = names.iter().map(|n| (*n).to_owned()).collect();
+        Ok((writer, Self::ids()))
+    }
+
+    /// Like [`JobWriter::named`], over arbitrary sinks, for tests.
+    #[must_use]
+    pub fn named_writers<const N: usize>(
+        names: [&str; N],
+        tables: Vec<Box<dyn Write>>,
+        format: YsonFormat,
+    ) -> (Self, [TableId; N]) {
+        let mut writer = Self::from_writers(tables, format);
+        writer.names = names.iter().map(|n| (*n).to_owned()).collect();
+        (writer, Self::ids())
+    }
+
+    /// Handles `0..N`, in declaration order.
+    fn ids<const N: usize>() -> [TableId; N] {
+        let mut ids = [TableId(0); N];
+        for (i, id) in ids.iter_mut().enumerate() {
+            *id = TableId(i);
+        }
+        ids
+    }
+
+    /// The name declared for `table`, if the writer was built with
+    /// [`JobWriter::named`].
+    #[must_use]
+    pub fn table_name(&self, table: impl Into<TableId>) -> Option<&str> {
+        self.names.get(table.into().index()).map(String::as_str)
     }
 
     /// Writes every table to fd 1, switching with `<table_index=N>#` records.
@@ -154,6 +251,7 @@ impl JobWriter {
             scratch: Vec::with_capacity(8192),
             finished: false,
             logical_tables,
+            names: Vec::new(),
         }
     }
 
@@ -170,7 +268,12 @@ impl JobWriter {
     /// Returns [`JobError::UnknownTable`] if `table` is out of range,
     /// [`JobError::Serialize`] if the row cannot be encoded, or
     /// [`JobError::Write`] if the descriptor rejects the write.
-    pub fn write<T: Serialize + ?Sized>(&mut self, table: usize, row: &T) -> Result<()> {
+    pub fn write<T: Serialize + ?Sized>(
+        &mut self,
+        table: impl Into<TableId>,
+        row: &T,
+    ) -> Result<()> {
+        let table = table.into().index();
         self.check_table(table)?;
 
         // Take the scratch buffer out so `write_bytes` can borrow `self`
@@ -200,7 +303,8 @@ impl JobWriter {
     /// # Errors
     ///
     /// Returns [`JobError::UnknownTable`] or [`JobError::Write`].
-    pub fn write_raw(&mut self, table: usize, row: &[u8]) -> Result<()> {
+    pub fn write_raw(&mut self, table: impl Into<TableId>, row: &[u8]) -> Result<()> {
+        let table = table.into().index();
         self.check_table(table)?;
         self.write_bytes(table, row)
     }
@@ -210,6 +314,7 @@ impl JobWriter {
             return Err(JobError::UnknownTable {
                 index: table,
                 count: self.logical_tables,
+                names: self.names.clone(),
             });
         }
         Ok(())

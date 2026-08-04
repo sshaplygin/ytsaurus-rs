@@ -78,7 +78,14 @@ fn writing_to_a_missing_table_is_an_error() {
         .expect_err("must reject");
 
     assert!(
-        matches!(err, JobError::UnknownTable { index: 5, count: 2 }),
+        matches!(
+            err,
+            JobError::UnknownTable {
+                index: 5,
+                count: 2,
+                ..
+            }
+        ),
         "got {err:?}"
     );
     writer.finish().expect("flushes");
@@ -354,4 +361,88 @@ fn finish_flushes_buffered_output() {
         String::from_utf8(buffer.contents()).expect("UTF-8"),
         "{key=a;count=1};"
     );
+}
+
+// ------------------------------------------------- named tables (#4)
+
+/// Handles read at the call site, which is the whole point: `write(rejects, …)`
+/// cannot be mistaken for `write(events, …)` the way `write(1, …)` can.
+#[test]
+fn named_tables_hand_out_one_handle_each() {
+    let buffers: Vec<SharedBuffer> = (0..2).map(|_| SharedBuffer::new()).collect();
+    let sinks: Vec<Box<dyn std::io::Write>> = buffers
+        .iter()
+        .map(|b| Box::new(b.clone()) as Box<dyn std::io::Write>)
+        .collect();
+
+    let (mut writer, [events, rejects]) =
+        JobWriter::named_writers(["events", "rejects"], sinks, YsonFormat::Text);
+
+    assert_eq!(events.index(), 0);
+    assert_eq!(rejects.index(), 1);
+
+    writer
+        .write(
+            rejects,
+            &Row {
+                key: "bad".into(),
+                count: 0,
+            },
+        )
+        .expect("writes");
+    writer.finish().expect("flushes");
+
+    assert!(
+        buffers[0].contents().is_empty(),
+        "events should be untouched"
+    );
+    assert!(
+        !buffers[1].contents().is_empty(),
+        "rejects should have the row"
+    );
+}
+
+#[test]
+fn table_names_reach_the_error_message() {
+    let buffers: Vec<SharedBuffer> = (0..2).map(|_| SharedBuffer::new()).collect();
+    let sinks: Vec<Box<dyn std::io::Write>> = buffers
+        .iter()
+        .map(|b| Box::new(b.clone()) as Box<dyn std::io::Write>)
+        .collect();
+
+    let (mut writer, _) =
+        JobWriter::named_writers::<2>(["events", "rejects"], sinks, YsonFormat::Text);
+
+    assert_eq!(writer.table_name(0usize), Some("events"));
+    assert_eq!(writer.table_name(1usize), Some("rejects"));
+    assert_eq!(writer.table_name(9usize), None);
+
+    let err = writer
+        .write(
+            9usize,
+            &Row {
+                key: "x".into(),
+                count: 0,
+            },
+        )
+        .expect_err("out of range");
+    let message = err.to_string();
+    assert!(message.contains("events, rejects"), "unhelpful: {message}");
+}
+
+/// A plain `usize` still works, so code written against 0.1 keeps compiling.
+#[test]
+fn a_bare_index_still_addresses_a_table() {
+    let (mut writer, buffers) = writer_with_tables(2, YsonFormat::Text);
+    writer
+        .write(
+            1,
+            &Row {
+                key: "a".into(),
+                count: 1,
+            },
+        )
+        .expect("writes");
+    writer.finish().expect("flushes");
+    assert!(!buffers[1].contents().is_empty());
 }

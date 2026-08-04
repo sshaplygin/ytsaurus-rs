@@ -261,7 +261,81 @@ impl<R: Read> JobReader<R> {
         Groups {
             reader: self,
             in_group: false,
+            key_columns: Vec::new(),
         }
+    }
+
+    /// Like [`JobReader::groups`], but decodes the reduce key for each group.
+    ///
+    /// Pass the same columns the operation was given as `reduce_by`. Each
+    /// [`Group`] then answers [`Group::key`] without the caller having to parse
+    /// its first row and copy the key out.
+    ///
+    /// YTsaurus does not transmit the key: `key_switch` carries no payload, and
+    /// the key lives in the rows. So this reads it from the group's first row —
+    /// the same work a job would do by hand, done once and in one place.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use ytsaurus_job::JobReader;
+    /// let mut reader = JobReader::from_stdin();
+    /// let mut groups = reader.groups_by(["user_id"]);
+    /// while let Some(mut group) = groups.next_group()? {
+    ///     let user = group.key().bytes("user_id").unwrap_or_default().to_vec();
+    ///     while let Some(row) = group.next_row()? {
+    ///         let _ = (&user, row.raw());
+    ///     }
+    /// }
+    /// # Ok::<(), ytsaurus_job::JobError>(())
+    /// ```
+    pub fn groups_by<I>(&mut self, columns: I) -> Groups<'_, R>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        Groups {
+            reader: self,
+            in_group: false,
+            key_columns: columns
+                .into_iter()
+                .map(|c| c.as_ref().as_bytes().to_vec())
+                .collect(),
+        }
+    }
+
+    /// Decodes the requested key columns out of the pending row.
+    ///
+    /// Called while a row is pending, so `pos..pos + len` is that row and the
+    /// buffer cannot move underneath it.
+    fn decode_key(&mut self, len: usize, columns: &[Vec<u8>]) -> Result<GroupKey> {
+        let start = self.pos;
+        let offset = self.base_offset + start as u64;
+        let record = &self.buf[start..start + len];
+
+        let value: YsonValue =
+            from_slice(record, self.format).map_err(|source| JobError::Yson { offset, source })?;
+
+        let YsonNode::Map(fields) = &value.node else {
+            return Err(JobError::Yson {
+                offset,
+                source: ytsaurus_yson::YsonError::Custom(
+                    "a reduce key can only be read from a row that is a map".to_owned(),
+                ),
+            });
+        };
+
+        // Missing columns are skipped rather than fatal: a reduce key column
+        // may legitimately be absent from a row, and failing the whole job over
+        // it would be a worse default than reporting the key we could read.
+        let mut decoded = Vec::with_capacity(columns.len());
+        for name in columns {
+            if let Some(v) = fields.get(name) {
+                decoded.push((name.clone(), v.clone()));
+            }
+        }
+
+        Ok(GroupKey { columns: decoded })
     }
 
     /// Advances `pos` past a record that has been handed out.
@@ -499,11 +573,69 @@ fn classify_attributed(record: &[u8], format: YsonFormat, offset: u64) -> Result
     Ok(Classified::Skip)
 }
 
-/// Iterator over reduce groups. Created by [`JobReader::groups`].
+/// The reduce key of a group, decoded from its first row.
+///
+/// Empty unless the group came from [`JobReader::groups_by`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupKey {
+    columns: Vec<(Vec<u8>, YsonValue)>,
+}
+
+impl GroupKey {
+    /// The key column `name`, if the group has one.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&YsonValue> {
+        self.columns
+            .iter()
+            .find(|(k, _)| k == name.as_bytes())
+            .map(|(_, v)| v)
+    }
+
+    /// The key column `name` as raw bytes, if it is a string.
+    ///
+    /// Reduce keys are frequently byte strings rather than text, so this does
+    /// not go through `str`.
+    #[must_use]
+    pub fn bytes(&self, name: &str) -> Option<&[u8]> {
+        match &self.get(name)?.node {
+            YsonNode::String(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// The key column `name` as UTF-8, if it is a string and valid UTF-8.
+    #[must_use]
+    pub fn str(&self, name: &str) -> Option<&str> {
+        std::str::from_utf8(self.bytes(name)?).ok()
+    }
+
+    /// The key column `name` as an integer, if it is one.
+    #[must_use]
+    pub fn i64(&self, name: &str) -> Option<i64> {
+        self.get(name)?.as_i64()
+    }
+
+    /// Every key column, in the order they were requested.
+    #[must_use]
+    pub fn columns(&self) -> &[(Vec<u8>, YsonValue)] {
+        &self.columns
+    }
+
+    /// Whether any key column was decoded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+}
+
+/// Iterator over reduce groups. Created by [`JobReader::groups`] or
+/// [`JobReader::groups_by`].
 #[derive(Debug)]
 pub struct Groups<'r, R> {
     reader: &'r mut JobReader<R>,
     in_group: bool,
+    /// Columns forming the reduce key; empty for [`JobReader::groups`].
+    key_columns: Vec<Vec<u8>>,
 }
 
 impl<R: Read> Groups<'_, R> {
@@ -547,13 +679,24 @@ impl<R: Read> Groups<'_, R> {
                 Ok(Some(Group {
                     reader: self.reader,
                     done: false,
+                    key: GroupKey::default(),
                 }))
             }
-            Some(Pending::Row { .. }) => {
+            Some(Pending::Row { len }) => {
+                // Decode the key now, while the first row is pending and the
+                // buffer is guaranteed not to move. Doing it here rather than
+                // in `Group::key` keeps that accessor a plain `&self`.
+                let key = if self.key_columns.is_empty() {
+                    GroupKey::default()
+                } else {
+                    self.reader.decode_key(len, &self.key_columns)?
+                };
+
                 self.in_group = true;
                 Ok(Some(Group {
                     reader: self.reader,
                     done: false,
+                    key,
                 }))
             }
         }
@@ -565,9 +708,19 @@ impl<R: Read> Groups<'_, R> {
 pub struct Group<'g, R> {
     reader: &'g mut JobReader<R>,
     done: bool,
+    key: GroupKey,
 }
 
 impl<R: Read> Group<'_, R> {
+    /// The group's reduce key.
+    ///
+    /// Populated only for groups from [`JobReader::groups_by`]; otherwise
+    /// [`GroupKey::is_empty`] is true.
+    #[must_use]
+    pub fn key(&self) -> &GroupKey {
+        &self.key
+    }
+
     /// Returns the next row of this group, or `None` at the group boundary.
     ///
     /// # Errors

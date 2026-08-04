@@ -555,3 +555,190 @@ fn control_records_inside_a_group_do_not_split_it() {
         vec![vec![a.clone(), a.clone()], vec![a]]
     );
 }
+
+// ------------------------------------------------------- reduce keys (#2)
+
+#[test]
+fn groups_by_decodes_the_reduce_key() {
+    let a1 = bin_row_str(b"user", b"alice");
+    let a2 = bin_row_str(b"user", b"alice");
+    let b1 = bin_row_str(b"user", b"bob");
+
+    let input = fragment(&[
+        a1.clone(),
+        a2.clone(),
+        bin_control_bool(b"key_switch", true),
+        b1.clone(),
+    ]);
+
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["user"]);
+
+    let mut seen = Vec::new();
+    while let Some(mut group) = groups.next_group().expect("reads") {
+        let key = group.key().bytes("user").expect("key present").to_vec();
+        let mut rows = 0;
+        while group.next_row().expect("reads").is_some() {
+            rows += 1;
+        }
+        seen.push((key, rows));
+    }
+
+    assert_eq!(seen, vec![(b"alice".to_vec(), 2), (b"bob".to_vec(), 1)]);
+}
+
+/// The key must survive being a byte string that is not UTF-8 — reduce keys
+/// routinely are.
+#[test]
+fn a_non_utf8_reduce_key_is_preserved() {
+    let key: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+    let input = fragment(&[bin_row_str(b"id", key)]);
+
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["id"]);
+    let group = groups.next_group().expect("reads").expect("a group");
+
+    assert_eq!(group.key().bytes("id"), Some(key));
+    assert_eq!(group.key().str("id"), None, "must not claim it is UTF-8");
+}
+
+#[test]
+fn a_multi_column_key_keeps_every_column() {
+    let mut row = vec![b'{'];
+    bin_string(b"shard", &mut row);
+    row.push(b'=');
+    bin_i64(7, &mut row);
+    row.push(b';');
+    bin_string(b"user", &mut row);
+    row.push(b'=');
+    bin_string(b"carol", &mut row);
+    row.push(b'}');
+
+    let input = fragment(&[row]);
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["shard", "user"]);
+    let group = groups.next_group().expect("reads").expect("a group");
+
+    assert_eq!(group.key().i64("shard"), Some(7));
+    assert_eq!(group.key().str("user"), Some("carol"));
+    assert_eq!(group.key().columns().len(), 2);
+}
+
+/// A key column absent from the row must not fail the job.
+#[test]
+fn a_missing_key_column_is_simply_absent() {
+    let input = fragment(&[bin_row_str(b"other", b"x")]);
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["user"]);
+    let group = groups.next_group().expect("reads").expect("a group");
+
+    assert!(group.key().is_empty());
+    assert_eq!(group.key().bytes("user"), None);
+}
+
+/// `groups()` keeps its old behaviour: no key, no cost.
+#[test]
+fn plain_groups_carry_no_key() {
+    let input = fragment(&[bin_row_str(b"user", b"alice")]);
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups();
+    let group = groups.next_group().expect("reads").expect("a group");
+    assert!(group.key().is_empty());
+}
+
+/// Reading the key must not consume the row it was read from.
+#[test]
+fn reading_the_key_leaves_every_row_available() {
+    let row = bin_row_str(b"user", b"alice");
+    let input = fragment(&[row.clone(), row.clone(), row.clone()]);
+
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["user"]);
+    let mut group = groups.next_group().expect("reads").expect("a group");
+
+    assert_eq!(group.key().str("user"), Some("alice"));
+
+    let mut rows = 0;
+    while group.next_row().expect("reads").is_some() {
+        rows += 1;
+    }
+    assert_eq!(rows, 3, "the row the key came from must still be delivered");
+}
+
+#[test]
+fn keys_survive_being_split_across_reads() {
+    let a = bin_row_str(b"user", b"aaaaaaaaaaaaaaaa");
+    let b = bin_row_str(b"user", b"bbbbbbbbbbbbbbbb");
+    let input = fragment(&[a, bin_control_bool(b"key_switch", true), b]);
+
+    for chunk in [1usize, 3, 17] {
+        let mut reader =
+            JobReader::binary(ChunkedReader::new(input.clone(), chunk)).with_buffer_size(16);
+        let mut groups = reader.groups_by(["user"]);
+        let mut keys = Vec::new();
+        while let Some(mut group) = groups.next_group().expect("reads") {
+            keys.push(group.key().bytes("user").expect("key").to_vec());
+            while group.next_row().expect("reads").is_some() {}
+        }
+        assert_eq!(
+            keys,
+            vec![b"aaaaaaaaaaaaaaaa".to_vec(), b"bbbbbbbbbbbbbbbb".to_vec()],
+            "chunk {chunk}"
+        );
+    }
+}
+
+// --------------------------------------------- error classification (#1)
+
+/// A job that quarantines bad rows needs a cheap, stable reason and a way to
+/// tell "this row is bad" from "the stream is bad".
+#[test]
+fn errors_classify_themselves_without_formatting() {
+    // A row that is not valid YSON: bad row, keep going.
+    let input = fragment(&[bin_row_str(b"a", b"1")]);
+    let mut reader = JobReader::binary(input.as_slice());
+    let Some(Event::Row(row)) = reader.next_event().expect("reads") else {
+        panic!("expected a row");
+    };
+
+    #[derive(serde::Deserialize, Debug)]
+    struct Mismatch {
+        #[allow(dead_code)]
+        missing_column: i64,
+    }
+    let err = row.parse::<Mismatch>().expect_err("must not parse");
+    assert_eq!(err.kind(), "invalid_yson");
+    assert!(err.is_row_local(), "a bad row must not stop the job");
+
+    // A truncated stream: not row-local, the job must stop.
+    let full = fragment(&[bin_row_str(b"key", b"value")]);
+    let mut reader = JobReader::binary(&full[..full.len() - 4]);
+    let err = loop {
+        match reader.next_event() {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("expected an error"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.kind(), "truncated_record");
+    assert!(
+        !err.is_row_local(),
+        "a truncated stream means every later row is suspect"
+    );
+}
+
+/// `kind()` must not allocate or change shape — it goes in an output column.
+#[test]
+fn error_kinds_are_stable_identifiers() {
+    let err = JobError::RecordTooLarge {
+        offset: 0,
+        limit: 1,
+    };
+    assert_eq!(err.kind(), "record_too_large");
+    assert!(
+        err.kind()
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_'),
+        "a kind is written into a table; keep it a plain identifier"
+    );
+}
