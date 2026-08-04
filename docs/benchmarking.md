@@ -54,11 +54,70 @@ Any real job does work per row, and the parse share falls in proportion. So the
 threshold question **cannot be answered without a real workload**, which is
 exactly why this is a joint decision rather than a benchmark result.
 
+The pilot on a cluster (§3) is the other end of that range: a job that does
+something with its rows spends **~10 %** on decoding, not 66 %. The true answer
+for any given workload sits between the two, and closer to the pilot's end for
+anything that does real work per row.
+
 Two findings are actionable regardless of how Skiff goes:
 
 - Borrowed decoding is **15 % faster** than owned, for a one-line change in the
   row struct. [The guide](writing-a-job.md) leads with it.
 - `YsonValue` costs **1.8×** what a typed struct costs. Avoid it on hot paths.
+
+### 3. The pilot, on a cluster
+
+The two benchmarks above measure a job that does nothing but decode, which is
+the worst case for YSON and not a workload. This one asks the same question of
+the **pilot** — access-log sessionization, wide mixed-type rows, two output
+tables — with the cluster doing the timing:
+
+```sh
+export YT_PROXY=http://localhost:8000
+scripts/build-worker.sh sessionize
+cargo run --release -p ytsaurus-client --example profile
+```
+
+The method is subtraction. The same mapper runs three times over one table,
+stopped at three depths — `map-frames` finds record boundaries and decodes
+nothing, `map-parse` decodes each row into the mapper's own struct, `map` is the
+pilot — and the scheduler's `time/exec` for each is what it cost. One job per
+operation, three rounds per mode, fastest round counted.
+
+48 MiB of generated events, 245 521 rows, on the local Docker cluster:
+
+| | | |
+| --- | ---: | ---: |
+| being handed the rows | 2225 ms | 45.8 % |
+| **decoding them** | **514 ms** | **10.6 %** |
+| validating and writing | 2120 ms | 43.6 % |
+| the pilot's map | 4859 ms | 100 % |
+
+At 16 MiB the decode share was 6.6 %; the rise with size is process startup
+being amortised, since that sits in the first bucket.
+
+**Decoding is not what this job spends its time on.** ~10 %, against ~46 % to
+be handed the rows and ~44 % to validate and write them — the last of which is
+mostly *output* encoding, since the validation is a handful of comparisons. On
+these numbers the Skiff question loses urgency, and if anything the write path
+is the more interesting place to look.
+
+Three reasons this is a reading and not a verdict:
+
+- **`time/exec` is wall time, not CPU.** It includes process start and the pipe.
+- **The cluster runs under emulation** here — x86-64 on arm64 — so absolute
+  numbers mean nothing and even ratios are only indicative.
+- **The noise is larger than the quantity.** Rounds of the same mode ranged 2225
+  to 3509 ms; the decode bucket is 514 ms. Taking the fastest round of three
+  helps, since a slow round is interference and a fast one cannot be, but a
+  514 ms difference read off numbers that scatter by a second is a direction,
+  not a measurement. Two single-round runs of the identical 16 MiB job, minutes
+  apart, reported 1776 ms and 897 ms — the same work, twice the time. Anything
+  read off one round is worthless, and three is the least that is not.
+
+What it does establish is a bound: decoding is not 30 % of this job, and it is
+not close. It would take a very different workload — or a very much faster
+cluster making the fixed costs smaller — to change that.
 
 ## What has *not* been measured
 
@@ -110,7 +169,8 @@ Implement `ytsaurus-skiff` if **both** hold:
 
 1. **Parsing is the bottleneck.** `parse_borrowed - pass_through`, or the
    equivalent measured on the cluster, exceeds ~30 % of job CPU. Below that,
-   Skiff optimises something that is not the problem.
+   Skiff optimises something that is not the problem. *The one workload measured
+   this way so far — the pilot, §3 — came out at ~10 %.*
 2. **The Rust job is not already fast enough.** If it already beats the C++
    baseline on CPU per byte, the remaining headroom is unlikely to justify a
    second wire format, its schema negotiation, and the ongoing compatibility

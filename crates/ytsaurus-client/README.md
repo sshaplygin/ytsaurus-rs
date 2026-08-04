@@ -51,7 +51,7 @@ cargo run -p ytsaurus-client --example launch
 | Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation` |
-| Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum` |
+| Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum`, `job_statistics`, `job_statistic_sum` |
 | Transactions | `start_transaction`, `with_transaction`, `Transaction::{commit, abort, ping}` |
 
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /

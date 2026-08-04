@@ -62,6 +62,7 @@ cargo run -p ytsaurus-client --example schema       # a derived schema the clust
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
+cargo run --release -p ytsaurus-client --example profile     # what the pilot spends on decoding
 
 # One binary that is both launcher and job. On macOS the launcher cannot be the
 # uploaded file, so point it at the musl build of the same source.
@@ -264,6 +265,26 @@ event rather than two. And the last section holds a transaction three timeouts
 past its expiry: without the ping thread the cluster would have aborted it four
 seconds earlier, so it is the one check that fails if the keep-alive stops
 working.
+
+`profile`, same cluster — the pilot's mapper run three times over one 48 MiB
+table, stopped at three depths, timed by the scheduler:
+
+```text
+== What each phase cost
+   being handed the rows        2225 ms    45.8%
+   decoding them                 514 ms    10.6%
+   validating and writing       2120 ms    43.6%
+   ————————————————————————————————————————
+   the pilot's map              4859 ms   100.0%
+```
+
+Decoding is ~10 % of a job that does something with its rows, against 66 % for
+the microbenchmark's job that does nothing with them. That is the answer the
+backlog wanted from this: the Skiff question loses urgency.
+[`docs/benchmarking.md`](../../docs/benchmarking.md) records it with the three
+reasons it is a reading rather than a verdict — chief among them that rounds of
+the same mode scattered by a second, which is more than the quantity being
+measured.
 
 `streaming`, same cluster — the same 64 MiB table written from a generator and
 then read back both ways, with peak RSS watched throughout:

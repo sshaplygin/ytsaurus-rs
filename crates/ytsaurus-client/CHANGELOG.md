@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Reading what the scheduler recorded
+
+- **Added** `Client::job_statistics` and `Client::job_statistic_sum`, the
+  built-in counterpart to `custom_statistics` / `statistic_sum`.
+
+The two trees are stored differently, which is why they are read differently: a
+custom name keeps its slash as **one key**, while a built-in statistic **nests**
+by path component. The separator differs too — `$$` rather than `$` — and both
+are now accepted, since that is not something a caller should have to know.
+
+```text
+custom:    {"rows/rejected" = {"$"  = {completed = {map = {sum=3}}}}}
+built-in:  {time = {exec    = {"$$" = {completed = {map = {sum=744}}}}}}
+```
+
+**A local cluster reports nothing under `user_job/cpu`**, so the CPU comparison
+[`docs/benchmarking.md`](../../docs/benchmarking.md) describes cannot be run
+here at all. `time/exec` is what it does report, and that is what the new
+`profile` example measures with.
+
 ### Pointing it at a real installation
 
 - **Changed** `Client::from_env` to find a token the way the `yt` CLI does:

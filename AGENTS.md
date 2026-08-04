@@ -153,6 +153,13 @@ aborted job's work is redone by its replacement, so counting it would double.
 serving as both launcher and job, fd 5 in the launcher is as likely to be an
 open socket to the cluster as to be nothing.
 
+**Built-in statistics are stored differently from custom ones**, so
+`Client::job_statistic_sum` exists beside `statistic_sum`: a built-in name
+**nests** by path component (`time` → `exec`) where a custom one keeps its slash
+as one key, and the state separator is **`$$`** rather than `$`. A local cluster
+reports **nothing under `user_job/cpu`**, so job-CPU comparisons cannot be run
+here; `time/exec` is what it does report.
+
 ### Table schemas
 
 A schema is a YSON **list** of column dicts with `strict` and `unique_keys` as

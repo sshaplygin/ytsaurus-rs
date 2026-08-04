@@ -1435,6 +1435,24 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn custom_statistics(&self, operation_id: &str) -> Result<YsonValue> {
+        let all = self.job_statistics(operation_id)?;
+        Ok(jobs::field(&all, "custom").cloned().unwrap_or(YsonValue {
+            attributes: None,
+            node: YsonNode::Map(std::collections::BTreeMap::new()),
+        }))
+    }
+
+    /// Everything the scheduler recorded about an operation's jobs.
+    ///
+    /// The whole `job_statistics` tree, custom and built-in alike.
+    /// [`Client::job_statistic_sum`] is the way to read one number out of it;
+    /// this is for looking around, which is how anyone finds out what a cluster
+    /// actually reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn job_statistics(&self, operation_id: &str) -> Result<YsonValue> {
         let params = yson_build::map([
             ("operation_id", yson_build::string(operation_id)),
             (
@@ -1451,15 +1469,50 @@ impl Client {
         )?;
 
         let envelope = self.strip_envelope(&body, "get_operation")?;
-        let custom = jobs::field(&envelope, "progress")
+        let statistics = jobs::field(&envelope, "progress")
             .and_then(|p| jobs::field(p, "job_statistics"))
-            .and_then(|s| jobs::field(s, "custom"))
             .cloned();
 
-        Ok(custom.unwrap_or(YsonValue {
+        Ok(statistics.unwrap_or(YsonValue {
             attributes: None,
             node: YsonNode::Map(std::collections::BTreeMap::new()),
         }))
+    }
+
+    /// The total of one **built-in** job statistic, e.g. `time/exec`.
+    ///
+    /// The cluster's own statistics **nest** by path component, where a custom
+    /// name keeps its slash as one key — the two are stored differently, which
+    /// is why they are read differently:
+    ///
+    /// ```text
+    /// custom:    {"rows/rejected" = {"$"  = {completed = {map = {sum=3}}}}}
+    /// built-in:  {time = {exec    = {"$$" = {completed = {map = {sum=744}}}}}}
+    /// ```
+    ///
+    /// Note the separator differs too — `$$` rather than `$`. Both are
+    /// accepted here, because that difference is not something a caller should
+    /// have to know.
+    ///
+    /// Totalled over `completed` jobs across job types, as
+    /// [`Client::statistic_sum`] does, and `None` when the cluster reports
+    /// nothing under that path — which is not the same as zero. A local cluster
+    /// reports nothing under `user_job/cpu`, for instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn job_statistic_sum(&self, operation_id: &str, path: &str) -> Result<Option<i64>> {
+        let statistics = self.job_statistics(operation_id)?;
+
+        let mut node = &statistics;
+        for component in path.split('/') {
+            match jobs::field(node, component) {
+                Some(next) => node = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(completed_total(node))
     }
 
     /// The total of one custom statistic over an operation's completed jobs.
@@ -1790,7 +1843,10 @@ fn child_names(value: &YsonValue, path: &str) -> Result<Vec<String>> {
 /// A flatter shape is accepted too, so a cluster that reports a bare aggregate
 /// still yields a number rather than nothing.
 fn completed_total(statistic: &YsonValue) -> Option<i64> {
-    let Some(by_state) = jobs::field(statistic, "$") else {
+    // `$` under a custom statistic, `$$` under a built-in one. The cluster
+    // spells the same idea two ways depending on which tree you are in.
+    let by_state = jobs::field(statistic, "$").or_else(|| jobs::field(statistic, "$$"));
+    let Some(by_state) = by_state else {
         return jobs::field(statistic, "sum").and_then(YsonValue::as_i64);
     };
 
