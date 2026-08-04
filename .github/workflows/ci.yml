@@ -15,7 +15,7 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rust-toolchain.toml pins the channel, components and targets.
       - name: Install toolchain
@@ -33,7 +33,7 @@ jobs:
         run: cargo test --workspace --all-targets
 
       # `--all-targets` skips doctests, and the mapper example in the
-      # ytsaurus-job docs must keep compiling (phase 2 DoD).
+      # the mapper example in the ytsaurus-job docs must keep compiling.
       - name: cargo test --doc
         run: cargo test --workspace --doc
 
@@ -41,7 +41,7 @@ jobs:
     name: static musl worker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
