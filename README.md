@@ -96,8 +96,11 @@ not JSON, `map-reduce` needs `--map-local-file`/`--reduce-local-file`, a column
 value may not carry attributes, and YTsaurus emits `<table_index=0;>#` with a
 trailing semicolon inside the attribute block.
 
-Other verified numbers: 2 GB of input streams through the reader at **1.9 MiB peak
-RSS**; fuzzing ran 6.5 M iterations across both YSON formats without a crash.
+Other verified numbers: streaming 2 GB through the reader **does not raise peak
+RSS at all** — 46.6 MiB before and after on Linux CI, 1.9 → 2.0 MiB on macOS
+(the absolute figure is the test binary's own footprint, which differs by
+platform; the invariant is that it does not grow). Fuzzing ran 6.5 M iterations
+across both YSON formats without a crash.
 
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).

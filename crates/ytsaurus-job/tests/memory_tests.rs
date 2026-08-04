@@ -20,6 +20,13 @@ const TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// is accumulating.
 const RSS_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How much the process may grow while consuming the whole 2 GB.
+///
+/// The reader's own steady state is a single 1 MiB buffer, so anything beyond a
+/// few multiples of that means it is holding on to input. This catches a leak
+/// that [`RSS_LIMIT_BYTES`] alone would not.
+const RSS_GROWTH_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Generates a list fragment of `{key=...;value=...}` rows without ever holding
 /// more than one row in memory.
 struct SyntheticInput {
@@ -188,15 +195,30 @@ fn two_gigabytes_of_input_stay_within_the_memory_budget() {
 
     match (before, after) {
         (Some(before), Some(after)) => {
+            let growth = after.saturating_sub(before);
             println!(
-                "peak RSS: {:.1} MiB -> {:.1} MiB",
+                "peak RSS: {:.1} MiB -> {:.1} MiB (grew {:.1} MiB)",
                 before as f64 / 1048576.0,
-                after as f64 / 1048576.0
+                after as f64 / 1048576.0,
+                growth as f64 / 1048576.0,
             );
+
+            // The absolute figure is dominated by the test binary's own
+            // footprint and differs by platform — ~47 MiB on Linux, ~2 MiB on
+            // macOS — so the budget alone is a loose check.
             assert!(
                 after < RSS_LIMIT_BYTES,
                 "peak RSS {after} bytes exceeded the {RSS_LIMIT_BYTES} byte budget; \
                  the reader is accumulating input instead of streaming it"
+            );
+
+            // The real invariant: consuming 2 GB must not grow the process.
+            // This is far sharper than the budget above, which a 100 MB leak
+            // would slip past unnoticed.
+            assert!(
+                growth < RSS_GROWTH_LIMIT_BYTES,
+                "peak RSS grew by {growth} bytes while streaming {TOTAL_BYTES} bytes; \
+                 the reader should hold a bounded buffer regardless of input size"
             );
         }
         _ => println!("peak RSS unavailable on this platform; skipped the memory assertion"),

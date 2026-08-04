@@ -153,7 +153,8 @@ without it.
   the read buffer, so the borrow must end before the next call. This is what makes
   zero-copy decoding safe, and the compiler enforces it.
 - The reader holds **one buffer** (1 MiB default), compacts it, and grows it only
-  when a single record does not fit. 2 GB of input runs at 1.9 MiB peak RSS.
+  when a single record does not fit. Streaming 2 GB does not raise peak RSS:
+  46.6 MiB before and after on Linux CI, 1.9 -> 2.0 MiB on macOS.
 - **Unknown control records are skipped, not surfaced as rows.** A control record
   is an attributed entity, and YTsaurus may add attributes this version has never
   seen. Handing one to the job as a row would silently corrupt the output table.
@@ -225,29 +226,50 @@ codec.
 
 Verified: identity map reproduces 309 688 bytes byte-for-byte; table switching
 across two input and two output tables; wordcount map-reduce matching a
-hand-computed result; 2 GB streamed at 1.9 MiB peak RSS; 6.5 M fuzz iterations
-without a crash.
+hand-computed result; 2 GB streamed with no growth in peak RSS; 6.5 M fuzz
+iterations without a crash.
 
-### Open, needing a human
+### Shipped
 
-1. **API review of `ytsaurus-job`** — the design decisions above are the ones
-   worth arguing with.
-2. **Skiff go/no-go.** Job-path benchmarks exist
-   ([`docs/benchmarking.md`](docs/benchmarking.md)); the decision needs a real
-   workload on a real cluster. Decoding is 66 % of job CPU for a job that does
-   nothing else, which is the worst case for YSON, not a verdict.
-3. **Create the GitHub repository** and decide visibility. Nothing has been
-   pushed; nothing is published to crates.io.
-4. **Contact the upstream yson-rs author.** The fork, and the three bugs fixed
-   in it, have not been reported to `ss123she`. See the Fork status section.
+- **GitHub**: [sshaplygin/ytsaurus-rs](https://github.com/sshaplygin/ytsaurus-rs),
+  public, CI green, tagged `v0.1.0` with a release.
+- **crates.io**: [`ytsaurus-yson` 0.1.0](https://crates.io/crates/ytsaurus-yson)
+  and [`ytsaurus-job` 0.1.0](https://crates.io/crates/ytsaurus-job); docs.rs
+  built both.
+- **Upstream courtesy**: the fork and the three fixed defects are filed as
+  [ss123she/yson-rs#1](https://github.com/ss123she/yson-rs/issues/1). The fork
+  is licence-compliant on its own, so nothing waits on a reply.
 
-### Deferred by decision — do not start without a go-ahead
+### Roadmap
 
-- **`ytsaurus-client`**, a thin launcher: HTTP API v4, `write_file` →
-  `start_operation` → poll `get_operation`, token from `YT_TOKEN`.
+**1. Pilot worker on the local cluster.** Port one representative,
+production-shaped task to `ytsaurus-job`: wide rows with mixed types and byte
+columns, several output tables, a reduce with realistic keys, malformed-input
+handling. Run it end to end on the Docker local cluster. Keep a friction log —
+every place the API forces a workaround becomes an issue. *DoD: pilot runs e2e
+locally; friction filed as issues.*
+
+**2. API stabilization from pilot feedback.** Apply the accepted changes, update
+[`docs/writing-a-job.md`](docs/writing-a-job.md), record everything in the
+CHANGELOGs, bump to 0.2.0. *DoD: pilot issues closed or explicitly rejected; the
+guide reflects the final API.*
+
+**3. `ytsaurus-client`, a thin launcher.** HTTP API v4: `write_file` (upload the
+worker with the `executable` attribute) → `start_operation` (map / map_reduce
+specs) → poll `get_operation`; token from `YT_TOKEN`. Testable against the Docker
+local cluster on `localhost:8000` — no real cluster needed. *DoD: an operation
+launched end to end with no Python on the machine.*
+
+### Parked — needs a human and a real cluster
+
+- **Skiff go/no-go.** Job-path benchmarks exist
+  ([`docs/benchmarking.md`](docs/benchmarking.md)) but the decision needs a
+  ≥ 10 GB table and C++/Python baselines. Decoding is 66 % of job CPU for a job
+  that does nothing else, which is the worst case for YSON, not a verdict.
 - **Upstreaming** to
   [ytsaurus/ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk) —
-  the maintainers' stance in ytsaurus#6 is "PRs welcome".
+  the maintainers' stance in ytsaurus#6 is "PRs welcome". **Do not start without
+  a go-ahead.**
 - **Contacting the yson-rs author** about co-ownership or publishing.
 - **`ytsaurus-skiff`**, only if the benchmarks justify it — see
   [`docs/benchmarking.md`](docs/benchmarking.md). Reference implementation: the
