@@ -163,6 +163,54 @@ mod unit_tests {
         assert!(matches!(back.node, YsonNode::Map(_)), "{back:?}");
     }
 
+    /// The serializer used to emit structural garbage for three struct shapes
+    /// instead of either valid YSON or an error: an `@`-field declared after a
+    /// plain field produced `{a=1<x=2>}`, an empty struct produced zero bytes,
+    /// and an all-attribute struct produced `<x=1>` with no value node. The
+    /// first is now an error (YSON attributes stand strictly before their
+    /// value); the other two produce `{}` and `<…>#`.
+    #[test]
+    fn struct_shapes_serialize_to_valid_yson_or_error() {
+        use ytsaurus_yson::{YsonFormat, YsonValue, to_vec};
+
+        #[derive(Serialize)]
+        struct AttrAfterValue {
+            a: i64,
+            #[serde(rename = "@x")]
+            x: i64,
+        }
+        let err = to_vec(&AttrAfterValue { a: 1, x: 2 }, YsonFormat::Text)
+            .expect_err("an attribute after a value field cannot serialize");
+        assert!(err.to_string().contains("@x"), "{err}");
+
+        #[derive(Serialize)]
+        struct ValueBesidePlain {
+            a: i64,
+            #[serde(rename = "$value")]
+            v: i64,
+        }
+        let err = to_vec(&ValueBesidePlain { a: 1, v: 2 }, YsonFormat::Text)
+            .expect_err("$value beside a plain field cannot serialize");
+        assert!(err.to_string().contains("$value"), "{err}");
+
+        #[derive(Serialize)]
+        struct Empty {}
+        let bytes = to_vec(&Empty {}, YsonFormat::Text).expect("an empty struct serializes");
+        assert_eq!(bytes, b"{}");
+        let _: YsonValue = from_slice(&bytes, YsonFormat::Text).expect("and parses back");
+
+        #[derive(Serialize)]
+        struct OnlyAttributes {
+            #[serde(rename = "@x")]
+            x: i64,
+        }
+        let bytes =
+            to_vec(&OnlyAttributes { x: 1 }, YsonFormat::Text).expect("attributes serialize");
+        assert_eq!(bytes, b"<x=1>#");
+        let back: YsonValue = from_slice(&bytes, YsonFormat::Text).expect("and parse back");
+        assert_eq!(back.attr("x").and_then(|a| a.as_i64()), Some(1));
+    }
+
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     #[serde(untagged)]
     enum Untagged {

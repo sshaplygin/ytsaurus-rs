@@ -36,6 +36,16 @@ fork modifications below are unchanged and still apply.
 
 ### Fixed
 
+- **Three struct shapes serialized to unparseable output instead of valid
+  YSON or an error.** A struct field renamed to `@x` *after* a plain field
+  pushed its `<` inside the already-open map body — `{a=1<x=2>}`, which this
+  crate's own parser rejects; it is now a serialization error, since YSON
+  attributes stand strictly before the value they decorate (`$value` beside
+  plain fields errors for the same reason: one value cannot have two bodies).
+  An empty struct serialized to **zero bytes** and an all-attribute struct to
+  `<x=1>` with no value node — neither is a YSON value; they now produce `{}`
+  and `<x=1>#`. Regression test: `struct_shapes_serialize_to_valid_yson_or_error`.
+
 - **Decoding an attributed map into `YsonValue` silently dropped the map.**
   An attributed value reaches the visitor flattened — `@`-keys for the
   attributes, and the body either as a `"$value"` entry (scalars) or as the
