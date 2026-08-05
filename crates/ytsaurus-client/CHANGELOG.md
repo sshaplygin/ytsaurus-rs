@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### A connection cut mid-body retries like one cut mid-request
+
+- **Fixed** a network failure while reading a response body being wrapped as
+  `Decode`, which the retry policy never repeats — so a `Repeatable::Freely`
+  read whose body was cut off failed permanently, while the identical reset
+  one packet earlier (before the headers) retried as `Transport`. Both are now
+  `Transport`.
+
 ### Builder order stopped mattering in `MapReduceSpec`
 
 - **Fixed** `with_local_file`, `with_local_file_named` and `with_memory_limit`

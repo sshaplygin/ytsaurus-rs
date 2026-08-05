@@ -273,9 +273,13 @@ impl Transport {
             // conservative enough to truncate a modest table silently.
             .limit(512 * 1024 * 1024)
             .read_to_vec()
-            .map_err(|e| ClientError::Decode {
+            // A `Transport` error, not `Decode`: a connection cut while the
+            // body streams in is the same network failure as one cut a packet
+            // earlier, and `Decode` is the one thing the retry policy never
+            // repeats.
+            .map_err(|e| ClientError::Transport {
                 command: command.to_owned(),
-                reason: format!("could not read the response body: {e}"),
+                source: Box::new(e),
             })?;
 
         if !(200..300).contains(&status) {
@@ -393,9 +397,11 @@ impl Transport {
             let body = response
                 .body_mut()
                 .read_to_string()
-                .map_err(|e| ClientError::Decode {
+                // As in `send`: a body cut off by the network must stay
+                // retriable, and `Decode` is not.
+                .map_err(|e| ClientError::Transport {
                     command: what.to_owned(),
-                    reason: format!("could not read the response body: {e}"),
+                    source: Box::new(e),
                 })?;
 
             if !(200..300).contains(&status) {
