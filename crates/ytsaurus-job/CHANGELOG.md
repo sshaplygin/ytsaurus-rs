@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### A late row is refused, not lost
+
+- **Fixed** `JobWriter` accepting rows after `finish()`. Such a row went into
+  the buffer, `Drop` saw a finished writer and flushed nothing, and the job
+  exited zero with a short table — the exact outcome `finish` exists to rule
+  out. Writing after `finish` now fails with the new
+  `JobError::WriteAfterFinish`. **Breaking** for anyone matching `JobError`
+  exhaustively; add `..` or a `_` arm.
+
 ### Row numbering matches the cluster's
 
 - **Fixed** `Row::row_index` standing still between control records. YTsaurus

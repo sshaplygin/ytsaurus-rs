@@ -129,6 +129,21 @@ pub enum JobError {
         /// What went wrong.
         reason: String,
     },
+
+    /// A row was written after [`crate::JobWriter::finish`].
+    ///
+    /// `finish` is the writer's end: a row accepted after it would sit in the
+    /// buffer and vanish when the job exits — a short table under exit code
+    /// zero, the exact outcome `finish` exists to rule out. Refusing the row
+    /// makes the bug the caller's to see instead of the table's to carry.
+    #[error(
+        "row for output table {table} written after finish(); \
+         finish() must be the last thing a job does with its writer"
+    )]
+    WriteAfterFinish {
+        /// Index of the output table the late row was meant for.
+        table: usize,
+    },
 }
 
 impl JobError {
@@ -159,6 +174,7 @@ impl JobError {
             JobError::Serialize { .. } => "serialize_failed",
             JobError::TooManyStatistics { .. } => "too_many_statistics",
             JobError::Statistics { .. } => "statistics_failed",
+            JobError::WriteAfterFinish { .. } => "write_after_finish",
         }
     }
 
@@ -193,7 +209,10 @@ impl JobError {
             // statistics than it may have, the other that reporting them
             // failed. Quarantining a row would not help either.
             | JobError::TooManyStatistics { .. }
-            | JobError::Statistics { .. } => false,
+            | JobError::Statistics { .. }
+            // A program-order bug, not a data problem: every later row
+            // would be refused the same way.
+            | JobError::WriteAfterFinish { .. } => false,
         }
     }
 }
