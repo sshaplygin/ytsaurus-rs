@@ -1302,15 +1302,17 @@ impl Client {
         rows: &[u8],
         format: &SkiffFormat,
     ) -> Result<()> {
+        // The path first: it is what rejects a format that is not single-table
+        // direct I/O. Checking the stream first would answer a multi-table
+        // format with a decode error about a tag mismatch, which describes a
+        // consequence rather than the mistake.
+        let path_value = skiff_table_path(path, format)?;
         check_complete_skiff_stream(rows, format).map_err(|reason| ClientError::Decode {
             command: "write_table".to_owned(),
             reason: format!("{}: {reason}", path.as_str()),
         })?;
 
-        let params = yson_build::map([
-            ("path", skiff_table_path(path, format)?),
-            ("input_format", format.to_yson()),
-        ]);
+        let params = yson_build::map([("path", path_value), ("input_format", format.to_yson())]);
         self.transport.call(
             Method::Put,
             "write_table",

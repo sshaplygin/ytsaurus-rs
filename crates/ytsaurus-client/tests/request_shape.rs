@@ -10,7 +10,10 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
-use ytsaurus_client::{Client, RetryPolicy, TablePath};
+use ytsaurus_client::{
+    Client, ClientError, DataFormat, RetryPolicy, SkiffFormat, SkiffSchema, SkiffSchemaRef,
+    SkiffWireType, TablePath,
+};
 
 /// Serves exactly one request and returns its headers as text.
 ///
@@ -338,5 +341,43 @@ fn an_unauthenticated_client_sends_no_authorization_at_all() {
     assert!(
         !head.to_lowercase().contains("authorization:"),
         "an unauthenticated client sent an authorization header:\n{head}"
+    );
+}
+
+/// A refusal that has to happen before the socket does.
+#[test]
+fn a_multi_table_skiff_write_is_refused_before_anything_is_sent() {
+    // Nothing listens on this port, so reaching the transport at all would be
+    // a connection error. A Config error is therefore proof that the format
+    // was checked first, and that the caller is told what is actually wrong
+    // with the request rather than what the stream looked like to a decoder
+    // holding the wrong schema.
+    let client = Client::new("http://127.0.0.1:1").with_retries(RetryPolicy::none());
+    let two_tables = SkiffFormat::new(vec![
+        SkiffSchemaRef::Inline(SkiffSchema::tuple([SkiffSchema::named(
+            "a",
+            SkiffWireType::Uint64,
+        )])),
+        SkiffSchemaRef::Inline(SkiffSchema::tuple([SkiffSchema::named(
+            "b",
+            SkiffWireType::Uint64,
+        )])),
+    ])
+    .expect("two named tuples are a valid format");
+
+    let error = client
+        .write_table_with_format(
+            // Truncated on purpose: with the checks the other way round this
+            // is the byte that produces the misleading answer.
+            TablePath::from("//tmp/out"),
+            b"\x00",
+            &DataFormat::skiff(two_tables),
+        )
+        .expect_err("direct table I/O takes exactly one table schema");
+
+    assert!(matches!(error, ClientError::Config(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("exactly one table schema"),
+        "{error}"
     );
 }
