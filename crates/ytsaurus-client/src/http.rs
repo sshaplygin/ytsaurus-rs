@@ -101,6 +101,9 @@ pub(crate) struct Transport {
     base: String,
     token: Option<String>,
     retries: RetryPolicy,
+    /// End-to-end limit for buffered commands; per-phase limit for streaming
+    /// ones — see [`Transport::dispatch`].
+    timeout: Duration,
     /// Stamped onto every command, when the client is bound to a transaction.
     transaction: Option<String>,
 }
@@ -125,15 +128,6 @@ impl Transport {
             format!("https://{}", proxy.trim_end_matches('/'))
         };
 
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            // Keep non-2xx as ordinary responses so the X-YT-Error header can
-            // be read off them; ureq would otherwise collapse them to a status
-            // code and discard the cluster's explanation.
-            .http_status_as_error(false)
-            .build()
-            .into();
-
         // Quiet inside a job, where stderr is the cluster's diagnostic channel
         // and not a terminal. See `retry::report_by_default`.
         let retries = if crate::retry::report_by_default() {
@@ -143,16 +137,22 @@ impl Transport {
         };
 
         Self {
-            agent,
+            agent: build_agent(timeout),
             base,
             token,
             retries,
+            timeout,
             transaction: None,
         }
     }
 
     pub(crate) fn set_retries(&mut self, policy: RetryPolicy) {
         self.retries = policy;
+    }
+
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+        self.agent = build_agent(timeout);
     }
 
     pub(crate) fn set_transaction(&mut self, id: Option<String>) {
@@ -262,7 +262,7 @@ impl Transport {
             Payload::None => &[],
             Payload::Bytes(bytes) => bytes,
         };
-        let mut response = self.dispatch(method, command, parameters, bytes.as_body())?;
+        let mut response = self.dispatch(method, command, parameters, bytes.as_body(), false)?;
 
         let status = response.status().as_u16();
         let body = response
@@ -305,7 +305,7 @@ impl Transport {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
-        let response = self.dispatch(method, command, parameters, SendBody::none())?;
+        let response = self.dispatch(method, command, parameters, SendBody::none(), true)?;
         let status = response.status().as_u16();
 
         if !(200..300).contains(&status) {
@@ -336,8 +336,13 @@ impl Transport {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
-        let mut response =
-            self.dispatch(method, command, parameters, SendBody::from_reader(rows))?;
+        let mut response = self.dispatch(
+            method,
+            command,
+            parameters,
+            SendBody::from_reader(rows),
+            true,
+        )?;
         let status = response.status().as_u16();
 
         // Read whichever way it went. A body left unread keeps the connection
@@ -409,12 +414,21 @@ impl Transport {
     ///
     /// Everything past this point differs only in how the response body is
     /// consumed.
+    ///
+    /// `streaming` lifts the agent's end-to-end timeout for this request: a
+    /// table moves through [`Transport::open`] and [`Transport::upload`] for as
+    /// long as it takes, and a deadline sized for control commands would cut
+    /// the transfer off mid-table. The waits that precede the data — resolve,
+    /// connect, sending the request, the response headers — each stay bounded
+    /// by the same timeout, so a dead proxy still fails promptly; only the
+    /// body itself is open-ended.
     fn dispatch(
         &self,
         method: Method,
         command: &str,
         parameters: &YsonValue,
         body: SendBody<'_>,
+        streaming: bool,
     ) -> Result<ureq::http::Response<ureq::Body>> {
         if let Some(error) = tls_unavailable(&self.base) {
             return Err(error);
@@ -440,9 +454,15 @@ impl Transport {
         let sent = match method {
             // A GET carries no body in `ureq`'s type system, which is also true
             // of every command this client sends as one.
-            Method::Get => with_headers!(self.agent.get(&url), &headers).call(),
-            Method::Post => with_headers!(self.agent.post(&url), &headers).send(body),
-            Method::Put => with_headers!(self.agent.put(&url), &headers).send(body),
+            Method::Get => {
+                with_headers!(self.scoped(self.agent.get(&url), streaming), &headers).call()
+            }
+            Method::Post => {
+                with_headers!(self.scoped(self.agent.post(&url), streaming), &headers).send(body)
+            }
+            Method::Put => {
+                with_headers!(self.scoped(self.agent.put(&url), streaming), &headers).send(body)
+            }
         };
 
         let response = sent.map_err(|e| ClientError::Transport {
@@ -461,6 +481,42 @@ impl Transport {
 
         Ok(response)
     }
+
+    /// Applies the streaming timeout override to one request.
+    ///
+    /// The end-to-end deadline comes off; every phase before the data — DNS,
+    /// connect, sending the request, waiting for the response headers — keeps
+    /// the same bound individually. See [`Transport::dispatch`].
+    fn scoped<Any>(
+        &self,
+        request: ureq::RequestBuilder<Any>,
+        streaming: bool,
+    ) -> ureq::RequestBuilder<Any> {
+        if !streaming {
+            return request;
+        }
+        request
+            .config()
+            .timeout_global(None)
+            .timeout_resolve(Some(self.timeout))
+            .timeout_connect(Some(self.timeout))
+            .timeout_send_request(Some(self.timeout))
+            .timeout_recv_response(Some(self.timeout))
+            .build()
+    }
+}
+
+/// The one place the agent is configured, so a timeout change rebuilds it the
+/// same way it was first built.
+fn build_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        // Keep non-2xx as ordinary responses so the X-YT-Error header can be
+        // read off them; ureq would otherwise collapse them to a status code
+        // and discard the cluster's explanation.
+        .http_status_as_error(false)
+        .build()
+        .into()
 }
 
 /// Refuses an `https://` proxy when the crate was built without TLS.

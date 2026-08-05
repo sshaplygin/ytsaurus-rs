@@ -245,6 +245,19 @@ impl Client {
         self
     }
 
+    /// Overrides the request timeout, which defaults to two minutes.
+    ///
+    /// For a buffered command the limit is end to end. A streaming transfer —
+    /// [`Client::read_table_streaming`], [`Client::write_table_rows`] and
+    /// their kin — is not cut off mid-table: there the timeout bounds each
+    /// wait *around* the data (connecting, sending the request, the response
+    /// headers), and the data itself moves for as long as it takes.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.transport.set_timeout(timeout);
+        self
+    }
+
     /// Overrides how a failed request is repeated.
     ///
     /// The default is five attempts with a doubling delay, which covers the

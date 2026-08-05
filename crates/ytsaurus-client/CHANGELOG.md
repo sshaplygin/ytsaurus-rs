@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### A table transfer is no longer on a two-minute clock
+
+- **Fixed** the 120-second request timeout applying end to end to streaming
+  transfers. It was installed as `ureq`'s global timeout, which by its own
+  definition runs "from DNS lookup to finishing reading the response body" —
+  so `read_table_streaming`, `write_table_rows` and `write_table_streaming`,
+  the APIs that exist for tables too big to buffer, were cut off mid-table
+  after two minutes. A streaming request now bounds each wait *around* the
+  data — resolve, connect, sending the request, the response headers — by the
+  same timeout, and leaves the data itself open-ended. Buffered commands keep
+  the end-to-end limit.
+- **Added** `Client::with_timeout`. The two-minute default was also the only
+  value: nothing let a caller on a slow link raise it, or a test against a
+  dead proxy lower it.
+
 ### Stopping an operation, and adding to a table
 
 The two gaps [`docs/go-parity.md`](../../docs/go-parity.md) found by going
