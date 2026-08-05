@@ -60,6 +60,8 @@ pub struct RetryPolicy {
     attempts: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    /// Whether a retry announces itself on stderr. See [`RetryPolicy::quiet`].
+    report: bool,
 }
 
 impl Default for RetryPolicy {
@@ -68,6 +70,7 @@ impl Default for RetryPolicy {
             attempts: 5,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(10),
+            report: true,
         }
     }
 }
@@ -84,6 +87,7 @@ impl RetryPolicy {
             attempts: attempts.max(1),
             initial_backoff,
             max_backoff,
+            report: true,
         }
     }
 
@@ -91,6 +95,40 @@ impl RetryPolicy {
     #[must_use]
     pub fn none() -> Self {
         Self::new(1, Duration::ZERO, Duration::ZERO)
+    }
+
+    /// The same policy, retrying without saying so.
+    ///
+    /// A retry normally announces itself on stderr, so a launcher that pauses
+    /// for fifteen seconds says why rather than looking hung. Inside a **job**
+    /// that same stream is the cluster's diagnostic channel — a bounded buffer
+    /// the operation UI shows, and the one the job's own messages go to — so a
+    /// worker that talks to the cluster while a proxy is flaky would fill it
+    /// with retry chatter.
+    ///
+    /// A [`Client`](crate::Client) built inside a job is quiet already; this is
+    /// for choosing it anywhere else:
+    ///
+    /// ```
+    /// use ytsaurus_client::{Client, RetryPolicy};
+    ///
+    /// let client = Client::new("http://localhost:8000")
+    ///     .with_retries(RetryPolicy::default().quiet());
+    /// ```
+    #[must_use]
+    pub fn quiet(mut self) -> Self {
+        self.report = false;
+        self
+    }
+
+    /// The same policy, announcing each retry on stderr.
+    ///
+    /// The default outside a job, and what puts the messages back inside one —
+    /// a job whose stderr nobody else is using may well want them.
+    #[must_use]
+    pub fn loud(mut self) -> Self {
+        self.report = true;
+        self
     }
 
     /// How long to wait after the `attempt`-th failure, counting from one.
@@ -255,12 +293,32 @@ fn contains_retriable_code(value: &serde_json::Value) -> bool {
         .is_some_and(|inner| inner.iter().any(contains_retriable_code))
 }
 
+/// Whether a fresh client should announce its retries.
+///
+/// Not inside a job. `YT_JOB_ID` is set by the node that starts one, and a
+/// job's stderr is the cluster's diagnostic channel rather than a terminal: a
+/// bounded buffer the operation UI shows, shared with whatever the job wanted
+/// to say. This crate is linked into worker binaries — that is the whole point
+/// of the one-binary pattern — so the same `Client::from_env()` runs in both
+/// roles, and the default has to be the one the caller cannot easily choose
+/// for itself. [`RetryPolicy::loud`] puts the messages back.
+pub(crate) fn report_by_default() -> bool {
+    !inside_job(std::env::var_os("YT_JOB_ID"))
+}
+
+/// The decision itself, split out so it can be tested without touching the
+/// process environment — which is global, and in edition 2024 unsafe to write.
+fn inside_job(job_id: Option<std::ffi::OsString>) -> bool {
+    job_id.is_some_and(|id| !id.is_empty())
+}
+
 /// Runs `action` until it succeeds, gives up, or fails for a reason a retry
 /// cannot fix.
 ///
 /// `action` is told whether this is a retry, which is what a mutating command
-/// puts in its `retry` parameter. Progress goes to stderr: a run that pauses
-/// for fifteen seconds should say why rather than look hung.
+/// puts in its `retry` parameter. Progress goes to stderr unless the policy is
+/// [`RetryPolicy::quiet`]: a run that pauses for fifteen seconds should say why
+/// rather than look hung.
 pub(crate) fn run<T>(
     policy: RetryPolicy,
     repeatable: Repeatable,
@@ -282,12 +340,14 @@ pub(crate) fn run<T>(
                 }
 
                 let wait = policy.backoff(attempt);
-                eprintln!(
-                    "ytsaurus-client: {command} failed ({error}); \
-                     retrying in {:.1}s ({attempt}/{})",
-                    wait.as_secs_f64(),
-                    allowed - 1
-                );
+                if policy.report {
+                    eprintln!(
+                        "ytsaurus-client: {command} failed ({error}); \
+                         retrying in {:.1}s ({attempt}/{})",
+                        wait.as_secs_f64(),
+                        allowed - 1
+                    );
+                }
                 std::thread::sleep(wait);
                 attempt += 1;
             }
@@ -453,6 +513,29 @@ mod tests {
         // A shift wide enough to overflow must saturate, not panic.
         assert_eq!(policy.backoff(64), Duration::from_secs(8));
         assert_eq!(policy.backoff(u32::MAX), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn a_job_gets_a_quiet_client_and_a_terminal_a_talkative_one() {
+        // A worker's stderr is the cluster's bounded diagnostic buffer, shared
+        // with whatever the job itself writes. A launcher's is a terminal.
+        assert!(inside_job(Some("55aff293-7ef14284-3fe0384-3e07".into())));
+        assert!(!inside_job(None));
+        // An empty variable is not a job, the same reading `ytsaurus-job` takes.
+        assert!(!inside_job(Some(String::new().into())));
+    }
+
+    #[test]
+    fn quiet_changes_the_reporting_and_nothing_else() {
+        let policy = RetryPolicy::default();
+
+        assert!(policy.report);
+        assert!(!policy.quiet().report);
+        assert!(policy.quiet().loud().report);
+
+        // Same patience either way: this is about the messages, not the waiting.
+        assert_eq!(policy.quiet().attempts, policy.attempts);
+        assert_eq!(policy.quiet().backoff(3), policy.backoff(3));
     }
 
     #[test]

@@ -139,7 +139,10 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`ClientError`] if the commit fails, which leaves the
-    /// transaction aborted and nothing published.
+    /// transaction aborted and nothing published: the handle is consumed either
+    /// way, and a commit that did not land drops through `Drop`, which sends the
+    /// abort. A failed commit that was left neither committed nor aborted would
+    /// hold its locks until it expired.
     pub fn commit(mut self) -> Result<()> {
         self.finish("commit_transaction")
     }
@@ -171,15 +174,19 @@ impl Transaction {
     }
 
     fn finish(&mut self, command: &'static str) -> Result<()> {
-        self.stop_pinging();
-
         if self.done {
+            self.stop_pinging();
             return Ok(());
         }
-        self.done = true;
 
         let params = yson_build::map([("transaction_id", yson_build::string(&self.id))]);
-        self.client.transport.call(
+        // Sent while the pings are still running. A commit can take longer than
+        // the transaction's own timeout — the request timeout is two minutes,
+        // the default transaction timeout thirty seconds, and the retry loop
+        // adds fifteen more — and a transaction that expires mid-commit is
+        // answered `No such transaction`, discarding work that would have
+        // survived had something kept saying it was wanted.
+        let outcome = self.client.transport.call(
             Method::Post,
             command,
             &params,
@@ -189,8 +196,20 @@ impl Transaction {
             // transaction`, which reads like the commit failed when it
             // succeeded. The mutation ID makes the retry the same commit.
             Repeatable::WithMutationId,
-        )?;
-        Ok(())
+        );
+
+        // Only a terminal answer ends the transaction. A commit that failed
+        // published nothing and still holds its locks, so `done` stays unset
+        // and `Drop` aborts it on the way out — otherwise the transaction would
+        // be neither committed nor aborted nor pinged, and would sit on its
+        // locks until it expired, which for an hour-long timeout blocks the
+        // next launcher for an hour. An abort that failed is finished either
+        // way: there is nothing left to undo, and repeating it in `Drop` would
+        // only spend the retry budget twice.
+        self.done = outcome.is_ok() || command == "abort_transaction";
+        self.stop_pinging();
+
+        outcome.map(|_| ())
     }
 
     fn stop_pinging(&mut self) {
@@ -339,6 +358,43 @@ mod tests {
             ping_interval(Duration::from_millis(50)),
             Duration::from_secs(1)
         );
+    }
+
+    /// A transaction whose commit is going nowhere: nothing listens on port 1.
+    fn doomed() -> Transaction {
+        let client = Client::new("http://127.0.0.1:1").with_retries(crate::RetryPolicy::none());
+        Transaction {
+            client: client.with_transaction("1-2-3-4"),
+            id: "1-2-3-4".to_owned(),
+            done: false,
+            keep_alive: None,
+        }
+    }
+
+    #[test]
+    fn a_commit_that_failed_leaves_drop_an_abort_to_send() {
+        // The bug this pins down: marking the transaction finished before the
+        // commit was answered. `Drop` would then send nothing, and a
+        // transaction that is neither committed nor aborted nor pinged sits on
+        // its locks until it expires — an hour, for an hour-long timeout.
+        let mut tx = doomed();
+
+        assert!(tx.finish("commit_transaction").is_err());
+        assert!(!tx.done, "a failed commit has not finished the transaction");
+
+        // And the abort that `Drop` would send does finish it, whether or not
+        // the cluster heard it: there is nothing left to undo.
+        assert!(tx.finish("abort_transaction").is_err());
+        assert!(tx.done);
+    }
+
+    #[test]
+    fn a_transaction_is_finished_once() {
+        let mut tx = doomed();
+        tx.done = true;
+
+        // No request at all — the second call would be a second commit.
+        assert!(tx.finish("commit_transaction").is_ok());
     }
 
     #[test]

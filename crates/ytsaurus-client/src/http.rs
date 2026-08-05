@@ -45,6 +45,33 @@ const ERROR: &str = "X-YT-Error";
 /// The parameter that puts a command inside a transaction.
 const TRANSACTION_ID: &str = "transaction_id";
 
+/// Commands that have no transaction to be in.
+///
+/// These go to the scheduler and the controller agents rather than to the
+/// master, and take no `TTransactionalOptions`. Stamping them works only for as
+/// long as the proxy quietly drops parameters it does not recognise; on a
+/// cluster or a version that refuses them instead, every transaction-scoped
+/// launcher would fail at its first `wait_for_operation`.
+///
+/// `start_operation` is deliberately *not* here: an operation genuinely can run
+/// inside a transaction, which is how its output tables stay invisible until
+/// the launcher commits.
+const NO_TRANSACTION: &[&str] = &[
+    "get_operation",
+    "list_operations",
+    "abort_operation",
+    "complete_operation",
+    "suspend_operation",
+    "resume_operation",
+    "update_operation_parameters",
+    "list_jobs",
+    "get_job",
+    "get_job_stderr",
+    "get_job_input",
+    "abort_job",
+    "poll_job_shell",
+];
+
 /// Applies a header list to either builder flavour.
 ///
 /// `ureq` gives requests with and without a body distinct builder types, so a
@@ -107,17 +134,21 @@ impl Transport {
             .build()
             .into();
 
+        // Quiet inside a job, where stderr is the cluster's diagnostic channel
+        // and not a terminal. See `retry::report_by_default`.
+        let retries = if crate::retry::report_by_default() {
+            RetryPolicy::default()
+        } else {
+            RetryPolicy::default().quiet()
+        };
+
         Self {
             agent,
             base,
             token,
-            retries: RetryPolicy::default(),
+            retries,
             transaction: None,
         }
-    }
-
-    pub(crate) fn base(&self) -> &str {
-        &self.base
     }
 
     pub(crate) fn set_retries(&mut self, policy: RetryPolicy) {
@@ -164,7 +195,7 @@ impl Transport {
             _ => None,
         };
 
-        let stamped = self.in_transaction(parameters);
+        let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
         crate::retry::run(self.retries, repeatable, command, |is_retry| {
@@ -196,8 +227,17 @@ impl Transport {
     /// A command that already names a transaction keeps the one it named:
     /// `commit_transaction` and its siblings mean a specific transaction, and
     /// that is exactly the one they are given.
-    fn in_transaction(&self, parameters: &YsonValue) -> Option<YsonValue> {
+    ///
+    /// A command that has no transaction to be in is left alone — see
+    /// [`NO_TRANSACTION`]. `Transaction` derefs to `Client`, so a launcher
+    /// reaches `wait_for_operation` and its diagnostics through a bound client
+    /// as a matter of course.
+    fn in_transaction(&self, command: &str, parameters: &YsonValue) -> Option<YsonValue> {
         let id = self.transaction.as_ref()?;
+
+        if NO_TRANSACTION.contains(&command) {
+            return None;
+        }
 
         if let ytsaurus_yson::YsonNode::Map(m) = &parameters.node
             && m.contains_key(TRANSACTION_ID.as_bytes())
@@ -262,7 +302,7 @@ impl Transport {
         command: &str,
         parameters: &YsonValue,
     ) -> Result<ureq::Body> {
-        let stamped = self.in_transaction(parameters);
+        let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
         let response = self.dispatch(method, command, parameters, SendBody::none())?;
@@ -293,7 +333,7 @@ impl Transport {
         parameters: &YsonValue,
         rows: &mut dyn std::io::Read,
     ) -> Result<()> {
-        let stamped = self.in_transaction(parameters);
+        let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
         let mut response =
@@ -316,6 +356,53 @@ impl Transport {
         }
 
         Ok(())
+    }
+
+    /// Fetches a path that is not an API v4 command.
+    ///
+    /// `/hosts` is the only one, and it is not a command — but it wants
+    /// everything a command gets: the token, the global timeout, the retry
+    /// policy, and the guard that turns an `https://` proxy in a build without
+    /// TLS into an explanation rather than a connection error. Building a bare
+    /// `ureq` request here instead is how it came to miss all four.
+    pub(crate) fn fetch(&self, path: &str, what: &str) -> Result<String> {
+        if let Some(error) = tls_unavailable(&self.base) {
+            return Err(error);
+        }
+
+        let url = format!("{}{path}", self.base);
+        let mut headers: Vec<(&str, String)> = Vec::new();
+        if let Some(token) = &self.token {
+            headers.push(("Authorization", format!("OAuth {token}")));
+        }
+
+        crate::retry::run(self.retries, Repeatable::Freely, what, |_| {
+            let mut response = with_headers!(self.agent.get(&url), &headers)
+                .call()
+                .map_err(|e| ClientError::Transport {
+                    command: what.to_owned(),
+                    source: Box::new(e),
+                })?;
+
+            let status = response.status().as_u16();
+            let body = response
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| ClientError::Decode {
+                    command: what.to_owned(),
+                    reason: format!("could not read the response body: {e}"),
+                })?;
+
+            if !(200..300).contains(&status) {
+                return Err(ClientError::Http {
+                    command: what.to_owned(),
+                    status,
+                    body: truncate(&body, 400),
+                });
+            }
+
+            Ok(body)
+        })
     }
 
     /// Builds and sends one request, and checks the cluster's own error header.
@@ -430,7 +517,7 @@ mod tests {
     fn a_bound_client_puts_every_command_in_its_transaction() {
         let params = map([("path", string("//tmp/out"))]);
         let stamped = transport(Some("3-5d231-10001-db88"))
-            .in_transaction(&params)
+            .in_transaction("write_table", &params)
             .expect("stamped");
 
         assert_eq!(
@@ -443,7 +530,7 @@ mod tests {
     fn an_unbound_client_leaves_the_parameters_alone() {
         // `None` rather than a copy: this is every command's hot path.
         let params = map([("path", string("//tmp/out"))]);
-        assert!(transport(None).in_transaction(&params).is_none());
+        assert!(transport(None).in_transaction("get", &params).is_none());
     }
 
     #[test]
@@ -455,8 +542,44 @@ mod tests {
         let params = map([("transaction_id", string("the-one-i-meant"))]);
         assert!(
             transport(Some("some-other-one"))
-                .in_transaction(&params)
+                .in_transaction("commit_transaction", &params)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_scheduler_command_is_not_put_in_a_transaction() {
+        // `Transaction` derefs to `Client`, so `tx.wait_for_operation(&id)` is
+        // ordinary usage — and it, plus the three diagnostic calls it makes on
+        // a failure, go to the scheduler, which has no transaction to put them
+        // in. Stamping them survives only as long as the proxy ignores
+        // parameters it does not know.
+        let params = map([("operation_id", string("1-2-3-4"))]);
+        let bound = transport(Some("3-5d231-10001-db88"));
+
+        for command in [
+            "get_operation",
+            "list_jobs",
+            "get_job_stderr",
+            "abort_operation",
+        ] {
+            assert!(
+                bound.in_transaction(command, &params).is_none(),
+                "{command} was stamped with a transaction id"
+            );
+        }
+    }
+
+    #[test]
+    fn starting_an_operation_still_joins_the_transaction() {
+        // The exception that makes the list a list rather than "anything to do
+        // with operations": an operation can run inside a transaction, and that
+        // is what keeps its output invisible until the launcher commits.
+        let params = map([("operation_type", string("map"))]);
+        assert!(
+            transport(Some("3-5d231-10001-db88"))
+                .in_transaction("start_operation", &params)
+                .is_some()
         );
     }
 }

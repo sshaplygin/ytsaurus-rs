@@ -743,10 +743,29 @@ impl VanillaSpec {
     }
 
     /// Adds another task, of a different kind.
+    ///
+    /// It needs a different *name* too — see [`VanillaSpec::duplicate_task`].
     #[must_use]
     pub fn with_task(mut self, task: VanillaTask) -> Self {
         self.tasks.push(task);
         self
+    }
+
+    /// The name two tasks share, if any.
+    ///
+    /// The spec keys its tasks by name, so two tasks called the same thing are
+    /// one task: the later one replaces the earlier, and the operation quietly
+    /// runs half the work it was handed — it completes, so nothing anywhere
+    /// reports a problem. [`Client::start_vanilla`](crate::Client::start_vanilla)
+    /// checks this before sending the spec; check it here if you render the
+    /// spec yourself with [`VanillaSpec::to_yson`].
+    #[must_use]
+    pub fn duplicate_task(&self) -> Option<&str> {
+        let mut seen = std::collections::HashSet::new();
+        self.tasks
+            .iter()
+            .find(|task| !seen.insert(task.name.as_str()))
+            .map(|task| task.name.as_str())
     }
 
     /// Sets any spec field this builder does not model.
@@ -1052,6 +1071,27 @@ mod tests {
         assert!(out.contains("max_failed_job_count=1"), "{out}");
         // No input: that is what makes it vanilla.
         assert!(!out.contains("input_table_paths"), "{out}");
+    }
+
+    #[test]
+    fn two_tasks_with_one_name_are_caught_before_the_cluster_sees_them() {
+        // Rendered, they collapse into a single `worker={…}` — four jobs
+        // instead of eight, the first command never run, and an operation that
+        // completes. `Client::start_vanilla` refuses this rather than send it.
+        let spec = VanillaSpec::new(VanillaTask::new("worker", "./j shard-a", 4))
+            .with_task(VanillaTask::new("worker", "./j shard-b", 4));
+
+        assert_eq!(spec.duplicate_task(), Some("worker"));
+
+        let out = render(&spec.to_yson());
+        assert!(!out.contains("shard-a"), "the first task is gone: {out}");
+    }
+
+    #[test]
+    fn tasks_with_distinct_names_are_fine() {
+        let spec = VanillaSpec::new(VanillaTask::new("worker", "./j", 4))
+            .with_task(VanillaTask::new("master", "./j master", 1));
+        assert_eq!(spec.duplicate_task(), None);
     }
 
     /// A task with no output tables still sends the field. Leaving it out is a

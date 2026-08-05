@@ -138,6 +138,22 @@ const STDERR_EXCERPT: usize = 4096;
 /// too.
 const DEFAULT_FILE_CACHE: &str = "//tmp/yt_wrapper/file_storage/new_cache";
 
+/// The cluster's code for "no such path".
+///
+/// Distinguishing it from every other refusal is what lets a lookup answer
+/// "nothing there" without hiding a permission error behind the same `None`.
+const RESOLVE_ERROR: i64 = 500;
+
+/// The `{value=…}` API v4 wraps a structured answer in.
+///
+/// Deserialised rather than walked, so [`Client::get_as`] reads the response
+/// once. Keys the type does not mention are ignored, which is what lets the
+/// envelope grow a field without breaking this.
+#[derive(serde::Deserialize)]
+struct Envelope<T> {
+    value: T,
+}
+
 /// A worker binary on the cluster, as [`Client::upload_worker_cached`] left it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedFile {
@@ -347,23 +363,22 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails.
+    /// Returns [`ClientError`] if the request fails, or if `/hosts` does not
+    /// answer with the documented list of host names. `Ok(None)` means the
+    /// cluster answered and named no heavy proxy — which a failure must not be
+    /// allowed to look like, since the caller's next move is to stop looking.
     pub fn heavy_proxy(&self) -> Result<Option<String>> {
-        let url = format!("{}/hosts", self.transport.base());
-        let body = ureq::get(&url)
-            .call()
-            .map_err(|e| ClientError::Transport {
-                command: "hosts".to_owned(),
-                source: Box::new(e),
-            })?
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ClientError::Decode {
-                command: "hosts".to_owned(),
-                reason: e.to_string(),
-            })?;
+        // Through the transport, so this carries the token and honours the
+        // timeout, the retry policy and the TLS guard like every other request.
+        let body = self.transport.fetch("/hosts", "hosts")?;
 
-        let hosts: Vec<String> = serde_json::from_str(&body).unwrap_or_default();
+        let hosts: Vec<String> = serde_json::from_str(&body).map_err(|e| ClientError::Decode {
+            command: "hosts".to_owned(),
+            reason: format!(
+                "/hosts did not answer with a list of host names: {e}; body was {}",
+                crate::error::truncate(&body, 200)
+            ),
+        })?;
         Ok(hosts.into_iter().next())
     }
 
@@ -971,18 +986,39 @@ impl Client {
             });
         }
 
+        // Created here rather than in the lookup: a cache the installation
+        // maintains is one a user may only be able to read, and a lookup that
+        // mutated it would fail on exactly the clusters where the cache is
+        // worth the most.
+        self.create("map_node", &self.file_cache)?;
+
         // Staged inside the cache node, so a cluster that expires the cache
         // expires an interrupted upload with it.
-        let staging = format!("{}/staged_{digest}", self.file_cache);
+        //
+        // The name carries a nonce as well as the hash. Keyed by the hash alone
+        // it names the same node for every process uploading the same binary,
+        // and two CI jobs launching together would write to one node and then
+        // remove it from under each other.
+        let staging = format!("{}/staged_{digest}_{}", self.file_cache, MutationId::new());
         self.create("file", &staging)?;
-        self.write_file_computing_md5(&staging, &bytes)?;
-        self.set_attribute(&staging, "executable", yson_build::boolean(true))?;
 
-        let path = self.put_file_to_cache(&staging, &digest)?;
-        // The cache may keep the node itself rather than a copy of it, so this
-        // is `force`-removing something that may already be gone. `remove`
-        // tolerates that.
-        self.remove(&staging)?;
+        let cached = self
+            .write_file_computing_md5(&staging, &bytes)
+            .and_then(|()| self.set_attribute(&staging, "executable", yson_build::boolean(true)))
+            .and_then(|()| self.put_file_to_cache(&staging, &digest));
+
+        // Removed whichever way that went. On success the cache may have kept
+        // the node itself rather than a copy, so this is `force`-removing
+        // something that may already be gone, which `remove` tolerates. On
+        // failure it is what stops a rejected upload from leaving tens of
+        // megabytes behind for good: cache expiry walks the entries the cache
+        // itself created, not the staging nodes beside them.
+        let removed = self.remove(&staging);
+        // The upload's own failure is the one worth reporting; a cleanup that
+        // also failed only matters when there was nothing else wrong.
+        let path = cached?;
+        removed?;
+
         // Set on the cached path too: whether the attribute survives the move
         // decides whether the job can exec at all, and it is cheap to be sure.
         self.set_attribute(&path, "executable", yson_build::boolean(true))?;
@@ -996,25 +1032,39 @@ impl Client {
 
     /// Looks up a file in the cluster's file cache by its MD5.
     ///
-    /// `None` means nothing is cached under that hash.
+    /// `None` means nothing is cached under that hash — including when the
+    /// cache directory does not exist yet, which is what
+    /// [`Client::upload_worker_cached`] creates on its way past.
+    ///
+    /// A lookup and nothing more: it sends no mutation, so it works against a
+    /// cache the caller may only read.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn file_from_cache(&self, md5: &str) -> Result<Option<String>> {
-        self.create("map_node", &self.file_cache)?;
-
         let params = yson_build::map([
             ("md5", yson_build::string(md5)),
             ("cache_path", yson_build::string(&self.file_cache)),
         ]);
-        let body = self.transport.call(
+        let body = match self.transport.call(
             Method::Get,
             "get_file_from_cache",
             &params,
             Payload::None,
             Repeatable::Freely,
-        )?;
+        ) {
+            Ok(body) => body,
+            // A cache directory that is not there yet holds nothing, which is a
+            // miss and not a failure — and is how the first upload against a
+            // fresh cluster starts. Only the resolve error is read this way; any
+            // other refusal is the caller's to see.
+            Err(ClientError::Cluster {
+                code: RESOLVE_ERROR,
+                ..
+            }) => return Ok(None),
+            Err(other) => return Err(other),
+        };
 
         self.cached_path(&body, "get_file_from_cache")
     }
@@ -1328,21 +1378,30 @@ impl Client {
     /// Returns [`ClientError`] if the request fails or the answer does not fit
     /// `T`.
     pub fn get_as<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let value = self.get(path)?;
+        let params = yson_build::map([("path", yson_build::string(path))]);
+        let body = self.transport.call(
+            Method::Get,
+            "get",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
 
-        // Through the codec rather than by walking the value: the cluster's
-        // answer is a document, and serde is the thing that turns documents
-        // into types. Binary because it is the cheaper of the two to re-read.
-        let bytes =
-            ytsaurus_yson::to_vec(&value, YsonFormat::Binary).map_err(|e| ClientError::Decode {
+        // Decoded straight out of the response, envelope and all. Going through
+        // `get` would build a whole `YsonValue` tree, encode it back to bytes
+        // and decode those into `T` — three passes over the document and two
+        // copies of it in memory, where one pass does the same job. Invisible
+        // for `//@`; not for a large attribute or a subtree.
+        let envelope: Envelope<T> =
+            from_slice(&body, YsonFormat::Text).map_err(|e| ClientError::Decode {
                 command: "get".to_owned(),
-                reason: format!("{path}: could not re-encode the answer: {e}"),
+                reason: format!(
+                    "{path}: the answer does not fit the type asked for: {e}; body was {}",
+                    crate::error::truncate(&String::from_utf8_lossy(&body), 200)
+                ),
             })?;
 
-        ytsaurus_yson::from_slice(&bytes, YsonFormat::Binary).map_err(|e| ClientError::Decode {
-            command: "get".to_owned(),
-            reason: format!("{path}: the answer does not fit the type asked for: {e}"),
-        })
+        Ok(envelope.value)
     }
 
     /// Reads a table as a stream, without holding it.
@@ -1477,8 +1536,21 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails.
+    /// Returns [`ClientError::Config`] if two tasks share a name, and
+    /// [`ClientError`] if the request fails.
     pub fn start_vanilla(&self, spec: &VanillaSpec) -> Result<String> {
+        // Refused here rather than sent: the spec keys tasks by name, so the
+        // cluster would take two tasks called the same thing as one, run half
+        // the jobs, and complete. A silent half-run is worse than a rejected
+        // launch.
+        if let Some(name) = spec.duplicate_task() {
+            return Err(ClientError::Config(format!(
+                "two vanilla tasks are both called {name:?}; a spec keys its tasks \
+                 by name, so the second would replace the first and its jobs would \
+                 never run"
+            )));
+        }
+
         self.start_operation(OperationType::Vanilla, &spec.to_yson())
     }
 
@@ -1772,11 +1844,20 @@ impl Client {
             match state.as_str() {
                 "completed" => return Ok(()),
                 "failed" | "aborted" => {
+                    // The diagnostics go through a client that does not retry.
+                    // Up to four more requests are about to be sent to explain
+                    // a failure the caller already knows about, and an
+                    // unhealthy cluster is exactly when they fail: under the
+                    // default policy `list_jobs` alone can spend ten minutes on
+                    // backoff before giving up, and every step here is
+                    // best-effort, so the wait buys nothing but a program that
+                    // looks hung after the operation has already ended.
+                    let quick = self.without_retries();
                     return Err(ClientError::OperationFailed {
                         id: id.to_owned(),
                         state,
-                        error: self.operation_error(id),
-                        jobs: self.failed_jobs(id),
+                        error: quick.operation_error(id),
+                        jobs: quick.failed_jobs(id),
                     });
                 }
                 _ => std::thread::sleep(self.poll_interval),
@@ -1984,6 +2065,15 @@ impl Client {
     }
 
     // -------------------------------------------------------------- helpers
+
+    /// A copy of this client that sends each request once.
+    ///
+    /// For best-effort work — the diagnostics on a failed operation — where
+    /// waiting out a backoff cannot improve the answer, and where the delay
+    /// lands after the caller's real result is already decided.
+    fn without_retries(&self) -> Self {
+        self.clone().with_retries(RetryPolicy::none())
+    }
 
     /// API v4 wraps every structured response in a dict. Unwraps one level.
     fn strip_envelope(&self, body: &[u8], command: &str) -> Result<YsonValue> {
@@ -2193,6 +2283,41 @@ fn check_complete_fragment(mut data: &[u8]) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_get_answer_decodes_straight_into_the_type_asked_for() {
+        // What `get_as` does with the response body, without a cluster to ask.
+        // The point of the envelope struct: one pass over the document, and
+        // attributes the type does not mention are skipped rather than
+        // collected — which is what makes `//@`, with dozens of them, worth
+        // asking about at all.
+        #[derive(serde::Deserialize)]
+        struct Node {
+            account: String,
+            #[serde(rename = "type")]
+            node_type: String,
+        }
+
+        let body = br#"{"value"={"account"="tmp";"type"="table";"chunk_count"=3}}"#;
+        let envelope: Envelope<Node> = from_slice(body, YsonFormat::Text).expect("decodes");
+
+        assert_eq!(envelope.value.account, "tmp");
+        assert_eq!(envelope.value.node_type, "table");
+    }
+
+    #[test]
+    fn an_answer_that_does_not_fit_the_type_is_an_error_rather_than_a_default() {
+        #[derive(serde::Deserialize)]
+        struct Node {
+            #[allow(dead_code)]
+            account: String,
+        }
+
+        // No `account` at all: silently defaulting it would hand the caller a
+        // node that does not exist.
+        let body = br#"{"value"={"type"="table"}}"#;
+        assert!(from_slice::<Envelope<Node>>(body, YsonFormat::Text).is_err());
+    }
 
     #[test]
     fn a_complete_fragment_is_accepted() {

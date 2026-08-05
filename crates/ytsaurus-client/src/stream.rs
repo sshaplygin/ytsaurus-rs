@@ -91,6 +91,15 @@ pub(crate) struct RowStream<I> {
     /// the caller be told what actually happened: which is that row 40 000 has
     /// a map key that is not a string, not that the connection broke.
     pub(crate) failed: Option<String>,
+    /// Latched once the rows have run out.
+    ///
+    /// `Read::read` may be called again after it has answered `Ok(0)`, and
+    /// without this the next call would poll the iterator past its first
+    /// `None`. `write_table_rows` accepts any `IntoIterator`, and what an
+    /// iterator that is not `Fuse` does after `None` is unspecified — a
+    /// generator that resumed yielding would append rows to a body the
+    /// transport had already finished sending.
+    exhausted: bool,
 }
 
 /// How much to encode before handing bytes over.
@@ -108,6 +117,7 @@ where
             position: 0,
             written: 0,
             failed: None,
+            exhausted: false,
         }
     }
 
@@ -116,8 +126,15 @@ where
         self.buffer.clear();
         self.position = 0;
 
+        if self.exhausted {
+            return;
+        }
+
         while self.buffer.len() < ROW_CHUNK {
-            let Some(row) = self.rows.next() else { break };
+            let Some(row) = self.rows.next() else {
+                self.exhausted = true;
+                break;
+            };
 
             // Serialised straight into the buffer that is about to be sent:
             // `to_vec` would allocate a `Vec` per row, which for a table write
@@ -200,6 +217,38 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0]["n"], 1);
         assert_eq!(decoded[1]["n"], 2);
+    }
+
+    #[test]
+    fn an_exhausted_iterator_is_not_polled_again() {
+        /// Yields a row, then `None`, then rows again — which is unspecified
+        /// behaviour for an iterator, and exactly what `write_table_rows`
+        /// cannot rule out: it accepts any `IntoIterator`.
+        struct Resumes(u32);
+
+        impl Iterator for Resumes {
+            type Item = i64;
+
+            fn next(&mut self) -> Option<i64> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Some(1),
+                    2 => None,
+                    _ => Some(2),
+                }
+            }
+        }
+
+        let mut stream = RowStream::new(Resumes(0));
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("encodes");
+        assert_eq!(out.iter().filter(|b| **b == b';').count(), 1);
+
+        // `Read::read` after `Ok(0)` is allowed, and must stay `Ok(0)`. Without
+        // the latch this hands back a second row, appended to a body the
+        // transport has already finished sending.
+        let mut more = [0_u8; 64];
+        assert_eq!(stream.read(&mut more).expect("reads"), 0);
     }
 
     #[test]

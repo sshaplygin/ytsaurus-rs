@@ -134,34 +134,57 @@ fn run() -> Result<(), ClientError> {
     let parse = measured[1].1;
     let full = measured[2].1;
 
+    if full <= 0 {
+        println!("   the cluster reported {full} ms of exec time for the pilot's map,");
+        println!("   so there is nothing here to divide into phases.");
+        return Ok(());
+    }
+
+    // Three separate cluster runs, each the best of `rounds`. Scheduler noise
+    // can still make a shallower mode measure slower than a deeper one, and a
+    // phase cannot cost less than nothing: a difference that came out negative
+    // means the modes were not separable on this run, not that the phase was
+    // free. Clamped so the table stays readable, and flagged so the conclusion
+    // below does not pretend the numbers held.
+    let separable = frames <= parse && parse <= full;
+    let decoding = (parse - frames).max(0);
+    let writing = (full - parse).max(0);
+
     let share = |part: i64| 100.0 * part as f64 / full as f64;
     println!(
         "   being handed the rows      {frames:>6} ms   {:>5.1}%",
         share(frames)
     );
     println!(
-        "   decoding them              {:>6} ms   {:>5.1}%",
-        parse - frames,
-        share(parse - frames)
+        "   decoding them              {decoding:>6} ms   {:>5.1}%",
+        share(decoding)
     );
     println!(
-        "   validating and writing     {:>6} ms   {:>5.1}%",
-        full - parse,
-        share(full - parse)
+        "   validating and writing     {writing:>6} ms   {:>5.1}%",
+        share(writing)
     );
     println!("   ————————————————————————————————————————");
     println!("   the pilot's map            {full:>6} ms   100.0%");
 
     // The threshold docs/benchmarking.md sets for taking Skiff seriously.
-    let decoding = share(parse - frames);
+    let decoding_share = share(decoding);
     println!();
-    if decoding > 30.0 {
+    if !separable {
         println!(
-            "Decoding is {decoding:.1}% of this job — above the 30% the Skiff question turns on."
+            "A shallower mode measured slower than a deeper one ({frames}, {parse}, {full} ms), \
+             so this run cannot split the phases apart: the differences are inside the noise. \
+             Raise YT_PROFILE_ROUNDS or YT_PROFILE_MIB and run it again — there is no answer \
+             to the Skiff question in these numbers."
+        );
+    } else if decoding_share > 30.0 {
+        println!(
+            "Decoding is {decoding_share:.1}% of this job — above the 30% the Skiff \
+             question turns on."
         );
     } else {
         println!(
-            "Decoding is {decoding:.1}% of this job — below the 30% the Skiff question turns on."
+            "Decoding is {decoding_share:.1}% of this job — below the 30% the Skiff \
+             question turns on."
         );
     }
     println!(
