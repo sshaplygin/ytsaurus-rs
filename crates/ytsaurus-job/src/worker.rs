@@ -34,15 +34,23 @@ pub enum WorkerEvent<'input> {
     Skiff(SkiffRow),
 }
 
-impl WorkerReader<std::io::Stdin> {
+impl WorkerReader<std::io::BufReader<std::io::Stdin>> {
     /// Reads stdin using the operation's selected input format.
+    ///
+    /// Buffered, because this constructor may end up on the Skiff side, which
+    /// reads field by field — see `skiff::STDIN_BUFFER_BYTES`. The YSON side
+    /// asks for a whole buffer at a time and is handed the descriptor's bytes
+    /// without a second copy.
     ///
     /// # Errors
     ///
     /// Returns an error if the format is unknown to this runtime or a Skiff
     /// schema is not suitable for job input.
     pub fn from_stdin(format: DataFormat) -> Result<Self> {
-        Self::new(std::io::stdin(), format)
+        Self::new(
+            std::io::BufReader::with_capacity(crate::skiff::STDIN_BUFFER_BYTES, std::io::stdin()),
+            format,
+        )
     }
 }
 

@@ -48,10 +48,23 @@ pub struct SkiffJobReader<R> {
     state: Vec<ControlState>,
 }
 
-impl SkiffJobReader<std::io::Stdin> {
+/// The stdin buffer a Skiff job reads through.
+///
+/// The same 1 MiB `JobReader` fills for YSON, and for a stronger reason: the
+/// Skiff decoder reads a field at a time, and `Read for Stdin` takes the global
+/// stdin lock on every call. Unbuffered, a twelve-column row costs a dozen
+/// lock/unlock round trips. At this capacity a reader asking for a whole buffer
+/// bypasses the copy, so nothing downstream pays for the buffer it does not
+/// need.
+pub(crate) const STDIN_BUFFER_BYTES: usize = 1024 * 1024;
+
+impl SkiffJobReader<std::io::BufReader<std::io::Stdin>> {
     /// Reads Skiff input from fd 0 using the operation's input format.
     pub fn from_stdin(format: Format) -> Result<Self> {
-        Self::new(std::io::stdin(), format)
+        Self::new(
+            std::io::BufReader::with_capacity(STDIN_BUFFER_BYTES, std::io::stdin()),
+            format,
+        )
     }
 }
 
