@@ -14,6 +14,8 @@ categories = ["encoding"]
 
 [dependencies]
 ytsaurus-yson.workspace = true
+ytsaurus-skiff.workspace = true
+ytsaurus-format.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

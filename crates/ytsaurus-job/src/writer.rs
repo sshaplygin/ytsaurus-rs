@@ -14,7 +14,7 @@ use crate::error::{JobError, Result};
 
 /// Per-table output buffer. 256 KiB keeps the write syscall count low without
 /// making a many-table job expensive.
-const TABLE_BUFFER_BYTES: usize = 256 * 1024;
+pub(crate) const TABLE_BUFFER_BYTES: usize = 256 * 1024;
 
 /// File descriptor for output table `index`, per the `3k + 1` rule.
 #[must_use]
@@ -123,6 +123,23 @@ impl JobWriter {
     /// can start reporting failures without breaking callers.
     #[cfg(unix)]
     pub fn descriptors(table_count: usize) -> Result<Self> {
+        Self::descriptors_with_format(table_count, YsonFormat::Binary)
+    }
+
+    /// Writes YSON in `format` to one descriptor per output table (fds 1, 4,
+    /// 7, …).
+    ///
+    /// Most workers should use [`JobWriter::descriptors`], whose binary YSON
+    /// default matches YTsaurus jobs. This constructor exists for
+    /// [`crate::WorkerWriter`], which exposes the shared [`ytsaurus_format::DataFormat`]
+    /// selection without silently changing the requested YSON encoding.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible, but returns `Result` so that opening descriptors
+    /// can start reporting failures without breaking callers.
+    #[cfg(unix)]
+    pub fn descriptors_with_format(table_count: usize, format: YsonFormat) -> Result<Self> {
         let tables = (0..table_count)
             .map(|i| -> Box<dyn Write> {
                 Box::new(std::io::BufWriter::with_capacity(
@@ -132,7 +149,7 @@ impl JobWriter {
             })
             .collect();
 
-        Ok(Self::from_writers(tables, YsonFormat::Binary))
+        Ok(Self::from_writers(tables, format))
     }
 
     /// Declares output tables by name, returning a handle for each.
@@ -428,7 +445,7 @@ fn write_zigzag(value: i64, out: &mut Vec<u8>) {
 
 /// Wraps an inherited descriptor without taking ownership of it.
 #[cfg(unix)]
-fn output_descriptor(fd: i32) -> OutputDescriptor {
+pub(crate) fn output_descriptor(fd: i32) -> OutputDescriptor {
     use std::os::fd::FromRawFd;
 
     // SAFETY: `fd` was opened by YTsaurus for this job before it started, and

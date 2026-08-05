@@ -16,6 +16,7 @@ tls = ["ytsaurus-client/tls"]
 
 [dependencies]
 ytsaurus-job.workspace = true
+ytsaurus-skiff.workspace = true
 ytsaurus-yson.workspace = true
 # `default-features = false` drops TLS, which is what keeps
 # `scripts/build-worker.sh` working with nothing but the Rust toolchain. Spelled

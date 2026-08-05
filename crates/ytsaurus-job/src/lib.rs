@@ -66,15 +66,25 @@
 pub mod error;
 /// Reading the input stream.
 pub mod reader;
+/// Reading Skiff input streams.
+pub mod skiff;
+/// Writing Skiff output streams.
+pub mod skiff_writer;
 /// Custom job statistics.
 pub mod statistics;
+/// Shared-format worker reader and writer.
+pub mod worker;
 /// Writing output tables.
 pub mod writer;
 
 pub use crate::error::{JobError, Result};
 pub use crate::reader::{Event, Group, GroupKey, Groups, JobReader, Row};
+pub use crate::skiff::{SkiffJobReader, SkiffRow};
+pub use crate::skiff_writer::SkiffJobWriter;
 pub use crate::statistics::JobStatistics;
+pub use crate::worker::{WorkerEvent, WorkerReader, WorkerRow, WorkerWriter};
 pub use crate::writer::{JobWriter, TableId, table_descriptor};
+pub use ytsaurus_format::DataFormat;
 
 pub use ytsaurus_yson as yson;
 

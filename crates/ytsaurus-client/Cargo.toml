@@ -26,6 +26,8 @@ derive = ["dep:ytsaurus-helpers"]
 
 [dependencies]
 ytsaurus-yson.workspace = true
+ytsaurus-skiff.workspace = true
+ytsaurus-format.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 ureq = { version = "3.3", default-features = false, features = ["gzip"] }

@@ -48,6 +48,7 @@ cargo run -p ytsaurus-client --example launch
 | Naming | `copy`, `move_node`, `link` — each with a `_replacing` twin that overwrites |
 | Locks | `lock`, `lock_waiting` |
 | Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| Formats | `write_table_with_format`, `read_table_with_format`, `write_skiff_table`, `read_skiff_table` |
 | Typed | `write_table_rows`, `read_table_rows`, `get_as` |
 | Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
@@ -58,6 +59,23 @@ cargo run -p ytsaurus-client --example launch
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
 [`MapReduceSpec`] / [`VanillaSpec`], which model what launching a
 `ytsaurus-job` worker needs and expose `with_raw` for everything else.
+
+`DataFormat` is the common public format choice: use `MapSpec::with_formats`,
+the map-reduce phase equivalents, and `write_table_with_format` /
+`read_table_with_format`. It supports binary/text YSON and validated **dynamic**
+Skiff today. Direct Skiff table I/O derives the rich-path column projection from
+the format, as the Go SDK does. The former `*_skiff_*` methods remain convenience
+wrappers. Typed rows and schema inference are not available yet; see the
+[compatibility contract](../../docs/skiff-compatibility.md).
+
+The runnable [`skiff_launch.rs`](examples/skiff_launch.rs) example pairs those
+methods with the `skiff_cat` worker and checks non-UTF-8 `string32` data:
+
+```sh
+./scripts/build-worker.sh skiff_cat
+export YT_PROXY=http://localhost:8000
+cargo run -p ytsaurus-client --example skiff_launch
+```
 
 Two defaults exist because getting them wrong is quiet rather than loud:
 
@@ -424,9 +442,10 @@ source, where the word does not appear. `read_table` compensates by checking the
 response is a complete YSON list fragment, so a truncated read is caught; a
 mid-stream failure that still yields well-formed output would not be.
 
-**`read_table` and `write_table` hold the whole table.** They are for results a
-launcher inspects; `read_table_streaming` and `write_table_streaming` are for
-everything larger.
+**`read_table` and `write_table` hold the whole table**, as do their
+`_with_format` and `_skiff_table` variants. They are for results a launcher
+inspects; `read_table_streaming` and `write_table_streaming` are for everything
+larger.
 
 ## Why not JSON
 

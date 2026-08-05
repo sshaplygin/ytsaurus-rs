@@ -106,11 +106,17 @@ pub use crate::spec::{
 };
 pub use crate::stream::TableReader;
 pub use crate::transaction::Transaction;
+pub use ytsaurus_format::DataFormat;
 #[cfg(feature = "derive")]
 pub use ytsaurus_helpers::TableRow;
+pub use ytsaurus_skiff::{
+    Format as SkiffFormat, Schema as SkiffSchema, SchemaRef as SkiffSchemaRef,
+    WireType as SkiffWireType,
+};
 
 use crate::http::{Method, Payload, Transport};
 use crate::retry::Repeatable;
+use ytsaurus_skiff::Decoder as SkiffDecoder;
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
 /// Default request timeout.
@@ -1222,10 +1228,86 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn write_table(&self, path: impl Into<TablePath>, rows: &[u8]) -> Result<()> {
+        self.write_table_with_format(path, rows, &DataFormat::binary_yson())
+    }
+
+    /// Writes rows to a table using a shared [`DataFormat`], replacing its
+    /// contents.
+    ///
+    /// YSON data is a list fragment in the selected representation. Skiff data
+    /// is a complete schema-described stream; direct table I/O requires exactly
+    /// one schema with named non-system fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the format is unsupported, the data is not a
+    /// complete Skiff stream, or the request fails.
+    pub fn write_table_with_format(
+        &self,
+        path: impl Into<TablePath>,
+        rows: &[u8],
+        format: &DataFormat,
+    ) -> Result<()> {
+        let path = path.into();
+        match format {
+            DataFormat::Yson(format) => self.write_yson_table(&path, rows, *format),
+            DataFormat::Skiff(format) => self.write_skiff_table_impl(&path, rows, format),
+            _ => Err(unsupported_data_format()),
+        }
+    }
+
+    fn write_yson_table(&self, path: &TablePath, rows: &[u8], format: YsonFormat) -> Result<()> {
         let params = yson_build::map([
-            ("path", path.into().to_yson()),
-            ("input_format", yson_build::binary_yson_format()),
+            ("path", path.to_yson()),
+            ("input_format", DataFormat::yson(format).to_yson()),
         ]);
+        self.transport.call(
+            Method::Put,
+            "write_table",
+            &params,
+            Payload::Bytes(rows),
+            Repeatable::Never,
+        )?;
+        Ok(())
+    }
+
+    /// Writes a complete Skiff stream to one table, replacing its contents.
+    ///
+    /// `format` must have exactly one table schema. Its named fields are sent
+    /// as the rich-path `columns` projection, matching the Go SDK; this is how
+    /// the proxy maps the positional Skiff tuple to table columns. `rows` is
+    /// checked against that schema before the request is made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the format is not a direct-table format, the
+    /// stream is incomplete, or the request fails.
+    pub fn write_skiff_table(
+        &self,
+        path: impl Into<TablePath>,
+        rows: &[u8],
+        format: &SkiffFormat,
+    ) -> Result<()> {
+        self.write_table_with_format(path, rows, &DataFormat::skiff(format.clone()))
+    }
+
+    fn write_skiff_table_impl(
+        &self,
+        path: &TablePath,
+        rows: &[u8],
+        format: &SkiffFormat,
+    ) -> Result<()> {
+        // The path first: it is what rejects a format that is not single-table
+        // direct I/O. Checking the stream first would answer a multi-table
+        // format with a decode error about a tag mismatch, which describes a
+        // consequence rather than the mistake.
+        let path_value = skiff_table_path(path, format)?;
+        check_complete_skiff_stream(rows, format).map_err(|reason| ClientError::Decode {
+            command: "write_table".to_owned(),
+            reason: format!("{}: {reason}", path.as_str()),
+        })?;
+
+        let params = yson_build::map([("path", path_value), ("input_format", format.to_yson())]);
         self.transport.call(
             Method::Put,
             "write_table",
@@ -1251,9 +1333,31 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails or the stream is truncated.
     pub fn read_table(&self, path: &str) -> Result<Vec<u8>> {
+        self.read_table_with_format(path, &DataFormat::binary_yson())
+    }
+
+    /// Reads a whole table using a shared [`DataFormat`].
+    ///
+    /// The returned bytes are a YSON list fragment or a complete Skiff stream,
+    /// according to `format`. The response is checked for truncated records
+    /// before it is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the format is unsupported, the response is
+    /// incomplete, or the request fails.
+    pub fn read_table_with_format(&self, path: &str, format: &DataFormat) -> Result<Vec<u8>> {
+        match format {
+            DataFormat::Yson(format) => self.read_yson_table(path, *format),
+            DataFormat::Skiff(format) => self.read_skiff_table_impl(path, format),
+            _ => Err(unsupported_data_format()),
+        }
+    }
+
+    fn read_yson_table(&self, path: &str, format: YsonFormat) -> Result<Vec<u8>> {
         let params = yson_build::map([
             ("path", yson_build::string(path)),
-            ("output_format", yson_build::binary_yson_format()),
+            ("output_format", DataFormat::yson(format).to_yson()),
         ]);
         let body = self.transport.call(
             Method::Get,
@@ -1263,7 +1367,43 @@ impl Client {
             Repeatable::Never,
         )?;
 
-        check_complete_fragment(&body).map_err(|reason| ClientError::Decode {
+        check_complete_yson_fragment(&body, format).map_err(|reason| ClientError::Decode {
+            command: "read_table".to_owned(),
+            reason: format!("{path}: {reason}"),
+        })?;
+
+        Ok(body)
+    }
+
+    /// Reads one table as a complete Skiff stream.
+    ///
+    /// `format` must have exactly one table schema. Its named fields select
+    /// the table columns and determine the bytes returned. The response is
+    /// decoded to its end before being returned so a truncated Skiff stream is
+    /// never reported as a successful table read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the format is not a direct-table format, the
+    /// response is incomplete, or the request fails.
+    pub fn read_skiff_table(&self, path: &str, format: &SkiffFormat) -> Result<Vec<u8>> {
+        self.read_table_with_format(path, &DataFormat::skiff(format.clone()))
+    }
+
+    fn read_skiff_table_impl(&self, path: &str, format: &SkiffFormat) -> Result<Vec<u8>> {
+        let params = yson_build::map([
+            ("path", skiff_table_path(&TablePath::from(path), format)?),
+            ("output_format", format.to_yson()),
+        ]);
+        let body = self.transport.call(
+            Method::Get,
+            "read_table",
+            &params,
+            Payload::None,
+            Repeatable::Never,
+        )?;
+
+        check_complete_skiff_stream(&body, format).map_err(|reason| ClientError::Decode {
             command: "read_table".to_owned(),
             reason: format!("{path}: {reason}"),
         })?;
@@ -1520,6 +1660,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_map(&self, spec: &MapSpec) -> Result<String> {
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::Map, &spec.to_yson())
     }
 
@@ -1529,6 +1670,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_map_reduce(&self, spec: &MapReduceSpec) -> Result<String> {
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::MapReduce, &spec.to_yson())
     }
 
@@ -1542,6 +1684,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_reduce(&self, spec: &ReduceSpec) -> Result<String> {
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::Reduce, &spec.to_yson())
     }
 
@@ -1576,6 +1719,7 @@ impl Client {
             )));
         }
 
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::Vanilla, &spec.to_yson())
     }
 
@@ -2274,7 +2418,16 @@ fn completed_total(statistic: &YsonValue) -> Option<i64> {
 ///
 /// Walks record boundaries without decoding, so the cost is a scan rather than
 /// a parse of the whole table.
-fn check_complete_fragment(mut data: &[u8]) -> std::result::Result<(), String> {
+#[cfg(test)]
+fn check_complete_fragment(data: &[u8]) -> std::result::Result<(), String> {
+    check_complete_yson_fragment(data, YsonFormat::Binary)
+}
+
+/// Verifies that `data` is a whole YSON list fragment in `format`.
+fn check_complete_yson_fragment(
+    mut data: &[u8],
+    format: YsonFormat,
+) -> std::result::Result<(), String> {
     use ytsaurus_yson::{Scan, scan_value};
 
     let total = data.len();
@@ -2286,7 +2439,7 @@ fn check_complete_fragment(mut data: &[u8]) -> std::result::Result<(), String> {
             return Ok(());
         }
 
-        match scan_value(data, YsonFormat::Binary) {
+        match scan_value(data, format) {
             Ok(Scan::Complete { len }) => data = &data[len..],
             Ok(Scan::Incomplete) => {
                 return Err(format!(
@@ -2297,7 +2450,7 @@ fn check_complete_fragment(mut data: &[u8]) -> std::result::Result<(), String> {
             }
             Err(e) => {
                 return Err(format!(
-                    "the response is not valid binary YSON at byte {}: {e}",
+                    "the response is not valid {format:?} YSON at byte {}: {e}",
                     total - data.len()
                 ));
             }
@@ -2305,9 +2458,106 @@ fn check_complete_fragment(mut data: &[u8]) -> std::result::Result<(), String> {
     }
 }
 
+fn unsupported_data_format() -> ClientError {
+    ClientError::Config(
+        "this ytsaurus-client version does not support the selected data format".to_owned(),
+    )
+}
+
+/// Builds the rich table path a direct Skiff table read/write requires.
+///
+/// The Go SDK derives this `columns` projection from the single table schema;
+/// without it the positional tuple has no explicit column selection. Job I/O
+/// differs: its format may have several schemas and uses the Variant16 table
+/// prefix, so it is deliberately configured through operation specs instead.
+///
+/// The path's own attributes are kept: a Skiff write to an appending
+/// [`TablePath`] has to append, exactly as the YSON one does.
+/// Refuses a spec whose Skiff format does not describe the tables it will meet.
+///
+/// Refused here rather than sent, for the reason the duplicate-task check
+/// above is: the cluster's answer to this is a rejected operation at best, and
+/// at worst a job that reads a table its format does not describe and fails
+/// part-way through, having already written output that now has to be cleaned
+/// up.
+fn refuse_skiff_table_mismatch(mismatch: Option<String>) -> Result<()> {
+    match mismatch {
+        Some(reason) => Err(ClientError::Config(reason)),
+        None => Ok(()),
+    }
+}
+
+fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue> {
+    if format.table_schemas().len() != 1 {
+        return Err(ClientError::Config(format!(
+            "Skiff table I/O requires exactly one table schema, got {}",
+            format.table_schemas().len()
+        )));
+    }
+    let schema = format.table_schema(0).map_err(|error| {
+        ClientError::Config(format!(
+            "Skiff table I/O has an invalid table schema: {error}"
+        ))
+    })?;
+    let columns = schema
+        .children
+        .iter()
+        .map(|column| {
+            let name = column.name.as_deref().ok_or_else(|| {
+                ClientError::Config("Skiff table I/O schema has an unnamed column".to_owned())
+            })?;
+            if matches!(name, "$key_switch" | "$row_index" | "$range_index") {
+                return Err(ClientError::Config(format!(
+                    "Skiff table I/O schema contains job-only system column {name}"
+                )));
+            }
+            Ok(yson_build::string(name))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut attributes = vec![("columns", yson_build::list(columns))];
+    if path.is_append() {
+        attributes.push(("append", yson_build::boolean(true)));
+    }
+
+    Ok(yson_build::with_attributes(
+        yson_build::string(path.as_str()),
+        attributes,
+    ))
+}
+
+/// Checks that a returned or submitted Skiff stream is a whole number of rows.
+///
+/// Walks the rows without building them: `skip_row` applies the same framing,
+/// schema and limit checks the decoder does — including the per-blob bound —
+/// and allocates nothing. Decoding instead would build a `Value` tree for
+/// every row of the caller's whole table only to drop it, which on the write
+/// path is a second copy of the table in memory before the request is even
+/// made. The YSON counterpart walks record boundaries the same way.
+fn check_complete_skiff_stream(
+    data: &[u8],
+    format: &SkiffFormat,
+) -> std::result::Result<(), String> {
+    let mut decoder = SkiffDecoder::new(data, format.clone());
+    while decoder
+        .skip_row()
+        .map_err(|error| format!("not a complete Skiff stream: {error}"))?
+        .is_some()
+    {}
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+        time::Duration,
+    };
+
     use super::*;
+    use ytsaurus_skiff::{Encoder as SkiffEncoder, Schema, SchemaRef, Value, WireType};
 
     #[test]
     fn a_get_answer_decodes_straight_into_the_type_asked_for() {
@@ -2368,6 +2618,179 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    fn skiff_format() -> SkiffFormat {
+        SkiffFormat::new(vec![SchemaRef::Inline(Schema::tuple([
+            Schema::named("found", WireType::Uint64),
+            Schema::named("rcl", WireType::String32),
+        ]))])
+        .expect("a named tuple is a direct-table format")
+    }
+
+    #[test]
+    fn skiff_table_path_selects_schema_columns() {
+        let value = skiff_table_path(&TablePath::from("//tmp/table"), &skiff_format()).unwrap();
+        let rendered = ytsaurus_yson::to_string(&value, YsonFormat::Text).unwrap();
+        assert_eq!(rendered, r#"<columns=[found;rcl]>"//tmp/table""#);
+    }
+
+    #[test]
+    fn skiff_stream_completeness_uses_the_declared_schema() {
+        let schema = skiff_format().table_schema(0).unwrap().clone();
+        let mut encoder = SkiffEncoder::new(Vec::new(), schema).unwrap();
+        encoder
+            .write(&Value::Tuple(vec![
+                Value::Uint64(7),
+                Value::Bytes(b"ok".to_vec()),
+            ]))
+            .unwrap();
+        let complete = encoder.into_inner().unwrap();
+
+        assert!(check_complete_skiff_stream(&complete, &skiff_format()).is_ok());
+        for cut in 1..complete.len() {
+            assert!(
+                check_complete_skiff_stream(&complete[..cut], &skiff_format()).is_err(),
+                "cut at {cut} must not pass"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_skiff_table_format_rejects_multi_table_and_job_controls() {
+        let multiple = SkiffFormat::new(vec![
+            SchemaRef::Inline(Schema::tuple([Schema::named("a", WireType::Uint64)])),
+            SchemaRef::Inline(Schema::tuple([Schema::named("b", WireType::Uint64)])),
+        ])
+        .unwrap();
+        assert!(matches!(
+            skiff_table_path(&TablePath::from("//tmp/table"), &multiple),
+            Err(ClientError::Config(_))
+        ));
+
+        let job_control =
+            SkiffFormat::new(vec![SchemaRef::Inline(Schema::tuple([Schema::named(
+                "$key_switch",
+                WireType::Boolean,
+            )]))])
+            .unwrap();
+        assert!(matches!(
+            skiff_table_path(&TablePath::from("//tmp/table"), &job_control),
+            Err(ClientError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn skiff_table_calls_use_schema_format_columns_and_raw_streams() {
+        let schema = skiff_format().table_schema(0).unwrap().clone();
+        let mut encoder = SkiffEncoder::new(Vec::new(), schema).unwrap();
+        encoder
+            .write(&Value::Tuple(vec![
+                Value::Uint64(7),
+                Value::Bytes(b"ok".to_vec()),
+            ]))
+            .unwrap();
+        let stream = encoder.into_inner().unwrap();
+
+        let (proxy, write_request) = one_request_proxy(Vec::new());
+        Client::new(&proxy)
+            .write_table_with_format("//tmp/write", &stream, &DataFormat::skiff(skiff_format()))
+            .unwrap();
+        let write_request = write_request.join().unwrap();
+        assert!(write_request.starts_with(b"PUT /api/v4/write_table HTTP/1.1\r\n"));
+        let write_headers = String::from_utf8_lossy(&write_request);
+        assert!(
+            write_headers.contains("input_format=<table_skiff_schemas="),
+            "{write_headers}"
+        );
+        assert!(
+            write_headers.contains(r#"path=<columns=[found;rcl]>"//tmp/write""#),
+            "{write_headers}"
+        );
+        assert!(write_request.ends_with(&stream));
+
+        let (proxy, read_request) = one_request_proxy(stream.clone());
+        let received = Client::new(&proxy)
+            .read_table_with_format("//tmp/read", &DataFormat::skiff(skiff_format()))
+            .unwrap();
+        let read_request = read_request.join().unwrap();
+        assert!(read_request.starts_with(b"GET /api/v4/read_table HTTP/1.1\r\n"));
+        let read_headers = String::from_utf8_lossy(&read_request);
+        assert!(
+            read_headers.contains("output_format=<table_skiff_schemas="),
+            "{read_headers}"
+        );
+        assert!(
+            read_headers.contains(r#"path=<columns=[found;rcl]>"//tmp/read""#),
+            "{read_headers}"
+        );
+        assert_eq!(received, stream);
+    }
+
+    #[test]
+    fn shared_yson_table_format_uses_the_requested_yson_encoding() {
+        let (proxy, request) = one_request_proxy(Vec::new());
+        Client::new(&proxy)
+            .write_table_with_format("//tmp/write", b"{value=one};", &DataFormat::text_yson())
+            .unwrap();
+
+        let request = request.join().unwrap();
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.contains("input_format=<format=text>yson"),
+            "{request}"
+        );
+    }
+
+    fn one_request_proxy(body: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            request
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        let expected = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read != 0, "client closed before sending a complete request");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end + 4]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            break headers_end + 4 + content_length;
+        };
+        while request.len() < expected {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read != 0, "client closed before sending its request body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request
     }
 
     #[test]

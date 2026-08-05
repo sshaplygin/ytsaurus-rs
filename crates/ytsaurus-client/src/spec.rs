@@ -8,15 +8,47 @@
 //! Reference:
 //! <https://ytsaurus.tech/docs/en/user-guide/data-processing/operations/operations-options>
 
+use ytsaurus_format::DataFormat;
+use ytsaurus_skiff::Format as SkiffFormat;
 use ytsaurus_yson::YsonValue;
 
-use crate::yson_build::{
-    binary_yson_format, boolean, insert, int, list, map, string, with_attributes,
-};
+use crate::yson_build::{boolean, insert, int, list, map, string, with_attributes};
 
 /// A `file_paths` entry that lands in the sandbox under `name`.
 fn named_file(path: impl Into<String>, name: impl AsRef<str>) -> YsonValue {
     with_attributes(string(path.into()), [("file_name", string(name.as_ref()))])
+}
+
+/// Describes a Skiff format applied to a different number of tables than it
+/// has schemas, or `None` when the format is YSON or the counts agree.
+///
+/// A Skiff format is positional: schema `k` describes table `k`, which is why
+/// YTsaurus needs one per table and a YSON selection needs none. `tables` is
+/// how many tables the format will actually meet, and `kind` names them for the
+/// message.
+fn skiff_table_mismatch(
+    what: &str,
+    format: &DataFormat,
+    tables: usize,
+    kind: &str,
+) -> Option<String> {
+    let schemas = format.as_skiff()?.table_schemas().len();
+    if schemas == tables {
+        return None;
+    }
+    Some(format!(
+        "{what} declares {}, but this operation has {}",
+        plural(schemas, "Skiff table schema"),
+        plural(tables, kind)
+    ))
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 /// The kind of operation to start.
@@ -59,6 +91,8 @@ struct UserJob {
     files: Vec<YsonValue>,
     memory_limit: Option<i64>,
     environment: Vec<(String, String)>,
+    input_format: DataFormat,
+    output_format: DataFormat,
 }
 
 impl UserJob {
@@ -68,16 +102,23 @@ impl UserJob {
             files: Vec::new(),
             memory_limit: None,
             environment: Vec::new(),
+            input_format: DataFormat::binary_yson(),
+            output_format: DataFormat::binary_yson(),
         }
+    }
+
+    fn with_formats(&mut self, input: DataFormat, output: DataFormat) {
+        self.input_format = input;
+        self.output_format = output;
     }
 
     fn to_yson(&self) -> YsonValue {
         let mut job = map([
             ("command", string(&self.command)),
-            // Both directions are binary YSON, which is what `JobReader` and
-            // `JobWriter` expect by default.
-            ("input_format", binary_yson_format()),
-            ("output_format", binary_yson_format()),
+            // Both directions default to binary YSON. `with_formats` replaces
+            // them together, so worker and operation cannot drift.
+            ("input_format", self.input_format.to_yson()),
+            ("output_format", self.output_format.to_yson()),
         ]);
 
         if !self.files.is_empty() {
@@ -163,6 +204,25 @@ impl MapSpec {
         self
     }
 
+    /// Selects the mapper's input and output data formats.
+    ///
+    /// YSON selections apply to every table. A Skiff selection must contain one
+    /// table schema per corresponding input or output table, in the same order.
+    /// The default remains binary YSON.
+    #[must_use]
+    pub fn with_formats(mut self, input: DataFormat, output: DataFormat) -> Self {
+        self.mapper.with_formats(input, output);
+        self
+    }
+
+    /// Uses validated Skiff formats for the mapper's input and output streams.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_formats`].
+    #[must_use]
+    pub fn with_skiff_formats(self, input: SkiffFormat, output: SkiffFormat) -> Self {
+        self.with_formats(DataFormat::skiff(input), DataFormat::skiff(output))
+    }
+
     /// Sets an environment variable for the job, e.g. `RUST_BACKTRACE`.
     #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -184,6 +244,33 @@ impl MapSpec {
     pub fn with_job_count(mut self, count: i64) -> Self {
         self.job_count = Some(count);
         self
+    }
+
+    /// Describes a Skiff format that does not match this spec's table lists.
+    ///
+    /// A Skiff format needs one table schema per table, in order. Get the count
+    /// wrong and the operation is submitted anyway: the cluster may refuse it,
+    /// or the job may read a table the format does not describe and fail
+    /// mid-stream, after it has already written output.
+    /// [`Client::start_map`](crate::Client::start_map) checks this before
+    /// sending the spec; check it here if you render the spec yourself with
+    /// [`MapSpec::to_yson`].
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        skiff_table_mismatch(
+            "the mapper's input_format",
+            &self.mapper.input_format,
+            self.inputs.len(),
+            "input table",
+        )
+        .or_else(|| {
+            skiff_table_mismatch(
+                "the mapper's output_format",
+                &self.mapper.output_format,
+                self.outputs.len(),
+                "output table",
+            )
+        })
     }
 
     /// Sets any spec field this builder does not model.
@@ -224,6 +311,12 @@ impl MapSpec {
 #[derive(Debug, Clone)]
 pub struct MapReduceSpec {
     mapper: Option<UserJob>,
+    /// The mapper's formats, for the same reason and by the same route as the
+    /// files below: the mapper may not exist yet when they are chosen. Keeping
+    /// them here and applying them at render time is what makes
+    /// `with_mapper_formats` before `with_mapper` mean what it says, without a
+    /// second copy on the phase that both methods would have to keep in step.
+    mapper_formats: Option<(DataFormat, DataFormat)>,
     reducer: UserJob,
     /// Files and the memory limit are promised "to both phases", so they live
     /// on the spec and reach each phase at render time. Holding them on the
@@ -253,6 +346,7 @@ impl MapReduceSpec {
     {
         Self {
             mapper: None,
+            mapper_formats: None,
             reducer: UserJob::new(reducer),
             files: Vec::new(),
             memory_limit: None,
@@ -272,6 +366,42 @@ impl MapReduceSpec {
     pub fn with_mapper(mut self, command: impl Into<String>) -> Self {
         self.mapper = Some(UserJob::new(command));
         self
+    }
+
+    /// Selects the mapper phase's input and output data formats.
+    ///
+    /// A Skiff format must contain one schema per corresponding table. It may
+    /// be called before or after [`Self::with_mapper`].
+    #[must_use]
+    pub fn with_mapper_formats(mut self, input: DataFormat, output: DataFormat) -> Self {
+        self.mapper_formats = Some((input, output));
+        self
+    }
+
+    /// Uses validated Skiff formats for the mapper phase.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_mapper_formats`].
+    #[must_use]
+    pub fn with_mapper_skiff_formats(self, input: SkiffFormat, output: SkiffFormat) -> Self {
+        self.with_mapper_formats(DataFormat::skiff(input), DataFormat::skiff(output))
+    }
+
+    /// Selects the reducer phase's input and output data formats.
+    ///
+    /// A Skiff format must contain one schema per corresponding table, in the
+    /// order YTsaurus uses for that phase.
+    #[must_use]
+    pub fn with_reducer_formats(mut self, input: DataFormat, output: DataFormat) -> Self {
+        self.reducer.with_formats(input, output);
+        self
+    }
+
+    /// Uses validated Skiff formats for the reducer phase.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_reducer_formats`].
+    #[must_use]
+    pub fn with_reducer_skiff_formats(self, input: SkiffFormat, output: SkiffFormat) -> Self {
+        self.with_reducer_formats(DataFormat::skiff(input), DataFormat::skiff(output))
     }
 
     /// Adds a Cypress file to both phases.
@@ -308,9 +438,12 @@ impl MapReduceSpec {
         self
     }
 
-    /// A phase's job spec, with the spec-level files and memory limit applied.
-    fn phase(&self, job: &UserJob) -> YsonValue {
+    /// A phase's job spec, with the spec-level settings applied.
+    fn phase(&self, job: &UserJob, formats: Option<&(DataFormat, DataFormat)>) -> YsonValue {
         let mut job = job.clone();
+        if let Some((input, output)) = formats {
+            job.with_formats(input.clone(), output.clone());
+        }
         job.files.extend(self.files.iter().cloned());
         if job.memory_limit.is_none() {
             job.memory_limit = self.memory_limit;
@@ -339,6 +472,50 @@ impl MapReduceSpec {
         self
     }
 
+    /// Describes a Skiff format that does not match this spec's table lists.
+    ///
+    /// Only the counts this builder can know. What the mapper writes and what
+    /// the reducer reads are shuffle streams, and how the output tables are
+    /// split between the phases depends on `mapper_output_table_count`, which
+    /// this builder does not model — a spec that sets it through
+    /// [`Self::with_raw`] therefore has its output side left to the cluster
+    /// rather than guessed at. The Go SDK declines to check its reduce phase
+    /// for the same reason.
+    ///
+    /// See [`MapSpec::skiff_table_mismatch`] for what an unchecked mismatch
+    /// costs. [`Client::start_map_reduce`](crate::Client::start_map_reduce)
+    /// checks this before sending the spec.
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        let split_outputs = self
+            .extra
+            .iter()
+            .any(|(key, _)| key == "mapper_output_table_count");
+
+        self.mapper
+            .as_ref()
+            .and(self.mapper_formats.as_ref())
+            .and_then(|(input, _)| {
+                skiff_table_mismatch(
+                    "the mapper's input_format",
+                    input,
+                    self.inputs.len(),
+                    "input table",
+                )
+            })
+            .or_else(|| {
+                if split_outputs {
+                    return None;
+                }
+                skiff_table_mismatch(
+                    "the reducer's output_format",
+                    &self.reducer.output_format,
+                    self.outputs.len(),
+                    "output table",
+                )
+            })
+    }
+
     /// Sets any spec field this builder does not model.
     #[must_use]
     pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
@@ -350,14 +527,18 @@ impl MapReduceSpec {
     #[must_use]
     pub fn to_yson(&self) -> YsonValue {
         let mut spec = map([
-            ("reducer", self.phase(&self.reducer)),
+            ("reducer", self.phase(&self.reducer, None)),
             ("input_table_paths", list(self.inputs.iter().map(string))),
             ("output_table_paths", list(self.outputs.iter().map(string))),
             ("reduce_by", list(self.reduce_by.iter().map(string))),
         ]);
 
         if let Some(mapper) = &self.mapper {
-            insert(&mut spec, "mapper", self.phase(mapper));
+            insert(
+                &mut spec,
+                "mapper",
+                self.phase(mapper, self.mapper_formats.as_ref()),
+            );
         }
 
         let sort_by = if self.sort_by.is_empty() {
@@ -465,6 +646,33 @@ impl ReduceSpec {
         self
     }
 
+    /// Selects the reducer's input and output data formats.
+    ///
+    /// YSON selections apply to every table. A Skiff selection must contain one
+    /// table schema per corresponding input or output table, in the same order.
+    /// The default remains binary YSON.
+    ///
+    /// A Skiff reducer receives its key switch as a `$key_switch` boolean
+    /// column rather than as a YSON control record, so the input schema has to
+    /// declare that column for `ytsaurus-job`'s `SkiffJobReader` to report it —
+    /// `enable_key_switch` asks the cluster to deliver key switches, and the
+    /// format decides how they arrive. A schema without the column leaves a
+    /// grouping reducer seeing one group, exactly as
+    /// [`Self::without_key_switch`] would.
+    #[must_use]
+    pub fn with_formats(mut self, input: DataFormat, output: DataFormat) -> Self {
+        self.reducer.with_formats(input, output);
+        self
+    }
+
+    /// Uses validated Skiff formats for the reducer's input and output streams.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_formats`].
+    #[must_use]
+    pub fn with_skiff_formats(self, input: SkiffFormat, output: SkiffFormat) -> Self {
+        self.with_formats(DataFormat::skiff(input), DataFormat::skiff(output))
+    }
+
     /// Sets an environment variable for the job, e.g. `RUST_BACKTRACE`.
     #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -510,6 +718,32 @@ impl ReduceSpec {
     pub fn without_key_switch(mut self) -> Self {
         self.key_switch = false;
         self
+    }
+
+    /// Describes a Skiff format that does not match this spec's table lists.
+    ///
+    /// A reduce merges its input tables into one sorted stream but keeps them
+    /// distinguishable, so the input format describes every input table, as the
+    /// Go SDK's `setupSkiffInputFormat` also requires. See
+    /// [`MapSpec::skiff_table_mismatch`] for what an unchecked mismatch costs.
+    /// [`Client::start_reduce`](crate::Client::start_reduce) checks this before
+    /// sending the spec.
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        skiff_table_mismatch(
+            "the reducer's input_format",
+            &self.reducer.input_format,
+            self.inputs.len(),
+            "input table",
+        )
+        .or_else(|| {
+            skiff_table_mismatch(
+                "the reducer's output_format",
+                &self.reducer.output_format,
+                self.outputs.len(),
+                "output table",
+            )
+        })
     }
 
     /// Sets any spec field this builder does not model.
@@ -694,6 +928,27 @@ impl VanillaTask {
         self
     }
 
+    /// Selects the data format these jobs write.
+    ///
+    /// Only the output direction, because a vanilla task has no input: there is
+    /// no input table for an input format to describe, and the one this spec
+    /// sends stays at the binary YSON every vanilla operation here has run
+    /// with. A Skiff selection must contain one table schema per output table
+    /// set by [`Self::with_outputs`], in the same order.
+    #[must_use]
+    pub fn with_output_format(mut self, output: DataFormat) -> Self {
+        self.job.output_format = output;
+        self
+    }
+
+    /// Uses a validated Skiff format for these jobs' output streams.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_output_format`].
+    #[must_use]
+    pub fn with_skiff_output_format(self, output: SkiffFormat) -> Self {
+        self.with_output_format(DataFormat::skiff(output))
+    }
+
     /// Sets an environment variable for these jobs.
     #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -785,6 +1040,23 @@ impl VanillaSpec {
             .map(|task| task.name.as_str())
     }
 
+    /// Describes a task whose Skiff output format does not match its outputs.
+    ///
+    /// See [`MapSpec::skiff_table_mismatch`] for what an unchecked mismatch
+    /// costs. [`Client::start_vanilla`](crate::Client::start_vanilla) checks
+    /// this before sending the spec.
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        self.tasks.iter().find_map(|task| {
+            skiff_table_mismatch(
+                &format!("task {:?}'s output_format", task.name),
+                &task.job.output_format,
+                task.outputs.len(),
+                "output table",
+            )
+        })
+    }
+
     /// Sets any spec field this builder does not model.
     #[must_use]
     pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
@@ -813,10 +1085,124 @@ impl VanillaSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ytsaurus_skiff::{Schema, SchemaRef, WireType};
     use ytsaurus_yson::{YsonFormat, to_string};
 
     fn render(v: &YsonValue) -> String {
         to_string(v, YsonFormat::Text).expect("encodes")
+    }
+
+    fn skiff_format(column: &str) -> SkiffFormat {
+        SkiffFormat::new(vec![SchemaRef::Inline(Schema::tuple([Schema::named(
+            column,
+            WireType::Uint64,
+        )]))])
+        .expect("a named tuple is a table schema")
+    }
+
+    fn skiff_tables(columns: &[&str]) -> SkiffFormat {
+        SkiffFormat::new(
+            columns
+                .iter()
+                .map(|column| {
+                    SchemaRef::Inline(Schema::tuple([Schema::named(*column, WireType::Uint64)]))
+                })
+                .collect(),
+        )
+        .expect("named tuples are table schemas")
+    }
+
+    #[test]
+    fn a_map_skiff_format_needs_one_schema_per_table() {
+        let two_in_one_out = MapSpec::new("./w", ["//a", "//b"], ["//out"]);
+
+        let short_input = two_in_one_out
+            .clone()
+            .with_skiff_formats(skiff_tables(&["source"]), skiff_tables(&["result"]));
+        let reason = short_input
+            .skiff_table_mismatch()
+            .expect("one schema cannot describe two input tables");
+        assert!(reason.contains("input_format"), "{reason}");
+        assert!(reason.contains("1 Skiff table schema,"), "{reason}");
+        assert!(reason.contains("2 input tables"), "{reason}");
+
+        let long_output = two_in_one_out
+            .clone()
+            .with_skiff_formats(skiff_tables(&["a", "b"]), skiff_tables(&["x", "y"]));
+        let reason = long_output
+            .skiff_table_mismatch()
+            .expect("two schemas cannot describe one output table");
+        assert!(reason.contains("output_format"), "{reason}");
+
+        assert!(
+            two_in_one_out
+                .clone()
+                .with_skiff_formats(skiff_tables(&["a", "b"]), skiff_tables(&["x"]))
+                .skiff_table_mismatch()
+                .is_none()
+        );
+        // A YSON selection applies to every table, so it has nothing to count.
+        assert!(two_in_one_out.skiff_table_mismatch().is_none());
+    }
+
+    #[test]
+    fn a_reduce_skiff_format_needs_one_schema_per_table() {
+        let spec = ReduceSpec::new("./w", ["//a", "//b"], ["//out"], ["key"]);
+
+        let reason = spec
+            .clone()
+            .with_skiff_formats(skiff_tables(&["source"]), skiff_tables(&["result"]))
+            .skiff_table_mismatch()
+            .expect("a reduce input format describes every input table");
+        assert!(reason.contains("input_format"), "{reason}");
+
+        assert!(
+            spec.with_skiff_formats(skiff_tables(&["a", "b"]), skiff_tables(&["x"]))
+                .skiff_table_mismatch()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn map_reduce_checks_the_counts_it_knows_and_leaves_the_shuffle_alone() {
+        let spec = MapReduceSpec::new("./r", ["//a", "//b"], ["//out"], ["key"])
+            .with_mapper("./m")
+            .with_mapper_skiff_formats(skiff_tables(&["one"]), skiff_tables(&["shuffle"]));
+        let reason = spec
+            .skiff_table_mismatch()
+            .expect("the mapper still reads the operation's input tables");
+        assert!(reason.contains("input_format"), "{reason}");
+
+        // Two schemas for what this builder renders as one shuffle stream is
+        // exactly the count it refuses to guess at.
+        let shuffle = MapReduceSpec::new("./r", ["//a"], ["//out"], ["key"])
+            .with_mapper("./m")
+            .with_mapper_skiff_formats(skiff_tables(&["one"]), skiff_tables(&["x", "y"]))
+            .with_reducer_skiff_formats(skiff_tables(&["x", "y"]), skiff_tables(&["out"]));
+        assert!(shuffle.skiff_table_mismatch().is_none());
+    }
+
+    #[test]
+    fn a_vanilla_task_skiff_output_needs_one_schema_per_output() {
+        let spec = VanillaSpec::new(
+            VanillaTask::new("worker", "./w", 1)
+                .with_outputs(["//one"])
+                .with_skiff_output_format(skiff_tables(&["a", "b"])),
+        );
+        let reason = spec
+            .skiff_table_mismatch()
+            .expect("two schemas cannot describe one output table");
+        assert!(reason.contains(r#"task "worker""#), "{reason}");
+
+        assert!(
+            VanillaSpec::new(
+                VanillaTask::new("worker", "./w", 1)
+                    .with_outputs(["//one"])
+                    .with_skiff_output_format(skiff_tables(&["a"])),
+            )
+            .skiff_table_mismatch()
+            .is_none()
+        );
     }
 
     #[test]
@@ -846,6 +1232,37 @@ mod tests {
             out.contains(r#"output_table_paths=["//tmp/x";"//tmp/y"]"#),
             "{out}"
         );
+    }
+
+    #[test]
+    fn map_can_select_schema_checked_skiff_for_both_directions() {
+        let out = render(
+            &MapSpec::new("./worker", ["//in"], ["//out"])
+                .with_skiff_formats(skiff_format("source"), skiff_format("result"))
+                .to_yson(),
+        );
+
+        assert!(out.contains("input_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("output_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("name=source"), "{out}");
+        assert!(out.contains("name=result"), "{out}");
+        assert!(!out.contains("format=binary"), "{out}");
+    }
+
+    #[test]
+    fn map_can_select_yson_and_skiff_through_the_shared_format_enum() {
+        let out = render(
+            &MapSpec::new("./worker", ["//in"], ["//out"])
+                .with_formats(
+                    DataFormat::text_yson(),
+                    DataFormat::skiff(skiff_format("result")),
+                )
+                .to_yson(),
+        );
+
+        assert!(out.contains("input_format=<format=text>yson"), "{out}");
+        assert!(out.contains("output_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("name=result"), "{out}");
     }
 
     #[test]
@@ -879,6 +1296,56 @@ mod tests {
             !out.contains(";job_io=") && !out.contains("{job_io="),
             "must not use the plain job_io section: {out}"
         );
+    }
+
+    #[test]
+    fn map_reduce_can_select_skiff_per_job_phase() {
+        let out = render(
+            &MapReduceSpec::new("./worker reduce", ["//in"], ["//out"], ["key"])
+                .with_mapper("./worker map")
+                .with_mapper_skiff_formats(skiff_format("map_input"), skiff_format("map_output"))
+                .with_reducer_skiff_formats(
+                    skiff_format("reduce_input"),
+                    skiff_format("reduce_output"),
+                )
+                .to_yson(),
+        );
+
+        for column in ["map_input", "map_output", "reduce_input", "reduce_output"] {
+            assert!(out.contains(&format!("name={column}")), "{out}");
+        }
+        assert_eq!(
+            out.matches("input_format=<table_skiff_schemas=").count(),
+            2,
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("output_format=<table_skiff_schemas=").count(),
+            2,
+            "{out}"
+        );
+    }
+
+    /// Formats are chosen for a phase that may not exist yet, so the two call
+    /// orders have to render the same spec.
+    #[test]
+    fn a_mapper_added_last_still_gets_its_formats() {
+        let before = render(
+            &MapReduceSpec::new("./r", ["//in"], ["//out"], ["k"])
+                .with_mapper_skiff_formats(skiff_format("map_input"), skiff_format("map_output"))
+                .with_mapper("./m")
+                .to_yson(),
+        );
+        let after = render(
+            &MapReduceSpec::new("./r", ["//in"], ["//out"], ["k"])
+                .with_mapper("./m")
+                .with_mapper_skiff_formats(skiff_format("map_input"), skiff_format("map_output"))
+                .to_yson(),
+        );
+
+        assert_eq!(before, after);
+        assert!(before.contains("name=map_input"), "{before}");
+        assert!(before.contains("name=map_output"), "{before}");
     }
 
     #[test]
@@ -1113,6 +1580,45 @@ mod tests {
         assert!(out.contains("max_failed_job_count=1"), "{out}");
         // No input: that is what makes it vanilla.
         assert!(!out.contains("input_table_paths"), "{out}");
+    }
+
+    #[test]
+    fn reduce_can_select_skiff_for_both_directions() {
+        let out = render(
+            &ReduceSpec::new("./worker", ["//in"], ["//out"], ["key"])
+                .with_skiff_formats(skiff_format("reduce_input"), skiff_format("reduce_output"))
+                .to_yson(),
+        );
+
+        assert!(out.contains("input_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("output_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("name=reduce_input"), "{out}");
+        assert!(out.contains("name=reduce_output"), "{out}");
+        assert!(!out.contains("format=binary"), "{out}");
+        // The control attribute is the request; the format is the delivery.
+        // Both belong in a Skiff reduce spec, as they do in the Go SDK.
+        assert!(
+            out.contains("control_attributes={enable_key_switch=%true}"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_vanilla_task_can_select_skiff_output_only() {
+        let out = render(
+            &VanillaSpec::new(
+                VanillaTask::new("worker", "./my_job", 1)
+                    .with_outputs(["//tmp/results"])
+                    .with_skiff_output_format(skiff_format("result")),
+            )
+            .to_yson(),
+        );
+
+        assert!(out.contains("output_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("name=result"), "{out}");
+        // No input table, so the input format stays where every vanilla
+        // operation here has left it.
+        assert!(out.contains("input_format=<format=binary>yson"), "{out}");
     }
 
     #[test]

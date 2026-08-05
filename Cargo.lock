@@ -1173,8 +1173,10 @@ dependencies = [
  "serde_json",
  "thiserror",
  "ureq",
+ "ytsaurus-format",
  "ytsaurus-helpers",
  "ytsaurus-job",
+ "ytsaurus-skiff",
  "ytsaurus-yson",
 ]
 
@@ -1186,6 +1188,15 @@ dependencies = [
  "serde_bytes",
  "ytsaurus-client",
  "ytsaurus-job",
+ "ytsaurus-skiff",
+ "ytsaurus-yson",
+]
+
+[[package]]
+name = "ytsaurus-format"
+version = "0.2.0"
+dependencies = [
+ "ytsaurus-skiff",
  "ytsaurus-yson",
 ]
 
@@ -1207,6 +1218,16 @@ dependencies = [
  "criterion",
  "serde",
  "serde_bytes",
+ "thiserror",
+ "ytsaurus-format",
+ "ytsaurus-skiff",
+ "ytsaurus-yson",
+]
+
+[[package]]
+name = "ytsaurus-skiff"
+version = "0.2.0"
+dependencies = [
  "thiserror",
  "ytsaurus-yson",
 ]
