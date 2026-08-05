@@ -543,6 +543,33 @@ impl ReduceSpec {
         self
     }
 
+    /// Selects the reducer's input and output data formats.
+    ///
+    /// YSON selections apply to every table. A Skiff selection must contain one
+    /// table schema per corresponding input or output table, in the same order.
+    /// The default remains binary YSON.
+    ///
+    /// A Skiff reducer receives its key switch as a `$key_switch` boolean
+    /// column rather than as a YSON control record, so the input schema has to
+    /// declare that column for `ytsaurus-job`'s `SkiffJobReader` to report it —
+    /// `enable_key_switch` asks the cluster to deliver key switches, and the
+    /// format decides how they arrive. A schema without the column leaves a
+    /// grouping reducer seeing one group, exactly as
+    /// [`Self::without_key_switch`] would.
+    #[must_use]
+    pub fn with_formats(mut self, input: DataFormat, output: DataFormat) -> Self {
+        self.reducer.with_formats(input, output);
+        self
+    }
+
+    /// Uses validated Skiff formats for the reducer's input and output streams.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_formats`].
+    #[must_use]
+    pub fn with_skiff_formats(self, input: SkiffFormat, output: SkiffFormat) -> Self {
+        self.with_formats(DataFormat::skiff(input), DataFormat::skiff(output))
+    }
+
     /// Sets an environment variable for the job, e.g. `RUST_BACKTRACE`.
     #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -770,6 +797,27 @@ impl VanillaTask {
     pub fn with_memory_limit(mut self, bytes: i64) -> Self {
         self.job.memory_limit = Some(bytes);
         self
+    }
+
+    /// Selects the data format these jobs write.
+    ///
+    /// Only the output direction, because a vanilla task has no input: there is
+    /// no input table for an input format to describe, and the one this spec
+    /// sends stays at the binary YSON every vanilla operation here has run
+    /// with. A Skiff selection must contain one table schema per output table
+    /// set by [`Self::with_outputs`], in the same order.
+    #[must_use]
+    pub fn with_output_format(mut self, output: DataFormat) -> Self {
+        self.job.output_format = output;
+        self
+    }
+
+    /// Uses a validated Skiff format for these jobs' output streams.
+    ///
+    /// This compatibility convenience delegates to [`Self::with_output_format`].
+    #[must_use]
+    pub fn with_skiff_output_format(self, output: SkiffFormat) -> Self {
+        self.with_output_format(DataFormat::skiff(output))
     }
 
     /// Sets an environment variable for these jobs.
@@ -1281,6 +1329,45 @@ mod tests {
         assert!(out.contains("max_failed_job_count=1"), "{out}");
         // No input: that is what makes it vanilla.
         assert!(!out.contains("input_table_paths"), "{out}");
+    }
+
+    #[test]
+    fn reduce_can_select_skiff_for_both_directions() {
+        let out = render(
+            &ReduceSpec::new("./worker", ["//in"], ["//out"], ["key"])
+                .with_skiff_formats(skiff_format("reduce_input"), skiff_format("reduce_output"))
+                .to_yson(),
+        );
+
+        assert!(out.contains("input_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("output_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("name=reduce_input"), "{out}");
+        assert!(out.contains("name=reduce_output"), "{out}");
+        assert!(!out.contains("format=binary"), "{out}");
+        // The control attribute is the request; the format is the delivery.
+        // Both belong in a Skiff reduce spec, as they do in the Go SDK.
+        assert!(
+            out.contains("control_attributes={enable_key_switch=%true}"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_vanilla_task_can_select_skiff_output_only() {
+        let out = render(
+            &VanillaSpec::new(
+                VanillaTask::new("worker", "./my_job", 1)
+                    .with_outputs(["//tmp/results"])
+                    .with_skiff_output_format(skiff_format("result")),
+            )
+            .to_yson(),
+        );
+
+        assert!(out.contains("output_format=<table_skiff_schemas="), "{out}");
+        assert!(out.contains("name=result"), "{out}");
+        // No input table, so the input format stays where every vanilla
+        // operation here has left it.
+        assert!(out.contains("input_format=<format=binary>yson"), "{out}");
     }
 
     #[test]
