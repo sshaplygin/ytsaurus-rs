@@ -1256,12 +1256,7 @@ impl Client {
         }
     }
 
-    fn write_yson_table(
-        &self,
-        path: &TablePath,
-        rows: &[u8],
-        format: YsonFormat,
-    ) -> Result<()> {
+    fn write_yson_table(&self, path: &TablePath, rows: &[u8], format: YsonFormat) -> Result<()> {
         let params = yson_build::map([
             ("path", path.to_yson()),
             ("input_format", DataFormat::yson(format).to_yson()),

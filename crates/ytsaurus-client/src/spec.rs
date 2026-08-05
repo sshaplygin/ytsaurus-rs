@@ -1126,10 +1126,9 @@ mod tests {
         assert!(reason.contains("1 Skiff table schema,"), "{reason}");
         assert!(reason.contains("2 input tables"), "{reason}");
 
-        let long_output = two_in_one_out.clone().with_skiff_formats(
-            skiff_tables(&["a", "b"]),
-            skiff_tables(&["x", "y"]),
-        );
+        let long_output = two_in_one_out
+            .clone()
+            .with_skiff_formats(skiff_tables(&["a", "b"]), skiff_tables(&["x", "y"]));
         let reason = long_output
             .skiff_table_mismatch()
             .expect("two schemas cannot describe one output table");

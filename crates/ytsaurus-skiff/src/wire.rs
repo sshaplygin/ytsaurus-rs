@@ -485,11 +485,7 @@ fn decode_value<R: Read>(
         WireType::Double => Ok(Value::Double(f64::from_le_bytes(read_array(
             input, "double",
         )?))),
-        WireType::String32 => Ok(Value::Bytes(read_blob(
-            input,
-            WireType::String32,
-            budget,
-        )?)),
+        WireType::String32 => Ok(Value::Bytes(read_blob(input, WireType::String32, budget)?)),
         WireType::Yson32 => Ok(Value::Yson(read_blob(input, WireType::Yson32, budget)?)),
         WireType::Variant8 | WireType::Variant16 => {
             let tag = read_variant_tag(input, schema.wire_type)?;
