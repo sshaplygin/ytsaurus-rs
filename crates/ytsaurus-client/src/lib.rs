@@ -138,12 +138,6 @@ const STDERR_EXCERPT: usize = 4096;
 /// too.
 const DEFAULT_FILE_CACHE: &str = "//tmp/yt_wrapper/file_storage/new_cache";
 
-/// The cluster's code for "no such path".
-///
-/// Distinguishing it from every other refusal is what lets a lookup answer
-/// "nothing there" without hiding a permission error behind the same `None`.
-const RESOLVE_ERROR: i64 = 500;
-
 /// The `{value=…}` API v4 wraps a structured answer in.
 ///
 /// Deserialised rather than walked, so [`Client::get_as`] reads the response
@@ -1084,24 +1078,18 @@ impl Client {
             ("md5", yson_build::string(md5)),
             ("cache_path", yson_build::string(&self.file_cache)),
         ]);
-        let body = match self.transport.call(
+        // A `cache_path` that does not exist needs no special case: the cluster
+        // answers 200 with the same empty string it uses for any other miss,
+        // rather than the resolve error a missing path usually earns. Checked
+        // against a local cluster with no `//tmp/yt_wrapper` at all, which is
+        // the state a first upload starts from.
+        let body = self.transport.call(
             Method::Get,
             "get_file_from_cache",
             &params,
             Payload::None,
             Repeatable::Freely,
-        ) {
-            Ok(body) => body,
-            // A cache directory that is not there yet holds nothing, which is a
-            // miss and not a failure — and is how the first upload against a
-            // fresh cluster starts. Only the resolve error is read this way; any
-            // other refusal is the caller's to see.
-            Err(ClientError::Cluster {
-                code: RESOLVE_ERROR,
-                ..
-            }) => return Ok(None),
-            Err(other) => return Err(other),
-        };
+        )?;
 
         self.cached_path(&body, "get_file_from_cache")
     }

@@ -243,8 +243,18 @@ per command. Cluster facts:
 - **An abort is forgiving**: aborting a committed transaction, or one that never
   existed, answers `{}`. So aborting from `Drop` is always safe.
 - **`get_operation`, `list_jobs`, `get_job_stderr` and the file-cache commands
-  accept `transaction_id`** and ignore it, so the blanket stamp needs no
-  exception list. A command that names a transaction itself keeps its own.
+  accept `transaction_id`** and ignore it, so the blanket stamp costs nothing
+  *here*. The client stops sending it to them anyway: `NO_TRANSACTION` in
+  `http.rs` lists the scheduler and job commands, which go to the scheduler and
+  the controller agents rather than the master and take no
+  `TTransactionalOptions`. That is hardening, not a fix — it buys nothing on
+  this cluster, and holds only for as long as a proxy quietly drops parameters
+  it does not recognise. It is worth having because `Transaction` derefs to
+  `Client`, so a launcher's first `wait_for_operation` inside a transaction is
+  what would break on a version that refuses them. **`start_operation` is
+  deliberately not on the list**: an operation genuinely can run inside a
+  transaction, which is how its output tables stay invisible until the launcher
+  commits. A command that names a transaction itself keeps its own.
 - `start_transaction` under a transaction makes a **nested** one, which is what a
   bound client naturally does.
 - Using an aborted or expired transaction fails with `No such transaction` nested
@@ -411,6 +421,15 @@ These cost time once. They are recorded so they do not cost it again.
 - **The file-cache commands answer with a bare string**, not the `{path=…}`
   envelope the rest of API v4 uses, and a **miss is an empty string** rather
   than an error or an entity.
+- **A `cache_path` that does not exist is a miss, not a resolve error.**
+  `get_file_from_cache` against a cluster with no `//tmp/yt_wrapper` at all
+  answers **200 and `""`** — the same empty string as any other miss, not the
+  error 500 a missing path usually earns. So the lookup needs no `create` to
+  guard it, which matters because the cache is often installation-managed and
+  read-only to the caller: a lookup that mutated it would fail exactly where the
+  cache is worth the most. `upload_worker_cached` creates the directory on the
+  miss branch instead. Verified by removing the whole tree and re-running
+  `cached_upload`.
 - **A cached file keeps its name from the hash, not from the upload.** Reference
   it in `file_paths` as `<file_name="my_job">//tmp/.../ab/cdef…` or the job's
   command finds nothing to run.
