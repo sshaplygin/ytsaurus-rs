@@ -8,14 +8,22 @@
 use std::borrow::Cow;
 
 use ytsaurus_client::{ColumnType, SortOrder, TableRow, TableSchema};
-use ytsaurus_helpers::TableRow;
+// The macro under this crate's own name, the trait under the client's.
+//
+// They are separate namespaces, so both can be called `TableRow` — until
+// `ytsaurus-client`'s `derive` feature is on, when the client re-exports this
+// very macro as `TableRow` too and the two collide in the macro namespace. The
+// feature is off in this crate's dev-dependency but on under `--all-features`,
+// where cargo unifies it across the workspace. The alias is about that
+// unification and nothing else.
+use ytsaurus_helpers::TableRow as DeriveTableRow;
 use ytsaurus_yson::{YsonFormat, YsonValue, to_string};
 
 fn render(schema: &TableSchema) -> String {
     to_string(&schema.to_yson(), YsonFormat::Text).expect("encodes")
 }
 
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[allow(dead_code)]
 struct Visit<'a> {
     #[yt(key)]
@@ -53,7 +61,7 @@ fn a_struct_becomes_the_schema_its_fields_describe() {
     schema.validate().expect("a derived schema must be valid");
 }
 
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[yt(unique_keys)]
 #[allow(dead_code)]
 struct Session {
@@ -87,7 +95,7 @@ fn keys_renames_and_skips_do_what_they_say() {
     schema.validate().expect("valid");
 }
 
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[yt(non_strict)]
 #[allow(dead_code)]
 struct Loose {
@@ -99,7 +107,7 @@ fn non_strict_lets_a_row_carry_more_than_the_schema() {
     assert!(render(&Loose::table_schema()).contains("strict=%false"));
 }
 
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[allow(dead_code)]
 struct EveryType<'a> {
     tiny: i8,
@@ -163,7 +171,7 @@ fn every_supported_rust_type_maps_to_a_column() {
     schema.validate().expect("valid");
 }
 
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[allow(dead_code)]
 struct Escaped {
     #[yt(column_type = "any")]
@@ -183,7 +191,7 @@ fn the_escape_hatch_names_a_type_the_derive_would_not_guess() {
 
 /// A struct whose every field is skipped still has to compile: the generated
 /// `TableSchema::new([])` must infer its element type from nothing.
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[allow(dead_code)]
 struct AllSkipped {
     #[yt(skip)]
@@ -200,7 +208,7 @@ fn a_schema_with_no_columns_is_still_a_schema() {
 }
 
 /// Generics and where clauses have to survive the impl.
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[allow(dead_code)]
 struct Generic<'a, T>
 where
@@ -222,7 +230,7 @@ fn a_generic_struct_gets_a_generic_impl() {
 
 /// A skipped field between two key fields must not break the key prefix: it is
 /// not a column, so it cannot come between two of them.
-#[derive(TableRow)]
+#[derive(DeriveTableRow)]
 #[allow(dead_code)]
 struct SkipBetweenKeys {
     #[yt(key)]
