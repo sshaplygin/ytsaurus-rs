@@ -135,8 +135,11 @@ pub struct Encoder<W> {
 impl<W: Write> Encoder<W> {
     /// Creates an encoder for a single table schema.
     ///
-    /// A table schema's root must be a tuple, as required by the YTsaurus
-    /// Skiff table-format contract.
+    /// The schema must satisfy the YTsaurus table-format contract in full: a
+    /// tuple root whose every child is named. These are the rules
+    /// [`Format::new`] applies, and they are applied here so that a schema
+    /// which can be encoded is always one that can also be declared to the
+    /// cluster and read back by the matching [`Decoder`].
     pub fn new(output: W, schema: Schema) -> Result<Self, CodecError> {
         schema.validate().map_err(CodecError::InvalidSchema)?;
         if schema.wire_type != WireType::Tuple {
@@ -144,6 +147,7 @@ impl<W: Write> Encoder<W> {
                 found: schema.wire_type,
             });
         }
+        crate::schema::validate_table_schema(&schema).map_err(CodecError::InvalidSchema)?;
         Ok(Self {
             output,
             schema,

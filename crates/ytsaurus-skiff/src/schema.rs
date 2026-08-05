@@ -608,7 +608,7 @@ pub enum SchemaError {
     },
 }
 
-fn validate_table_schema(schema: &Schema) -> Result<(), SchemaError> {
+pub(crate) fn validate_table_schema(schema: &Schema) -> Result<(), SchemaError> {
     if schema.wire_type != WireType::Tuple {
         return Err(SchemaError::TableSchemaRootMustBeTuple {
             found: schema.wire_type,

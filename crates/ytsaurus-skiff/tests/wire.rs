@@ -4,7 +4,7 @@ use std::{
 };
 
 use ytsaurus_skiff::{
-    CodecError, Decoder, Encoder, Format, Schema, SchemaRef, Value, Variant, WireType,
+    CodecError, Decoder, Encoder, Format, Schema, SchemaError, SchemaRef, Value, Variant, WireType,
 };
 
 fn go_reference_schema() -> Schema {
@@ -332,6 +332,24 @@ fn charges_blobs_against_the_row_limit_as_well_as_the_blob_limit() {
 
     let mut decoder = Decoder::new(Cursor::new(bytes), format(schema)).with_max_row_bytes(4096);
     assert_eq!(decoder.next_row().unwrap(), Some((0, row)));
+}
+
+#[test]
+fn an_encoder_accepts_exactly_what_a_format_can_declare() {
+    // A tuple root with an unnamed child: a valid Skiff schema, but not a
+    // valid *table* schema, and only a table schema can be sent to a cluster.
+    let unnamed = Schema::tuple([Schema::leaf(WireType::Uint64)]);
+
+    assert!(matches!(
+        Encoder::new(Vec::new(), unnamed.clone()),
+        Err(CodecError::InvalidSchema(
+            SchemaError::TableSchemaChildMissingName { index: 0 }
+        ))
+    ));
+    assert!(
+        Format::new(vec![SchemaRef::Inline(unnamed)]).is_err(),
+        "the two entry points must agree"
+    );
 }
 
 #[test]
