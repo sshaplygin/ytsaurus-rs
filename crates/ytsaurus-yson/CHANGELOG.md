@@ -46,6 +46,34 @@ fork modifications below are unchanged and still apply.
   `<x=1>` with no value node — neither is a YSON value; they now produce `{}`
   and `<x=1>#`. Regression test: `struct_shapes_serialize_to_valid_yson_or_error`.
 
+- **`from_slice` read the front of a document and called it the whole.**
+  Anything after the first value was ignored, so `42 garbage` answered
+  `Ok(42)` and a truncated or concatenated document was indistinguishable from
+  a healthy one. It now checks the input is exhausted, insignificant
+  whitespace aside, and names the offset of the first trailing byte. A genuine
+  sequence of values is what `StreamDeserializer` is for.
+
+- **A varint longer than `u64` decoded to a wrong number instead of an
+  error.** The tenth byte of a `u64` varint carries only the top bit; a
+  payload that spilled past it was shifted out silently, so malformed input
+  produced a plausible wrong value. Ten-byte varints that do fit — `u64::MAX`
+  is one — still decode. Regression test:
+  `a_ten_byte_varint_that_overflows_is_an_error`.
+
+- **A tuple left the bracket that closed it unread, ending the container
+  around it.** A `Vec` asks for one element more than there are, and the
+  `None` answering that last question is what consumed the `]`. A
+  **fixed-length** visitor — a tuple, a tuple struct, an array — asks exactly
+  its length of times and stops, so nothing ever read the terminator. At the
+  top level it was left as trailing data; *nested*, it was read as the
+  enclosing container's terminator, so `[[1;2];3]` into `(Vec<i32>, i32)`
+  ended the outer list at the inner `]` and lost the `3` without an error.
+  The deserializer that opens a container now closes it if the visitor did
+  not, and a list longer than the tuple it is read into is refused instead of
+  truncated. Affects text and binary alike, since both spell the brackets as
+  literal ASCII. Regression test:
+  `a_tuple_consumes_the_bracket_that_closes_it`.
+
 - **Decoding an attributed map into `YsonValue` silently dropped the map.**
   An attributed value reaches the visitor flattened — `@`-keys for the
   attributes, and the body either as a `"$value"` entry (scalars) or as the

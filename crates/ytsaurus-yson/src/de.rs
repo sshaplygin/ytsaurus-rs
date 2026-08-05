@@ -11,6 +11,12 @@ use std::collections::BTreeMap;
 pub struct Deserializer<'de> {
     pub(crate) lexer: YsonIterator<'de>,
     pub(crate) is_reading_attributes: bool,
+    /// Whether the container just visited consumed its own terminator.
+    ///
+    /// Written by `CommaSeparated`'s `Drop`, read by `end_container` the moment
+    /// the visit returns — so it always describes the container that has just
+    /// closed, never an earlier one.
+    pub(crate) container_ended: bool,
     depth: usize,
     max_depth: usize,
 }
@@ -41,8 +47,68 @@ impl<'de> Deserializer<'de> {
         Deserializer {
             lexer: YsonIterator::new(input, is_binary),
             is_reading_attributes: false,
+            container_ended: false,
             depth: 0,
             max_depth: 128,
+        }
+    }
+
+    /// Closes a container whose visitor stopped reading before the end of it.
+    ///
+    /// A `Vec` asks for one element more than there are, and the `None` that
+    /// answers it is what consumes the `]`. A **fixed-length** visitor — a
+    /// tuple, a tuple struct, an array — asks for exactly its length and stops,
+    /// so nothing ever reads the terminator. Left there it is read as the
+    /// *enclosing* container's: `[[1;2];3]` into `(Vec<i32>, i32)` would end the
+    /// outer list at the inner `]` and lose the `3`.
+    ///
+    /// So whoever opened the container closes it, if the visitor did not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`YsonError`] if what follows is not the terminator — which is
+    /// how a list longer than the tuple it is being read into is refused,
+    /// rather than silently truncated.
+    fn end_container(&mut self, end_byte: u8) -> Result<(), YsonError> {
+        if self.container_ended {
+            return Ok(());
+        }
+
+        // A trailing `;` is allowed before the terminator, exactly as it is
+        // between elements: `[10;20;]` is a two-element list.
+        if self.lexer.peek_byte()? == b';' {
+            self.lexer.next_token()?;
+        }
+
+        let byte = self.lexer.peek_byte()?;
+        if byte != end_byte {
+            return Err(YsonError::Custom(format!(
+                "expected {:?} to close the value, found byte {byte:#04x} at offset {}",
+                end_byte as char,
+                self.lexer.pos()
+            )));
+        }
+        self.lexer.next_token()?;
+        Ok(())
+    }
+
+    /// Verifies the input is exhausted, insignificant whitespace aside.
+    ///
+    /// [`crate::from_slice`] calls this after the value: trailing bytes mean a
+    /// corrupt or concatenated document, and reading just the front of one as
+    /// a healthy value is how corruption goes unnoticed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`YsonError`] naming the offset of the first trailing byte.
+    pub fn end(&mut self) -> Result<(), YsonError> {
+        match self.lexer.peek_byte() {
+            Err(YsonError::Eof) => Ok(()),
+            Ok(byte) => Err(YsonError::Custom(format!(
+                "trailing data after the value: byte {byte:#04x} at offset {}",
+                self.lexer.pos()
+            ))),
+            Err(other) => Err(other),
         }
     }
 
@@ -136,9 +202,21 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
                     Err(e) => visitor.visit_byte_buf(e.into_bytes()),
                 },
             },
-            Token::BeginList => visitor.visit_seq(CommaSeparated::new(self, b']')?),
-            Token::BeginMap => visitor.visit_map(CommaSeparated::new(self, b'}')?),
-            Token::BeginAttributes => visitor.visit_map(CommaSeparated::new(self, b'>')?),
+            Token::BeginList => {
+                let value = visitor.visit_seq(CommaSeparated::new(&mut *self, b']')?)?;
+                self.end_container(b']')?;
+                Ok(value)
+            }
+            Token::BeginMap => {
+                let value = visitor.visit_map(CommaSeparated::new(&mut *self, b'}')?)?;
+                self.end_container(b'}')?;
+                Ok(value)
+            }
+            Token::BeginAttributes => {
+                let value = visitor.visit_map(CommaSeparated::new(&mut *self, b'>')?)?;
+                self.end_container(b'>')?;
+                Ok(value)
+            }
             t => Err(YsonError::Custom(format!("Unexpected token: {t:?}"))),
         }
     }

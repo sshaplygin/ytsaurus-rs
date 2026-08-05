@@ -33,13 +33,22 @@ mod coverage_tests {
 
     #[test]
     fn test_lexer_comments() {
-        let comment = "10 // This is comment \n 20";
-        let val: i64 = from_slice(comment.as_bytes(), YsonFormat::Text).unwrap();
+        // A comment is whitespace: what is left when it is gone is the value.
+        let val: i64 = from_slice(b"10 // This is comment \n", YsonFormat::Text).unwrap();
         assert_eq!(val, 10);
 
-        let data2 = "10 /* Multiline \n comment */ 20";
-        let val2: i64 = from_slice(data2.as_bytes(), YsonFormat::Text).unwrap();
+        let val2: i64 = from_slice(b"10 /* Multiline \n comment */", YsonFormat::Text).unwrap();
         assert_eq!(val2, 10);
+
+        // Including inside a container, where it separates nothing.
+        let list: Vec<i64> = from_slice(b"[1; // one\n 2]", YsonFormat::Text).unwrap();
+        assert_eq!(list, vec![1, 2]);
+
+        // These inputs used to be written as `10 // comment \n 20` and to
+        // assert 10 — which passed only because the trailing `20` was dropped
+        // in silence. A document holding two values is not one value.
+        let two = from_slice::<i64>(b"10 // comment \n 20", YsonFormat::Text);
+        assert!(two.is_err(), "a second value must be refused, not ignored");
     }
 
     #[test]
@@ -468,5 +477,39 @@ mod coverage_tests {
         if let Err(YsonError::Custom(msg)) = res {
             assert_eq!(msg, "String length cannot be negative");
         }
+    }
+
+    /// A fixed-length visitor stops asking before it is told to stop.
+    ///
+    /// A `Vec` asks once more than there are elements, and that last question is
+    /// what consumes the `]`. A tuple asks exactly its length of times, so
+    /// nothing read the terminator and it was left for the *enclosing*
+    /// container — which then ended early. At the top level this surfaced as
+    /// trailing data; nested, it silently lost everything after the tuple.
+    #[test]
+    fn a_tuple_consumes_the_bracket_that_closes_it() {
+        let pair: (i32, i32) = from_slice(b"[10;20]", YsonFormat::Text).unwrap();
+        assert_eq!(pair, (10, 20));
+
+        // The nested case, which lost the 3 rather than reporting anything.
+        let nested: (Vec<i32>, i32) = from_slice(b"[[1;2];3]", YsonFormat::Text).unwrap();
+        assert_eq!(nested, (vec![1, 2], 3));
+
+        let inner_first: ((i32, i32), i32) = from_slice(b"[[1;2];3]", YsonFormat::Text).unwrap();
+        assert_eq!(inner_first, ((1, 2), 3));
+
+        // A trailing `;` closes a list just as it does between elements.
+        let trailing: (i32, i32) = from_slice(b"[10;20;]", YsonFormat::Text).unwrap();
+        assert_eq!(trailing, (10, 20));
+
+        // And a list longer than the tuple is refused rather than truncated.
+        let too_many = from_slice::<(i32, i32)>(b"[1;2;3]", YsonFormat::Text);
+        assert!(too_many.is_err(), "a third element must not be dropped");
+
+        // Binary YSON keeps the brackets as literal ASCII, so it is the same
+        // code path and the same bug would have been there too.
+        let encoded = to_vec(&(10_i32, 20_i32), YsonFormat::Binary).unwrap();
+        let round_tripped: (i32, i32) = from_slice(&encoded, YsonFormat::Binary).unwrap();
+        assert_eq!(round_tripped, (10, 20));
     }
 }

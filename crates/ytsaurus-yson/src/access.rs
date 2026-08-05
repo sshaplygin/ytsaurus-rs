@@ -313,17 +313,39 @@ impl<'de> SeqAccess<'de> for AttributesWrapperAccess<'_, 'de> {
 pub(crate) struct CommaSeparated<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
     end_byte: u8,
+    /// Whether the terminator has been read.
+    ///
+    /// A visitor that asks for elements until it is told there are none — a
+    /// `Vec`, a map — reads it here. A fixed-length one never asks the last
+    /// time, so it does not, and the deserializer that opened the container has
+    /// to close it. This is what tells the two apart.
+    ended: bool,
 }
 
 impl<'a, 'de> CommaSeparated<'a, 'de> {
     pub(crate) fn new(de: &'a mut Deserializer<'de>, end_byte: u8) -> Result<Self, YsonError> {
         de.enter_recursion()?;
-        Ok(CommaSeparated { de, end_byte })
+        Ok(CommaSeparated {
+            de,
+            end_byte,
+            ended: false,
+        })
+    }
+
+    /// Consumes the terminator and remembers having done so.
+    fn take_end(&mut self) -> Result<(), YsonError> {
+        self.de.lexer.next_token()?;
+        self.ended = true;
+        Ok(())
     }
 }
 
 impl Drop for CommaSeparated<'_, '_> {
     fn drop(&mut self) {
+        // Reported to the deserializer, which reads it the moment the visit
+        // returns. Nested containers finish first, so the last write before
+        // that read is always this container's own.
+        self.de.container_ended = self.ended;
         self.de.leave_recursion();
     }
 }
@@ -337,7 +359,7 @@ impl<'de> MapAccess<'de> for CommaSeparated<'_, 'de> {
     {
         let peeked = self.de.lexer.peek_byte()?;
         if peeked == self.end_byte {
-            self.de.lexer.next_token()?;
+            self.take_end()?;
             return Ok(None);
         }
 
@@ -345,7 +367,7 @@ impl<'de> MapAccess<'de> for CommaSeparated<'_, 'de> {
             self.de.lexer.next_token()?;
 
             if self.de.lexer.peek_byte()? == self.end_byte {
-                self.de.lexer.next_token()?;
+                self.take_end()?;
                 return Ok(None);
             }
         }
@@ -375,7 +397,7 @@ impl<'de> SeqAccess<'de> for CommaSeparated<'_, 'de> {
     {
         let peeked = self.de.lexer.peek_byte()?;
         if peeked == self.end_byte {
-            self.de.lexer.next_token()?;
+            self.take_end()?;
             return Ok(None);
         }
 
@@ -383,7 +405,7 @@ impl<'de> SeqAccess<'de> for CommaSeparated<'_, 'de> {
             self.de.lexer.next_token()?;
 
             if self.de.lexer.peek_byte()? == self.end_byte {
-                self.de.lexer.next_token()?;
+                self.take_end()?;
                 return Ok(None);
             }
         }
