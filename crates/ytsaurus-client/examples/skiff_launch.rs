@@ -23,7 +23,10 @@ fn main() -> Result<(), ytsaurus_client::ClientError> {
     ];
     let stream = encode_rows(&format, &rows);
 
-    client.remove(BASE)?;
+    // remove_tree, as every other example does: force, so the first run does
+    // not fail on a path that is not there yet, and recursive, so a second run
+    // does not fail on the non-empty map_node the first one left.
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;
