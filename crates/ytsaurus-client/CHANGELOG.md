@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### The keep-alive pings can no longer lose the transaction they keep alive
+
+- **Fixed** transaction pings riding the full retry pipeline and the
+  two-minute request timeout: one hung proxy connection could stall the ping
+  thread for minutes — five attempts, two minutes each, backoff between —
+  while the 30-second transaction it was keeping alive quietly expired. A
+  ping now gets one attempt, bounded by half the ping interval; the next
+  ping is its retry.
+- **Fixed** the ping thread outliving its transaction: every error was
+  swallowed, so a cluster answering `No such transaction` was pinged again
+  every interval for as long as the handle lived. A definitive
+  "transaction is gone" answer now stops the thread; transient failures
+  keep it pinging.
+- **Fixed** `Drop` of an uncommitted `Transaction` sending its abort through
+  the full retry pipeline — a destructor, possibly during a panic unwind,
+  could block its thread for ten minutes against an unreachable cluster. The
+  abort from `Drop` is now one attempt with a five-second bound; a lost one
+  is cleaned up by expiry, exactly as if the process had crashed. The
+  explicit `abort()` keeps the full retries, since it has a caller to wait
+  for it.
+
 ### A connection cut mid-body retries like one cut mid-request
 
 - **Fixed** a network failure while reading a response body being wrapped as

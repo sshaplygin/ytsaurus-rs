@@ -28,7 +28,7 @@ use ytsaurus_yson::YsonNode;
 
 use crate::error::{ClientError, Result};
 use crate::http::{Method, Payload};
-use crate::retry::Repeatable;
+use crate::retry::{Repeatable, RetryPolicy};
 use crate::{Client, yson_build};
 
 /// What the cluster itself defaults to, and what this crate asks for.
@@ -37,6 +37,13 @@ use crate::{Client, yson_build};
 /// from it: a client that assumed the wrong default would ping too slowly and
 /// lose the transaction.
 pub(crate) const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the abort sent from `Drop` may take.
+///
+/// A destructor — possibly running during a panic unwind — must not hang for
+/// the full retry budget against an unreachable cluster. If the abort is
+/// lost, the transaction expires on its own once nothing pings it.
+const DROP_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A transaction, alive for as long as this handle is.
 ///
@@ -106,7 +113,20 @@ impl Transaction {
         let id = String::from_utf8_lossy(bytes).into_owned();
 
         let client = client.clone().with_transaction(&id);
-        let keep_alive = KeepAlive::spawn(client.clone(), id.clone(), ping_interval(timeout));
+        let interval = ping_interval(timeout);
+
+        // The pings go through their own transport configuration: one attempt,
+        // bounded well under the interval. A ping that rode the full retry
+        // pipeline could stall its thread for minutes on one hung connection —
+        // five attempts, two minutes each, backoff between — while the
+        // transaction it was keeping alive quietly expired. A lost ping costs
+        // nothing (the next one is the retry); a late one costs everything.
+        let mut ping_client = client.clone();
+        ping_client.transport.set_retries(RetryPolicy::none());
+        ping_client
+            .transport
+            .set_timeout(ping_request_timeout(interval));
+        let keep_alive = KeepAlive::spawn(ping_client, id.clone(), interval);
 
         Ok(Self {
             client,
@@ -239,6 +259,14 @@ impl Drop for Transaction {
         // block the next attempt for half a minute. The error is dropped
         // because a destructor has nowhere to report one, and because the
         // cluster accepts an abort of a transaction that is already gone.
+        //
+        // One bounded attempt, not the retry pipeline: a destructor that can
+        // block its thread for the full budget — ten minutes against an
+        // unreachable cluster — is worse than a lost abort, which expiry
+        // cleans up anyway. The explicit `abort()` keeps the full retries; it
+        // has a caller to wait for it.
+        self.client.transport.set_retries(RetryPolicy::none());
+        self.client.transport.set_timeout(DROP_ABORT_TIMEOUT);
         let _ = self.finish("abort_transaction");
     }
 }
@@ -265,6 +293,34 @@ fn ping(client: &Client, id: &str) -> Result<()> {
 /// is one that is meant to expire.
 fn ping_interval(timeout: Duration) -> Duration {
     (timeout / 3).max(Duration::from_secs(1))
+}
+
+/// How long one ping request may take: half the interval, so a stalled ping
+/// still leaves the next one room inside the transaction's timeout, and never
+/// more than the transport's ordinary two minutes.
+fn ping_request_timeout(interval: Duration) -> Duration {
+    (interval / 2)
+        .max(Duration::from_secs(1))
+        .min(crate::DEFAULT_TIMEOUT)
+}
+
+/// Whether the cluster's answer says the transaction no longer exists.
+///
+/// 11000 is `NoSuchTransaction`; the substring covers the master's other
+/// spelling — `Transaction … has expired or was aborted` — and both are
+/// looked for in the full document, because the outer error is often a
+/// wrapper. Anything else (a transport failure, a busy master) is
+/// indistinguishable from a transaction that is still there, so the pings
+/// continue.
+fn transaction_is_gone(error: &ClientError) -> bool {
+    match error {
+        ClientError::Cluster { code, raw, .. } => {
+            *code == 11000
+                || raw.contains("No such transaction")
+                || raw.contains("has expired or was aborted")
+        }
+        _ => false,
+    }
 }
 
 /// The thread that keeps one transaction alive.
@@ -305,12 +361,18 @@ impl KeepAlive {
                         }
                     }
 
-                    // A failed ping is not fatal on its own — the transport has
-                    // already retried it, and there is time for the next one
-                    // before the transaction expires. Whatever the ping would
-                    // have said, the next command in the transaction says too,
-                    // and that one has a caller to report it to.
-                    let _ = ping(&client, &id);
+                    // A failed ping is not fatal on its own — the next one is
+                    // its retry, and whatever the ping would have said, the
+                    // next command in the transaction says too, to a caller
+                    // who can report it. But a cluster that answers "no such
+                    // transaction" has said something final: pinging on would
+                    // spend a request every interval, for as long as the
+                    // handle lives, on a transaction that cannot come back.
+                    if let Err(error) = ping(&client, &id)
+                        && transaction_is_gone(&error)
+                    {
+                        return;
+                    }
                 }
             })
             .ok()
@@ -395,6 +457,48 @@ mod tests {
 
         // No request at all — the second call would be a second commit.
         assert!(tx.finish("commit_transaction").is_ok());
+    }
+
+    #[test]
+    fn only_a_definitive_answer_stops_the_pinging() {
+        let gone_by_code = ClientError::Cluster {
+            command: "ping_transaction".into(),
+            code: 11000,
+            message: "whatever spelling".into(),
+            raw: "{}".into(),
+        };
+        assert!(transaction_is_gone(&gone_by_code));
+
+        let gone_by_text = ClientError::Cluster {
+            command: "ping_transaction".into(),
+            code: 1,
+            message: "Error resolving path".into(),
+            raw: r#"{"inner_errors"=[{"message"="No such transaction 1-2-3-4"}]}"#.into(),
+        };
+        assert!(transaction_is_gone(&gone_by_text));
+
+        // A busy master or an unreachable proxy says nothing about the
+        // transaction; the thread must keep pinging.
+        let transient = ClientError::Cluster {
+            command: "ping_transaction".into(),
+            code: 1,
+            message: "master is not ready".into(),
+            raw: "{}".into(),
+        };
+        assert!(!transaction_is_gone(&transient));
+        assert!(!transaction_is_gone(&ClientError::Config("x".into())));
+    }
+
+    #[test]
+    fn a_stalled_ping_leaves_room_for_the_next_one() {
+        // Half the interval, floored and capped: the request must not be able
+        // to consume the slot of the ping after it.
+        for seconds in [3, 30, 3600, 100_000] {
+            let interval = ping_interval(Duration::from_secs(seconds));
+            let bound = ping_request_timeout(interval);
+            assert!(bound * 2 <= interval.max(Duration::from_secs(2)));
+            assert!(bound <= crate::DEFAULT_TIMEOUT);
+        }
     }
 
     #[test]
