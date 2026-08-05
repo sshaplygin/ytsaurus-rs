@@ -121,6 +121,48 @@ mod unit_tests {
         assert_eq!(val, 42);
     }
 
+    /// An attributed *map* reaches `YsonValue`'s visitor flattened: `@`-keys
+    /// carry the attributes and the body's entries arrive as plain keys at the
+    /// same level. Those plain keys used to be discarded, so `<a=b>{x=10}`
+    /// decoded to an attributed entity — the whole body silently lost.
+    #[test]
+    fn an_attributed_map_keeps_its_body() {
+        use ytsaurus_yson::{YsonNode, YsonValue};
+
+        let val: YsonValue =
+            from_slice(b"<a=b; c=d> {x=10}", YsonFormat::Text).expect("attributed map");
+        assert!(val.attributes.is_some());
+        assert_eq!(
+            val["x"].as_i64(),
+            Some(10),
+            "the body must survive the attributes: {val:?}"
+        );
+
+        // The literal spelling of the flat form means the same thing.
+        let val: YsonValue =
+            from_slice(b"{\"@x\"=1; other=2}", YsonFormat::Text).expect("flat form");
+        assert_eq!(val.attr("x").and_then(|a| a.as_i64()), Some(1));
+        assert_eq!(val["other"].as_i64(), Some(2));
+
+        // A non-map body still travels as "$value".
+        let scalar: YsonValue =
+            from_slice(b"{\"@x\"=1; \"$value\"=2}", YsonFormat::Text).expect("scalar body");
+        assert_eq!(scalar.as_i64(), Some(2));
+
+        // "$value" beside a plain key would be two bodies for one value.
+        let err = from_slice::<YsonValue>(b"{\"$value\"=1; other=2}", YsonFormat::Text)
+            .expect_err("two bodies must not decode");
+        assert!(err.to_string().contains("other"), "{err}");
+
+        // And a round trip through the serializer loses nothing.
+        let source: YsonValue =
+            from_slice(b"<a=b> {x=10}", YsonFormat::Text).expect("attributed map");
+        let encoded = ytsaurus_yson::to_vec(&source, YsonFormat::Text).expect("encodes");
+        let back: YsonValue = from_slice(&encoded, YsonFormat::Text).expect("decodes back");
+        assert!(back.attr("a").is_some());
+        assert!(matches!(back.node, YsonNode::Map(_)), "{back:?}");
+    }
+
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     #[serde(untagged)]
     enum Untagged {

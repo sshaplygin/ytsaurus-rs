@@ -36,6 +36,18 @@ fork modifications below are unchanged and still apply.
 
 ### Fixed
 
+- **Decoding an attributed map into `YsonValue` silently dropped the map.**
+  An attributed value reaches the visitor flattened — `@`-keys for the
+  attributes, and the body either as a `"$value"` entry (scalars) or as the
+  map's own entries at the same level (maps). The visitor only knew about
+  `"$value"`: one `@`-key switched it to the attributed reading and every
+  plain key was then discarded, so `<a=b>{x=10}` — the shape every attributed
+  cluster response has — decoded to an attributed **entity**, the whole body
+  gone. The plain keys are now taken as the body when no `"$value"` is
+  present; `"$value"` *beside* plain keys (two bodies for one value) is a
+  deserialization error naming the extra key.
+  Regression test: `an_attributed_map_keeps_its_body`.
+
 - **A stray `/` in text input hung the parser forever.** In `skip_ignored`, a
   `/` followed by any byte other than `/` or `*` matched the "this might be a
   comment" branch but then hit `continue` without either branch having advanced
