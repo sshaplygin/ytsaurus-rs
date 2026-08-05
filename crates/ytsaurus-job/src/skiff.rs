@@ -83,6 +83,17 @@ impl<R: Read> SkiffJobReader<R> {
         self
     }
 
+    /// Changes the maximum decoded footprint accepted per row.
+    ///
+    /// This is the Skiff counterpart of [`crate::JobReader::with_max_record_bytes`]:
+    /// a field limit alone does not stop a repeated variant from decoding a
+    /// small stream into a very large row.
+    #[must_use]
+    pub fn with_max_row_bytes(mut self, bytes: usize) -> Self {
+        self.decoder = self.decoder.with_max_row_bytes(bytes);
+        self
+    }
+
     /// Returns the next input row, or `None` at a clean end of stream.
     pub fn next_row(&mut self) -> Result<Option<SkiffRow>> {
         let Some((table_index, row)) = self.decoder.next_row().map_err(JobError::Skiff)? else {

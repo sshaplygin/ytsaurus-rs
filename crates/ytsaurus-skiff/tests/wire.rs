@@ -282,6 +282,59 @@ fn rejects_a_blob_before_allocating_it() {
 }
 
 #[test]
+fn refuses_a_row_that_decodes_into_far_more_memory_than_its_wire_size() {
+    // repeated_variant8<nothing>: every item is one tag byte on the wire and a
+    // whole Value in memory, and the item loop ends only at the 0xff tag that
+    // this stream never reaches.
+    let schema = Schema::tuple([Schema {
+        wire_type: WireType::RepeatedVariant8,
+        name: Some("items".to_owned()),
+        children: vec![Schema::leaf(WireType::Nothing)],
+    }]);
+    let mut bytes = vec![0, 0];
+    bytes.resize(100_002, 0);
+
+    let mut decoder = Decoder::new(Cursor::new(bytes), format(schema)).with_max_row_bytes(1024);
+
+    assert!(matches!(
+        decoder.next_row(),
+        Err(CodecError::RowTooLarge { limit: 1024 })
+    ));
+    let consumed = decoder.into_inner().position();
+    assert!(
+        consumed < 1024,
+        "the limit must stop the decode, not be checked after it: {consumed} bytes read"
+    );
+}
+
+#[test]
+fn charges_blobs_against_the_row_limit_as_well_as_the_blob_limit() {
+    let schema = Schema::tuple([
+        Schema::named("first", WireType::String32),
+        Schema::named("second", WireType::String32),
+    ]);
+    let row = Value::Tuple(vec![
+        Value::Bytes(vec![b'a'; 600]),
+        Value::Bytes(vec![b'b'; 600]),
+    ]);
+    let mut encoder = Encoder::new(Vec::new(), schema.clone()).unwrap();
+    encoder.write(&row).unwrap();
+    let bytes = encoder.into_inner().unwrap();
+
+    // Each blob is well inside the blob limit; together they are not a row.
+    let mut decoder = Decoder::new(Cursor::new(bytes.clone()), format(schema.clone()))
+        .with_max_blob_bytes(1024)
+        .with_max_row_bytes(1024);
+    assert!(matches!(
+        decoder.next_row(),
+        Err(CodecError::RowTooLarge { limit: 1024 })
+    ));
+
+    let mut decoder = Decoder::new(Cursor::new(bytes), format(schema)).with_max_row_bytes(4096);
+    assert_eq!(decoder.next_row().unwrap(), Some((0, row)));
+}
+
+#[test]
 fn rejects_an_unknown_variant_tag() {
     let schema = Schema::tuple([Schema {
         wire_type: WireType::Variant8,
@@ -301,7 +354,7 @@ fn rejects_an_unknown_variant_tag() {
 }
 
 #[test]
-fn malformed_stream_fuzz_smoke_never_panics_or_exceeds_the_blob_limit() {
+fn malformed_stream_fuzz_smoke_never_panics_or_exceeds_its_limits() {
     let schema = Schema::tuple([
         Schema::named("flag", WireType::Boolean),
         Schema::named("blob", WireType::String32),
@@ -340,7 +393,9 @@ fn malformed_stream_fuzz_smoke_never_panics_or_exceeds_the_blob_limit() {
             bytes.push(next_random(&mut state) as u8);
         }
 
-        let mut decoder = Decoder::new(Cursor::new(bytes), format.clone()).with_max_blob_bytes(64);
+        let mut decoder = Decoder::new(Cursor::new(bytes), format.clone())
+            .with_max_blob_bytes(64)
+            .with_max_row_bytes(4096);
         for _ in 0..128 {
             match decoder.next_row() {
                 Ok(Some(_)) => {}

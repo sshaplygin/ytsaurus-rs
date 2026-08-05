@@ -14,4 +14,6 @@ pub mod schema;
 pub mod wire;
 
 pub use crate::schema::{Format, Schema, SchemaError, SchemaRef, WireType};
-pub use crate::wire::{CodecError, Decoder, Encoder, Value, Variant};
+pub use crate::wire::{
+    CodecError, DEFAULT_MAX_BLOB_BYTES, DEFAULT_MAX_ROW_BYTES, Decoder, Encoder, Value, Variant,
+};

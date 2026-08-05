@@ -22,6 +22,19 @@ use crate::{Format, Schema, WireType};
 /// length prefix into an unbounded allocation.
 pub const DEFAULT_MAX_BLOB_BYTES: usize = 128 * 1024 * 1024;
 
+/// The largest decoded footprint accepted for one row by default.
+///
+/// Bounding blobs does not bound a row. Skiff is compact and positional: one
+/// `repeated_variant8` item can cost a single tag byte on the wire and tens of
+/// bytes of decoded [`Value`], and the item loop runs until the end tag or the
+/// end of the stream. Without this limit a few hundred megabytes of hostile or
+/// corrupt stream decode into a multi-gigabyte value and the process is
+/// OOM-killed rather than given an error.
+///
+/// This is the same ceiling `ytsaurus-job`'s YSON `JobReader` puts on one
+/// record.
+pub const DEFAULT_MAX_ROW_BYTES: usize = 256 * 1024 * 1024;
+
 /// A dynamically decoded Skiff value.
 ///
 /// Every variant maps directly to one [`WireType`]. Compound values retain
@@ -169,6 +182,7 @@ pub struct Decoder<R> {
     input: R,
     format: Format,
     max_blob_bytes: usize,
+    max_row_bytes: usize,
 }
 
 impl<R: Read> Decoder<R> {
@@ -179,6 +193,7 @@ impl<R: Read> Decoder<R> {
             input,
             format,
             max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
+            max_row_bytes: DEFAULT_MAX_ROW_BYTES,
         }
     }
 
@@ -186,6 +201,15 @@ impl<R: Read> Decoder<R> {
     #[must_use]
     pub fn with_max_blob_bytes(mut self, bytes: usize) -> Self {
         self.max_blob_bytes = bytes;
+        self
+    }
+
+    /// Changes the maximum decoded footprint this decoder accepts per row.
+    ///
+    /// See [`DEFAULT_MAX_ROW_BYTES`] for why a blob limit alone is not enough.
+    #[must_use]
+    pub fn with_max_row_bytes(mut self, bytes: usize) -> Self {
+        self.max_row_bytes = bytes;
         self
     }
 
@@ -204,7 +228,8 @@ impl<R: Read> Decoder<R> {
             .format
             .table_schema(index)
             .map_err(CodecError::InvalidSchema)?;
-        let row = decode_value(&mut self.input, schema, self.max_blob_bytes)?;
+        let mut budget = RowBudget::new(self.max_blob_bytes, self.max_row_bytes);
+        let row = decode_value(&mut self.input, schema, &mut budget)?;
         Ok(Some((index, row)))
     }
 
@@ -232,6 +257,12 @@ pub enum CodecError {
     Truncated {
         /// The incomplete portion of the stream.
         context: &'static str,
+    },
+    /// One row would decode into more memory than the configured limit.
+    #[error("Skiff row does not fit in the {limit}-byte decode limit")]
+    RowTooLarge {
+        /// The configured maximum decoded footprint of one row.
+        limit: usize,
     },
     /// A declared blob size would exceed the configured resource limit.
     #[error("Skiff {wire_type} payload is {length} bytes, exceeding the {limit}-byte limit")]
@@ -351,11 +382,49 @@ fn encode_value<W: Write>(
     }
 }
 
+/// How much decoded row one call to [`Decoder::next_row`] may still produce.
+///
+/// The charge is an estimate of the decoded footprint — one [`Value`] per
+/// decoded node, plus each blob payload — rather than an exact allocation
+/// count. That is deliberate: the bound has to be proportional to what a row
+/// costs in memory, and for repeated variants that differs from what it costs
+/// on the wire by more than an order of magnitude. The blob limit rides along
+/// because both bounds are consumed at the same points.
+struct RowBudget {
+    max_blob_bytes: usize,
+    limit: usize,
+    remaining: usize,
+}
+
+impl RowBudget {
+    fn new(max_blob_bytes: usize, max_row_bytes: usize) -> Self {
+        Self {
+            max_blob_bytes,
+            limit: max_row_bytes,
+            remaining: max_row_bytes,
+        }
+    }
+
+    /// Charges `bytes` against the row, before the memory is committed.
+    fn charge(&mut self, bytes: usize) -> Result<(), CodecError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or(CodecError::RowTooLarge { limit: self.limit })?;
+        Ok(())
+    }
+}
+
 fn decode_value<R: Read>(
     input: &mut R,
     schema: &Schema,
-    max_blob_bytes: usize,
+    budget: &mut RowBudget,
 ) -> Result<Value, CodecError> {
+    // Every decoded node lands in a Box, a Vec or the row itself, so it costs
+    // at least one Value. Charging here also bounds the repeated-variant loop
+    // below: each item costs a Value, so the item count cannot outrun the
+    // budget however few wire bytes an item takes.
+    budget.charge(size_of::<Value>())?;
     match schema.wire_type {
         WireType::Nothing => Ok(Value::Nothing),
         WireType::Boolean => Ok(Value::Boolean(read_byte(input, "boolean")? != 0)),
@@ -389,17 +458,13 @@ fn decode_value<R: Read>(
         WireType::String32 => Ok(Value::Bytes(read_blob(
             input,
             WireType::String32,
-            max_blob_bytes,
+            budget,
         )?)),
-        WireType::Yson32 => Ok(Value::Yson(read_blob(
-            input,
-            WireType::Yson32,
-            max_blob_bytes,
-        )?)),
+        WireType::Yson32 => Ok(Value::Yson(read_blob(input, WireType::Yson32, budget)?)),
         WireType::Variant8 | WireType::Variant16 => {
             let tag = read_variant_tag(input, schema.wire_type)?;
             let child = variant_child(schema, tag)?;
-            let value = decode_value(input, child, max_blob_bytes)?;
+            let value = decode_value(input, child, budget)?;
             Ok(Value::Variant {
                 tag,
                 value: Box::new(value),
@@ -415,7 +480,7 @@ fn decode_value<R: Read>(
                 let child = variant_child(schema, tag)?;
                 items.push(Variant {
                     tag,
-                    value: decode_value(input, child, max_blob_bytes)?,
+                    value: decode_value(input, child, budget)?,
                 });
             }
             Ok(Value::RepeatedVariants(items))
@@ -424,7 +489,7 @@ fn decode_value<R: Read>(
             let values = schema
                 .children
                 .iter()
-                .map(|child| decode_value(input, child, max_blob_bytes))
+                .map(|child| decode_value(input, child, budget))
                 .collect::<Result<_, _>>()?;
             Ok(Value::Tuple(values))
         }
@@ -507,11 +572,12 @@ fn write_blob<W: Write>(
 fn read_blob<R: Read>(
     input: &mut R,
     wire_type: WireType,
-    max_blob_bytes: usize,
+    budget: &mut RowBudget,
 ) -> Result<Vec<u8>, CodecError> {
     let length = usize::try_from(u32::from_le_bytes(read_array(input, "blob length")?))
         .expect("u32 always fits usize on supported Rust targets");
-    check_blob_length(wire_type, length, max_blob_bytes)?;
+    check_blob_length(wire_type, length, budget.max_blob_bytes)?;
+    budget.charge(length)?;
     let mut value = vec![0; length];
     read_exact(input, &mut value, "blob payload")?;
     Ok(value)
