@@ -78,7 +78,7 @@ fn run() -> Result<(), ClientError> {
     let staging = format!("{BASE}/staging");
 
     step("Preparing Cypress");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &input)?;
     client.write_table_rows(&input, SAMPLE)?;

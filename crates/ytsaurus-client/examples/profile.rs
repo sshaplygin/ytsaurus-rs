@@ -71,7 +71,7 @@ fn run() -> Result<(), ClientError> {
     let input = format!("{BASE}/events");
 
     step(&format!("Writing about {mib} MiB of access-log events"));
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("table", &input)?;
     client.create("table", &format!("{BASE}/events_out"))?;
     client.create("table", &format!("{BASE}/rejects"))?;

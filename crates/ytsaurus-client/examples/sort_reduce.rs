@@ -59,7 +59,7 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Preparing Cypress");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     for table in ["input", "sorted", "counts"] {
         client.create("table", &format!("{BASE}/{table}"))?;

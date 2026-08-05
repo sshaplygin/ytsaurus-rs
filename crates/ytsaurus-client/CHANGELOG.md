@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### `remove` stopped being `rm -rf`
+
+- **Changed** `Client::remove`: it sent `recursive=%true; force=%true` on
+  every call, so `remove` of a map node deleted the entire subtree under it,
+  and a mistyped path "succeeded" by not existing. It now sends the
+  cluster's own defaults — the node must exist, a map node must be empty —
+  and the old behaviour has a deliberate spelling, `Client::remove_tree`.
+  **Breaking** for callers who relied on `remove` to clear subtrees or
+  tolerate absence: say `remove_tree`. The examples' cleanup already does.
+
 ### The keep-alive pings can no longer lose the transaction they keep alive
 
 - **Fixed** transaction pings riding the full retry pipeline and the

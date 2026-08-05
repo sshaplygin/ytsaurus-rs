@@ -99,7 +99,7 @@ fn launch() -> Result<(), ClientError> {
     let client = Client::from_env()?;
 
     step("Preparing Cypress");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;

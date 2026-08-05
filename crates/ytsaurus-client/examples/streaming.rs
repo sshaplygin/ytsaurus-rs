@@ -52,7 +52,7 @@ fn run() -> Result<(), ClientError> {
     let target = mib * 1024 * 1024;
 
     step("Preparing Cypress");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("table", &path)?;
     let baseline = peak_rss();
     done(&format!("{path}, peak RSS so far {}", megabytes(baseline)));

@@ -55,7 +55,7 @@ fn run() -> Result<(), ClientError> {
     step("Preparing Cypress");
     // These are mutating commands too, so they are already carrying mutation
     // IDs of their own — if the cluster disliked the format, this would fail.
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
     client.create("table", &format!("{BASE}/output"))?;

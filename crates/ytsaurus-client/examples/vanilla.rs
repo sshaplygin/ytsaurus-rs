@@ -54,7 +54,7 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Preparing Cypress");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/results"))?;
     let worker = client.upload_worker_cached(WORKER)?;

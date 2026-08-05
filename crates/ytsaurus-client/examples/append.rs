@@ -39,7 +39,7 @@ fn run() -> Result<(), ClientError> {
     let log = format!("{BASE}/log");
 
     step("Preparing Cypress");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &log)?;
     done(BASE);

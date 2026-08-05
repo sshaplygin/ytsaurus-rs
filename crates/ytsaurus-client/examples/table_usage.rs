@@ -54,7 +54,7 @@ fn run() -> Result<(), ClientError> {
     // Go names its table after a fresh guid, so every run leaves a new one. A
     // fixed path is easier to go and look at afterwards, and the remove is
     // what makes a second run behave like the first.
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     done(BASE);
 

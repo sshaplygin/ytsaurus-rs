@@ -592,16 +592,40 @@ impl Client {
         self.get(&format!("{path}/@schema"))
     }
 
-    /// Removes a Cypress node. Succeeds if it is already absent.
+    /// Removes a Cypress node.
+    ///
+    /// The node must exist, and a map node must be empty — the cluster's own
+    /// defaults, and the safe ones: a mistyped path fails instead of deleting
+    /// whatever it happened to name. [`Client::remove_tree`] is the deliberate
+    /// spelling for a subtree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the node does not exist, is a non-empty map
+    /// node, or the request fails.
+    pub fn remove(&self, path: &str) -> Result<()> {
+        self.remove_with(path, false, false)
+    }
+
+    /// Removes a Cypress node and everything under it. Succeeds if it is
+    /// already absent.
+    ///
+    /// This is `recursive` plus `force`: the spelling for "make this path not
+    /// exist", whatever is there now — which is also why it deserves a moment
+    /// of care with the argument.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails.
-    pub fn remove(&self, path: &str) -> Result<()> {
+    pub fn remove_tree(&self, path: &str) -> Result<()> {
+        self.remove_with(path, true, true)
+    }
+
+    fn remove_with(&self, path: &str, recursive: bool, force: bool) -> Result<()> {
         let params = yson_build::map([
             ("path", yson_build::string(path)),
-            ("recursive", yson_build::boolean(true)),
-            ("force", yson_build::boolean(true)),
+            ("recursive", yson_build::boolean(recursive)),
+            ("force", yson_build::boolean(force)),
         ]);
         self.transport.call(
             Method::Post,
@@ -1022,11 +1046,11 @@ impl Client {
 
         // Removed whichever way that went. On success the cache may have kept
         // the node itself rather than a copy, so this is `force`-removing
-        // something that may already be gone, which `remove` tolerates. On
-        // failure it is what stops a rejected upload from leaving tens of
+        // something that may already be gone, which `remove_tree` tolerates.
+        // On failure it is what stops a rejected upload from leaving tens of
         // megabytes behind for good: cache expiry walks the entries the cache
         // itself created, not the staging nodes beside them.
-        let removed = self.remove(&staging);
+        let removed = self.remove_tree(&staging);
         // The upload's own failure is the one worth reporting; a cleanup that
         // also failed only matters when there was nothing else wrong.
         let path = cached?;

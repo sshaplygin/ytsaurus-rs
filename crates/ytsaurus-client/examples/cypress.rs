@@ -41,7 +41,7 @@ fn run() -> Result<(), ClientError> {
     let latest = format!("{BASE}/latest");
 
     step("Preparing a tree that looks like a pipeline's output");
-    client.remove(BASE)?;
+    client.remove_tree(BASE)?;
     for (n, day) in RUNS.iter().enumerate() {
         let path = format!("{runs}/{day}");
         client.create("table", &path)?;
