@@ -109,9 +109,12 @@ fn applies_every_documented_control_record() {
                 raw: row_a,
             },
             Seen::KeySwitch,
+            // No control record before this row: consecutive rows advance the
+            // index implicitly, which is why the stream re-emits `row_index`
+            // before the third row — that one is not consecutive.
             Seen::Row {
                 table_index: 0,
-                row_index: Some(2),
+                row_index: Some(3),
                 range_index: Some(0),
                 raw: row_b,
             },
@@ -121,6 +124,71 @@ fn applies_every_documented_control_record() {
                 row_index: Some(0),
                 range_index: Some(0),
                 raw: row_c,
+            },
+        ]
+    );
+}
+
+/// A `row_index` control record numbers the *next* row; every row after it
+/// advances the index by one without any further control record.
+#[test]
+fn row_index_advances_across_consecutive_rows() {
+    let rows: Vec<_> = (0..4).map(|i| bin_row_str(b"n", &[b'0' + i])).collect();
+
+    let input = fragment(&[
+        bin_control_i64(b"row_index", 7),
+        rows[0].clone(),
+        rows[1].clone(),
+        rows[2].clone(),
+        bin_control_i64(b"row_index", 40),
+        rows[3].clone(),
+    ]);
+
+    let mut reader = JobReader::binary(input.as_slice());
+    let seen = drain(&mut reader).expect("reads");
+
+    let indices: Vec<Option<i64>> = seen
+        .iter()
+        .filter_map(|s| match s {
+            Seen::Row { row_index, .. } => Some(*row_index),
+            Seen::KeySwitch => None,
+        })
+        .collect();
+    assert_eq!(indices, vec![Some(7), Some(8), Some(9), Some(40)]);
+}
+
+/// A table switch restarts both row and range numbering; stale values from the
+/// previous table must not leak onto the new table's rows.
+#[test]
+fn table_switch_drops_stale_row_and_range_indices() {
+    let r0 = bin_row_str(b"t", b"0");
+    let r1 = bin_row_str(b"t", b"1");
+
+    let input = fragment(&[
+        bin_control_i64(b"row_index", 5),
+        bin_control_i64(b"range_index", 2),
+        r0.clone(),
+        bin_control_i64(b"table_index", 1),
+        r1.clone(),
+    ]);
+
+    let mut reader = JobReader::binary(input.as_slice());
+    let seen = drain(&mut reader).expect("reads");
+
+    assert_eq!(
+        seen,
+        vec![
+            Seen::Row {
+                table_index: 0,
+                row_index: Some(5),
+                range_index: Some(2),
+                raw: r0,
+            },
+            Seen::Row {
+                table_index: 1,
+                row_index: None,
+                range_index: None,
+                raw: r1,
             },
         ]
     );
@@ -534,6 +602,51 @@ fn groups_work_when_split_across_reads() {
             "chunk {chunk}"
         );
     }
+}
+
+/// Back-to-back key switches mean an empty group. It must come out empty —
+/// the old code returned a live group that then read the *next* group's rows
+/// under the empty group's key, and that group was never seen.
+#[test]
+fn an_empty_group_does_not_swallow_the_group_after_it() {
+    let a = bin_row_str(b"k", b"a");
+    let b = bin_row_str(b"k", b"b");
+
+    let input = fragment(&[
+        a.clone(),
+        bin_control_bool(b"key_switch", true),
+        bin_control_bool(b"key_switch", true),
+        b.clone(),
+    ]);
+
+    assert_eq!(
+        collect_groups(&input),
+        vec![vec![a], vec![], vec![b]],
+        "the middle group is empty and b's group survives"
+    );
+
+    // The same shape through groups_by: the non-empty groups keep their keys.
+    let a = bin_row_str(b"k", b"a");
+    let b = bin_row_str(b"k", b"b");
+    let input = fragment(&[
+        a,
+        bin_control_bool(b"key_switch", true),
+        bin_control_bool(b"key_switch", true),
+        b,
+    ]);
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["k"]);
+
+    let mut keys = Vec::new();
+    while let Some(mut group) = groups.next_group().expect("group reads") {
+        keys.push(group.key().bytes("k").map(<[u8]>::to_vec));
+        while group.next_row().expect("row reads").is_some() {}
+    }
+    assert_eq!(
+        keys,
+        vec![Some(b"a".to_vec()), None, Some(b"b".to_vec())],
+        "an empty group has no key; the groups around it keep theirs"
+    );
 }
 
 /// Control records interleaved inside a group must not end it.

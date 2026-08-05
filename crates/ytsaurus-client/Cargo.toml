@@ -12,12 +12,44 @@ readme = "README.md"
 keywords = ["ytsaurus", "mapreduce", "client", "yson"]
 categories = ["api-bindings"]
 
+[features]
+default = ["tls"]
+# TLS, and so `https://` proxies. On by default; turning it off is what lets a
+# worker binary that also launches operations be cross-compiled to musl without
+# a C toolchain — `rustls` pulls in `ring`, which needs one. A local cluster is
+# reached over plain HTTP and needs none of it.
+tls = ["ureq/rustls"]
+# `#[derive(TableRow)]`, so a schema is read off the struct the rows already
+# have. Off by default: it is a compiler plugin, and a crate that only launches
+# operations should not pay to build one.
+derive = ["dep:ytsaurus-helpers"]
+
 [dependencies]
 ytsaurus-yson.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-ureq = "3.3"
+ureq = { version = "3.3", default-features = false, features = ["gzip"] }
 serde_json = "1.0"
+# The file cache is keyed by MD5, so the client has to compute one. Chosen for
+# having no dependencies of its own: this crate is linked into worker binaries
+# that cross-compile to musl with nothing but the Rust toolchain.
+md5 = "0.8"
+ytsaurus-helpers = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_bytes.workspace = true
+# The examples derive schemas; users get the same through the `derive` feature.
+ytsaurus-helpers.workspace = true
+# Not a dependency: the client sends bytes and the job runtime decodes them, and
+# keeping that direction one-way is deliberate. It is here because a streamed
+# table is exactly what a job reads, and the example that says so should be
+# compiled rather than asserted.
+ytsaurus-job.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "rows"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true

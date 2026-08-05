@@ -125,11 +125,59 @@ fn main() {
     match mode.as_str() {
         "map" => ytsaurus_job::run(map),
         "reduce" => ytsaurus_job::run(reduce),
+        // The same mapper, stopped early. Running all three over one table and
+        // comparing what the scheduler charged each is how the cost of decoding
+        // is separated from the cost of the work — see `examples/profile.rs` in
+        // ytsaurus-client, and docs/benchmarking.md for what the answer is
+        // worth.
+        "map-frames" => ytsaurus_job::run(map_frames),
+        "map-parse" => ytsaurus_job::run(map_parse),
         other => {
-            eprintln!("usage: sessionize <map|reduce>   (got {other:?})");
+            eprintln!("usage: sessionize <map|reduce|map-frames|map-parse>   (got {other:?})");
             std::process::exit(2);
         }
     }
+}
+
+/// The mapper with everything after framing removed.
+///
+/// Reads the stream and finds record boundaries, decoding nothing. This is the
+/// floor: whatever a job cannot avoid paying to be handed its input.
+fn map_frames() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut rows = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        if let Event::Row(row) = event {
+            // Touch the bytes, so nothing here can be optimised away.
+            rows += row.raw().len() as u64 & 1;
+        }
+    }
+
+    eprintln!("sessionize map-frames: {rows}");
+    Ok(())
+}
+
+/// The mapper with everything after decoding removed.
+///
+/// Decodes each row into the same `RawEvent` the real mapper uses, then drops
+/// it. The difference from `map-frames` is the cost of YSON decoding on this
+/// job's actual rows, which is the number the Skiff question turns on.
+fn map_parse() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut kept = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+        match row.parse::<RawEvent>() {
+            Err(e) if !e.is_row_local() => return Err(e),
+            Err(_) => {}
+            Ok(event) => kept += event.timestamp as u64 & 1,
+        }
+    }
+
+    eprintln!("sessionize map-parse: {kept}");
+    Ok(())
 }
 
 /// Why a row is unusable. Returning a reason rather than a bool means the

@@ -11,6 +11,12 @@ pub fn read_uvarint(input: &[u8]) -> Result<(u64, usize), YsonError> {
         }
 
         let bits = u64::from(byte & 0x7F);
+        // The 10th byte holds only the top bit of a u64. Anything more used to
+        // be shifted out silently, decoding corrupt input to a wrong value
+        // instead of an error.
+        if shift == 63 && bits > 1 {
+            return Err(YsonError::Custom("Varint overflows u64".into()));
+        }
         result |= bits << shift;
         if (byte & 0x80) == 0 {
             return Ok((result, i + 1));
@@ -57,6 +63,23 @@ mod tests {
         input.push(0x01);
         let res = read_uvarint(&input);
         assert!(res.is_err());
+    }
+
+    /// Ten bytes is a legal length for a u64 varint, but the tenth byte holds
+    /// only one bit. A payload that spills past it used to be truncated
+    /// silently — a wrong value from malformed input, not an error.
+    #[test]
+    fn a_ten_byte_varint_that_overflows_is_an_error() {
+        let mut overflowing = vec![0x81; 9];
+        overflowing.push(0x7F);
+        assert!(read_uvarint(&overflowing).is_err());
+
+        // u64::MAX itself is ten bytes with exactly one bit in the last, and
+        // must keep decoding.
+        let mut buf = Vec::new();
+        write_uvarint(u64::MAX, &mut buf);
+        assert_eq!(buf.len(), 10);
+        assert_eq!(read_uvarint(&buf).unwrap(), (u64::MAX, 10));
     }
 
     #[test]

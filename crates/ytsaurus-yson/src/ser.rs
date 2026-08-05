@@ -330,6 +330,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
             CompoundMode::Struct {
                 attr_open: false,
                 body_open: false,
+                value_written: false,
             }
         };
         Ok(Compound {
@@ -365,7 +366,13 @@ enum CompoundMode {
     AttrWrapper,
     VariantSeq,
     VariantMap,
-    Struct { attr_open: bool, body_open: bool },
+    Struct {
+        attr_open: bool,
+        body_open: bool,
+        /// A `$value` field has been written: the struct *is* that value, and
+        /// no further field can follow it.
+        value_written: bool,
+    },
 }
 
 /// A helper for serializing compound YSON types such as lists, maps, and structs.
@@ -468,8 +475,18 @@ impl ser::SerializeStruct for Compound<'_> {
             CompoundMode::Struct {
                 mut attr_open,
                 mut body_open,
+                mut value_written,
             } => {
                 if let Some(attr_name) = key.strip_prefix('@') {
+                    // YSON attributes stand strictly before the value they
+                    // decorate. Opening `<` here would land it inside the map
+                    // body, and the output would not parse.
+                    if body_open || value_written {
+                        return Err(YsonError::Custom(format!(
+                            "attribute field \"@{attr_name}\" is declared after a value \
+                             field; attribute fields must come first in the struct"
+                        )));
+                    }
                     if !attr_open {
                         self.ser.output.push(b'<');
                         attr_open = true;
@@ -483,7 +500,24 @@ impl ser::SerializeStruct for Compound<'_> {
                         self.ser.output.push(b'>');
                         attr_open = false;
                     }
-                    if key != "$value" {
+                    if key == "$value" {
+                        // The struct *is* this value; it cannot also have map
+                        // entries, before or after.
+                        if body_open || value_written {
+                            return Err(YsonError::Custom(
+                                "\"$value\" cannot share a struct with plain fields: \
+                                 one value cannot have two bodies"
+                                    .into(),
+                            ));
+                        }
+                        value_written = true;
+                    } else {
+                        if value_written {
+                            return Err(YsonError::Custom(format!(
+                                "field \"{key}\" is declared after \"$value\"; a struct \
+                                 with a \"$value\" field can carry only attributes beside it"
+                            )));
+                        }
                         if !body_open {
                             self.ser.output.push(b'{');
                             body_open = true;
@@ -498,6 +532,7 @@ impl ser::SerializeStruct for Compound<'_> {
                 self.mode = CompoundMode::Struct {
                     attr_open,
                     body_open,
+                    value_written,
                 };
                 value.serialize(&mut *self.ser)?;
             }
@@ -518,12 +553,19 @@ impl ser::SerializeStruct for Compound<'_> {
             CompoundMode::Struct {
                 attr_open,
                 body_open,
+                value_written,
             } => {
                 if attr_open {
-                    self.ser.output.push(b'>');
-                }
-                if body_open {
+                    // Every field was an attribute. An attribute block cannot
+                    // stand alone, and the only value an all-attribute struct
+                    // can mean is the entity: `<a=1>#`.
+                    self.ser.output.extend_from_slice(b">#");
+                } else if body_open {
                     self.ser.output.push(b'}');
+                } else if !value_written {
+                    // No fields at all. Zero bytes is not a YSON value; an
+                    // empty struct is an empty map.
+                    self.ser.output.extend_from_slice(b"{}");
                 }
             }
             CompoundMode::AttrWrapper => {}

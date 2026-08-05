@@ -1,5 +1,10 @@
 # ytsaurus-job
 
+[![crates.io](https://img.shields.io/crates/v/ytsaurus-job.svg)](https://crates.io/crates/ytsaurus-job)
+[![docs.rs](https://img.shields.io/docsrs/ytsaurus-job)](https://docs.rs/ytsaurus-job)
+[![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 Runtime for writing [YTsaurus](https://ytsaurus.tech) MapReduce jobs in Rust.
 
 A job is an executable: rows arrive on fd 0 as binary
@@ -40,6 +45,30 @@ writer.finish()
   `<table_index=N>#` switch records.
 - **Failing usefully.** Truncated input, corrupt records and write errors are all
   fatal and explain themselves on stderr, where the operation UI shows them.
+- **Reporting its own numbers.** `JobStatistics` sends custom statistics on the
+  descriptor YTsaurus reserves for them, and the operation aggregates them
+  across jobs:
+
+  ```rust
+  let mut stats = JobStatistics::new();
+  stats.add("rows/rejected", 1)?;
+  stats.finish()?;
+  ```
+
+  Nothing else would tell you a mapper dropped rows: the operation succeeds and
+  the output table is simply shorter.
+- **Knowing it is a job.** The cluster sets `YT_JOB_ID`, so `is_inside_job()` and
+  `run_if_inside_job()` let one binary be both the launcher and the job it runs:
+
+  ```rust
+  fn main() {
+      ytsaurus_job::run_if_inside_job(mapper);   // never returns inside a job
+      launch();                                  // only your machine gets here
+  }
+  ```
+
+  With `ytsaurus-client`'s `upload_current_exe`, the binary uploads itself —
+  there is no second artifact to forget to rebuild.
 
 ## Design notes
 

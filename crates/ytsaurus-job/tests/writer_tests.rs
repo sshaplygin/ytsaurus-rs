@@ -430,6 +430,49 @@ fn table_names_reach_the_error_message() {
     assert!(message.contains("events, rejects"), "unhelpful: {message}");
 }
 
+/// A row written after `finish()` used to sit in the buffer and vanish when
+/// the job exited — a short table under exit code zero. It is refused now.
+#[test]
+fn a_row_written_after_finish_is_refused() {
+    let (mut writer, buffers) = writer_with_tables(1, YsonFormat::Text);
+    writer
+        .write(
+            0,
+            &Row {
+                key: "a".into(),
+                count: 1,
+            },
+        )
+        .expect("writes");
+    writer.finish().expect("flushes");
+
+    let err = writer
+        .write(
+            0,
+            &Row {
+                key: "late".into(),
+                count: 2,
+            },
+        )
+        .expect_err("a late row must not be accepted");
+    assert_eq!(err.kind(), "write_after_finish");
+    assert!(
+        !err.is_row_local(),
+        "every later row would fail the same way"
+    );
+
+    let err = writer
+        .write_raw(0, b"{key=late}")
+        .expect_err("raw writes are refused the same way");
+    assert_eq!(err.kind(), "write_after_finish");
+
+    drop(writer);
+    assert!(
+        !String::from_utf8_lossy(&buffers[0].contents()).contains("late"),
+        "the refused row must not reach the table"
+    );
+}
+
 /// A plain `usize` still works, so code written against 0.1 keeps compiling.
 #[test]
 fn a_bare_index_still_addresses_a_table() {

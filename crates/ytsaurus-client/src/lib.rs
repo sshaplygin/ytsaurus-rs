@@ -29,9 +29,38 @@
 //!
 //! # Configuration
 //!
-//! [`Client::from_env`] reads `YT_PROXY` for the cluster address and `YT_TOKEN`
-//! for the token, matching the `yt` CLI. A bare host is assumed to be HTTPS; a
-//! local cluster is reached as `http://localhost:8000`.
+//! [`Client::from_env`] reads `YT_PROXY` for the cluster address, and finds a
+//! token the way the `yt` CLI does: `YT_TOKEN`, then the file named by
+//! `YT_TOKEN_PATH`, then `~/.yt/token`. A machine where the CLI already works
+//! needs nothing else. A bare host is assumed to be HTTPS; a local cluster is
+//! reached as `http://localhost:8000`.
+//!
+//! # When an operation fails
+//!
+//! [`Client::wait_for_operation`] does not stop at the state. It asks the
+//! cluster which jobs failed and what they wrote to stderr, and carries both in
+//! [`ClientError::OperationFailed`], so a failure explains itself without a
+//! trip to the web UI:
+//!
+//! ```text
+//! operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
+//!   job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
+//!   stderr:
+//!     thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+//!     boom: this job fails on purpose (row 1, 23 bytes)
+//! ```
+//!
+//! That costs one [`Client::list_jobs`] and a few [`Client::get_job_stderr`]
+//! calls per failed operation; [`Client::with_job_diagnostics`] turns it off.
+//!
+//! # All at once, or not at all
+//!
+//! Each step above can fail halfway and leave something behind — an empty
+//! table, a stale worker, an output table holding neither the old result nor
+//! the new one. [`Client::start_transaction`] makes the whole sequence one
+//! event: nothing it does is visible until [`Transaction::commit`], and
+//! dropping the handle aborts it, so a `?` on any line leaves the cluster as it
+//! was.
 //!
 //! # What this does not do
 //!
@@ -48,14 +77,40 @@ use std::time::{Duration, Instant};
 /// Errors.
 pub mod error;
 mod http;
+mod jobs;
+/// Cypress locks.
+pub mod lock;
+/// Table paths that carry attributes.
+pub mod path;
+mod retry;
+/// Table schemas.
+pub mod schema;
 mod spec;
+/// Streaming table I/O.
+pub mod stream;
+mod transaction;
+mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
 pub mod yson_build;
 
 pub use crate::error::{ClientError, Result};
-pub use crate::spec::{MapReduceSpec, MapSpec, OperationType};
+pub use crate::jobs::{JobFailure, JobInfo};
+pub use crate::lock::{Lock, LockMode};
+pub use crate::path::TablePath;
+pub use crate::retry::{MutationId, RetryPolicy};
+pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
+// The derive and the trait share a name, as `serde::Serialize` does: they live
+// in different namespaces, and a user wants both under one import.
+pub use crate::spec::{
+    MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec, VanillaSpec, VanillaTask,
+};
+pub use crate::stream::TableReader;
+pub use crate::transaction::Transaction;
+#[cfg(feature = "derive")]
+pub use ytsaurus_helpers::TableRow;
 
 use crate::http::{Method, Payload, Transport};
+use crate::retry::Repeatable;
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
 /// Default request timeout.
@@ -64,11 +119,57 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often [`Client::wait_for_operation`] asks the cluster for progress.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How many failed jobs a failed operation reports.
+///
+/// Jobs of one operation usually fail the same way, so the first few explain
+/// the failure and the rest only make the message longer.
+const REPORTED_JOBS: u32 = 3;
+
+/// How much of a job's stderr goes into the error message.
+///
+/// The cluster caps saved stderr at megabytes; an error a user reads in a
+/// terminal wants the tail of it, not all of it.
+const STDERR_EXCERPT: usize = 4096;
+
+/// Where the cluster's file cache lives.
+///
+/// The path the Python wrapper uses, so a cache an installation already
+/// maintains — and already expires entries from — is the one this client uses
+/// too.
+const DEFAULT_FILE_CACHE: &str = "//tmp/yt_wrapper/file_storage/new_cache";
+
+/// The `{value=…}` API v4 wraps a structured answer in.
+///
+/// Deserialised rather than walked, so [`Client::get_as`] reads the response
+/// once. Keys the type does not mention are ignored, which is what lets the
+/// envelope grow a field without breaking this.
+#[derive(serde::Deserialize)]
+struct Envelope<T> {
+    value: T,
+}
+
+/// A worker binary on the cluster, as [`Client::upload_worker_cached`] left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedFile {
+    /// Cypress path to reference from a spec.
+    pub path: String,
+    /// The name to give it in the job's sandbox.
+    ///
+    /// The cached node is named after the file's hash, so a command like
+    /// `./my_job` needs this passed to
+    /// [`MapSpec::with_local_file_named`].
+    pub name: String,
+    /// Whether this call had to upload it. `false` is a cache hit.
+    pub uploaded: bool,
+}
+
 /// A connection to one YTsaurus cluster.
 #[derive(Debug, Clone)]
 pub struct Client {
     transport: Transport,
     poll_interval: Duration,
+    job_diagnostics: bool,
+    file_cache: String,
 }
 
 impl Client {
@@ -81,6 +182,8 @@ impl Client {
         Self {
             transport: Transport::new(proxy, None, DEFAULT_TIMEOUT),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            job_diagnostics: true,
+            file_cache: DEFAULT_FILE_CACHE.to_owned(),
         }
     }
 
@@ -90,10 +193,26 @@ impl Client {
         Self {
             transport: Transport::new(proxy, Some(token.into()), DEFAULT_TIMEOUT),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            job_diagnostics: true,
+            file_cache: DEFAULT_FILE_CACHE.to_owned(),
         }
     }
 
-    /// Connects using `YT_PROXY` and, if set, `YT_TOKEN`.
+    /// Connects using `YT_PROXY`, and whatever token the environment offers.
+    ///
+    /// The token is looked for the way the `yt` CLI looks for it, and stops at
+    /// the first that has one:
+    ///
+    /// 1. `YT_TOKEN`;
+    /// 2. the file named by `YT_TOKEN_PATH`;
+    /// 3. `~/.yt/token`.
+    ///
+    /// So a machine where the CLI already works needs no extra setup. A token
+    /// read from a file is **trimmed**: one written with `echo` ends in a
+    /// newline, and sending that produces an authentication failure that says
+    /// nothing about a newline. An unreadable file is treated as no token
+    /// rather than as an error, because that is what it means on a cluster that
+    /// wants none.
     ///
     /// # Errors
     ///
@@ -107,10 +226,7 @@ impl Client {
             )
         })?;
 
-        let token = std::env::var("YT_TOKEN")
-            .ok()
-            .filter(|t| !t.trim().is_empty());
-        Ok(match token {
+        Ok(match token_from_environment() {
             Some(token) => Self::with_token(&proxy, token),
             None => Self::new(&proxy),
         })
@@ -123,6 +239,128 @@ impl Client {
         self
     }
 
+    /// Overrides the request timeout, which defaults to two minutes.
+    ///
+    /// For a buffered command the limit is end to end. A streaming transfer —
+    /// [`Client::read_table_streaming`], [`Client::write_table_rows`] and
+    /// their kin — is not cut off mid-table: there the timeout bounds each
+    /// wait *around* the data (connecting, sending the request, the response
+    /// headers), and the data itself moves for as long as it takes.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.transport.set_timeout(timeout);
+        self
+    }
+
+    /// Overrides how a failed request is repeated.
+    ///
+    /// The default is five attempts with a doubling delay, which covers the
+    /// transient failures a shared cluster produces — a restarting proxy, a
+    /// scheduler that has lost the master. [`RetryPolicy::none`] turns it off.
+    ///
+    /// This applies to light commands only. Heavy ones — table and file I/O —
+    /// are sent once whatever the policy says, because the documentation is
+    /// explicit that they cannot be retried; a transaction is the way to make
+    /// one atomic.
+    #[must_use]
+    pub fn with_retries(mut self, policy: RetryPolicy) -> Self {
+        self.transport.set_retries(policy);
+        self
+    }
+
+    /// Overrides where [`Client::upload_worker_cached`] keeps its files.
+    ///
+    /// Defaults to the path the Python wrapper uses, so the cache is shared
+    /// with whatever else the installation runs — and whatever expiry its
+    /// administrators have set applies here too.
+    #[must_use]
+    pub fn with_file_cache(mut self, path: impl Into<String>) -> Self {
+        self.file_cache = path.into();
+        self
+    }
+
+    /// Turns the failed-job report in [`Client::wait_for_operation`] on or off.
+    ///
+    /// On by default: when an operation fails, the client asks the cluster
+    /// which jobs failed and what they printed, and puts that in the error.
+    /// That costs one `list_jobs` and a few `get_job_stderr` calls per failed
+    /// operation. The YTsaurus documentation asks that `list_jobs` not be used
+    /// without an administrator's approval, so this is the way to switch it
+    /// off on an installation where that approval was not given.
+    #[must_use]
+    pub fn with_job_diagnostics(mut self, enabled: bool) -> Self {
+        self.job_diagnostics = enabled;
+        self
+    }
+
+    /// Binds this client to an existing transaction.
+    ///
+    /// Every command it then sends happens inside that transaction. This is the
+    /// low-level door: [`Client::start_transaction`] is the one that starts a
+    /// transaction, keeps it alive and aborts it if the work does not finish.
+    /// Use this to rejoin a transaction whose ID came from somewhere else — a
+    /// parent process, or a previous run.
+    ///
+    /// Nothing pings the transaction on this path, so it expires on the
+    /// cluster's schedule unless its owner is pinging it.
+    #[must_use]
+    pub fn with_transaction(mut self, id: impl Into<String>) -> Self {
+        self.transport.set_transaction(Some(id.into()));
+        self
+    }
+
+    /// The transaction this client is bound to, if any.
+    #[must_use]
+    pub fn transaction_id(&self) -> Option<&str> {
+        self.transport.transaction()
+    }
+
+    /// Starts a transaction, and keeps it alive while the handle lives.
+    ///
+    /// Everything sent through the returned [`Transaction`] is invisible to
+    /// everything else until it commits, and is discarded if it does not:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// # let rows: Vec<u8> = Vec::new();
+    /// let tx = client.start_transaction()?;
+    ///
+    /// tx.create("table", "//tmp/out")?;   // no one else can see it yet
+    /// tx.write_table("//tmp/out", &rows)?;
+    ///
+    /// tx.commit()?;                       // and now everyone can
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The transaction lasts 30 seconds without a ping — the cluster's own
+    /// default — and the handle pings it every ten, so an operation that runs
+    /// for an hour is fine. [`Client::start_transaction_with`] changes the
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the transaction cannot be started.
+    pub fn start_transaction(&self) -> Result<Transaction> {
+        Transaction::start(self, transaction::DEFAULT_TRANSACTION_TIMEOUT)
+    }
+
+    /// Starts a transaction that expires `timeout` after its last ping.
+    ///
+    /// The handle pings three times per timeout, so this is about what happens
+    /// when the handle is *gone*: how long the transaction holds its locks
+    /// after the process holding it dies without aborting. Shorter frees them
+    /// sooner; longer survives a longer pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the transaction cannot be started.
+    pub fn start_transaction_with(&self, timeout: Duration) -> Result<Transaction> {
+        Transaction::start(self, timeout)
+    }
+
     /// Returns the least-loaded heavy proxy the cluster reports, if any.
     ///
     /// Large installations separate light and heavy proxies and answer heavy
@@ -132,23 +370,22 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails.
+    /// Returns [`ClientError`] if the request fails, or if `/hosts` does not
+    /// answer with the documented list of host names. `Ok(None)` means the
+    /// cluster answered and named no heavy proxy — which a failure must not be
+    /// allowed to look like, since the caller's next move is to stop looking.
     pub fn heavy_proxy(&self) -> Result<Option<String>> {
-        let url = format!("{}/hosts", self.transport.base());
-        let body = ureq::get(&url)
-            .call()
-            .map_err(|e| ClientError::Transport {
-                command: "hosts".to_owned(),
-                source: Box::new(e),
-            })?
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ClientError::Decode {
-                command: "hosts".to_owned(),
-                reason: e.to_string(),
-            })?;
+        // Through the transport, so this carries the token and honours the
+        // timeout, the retry policy and the TLS guard like every other request.
+        let body = self.transport.fetch("/hosts", "hosts")?;
 
-        let hosts: Vec<String> = serde_json::from_str(&body).unwrap_or_default();
+        let hosts: Vec<String> = serde_json::from_str(&body).map_err(|e| ClientError::Decode {
+            command: "hosts".to_owned(),
+            reason: format!(
+                "/hosts did not answer with a list of host names: {e}; body was {}",
+                crate::error::truncate(&body, 200)
+            ),
+        })?;
         Ok(hosts.into_iter().next())
     }
 
@@ -161,11 +398,19 @@ impl Client {
     /// Returns [`ClientError`] if the request fails.
     pub fn exists(&self, path: &str) -> Result<bool> {
         let params = yson_build::map([("path", yson_build::string(path))]);
-        let body = self
-            .transport
-            .call(Method::Get, "exists", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "exists",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+        // `{"value"=%false;}` — the envelope key is `value`, as it is for
+        // `get`, not the command's own name. Asking for `exists` here failed
+        // every call with a decode error, and nothing in the crate called this
+        // until transactions needed to ask whether a node had survived one.
         Ok(matches!(
-            self.value_field(&body, "exists")?.node,
+            self.value_field(&body, "value")?.node,
             YsonNode::Boolean(true)
         ))
     }
@@ -184,25 +429,448 @@ impl Client {
             ("recursive", yson_build::boolean(true)),
             ("ignore_existing", yson_build::boolean(true)),
         ]);
-        self.transport
-            .call(Method::Post, "create", &params, Payload::None)?;
+        self.transport.call(
+            Method::Post,
+            "create",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
         Ok(())
     }
 
-    /// Removes a Cypress node. Succeeds if it is already absent.
+    /// Creates a table with a schema.
+    ///
+    /// A schematised table is checked on every write, stores its columns in
+    /// their own types, and can be sorted and merged; an unschematised one
+    /// takes anything and finds out later.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let schema = TableSchema::new([
+    ///     Column::new("host", ColumnType::Utf8).required().key(),
+    ///     Column::new("size", ColumnType::Int64).required(),
+    /// ]);
+    /// client.create_table("//tmp/visits", &schema)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Unlike [`Client::create`], this **fails if the path already exists**.
+    /// That is deliberate: the cluster ignores the attributes of a create it
+    /// skips, so an `ignore_existing` version of this would quietly leave the
+    /// old table with the old schema and report success. Changing the schema of
+    /// a table that exists is `alter_table`'s job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if the schema is one the cluster would
+    /// refuse, or [`ClientError`] if the request fails.
+    pub fn create_table(&self, path: &str, schema: &TableSchema) -> Result<()> {
+        // Locally first: the same rules, but as one sentence naming the column
+        // rather than a nested error document from the cluster.
+        schema
+            .validate()
+            .map_err(|reason| ClientError::Config(format!("{path}: {reason}")))?;
+
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("type", yson_build::string("table")),
+            ("recursive", yson_build::boolean(true)),
+            // The schema goes *inside* `attributes`. A top-level `schema` here
+            // is accepted, answered with 200 and a node id, and silently
+            // ignored — the table comes back with an empty weak schema. This
+            // is the single worst mistake available in this command.
+            (
+                "attributes",
+                yson_build::map([("schema", schema.to_yson())]),
+            ),
+        ]);
+
+        self.transport.call(
+            Method::Post,
+            "create",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// Changes the schema of a table that already exists.
+    ///
+    /// The other half of [`Client::create_table`]: a table outlives the program
+    /// that made it, and the rows it holds gain columns.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let wider = TableSchema::new([
+    ///     Column::new("host", ColumnType::Utf8).required().key(),
+    ///     Column::new("size", ColumnType::Int64).required(),
+    ///     Column::new("referrer", ColumnType::Utf8), // new, and optional
+    /// ]);
+    /// client.alter_table("//tmp/visits", &wider)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// **A table with rows in it accepts only changes that ask less of the
+    /// rows already written.** Watched on a cluster, on a table holding two
+    /// rows — and each refusal says which column and why:
+    ///
+    /// | Change | |
+    /// | --- | --- |
+    /// | add an **optional** column, anywhere in the order | allowed |
+    /// | make a required column optional | allowed |
+    /// | `strict` → non-strict | allowed |
+    /// | add a **required** column | `Cannot insert a new required column "must" into a non-empty table` |
+    /// | remove a column | `Cannot remove column "size" from a strict schema` |
+    /// | change a column's type | `Type … is modified in non backward compatible manner` |
+    /// | rename a column | read as a removal, and refused as one |
+    /// | make the table sorted | `Cannot change schema from unsorted to sorted` |
+    /// | non-strict → `strict` | `Changing "strict" from "false" to "true" is not allowed` |
+    ///
+    /// Two consequences worth knowing before either becomes permanent:
+    ///
+    /// - **An empty table accepts all of it** — dropping columns, changing types,
+    ///   becoming sorted. So a schema change tried out on an empty table proves
+    ///   nothing about the same change on a full one.
+    /// - **A non-strict schema can never gain a named column**:
+    ///   `Cannot insert a new column "note" into non-strict schema`. Relaxing
+    ///   `strict` is a one-way door out of schema evolution.
+    ///
+    /// Unlike `create`, the schema here is a **top-level parameter** rather than
+    /// an attribute — the two commands are exact opposites on this, and `create`
+    /// silently ignores the spelling `alter_table` requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if the schema is one the cluster would
+    /// refuse outright, or [`ClientError`] if the change is rejected as
+    /// incompatible.
+    pub fn alter_table(&self, path: &str, schema: &TableSchema) -> Result<()> {
+        schema
+            .validate()
+            .map_err(|reason| ClientError::Config(format!("{path}: {reason}")))?;
+
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            // Top-level, where `create` wants it inside `attributes`. Getting
+            // this the wrong way round fails loudly here and silently there.
+            ("schema", schema.to_yson()),
+        ]);
+        self.transport.call(
+            Method::Post,
+            "alter_table",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// The schema of a table, as the cluster stores it.
+    ///
+    /// Returns the raw YSON: the cluster answers with more than it was given —
+    /// every column carries `required`, `type` *and* `type_v3` whichever was
+    /// written, and the keys come back in alphabetical order.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails.
+    pub fn table_schema(&self, path: &str) -> Result<YsonValue> {
+        self.get(&format!("{path}/@schema"))
+    }
+
+    /// Removes a Cypress node.
+    ///
+    /// The node must exist, and a map node must be empty — the cluster's own
+    /// defaults, and the safe ones: a mistyped path fails instead of deleting
+    /// whatever it happened to name. [`Client::remove_tree`] is the deliberate
+    /// spelling for a subtree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the node does not exist, is a non-empty map
+    /// node, or the request fails.
     pub fn remove(&self, path: &str) -> Result<()> {
+        self.remove_with(path, false, false)
+    }
+
+    /// Removes a Cypress node and everything under it. Succeeds if it is
+    /// already absent.
+    ///
+    /// This is `recursive` plus `force`: the spelling for "make this path not
+    /// exist", whatever is there now — which is also why it deserves a moment
+    /// of care with the argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn remove_tree(&self, path: &str) -> Result<()> {
+        self.remove_with(path, true, true)
+    }
+
+    fn remove_with(&self, path: &str, recursive: bool, force: bool) -> Result<()> {
         let params = yson_build::map([
             ("path", yson_build::string(path)),
-            ("recursive", yson_build::boolean(true)),
-            ("force", yson_build::boolean(true)),
+            ("recursive", yson_build::boolean(recursive)),
+            ("force", yson_build::boolean(force)),
         ]);
-        self.transport
-            .call(Method::Post, "remove", &params, Payload::None)?;
+        self.transport.call(
+            Method::Post,
+            "remove",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
         Ok(())
+    }
+
+    /// The names of a node's children.
+    ///
+    /// **Not sorted.** The order is the cluster's own and has no meaning; a
+    /// listing of three dated tables came back as the second, the third and
+    /// then the first. Sort it if the order matters.
+    ///
+    /// A path that is not a map node is an error rather than an empty list —
+    /// `"List" method is not supported` — and so is a path that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, or if the cluster marks
+    /// the answer `incomplete`: a listing that is silently short is worse than
+    /// no listing.
+    pub fn list(&self, path: &str) -> Result<Vec<String>> {
+        let params = yson_build::map([("path", yson_build::string(path))]);
+        let body = self.transport.call(
+            Method::Get,
+            "list",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        child_names(&self.value_field(&body, "value")?, path)
+    }
+
+    /// Copies a node, creating missing parents.
+    ///
+    /// Fails if `destination` exists; [`Client::copy_replacing`] is the one that
+    /// overwrites.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn copy(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("copy", source, destination, false)
+    }
+
+    /// Copies a node over whatever is at `destination`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn copy_replacing(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("copy", source, destination, true)
+    }
+
+    /// Moves a node, creating missing parents.
+    ///
+    /// Fails if `destination` exists; [`Client::move_replacing`] is the one that
+    /// overwrites, and the pair is how a result is published: write a staging
+    /// table, then move it over the live one.
+    ///
+    /// Named `move_node` because `move` is a Rust keyword, and `client.r#move`
+    /// at every call site would be a worse tax than the four extra characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn move_node(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("move", source, destination, false)
+    }
+
+    /// Moves a node over whatever is at `destination`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn move_replacing(&self, source: &str, destination: &str) -> Result<()> {
+        self.transfer("move", source, destination, true)
+    }
+
+    fn transfer(&self, command: &str, source: &str, destination: &str, force: bool) -> Result<()> {
+        let params = yson_build::map([
+            ("source_path", yson_build::string(source)),
+            ("destination_path", yson_build::string(destination)),
+            ("recursive", yson_build::boolean(true)),
+            ("force", yson_build::boolean(force)),
+        ]);
+        self.transport.call(
+            Method::Post,
+            command,
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// Creates a link at `link_path` pointing at `target`.
+    ///
+    /// A link resolves to its target, so `//tmp/latest/@row_count` reads the
+    /// target's row count. To ask about the link itself, put `&` after its path:
+    /// `//tmp/latest&/@target_path`. Without the `&` the question goes through
+    /// to the target and is answered as if the link were not there.
+    ///
+    /// Fails if `link_path` exists; [`Client::link_replacing`] is what points an
+    /// existing link somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn link(&self, target: &str, link_path: &str) -> Result<()> {
+        self.link_inner(target, link_path, false)
+    }
+
+    /// Points a link at `target`, replacing whatever is at `link_path`.
+    ///
+    /// The `//tmp/thing/latest` pattern: publish under a dated name, then move
+    /// the link. Readers that follow the link see the old version until this
+    /// call and the new one after it, and never a half-written table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn link_replacing(&self, target: &str, link_path: &str) -> Result<()> {
+        self.link_inner(target, link_path, true)
+    }
+
+    fn link_inner(&self, target: &str, link_path: &str, force: bool) -> Result<()> {
+        let params = yson_build::map([
+            ("target_path", yson_build::string(target)),
+            ("link_path", yson_build::string(link_path)),
+            ("recursive", yson_build::boolean(true)),
+            ("force", yson_build::boolean(force)),
+        ]);
+        self.transport.call(
+            Method::Post,
+            "link",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+        Ok(())
+    }
+
+    /// Takes a lock, or fails because somebody else holds one.
+    ///
+    /// Only inside a transaction: a lock lives as long as the transaction that
+    /// took it, and there is nothing else for it to belong to. A client that is
+    /// not in one is told so here rather than by the cluster.
+    ///
+    /// The failure is worth reading — it names the transaction that won:
+    ///
+    /// ```text
+    /// Cannot take "exclusive" lock for node //tmp/live since "exclusive" lock
+    /// is taken by concurrent transaction 4-dac2-10001-eb1b
+    /// ```
+    ///
+    /// [`Client::lock_waiting`] queues for it instead of failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if this client is not in a transaction,
+    /// or [`ClientError`] if the lock is refused.
+    pub fn lock(&self, path: &str, mode: LockMode) -> Result<Lock> {
+        self.lock_inner(path, mode, false)
+    }
+
+    /// Queues for a lock, and waits until it is held.
+    ///
+    /// A waitable lock is **granted later, or never** — the cluster answers
+    /// immediately with a lock that is `pending`, and it becomes `acquired` when
+    /// the transactions ahead of it end. Returning that lock as though it were
+    /// held is the mistake this command exists to make impossible: this polls
+    /// until the cluster says `acquired`, and gives up after `wait_for`.
+    ///
+    /// The deadline is not a nicety. A request can queue for something that will
+    /// never happen and the cluster will not say so: a transaction that already
+    /// holds a snapshot lock on the node is refused an exclusive one outright,
+    /// but the *waitable* version of the same request is queued behind a lock
+    /// only that transaction's own end will release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if this client is not in a transaction or
+    /// the wait ran out, or [`ClientError`] if a request fails. A lock that is
+    /// still queued when the wait runs out stays queued until the transaction
+    /// ends.
+    pub fn lock_waiting(&self, path: &str, mode: LockMode, wait_for: Duration) -> Result<Lock> {
+        let lock = self.lock_inner(path, mode, true)?;
+        let deadline = Instant::now() + wait_for;
+
+        loop {
+            let state = self.get(&format!("#{}/@state", lock.id))?;
+            if state.as_str() == Some("acquired") {
+                return Ok(lock);
+            }
+
+            if Instant::now() >= deadline {
+                return Err(ClientError::Config(format!(
+                    "lock on {path}: still {} after {:.0}s — the locks ahead of it are \
+                     still held, which can include a snapshot lock this same \
+                     transaction took. It stays queued until this transaction ends.",
+                    state.as_str().unwrap_or("queued"),
+                    wait_for.as_secs_f64()
+                )));
+            }
+            std::thread::sleep(self.poll_interval);
+        }
+    }
+
+    fn lock_inner(&self, path: &str, mode: LockMode, waitable: bool) -> Result<Lock> {
+        if self.transaction_id().is_none() {
+            return Err(ClientError::Config(format!(
+                "lock {path}: a lock belongs to a transaction, and this client is not in \
+                 one — take it through a Client::start_transaction handle. The cluster \
+                 answers this with `A valid master transaction is required`."
+            )));
+        }
+
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("mode", yson_build::string(mode.as_str())),
+            ("waitable", yson_build::boolean(waitable)),
+        ]);
+        let body = self.transport.call(
+            Method::Post,
+            "lock",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "lock")?;
+        let text = |key: &str| -> Result<String> {
+            match &self.field_of(&envelope, key)?.node {
+                YsonNode::String(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+                other => Err(ClientError::Decode {
+                    command: "lock".to_owned(),
+                    reason: format!("{key} is not a string: {other:?}"),
+                }),
+            }
+        };
+
+        Ok(Lock {
+            id: text("lock_id")?,
+            node_id: text("node_id")?,
+        })
     }
 
     /// Reads a node attribute, such as `@row_count`.
@@ -212,9 +880,13 @@ impl Client {
     /// Returns [`ClientError`] if the request fails.
     pub fn get(&self, path: &str) -> Result<YsonValue> {
         let params = yson_build::map([("path", yson_build::string(path))]);
-        let body = self
-            .transport
-            .call(Method::Get, "get", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "get",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
         self.value_field(&body, "value")
     }
 
@@ -249,8 +921,238 @@ impl Client {
             source,
         })?;
 
+        self.upload_executable(remote, &bytes)
+    }
+
+    /// Uploads the **running executable** to Cypress, marked executable.
+    ///
+    /// This is the one-binary pattern: the same program launches the operation
+    /// and runs as its job, telling the two apart with
+    /// [`ytsaurus_job::is_inside_job`]. The binary on the cluster is then by
+    /// construction the one you just built — the whole "I uploaded a stale
+    /// worker" class of bug disappears.
+    ///
+    /// The running executable has to be something a node can exec, so its ELF
+    /// header is checked before the upload: Linux, x86-64, statically linked.
+    /// Launching from macOS, or from a Linux host where the launcher is
+    /// dynamically linked, it is not — this returns
+    /// [`ClientError::NotAWorker`] naming the reason, instead of uploading a
+    /// binary that fails on the node minutes later. Build the worker with
+    /// `scripts/build-worker.sh` and upload it with [`Client::upload_worker`]
+    /// in that case.
+    ///
+    /// [`ytsaurus_job::is_inside_job`]: https://docs.rs/ytsaurus-job/latest/ytsaurus_job/fn.is_inside_job.html
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::NotAWorker`] if the running executable cannot run
+    /// on a node, or [`ClientError`] if the upload fails.
+    pub fn upload_current_exe(&self, remote: &str) -> Result<()> {
+        let exe = std::env::current_exe().map_err(|source| ClientError::Io {
+            path: "the running executable".to_owned(),
+            source,
+        })?;
+
+        let bytes = std::fs::read(&exe).map_err(|source| ClientError::Io {
+            path: exe.display().to_string(),
+            source,
+        })?;
+
+        if let Err(reason) = worker::check_worker_binary(&bytes) {
+            return Err(ClientError::NotAWorker {
+                path: exe.display().to_string(),
+                reason,
+            });
+        }
+
+        self.upload_executable(remote, &bytes)
+    }
+
+    /// Uploads a worker, or finds it already on the cluster.
+    ///
+    /// Keyed by the file's MD5, so an unchanged binary is uploaded once and
+    /// every later launch reuses it. That is the difference between a dev loop
+    /// that re-sends tens of megabytes on every run and one that does not.
+    ///
+    /// The cached node is named after the hash, so the returned
+    /// [`CachedFile::name`] is the name to give it in the sandbox — see
+    /// [`MapSpec::with_local_file_named`]:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, MapSpec};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let worker = client.upload_worker_cached("target/.../my_job")?;
+    /// let spec = MapSpec::new("./my_job", ["//tmp/in"], ["//tmp/out"])
+    ///     .with_local_file_named(&worker.path, &worker.name);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The cache is shared: [`Client::with_file_cache`] defaults to the path
+    /// the Python wrapper uses, so an installation that already expires old
+    /// entries there expires these too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the file cannot be read or the upload fails.
+    pub fn upload_worker_cached(&self, local: impl AsRef<std::path::Path>) -> Result<CachedFile> {
+        let local = local.as_ref();
+        let bytes = std::fs::read(local).map_err(|source| ClientError::Io {
+            path: local.display().to_string(),
+            source,
+        })?;
+
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "worker".to_owned());
+        let digest = format!("{:x}", md5::compute(&bytes));
+
+        if let Some(path) = self.file_from_cache(&digest)? {
+            return Ok(CachedFile {
+                path,
+                name,
+                uploaded: false,
+            });
+        }
+
+        // Created here rather than in the lookup: a cache the installation
+        // maintains is one a user may only be able to read, and a lookup that
+        // mutated it would fail on exactly the clusters where the cache is
+        // worth the most.
+        self.create("map_node", &self.file_cache)?;
+
+        // Staged inside the cache node, so a cluster that expires the cache
+        // expires an interrupted upload with it.
+        //
+        // The name carries a nonce as well as the hash. Keyed by the hash alone
+        // it names the same node for every process uploading the same binary,
+        // and two CI jobs launching together would write to one node and then
+        // remove it from under each other.
+        let staging = format!("{}/staged_{digest}_{}", self.file_cache, MutationId::new());
+        self.create("file", &staging)?;
+
+        let cached = self
+            .write_file_computing_md5(&staging, &bytes)
+            .and_then(|()| self.set_attribute(&staging, "executable", yson_build::boolean(true)))
+            .and_then(|()| self.put_file_to_cache(&staging, &digest));
+
+        // Removed whichever way that went. On success the cache may have kept
+        // the node itself rather than a copy, so this is `force`-removing
+        // something that may already be gone, which `remove_tree` tolerates.
+        // On failure it is what stops a rejected upload from leaving tens of
+        // megabytes behind for good: cache expiry walks the entries the cache
+        // itself created, not the staging nodes beside them.
+        let removed = self.remove_tree(&staging);
+        // The upload's own failure is the one worth reporting; a cleanup that
+        // also failed only matters when there was nothing else wrong.
+        let path = cached?;
+        removed?;
+
+        // Set on the cached path too: whether the attribute survives the move
+        // decides whether the job can exec at all, and it is cheap to be sure.
+        self.set_attribute(&path, "executable", yson_build::boolean(true))?;
+
+        Ok(CachedFile {
+            path,
+            name,
+            uploaded: true,
+        })
+    }
+
+    /// Looks up a file in the cluster's file cache by its MD5.
+    ///
+    /// `None` means nothing is cached under that hash — including when the
+    /// cache directory does not exist yet, which is what
+    /// [`Client::upload_worker_cached`] creates on its way past.
+    ///
+    /// A lookup and nothing more: it sends no mutation, so it works against a
+    /// cache the caller may only read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn file_from_cache(&self, md5: &str) -> Result<Option<String>> {
+        let params = yson_build::map([
+            ("md5", yson_build::string(md5)),
+            ("cache_path", yson_build::string(&self.file_cache)),
+        ]);
+        // A `cache_path` that does not exist needs no special case: the cluster
+        // answers 200 with the same empty string it uses for any other miss,
+        // rather than the resolve error a missing path usually earns. Checked
+        // against a local cluster with no `//tmp/yt_wrapper` at all, which is
+        // the state a first upload starts from.
+        let body = self.transport.call(
+            Method::Get,
+            "get_file_from_cache",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        self.cached_path(&body, "get_file_from_cache")
+    }
+
+    /// Hands a file already written to Cypress to the file cache.
+    ///
+    /// The cluster verifies that the node's MD5 is the one given, which is why
+    /// it must have been written with `compute_md5`. Returns the path the file
+    /// now lives at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn put_file_to_cache(&self, path: &str, md5: &str) -> Result<String> {
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("md5", yson_build::string(md5)),
+            ("cache_path", yson_build::string(&self.file_cache)),
+        ]);
+        let body = self.transport.call(
+            Method::Post,
+            "put_file_to_cache",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+        )?;
+
+        self.cached_path(&body, "put_file_to_cache")?
+            .ok_or_else(|| ClientError::Decode {
+                command: "put_file_to_cache".to_owned(),
+                reason: "the cluster returned no path for the cached file".to_owned(),
+            })
+    }
+
+    /// Reads the path out of a file-cache response.
+    ///
+    /// These two commands answer with a **bare string**, not the `{path=…}`
+    /// envelope the rest of API v4 uses, and a cache miss is an *empty* string
+    /// rather than an error or an entity. Both shapes are accepted so that a
+    /// cluster that grows an envelope later does not break this.
+    fn cached_path(&self, body: &[u8], command: &str) -> Result<Option<String>> {
+        let value = self.strip_envelope(body, command)?;
+        let value = match &value.node {
+            YsonNode::Map(_) => self.field_of(&value, "path")?,
+            _ => value,
+        };
+
+        match &value.node {
+            YsonNode::String(bytes) if !bytes.is_empty() => {
+                Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+            }
+            YsonNode::String(_) | YsonNode::Entity => Ok(None),
+            other => Err(ClientError::Decode {
+                command: command.to_owned(),
+                reason: format!("the cached path is not a string: {other:?}"),
+            }),
+        }
+    }
+
+    /// Writes `bytes` to `remote` as a file a node is allowed to run.
+    fn upload_executable(&self, remote: &str, bytes: &[u8]) -> Result<()> {
         self.create("file", remote)?;
-        self.write_file(remote, &bytes)?;
+        self.write_file(remote, bytes)?;
         self.set_attribute(remote, "executable", yson_build::boolean(true))
     }
 
@@ -260,9 +1162,28 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
-        let params = yson_build::map([("path", yson_build::string(path))]);
-        self.transport
-            .call(Method::Put, "write_file", &params, Payload::Bytes(contents))?;
+        self.write_file_inner(path, contents, false)
+    }
+
+    /// As `write_file`, asking the cluster to record the file's MD5 — which is
+    /// what `put_file_to_cache` then checks against.
+    fn write_file_computing_md5(&self, path: &str, contents: &[u8]) -> Result<()> {
+        self.write_file_inner(path, contents, true)
+    }
+
+    fn write_file_inner(&self, path: &str, contents: &[u8], compute_md5: bool) -> Result<()> {
+        let mut params = yson_build::map([("path", yson_build::string(path))]);
+        if compute_md5 {
+            yson_build::insert(&mut params, "compute_md5", yson_build::boolean(true));
+        }
+
+        self.transport.call(
+            Method::Put,
+            "write_file",
+            &params,
+            Payload::Bytes(contents),
+            Repeatable::Never,
+        )?;
         Ok(())
     }
 
@@ -282,8 +1203,13 @@ impl Client {
             ("path", yson_build::string(format!("{path}/@{name}"))),
             ("input_format", yson_build::binary_yson_format()),
         ]);
-        self.transport
-            .call(Method::Put, "set", &params, Payload::Bytes(&encoded))?;
+        self.transport.call(
+            Method::Put,
+            "set",
+            &params,
+            Payload::Bytes(&encoded),
+            Repeatable::WithMutationId,
+        )?;
         Ok(())
     }
 
@@ -295,13 +1221,18 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails.
-    pub fn write_table(&self, path: &str, rows: &[u8]) -> Result<()> {
+    pub fn write_table(&self, path: impl Into<TablePath>, rows: &[u8]) -> Result<()> {
         let params = yson_build::map([
-            ("path", yson_build::string(path)),
+            ("path", path.into().to_yson()),
             ("input_format", yson_build::binary_yson_format()),
         ]);
-        self.transport
-            .call(Method::Put, "write_table", &params, Payload::Bytes(rows))?;
+        self.transport.call(
+            Method::Put,
+            "write_table",
+            &params,
+            Payload::Bytes(rows),
+            Repeatable::Never,
+        )?;
         Ok(())
     }
 
@@ -324,9 +1255,13 @@ impl Client {
             ("path", yson_build::string(path)),
             ("output_format", yson_build::binary_yson_format()),
         ]);
-        let body = self
-            .transport
-            .call(Method::Get, "read_table", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "read_table",
+            &params,
+            Payload::None,
+            Repeatable::Never,
+        )?;
 
         check_complete_fragment(&body).map_err(|reason| ClientError::Decode {
             command: "read_table".to_owned(),
@@ -334,6 +1269,247 @@ impl Client {
         })?;
 
         Ok(body)
+    }
+
+    /// Writes rows to a table from anything that yields them.
+    ///
+    /// The rows are Rust values; the encoding is this crate's problem, which is
+    /// the difference between this and [`Client::write_table`]:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// #[derive(serde::Serialize)]
+    /// struct Contact<'a> {
+    ///     name: &'a str,
+    ///     email: &'a str,
+    ///     age: i64,
+    /// }
+    ///
+    /// client.write_table_rows("//tmp/contacts", (0..100).map(|n| Contact {
+    ///     name: "Gordon Freeman",
+    ///     email: "gordon@black-mesa.example",
+    ///     age: 27 + n,
+    /// }))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// It takes an iterator rather than a slice because the encoder sits
+    /// *inside* the request body: rows are serialised a bufferful at a time as
+    /// the connection asks for bytes, so a million rows cost one buffer rather
+    /// than a million rows' worth of memory, and the caller never has to
+    /// materialise them either.
+    ///
+    /// Replaces the table's contents, as [`Client::write_table`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Decode`] naming the row if one cannot be
+    /// serialised — the write fails rather than sending the rows before it —
+    /// or [`ClientError`] if the request fails.
+    pub fn write_table_rows<T, I>(&self, path: impl Into<TablePath>, rows: I) -> Result<()>
+    where
+        T: serde::Serialize,
+        I: IntoIterator<Item = T>,
+    {
+        let path = path.into();
+        let params = yson_build::map([
+            ("path", path.to_yson()),
+            ("input_format", yson_build::binary_yson_format()),
+        ]);
+
+        let mut stream = stream::RowStream::new(rows.into_iter());
+        let sent = self
+            .transport
+            .upload(Method::Put, "write_table", &params, &mut stream);
+
+        // Checked first: a body that failed to encode fails the request too,
+        // and the transport's account of that is "the body ended early".
+        if let Some(reason) = stream.failed {
+            return Err(ClientError::Decode {
+                command: "write_table".to_owned(),
+                reason: format!("{path}: {reason}"),
+            });
+        }
+        sent
+    }
+
+    /// Reads a whole table as typed rows.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// #[derive(serde::Deserialize)]
+    /// struct Contact {
+    ///     name: String,
+    ///     age: i64,
+    /// }
+    ///
+    /// for contact in client.read_table_rows::<Contact>("//tmp/contacts")? {
+    ///     println!("{} is {}", contact.name, contact.age);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Rows are **owned**, and the whole table is read before any of it is
+    /// returned — this is [`Client::read_table`] with the decoding done, and it
+    /// inherits the same purpose: results a launcher inspects. For a table that
+    /// does not fit, or for rows borrowed from the buffer they arrived in,
+    /// [`Client::read_table_streaming`] feeds `ytsaurus_job::JobReader`.
+    ///
+    /// Columns the type does not mention are ignored, so a struct naming two
+    /// columns of a twenty-column table is a projection rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, the stream is truncated,
+    /// or a row does not match `T`.
+    pub fn read_table_rows<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
+        decode_rows(&self.read_table(path)?, path)
+    }
+
+    /// Reads a node, or an attribute, into a Rust type.
+    ///
+    /// [`Client::get`] hands back a [`YsonValue`] to walk; this hands back the
+    /// shape you were going to walk it into:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// #[derive(serde::Deserialize)]
+    /// struct Cluster {
+    ///     #[serde(rename = "type")]
+    ///     node_type: String,
+    ///     creation_time: String,
+    ///     account: String,
+    /// }
+    ///
+    /// let root: Cluster = client.get_as("//@")?;
+    /// println!("the cluster was created at {}", root.creation_time);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Attributes the type does not mention are ignored, which is what makes
+    /// `//@` — a node with dozens of them — worth asking about at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails or the answer does not fit
+    /// `T`.
+    pub fn get_as<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let params = yson_build::map([("path", yson_build::string(path))]);
+        let body = self.transport.call(
+            Method::Get,
+            "get",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        // Decoded straight out of the response, envelope and all. Going through
+        // `get` would build a whole `YsonValue` tree, encode it back to bytes
+        // and decode those into `T` — three passes over the document and two
+        // copies of it in memory, where one pass does the same job. Invisible
+        // for `//@`; not for a large attribute or a subtree.
+        let envelope: Envelope<T> =
+            from_slice(&body, YsonFormat::Text).map_err(|e| ClientError::Decode {
+                command: "get".to_owned(),
+                reason: format!(
+                    "{path}: the answer does not fit the type asked for: {e}; body was {}",
+                    crate::error::truncate(&String::from_utf8_lossy(&body), 200)
+                ),
+            })?;
+
+        Ok(envelope.value)
+    }
+
+    /// Reads a table as a stream, without holding it.
+    ///
+    /// The same bytes [`Client::read_table`] returns — a binary YSON list
+    /// fragment — arriving as they come off the connection, so the table's size
+    /// stops being the program's memory ceiling.
+    ///
+    /// What comes out is what a job reads on fd 0, so the same decoder handles
+    /// both:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::from_env()?;
+    /// let mut reader = ytsaurus_job::JobReader::binary(client.read_table_streaming("//tmp/big")?);
+    ///
+    /// let mut rows = 0_u64;
+    /// while let Some(event) = reader.next_event()? {
+    ///     if matches!(event, ytsaurus_job::Event::Row(_)) {
+    ///         rows += 1;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`Client::read_table`] checks that what came back is a complete
+    /// fragment; this cannot, because it never has the whole thing. A fragment
+    /// cut short instead leaves a record that does not parse, and the decoder
+    /// fails on it — see [`TableReader`] for why that is the same protection
+    /// rather than none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails. Failures *during* the read
+    /// arrive from the reader, not from here.
+    pub fn read_table_streaming(&self, path: &str) -> Result<TableReader> {
+        let params = yson_build::map([
+            ("path", yson_build::string(path)),
+            ("output_format", yson_build::binary_yson_format()),
+        ]);
+        let body = self.transport.open(Method::Get, "read_table", &params)?;
+        Ok(TableReader::new(body))
+    }
+
+    /// Writes a table from a stream, without holding it.
+    ///
+    /// `rows` is read to its end and sent as it is read, so the rows can come
+    /// from a file, a pipe, or something that generates them — anything that is
+    /// a `Read`. The bytes are a binary YSON list fragment, exactly as
+    /// [`Client::write_table`] expects them.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::from_env()?;
+    /// client.create("table", "//tmp/big")?;
+    /// client.write_table_streaming("//tmp/big", std::fs::File::open("rows.yson")?)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// This is one attempt and can never be more: a reader that has been
+    /// consumed cannot be sent again. That agrees with the retry rules — heavy
+    /// commands are not repeated — and a transaction is what makes such a write
+    /// safe to fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, including when `rows`
+    /// itself fails to read.
+    pub fn write_table_streaming(
+        &self,
+        path: impl Into<TablePath>,
+        mut rows: impl std::io::Read,
+    ) -> Result<()> {
+        let params = yson_build::map([
+            ("path", path.into().to_yson()),
+            ("input_format", yson_build::binary_yson_format()),
+        ]);
+        self.transport
+            .upload(Method::Put, "write_table", &params, &mut rows)
     }
 
     // ---------------------------------------------------------- operations
@@ -356,6 +1532,53 @@ impl Client {
         self.start_operation(OperationType::MapReduce, &spec.to_yson())
     }
 
+    /// Starts a reduce operation over sorted input, returning its ID.
+    ///
+    /// The input tables must already be sorted by a column set beginning with
+    /// the spec's `reduce_by`; the cluster refuses the operation otherwise.
+    /// [`Client::start_sort`] is how they get that way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_reduce(&self, spec: &ReduceSpec) -> Result<String> {
+        self.start_operation(OperationType::Reduce, &spec.to_yson())
+    }
+
+    /// Starts a sort operation, returning its ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_sort(&self, spec: &SortSpec) -> Result<String> {
+        self.start_operation(OperationType::Sort, &spec.to_yson())
+    }
+
+    /// Starts a vanilla operation, returning its ID.
+    ///
+    /// Jobs with no input tables: a distributed process, a side-car
+    /// computation, anything that is not a transformation of a table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if two tasks share a name, and
+    /// [`ClientError`] if the request fails.
+    pub fn start_vanilla(&self, spec: &VanillaSpec) -> Result<String> {
+        // Refused here rather than sent: the spec keys tasks by name, so the
+        // cluster would take two tasks called the same thing as one, run half
+        // the jobs, and complete. A silent half-run is worse than a rejected
+        // launch.
+        if let Some(name) = spec.duplicate_task() {
+            return Err(ClientError::Config(format!(
+                "two vanilla tasks are both called {name:?}; a spec keys its tasks \
+                 by name, so the second would replace the first and its jobs would \
+                 never run"
+            )));
+        }
+
+        self.start_operation(OperationType::Vanilla, &spec.to_yson())
+    }
+
     /// Starts an operation from a spec built by hand.
     ///
     /// The escape hatch for anything [`MapSpec`] and [`MapReduceSpec`] do not
@@ -365,13 +1588,50 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_operation(&self, kind: OperationType, spec: &YsonValue) -> Result<String> {
+        self.start_operation_inner(kind, spec, None)
+    }
+
+    /// Starts an operation under a mutation ID you control.
+    ///
+    /// `start_operation` already tags its own retries with a fresh
+    /// [`MutationId`], so a retried start never leaves two operations running.
+    /// This is for the guarantee a single process cannot give itself: persist
+    /// the ID, and after a crash the same call returns the operation that was
+    /// already started instead of starting a second one.
+    ///
+    /// The cluster remembers a mutation ID for five to ten minutes, so this is
+    /// a guard against a crash-and-restart, not a permanent key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn start_operation_with(
+        &self,
+        kind: OperationType,
+        spec: &YsonValue,
+        mutation_id: &MutationId,
+    ) -> Result<String> {
+        self.start_operation_inner(kind, spec, Some(mutation_id))
+    }
+
+    fn start_operation_inner(
+        &self,
+        kind: OperationType,
+        spec: &YsonValue,
+        mutation_id: Option<&MutationId>,
+    ) -> Result<String> {
         let params = yson_build::map([
             ("operation_type", yson_build::string(kind.as_str())),
             ("spec", spec.clone()),
         ]);
-        let body = self
-            .transport
-            .call(Method::Post, "start_operation", &params, Payload::None)?;
+        let body = self.transport.call_with(
+            Method::Post,
+            "start_operation",
+            &params,
+            Payload::None,
+            Repeatable::WithMutationId,
+            mutation_id,
+        )?;
 
         let value = self.value_field(&body, "operation_id")?;
         match &value.node {
@@ -381,6 +1641,63 @@ impl Client {
                 reason: format!("operation_id is not a string: {other:?}"),
             }),
         }
+    }
+
+    /// Stops an operation that is still running.
+    ///
+    /// The counterpart to starting one, and the reason it is worth having: a
+    /// launcher that gives up — an interrupted `wait_for_operation`, a failed
+    /// step further down the script — otherwise leaves the operation running on
+    /// the cluster, spending quota on a result nobody will read.
+    ///
+    /// `reason` is put in the operation's error document, under the cluster's
+    /// own `Operation aborted by user request`, so whoever finds the aborted
+    /// operation later is told who stopped it and why. Pass `None` to say
+    /// nothing.
+    ///
+    /// By the time this returns the operation is already `aborted`: the call
+    /// takes a few hundred milliseconds, and the state has changed within it.
+    /// The `aborting` state exists but no caller of this can observe it.
+    ///
+    /// **This is not idempotent, unlike [`Transaction::abort`].** Once the
+    /// scheduler has let go of an operation it answers `No such operation`, and
+    /// it lets go as soon as the first abort is accepted — so a second abort is
+    /// an error rather than a shrug, even for an operation that was still
+    /// running a moment ago. An operation that finished *by itself* can still
+    /// be aborted for the short while the scheduler keeps it, so this is not a
+    /// reliable way to ask whether one has finished either.
+    ///
+    /// **Sent once, and never retried**, which is the other side of the same
+    /// coin. `abort_operation` is a scheduler command and the master's mutation
+    /// cache does not cover it: a retry after a lost answer would be told `No
+    /// such operation` and would report a successful abort as a failed one.
+    /// A transport error here means the request may or may not have arrived,
+    /// and the honest thing is to say so rather than to guess.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, including when the
+    /// scheduler no longer has the operation.
+    pub fn abort_operation(&self, id: &str, reason: Option<&str>) -> Result<()> {
+        let mut params = yson_build::map([("operation_id", yson_build::string(id))]);
+        if let Some(reason) = reason {
+            yson_build::insert(&mut params, "abort_message", yson_build::string(reason));
+        }
+
+        self.transport.call(
+            Method::Post,
+            "abort_operation",
+            &params,
+            Payload::None,
+            // Not `WithMutationId`, though this is a mutating command: that
+            // deduplication lives in the master and this request goes to the
+            // scheduler. Verified — a second send of the same mutation ID,
+            // flagged as a retry, is answered `No such operation` rather than
+            // with the first response. A retry would turn an abort that worked
+            // into an error the caller believes.
+            Repeatable::Never,
+        )?;
+        Ok(())
     }
 
     /// Fetches an operation's current state, e.g. `running` or `completed`.
@@ -396,9 +1713,13 @@ impl Client {
                 yson_build::list([yson_build::string("state")]),
             ),
         ]);
-        let body = self
-            .transport
-            .call(Method::Get, "get_operation", &params, Payload::None)?;
+        let body = self.transport.call(
+            Method::Get,
+            "get_operation",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
 
         let value = self.field_of(&self.strip_envelope(&body, "get_operation")?, "state")?;
         match &value.node {
@@ -408,6 +1729,120 @@ impl Client {
                 reason: format!("state is not a string: {other:?}"),
             }),
         }
+    }
+
+    /// The custom statistics an operation's jobs reported.
+    ///
+    /// Returns the `custom` subtree of the operation's job statistics, keyed by
+    /// the names the jobs used. Each leaf is an aggregate — `sum`, `count`,
+    /// `min`, `max` — over the jobs that reported it, so a per-row counter
+    /// comes back as one number for the whole operation.
+    /// [`Client::statistic_sum`] pulls a single total out of it.
+    ///
+    /// Empty if no job reported anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn custom_statistics(&self, operation_id: &str) -> Result<YsonValue> {
+        let all = self.job_statistics(operation_id)?;
+        Ok(jobs::field(&all, "custom").cloned().unwrap_or(YsonValue {
+            attributes: None,
+            node: YsonNode::Map(std::collections::BTreeMap::new()),
+        }))
+    }
+
+    /// Everything the scheduler recorded about an operation's jobs.
+    ///
+    /// The whole `job_statistics` tree, custom and built-in alike.
+    /// [`Client::job_statistic_sum`] is the way to read one number out of it;
+    /// this is for looking around, which is how anyone finds out what a cluster
+    /// actually reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn job_statistics(&self, operation_id: &str) -> Result<YsonValue> {
+        let params = yson_build::map([
+            ("operation_id", yson_build::string(operation_id)),
+            (
+                "attributes",
+                yson_build::list([yson_build::string("progress")]),
+            ),
+        ]);
+        let body = self.transport.call(
+            Method::Get,
+            "get_operation",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "get_operation")?;
+        let statistics = jobs::field(&envelope, "progress")
+            .and_then(|p| jobs::field(p, "job_statistics"))
+            .cloned();
+
+        Ok(statistics.unwrap_or(YsonValue {
+            attributes: None,
+            node: YsonNode::Map(std::collections::BTreeMap::new()),
+        }))
+    }
+
+    /// The total of one **built-in** job statistic, e.g. `time/exec`.
+    ///
+    /// The cluster's own statistics **nest** by path component, where a custom
+    /// name keeps its slash as one key — the two are stored differently, which
+    /// is why they are read differently:
+    ///
+    /// ```text
+    /// custom:    {"rows/rejected" = {"$"  = {completed = {map = {sum=3}}}}}
+    /// built-in:  {time = {exec    = {"$$" = {completed = {map = {sum=744}}}}}}
+    /// ```
+    ///
+    /// Note the separator differs too — `$$` rather than `$`. Both are
+    /// accepted here, because that difference is not something a caller should
+    /// have to know.
+    ///
+    /// Totalled over `completed` jobs across job types, as
+    /// [`Client::statistic_sum`] does, and `None` when the cluster reports
+    /// nothing under that path — which is not the same as zero. A local cluster
+    /// reports nothing under `user_job/cpu`, for instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn job_statistic_sum(&self, operation_id: &str, path: &str) -> Result<Option<i64>> {
+        let statistics = self.job_statistics(operation_id)?;
+
+        let mut node = &statistics;
+        for component in path.split('/') {
+            match jobs::field(node, component) {
+                Some(next) => node = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(completed_total(node))
+    }
+
+    /// The total of one custom statistic over an operation's completed jobs.
+    ///
+    /// `name` is exactly what the job called it, slashes included: the cluster
+    /// keeps `rows/rejected` as one key rather than nesting it.
+    ///
+    /// Only `completed` jobs are counted. An aborted job's work is done again
+    /// by its replacement, so including it would count the same rows twice.
+    /// Job *types* are summed together, so a map-reduce reporting one name from
+    /// both phases gives the operation's total.
+    ///
+    /// `None` means no job reported that name — which is not the same as zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn statistic_sum(&self, operation_id: &str, name: &str) -> Result<Option<i64>> {
+        let statistics = self.custom_statistics(operation_id)?;
+        Ok(jobs::field(&statistics, name).and_then(completed_total))
     }
 
     /// Polls until the operation reaches a terminal state.
@@ -434,10 +1869,20 @@ impl Client {
             match state.as_str() {
                 "completed" => return Ok(()),
                 "failed" | "aborted" => {
+                    // The diagnostics go through a client that does not retry.
+                    // Up to four more requests are about to be sent to explain
+                    // a failure the caller already knows about, and an
+                    // unhealthy cluster is exactly when they fail: under the
+                    // default policy `list_jobs` alone can spend ten minutes on
+                    // backoff before giving up, and every step here is
+                    // best-effort, so the wait buys nothing but a program that
+                    // looks hung after the operation has already ended.
+                    let quick = self.without_retries();
                     return Err(ClientError::OperationFailed {
                         id: id.to_owned(),
                         state,
-                        error: self.operation_error(id),
+                        error: quick.operation_error(id),
+                        jobs: quick.failed_jobs(id),
                     });
                 }
                 _ => std::thread::sleep(self.poll_interval),
@@ -445,7 +1890,66 @@ impl Client {
         }
     }
 
+    /// Why an operation ended as it did, in the cluster's words.
+    ///
+    /// `None` for one that succeeded, and for one that has not finished. This
+    /// is what [`ClientError::OperationFailed`] carries, and what reads back
+    /// the `reason` given to [`Client::abort_operation`]: the reason is folded
+    /// into the operation's error document rather than kept beside it, so this
+    /// is how to find out who stopped an operation and why.
+    ///
+    /// Flattened to the outer message plus the innermost one, because the outer
+    /// message of a YTsaurus error is a category and the cause is at the bottom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the operation cannot be looked up, or if its
+    /// answer cannot be decoded.
+    pub fn operation_result_error(&self, id: &str) -> Result<Option<String>> {
+        // Asked for through `get_operation`, not through Cypress: an operation
+        // is not a node under //sys/operations on every cluster, and a local
+        // one answers `has no child with key` for an id that certainly exists.
+        let params = yson_build::map([
+            ("operation_id", yson_build::string(id)),
+            (
+                "attributes",
+                yson_build::list([yson_build::string("result")]),
+            ),
+        ]);
+        let body = self.transport.call(
+            Method::Get,
+            "get_operation",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "get_operation")?;
+        let Some(error) = jobs::field(&envelope, "result").and_then(|r| jobs::field(r, "error"))
+        else {
+            return Ok(None);
+        };
+
+        // An operation that succeeded still has an error document — code 0 with
+        // an empty message. Reporting that as `Some("")` would make
+        // `if let Some(why)` fire on every success and print nothing, which is
+        // the shape of bug that survives review because it looks like it works.
+        if jobs::field(error, "code").and_then(YsonValue::as_i64) == Some(0) {
+            return Ok(None);
+        }
+
+        Ok(jobs::error_summary(error))
+    }
+
     /// Best-effort fetch of a failed operation's error document.
+    ///
+    /// Prefers the flattened message. Falls back to the raw document, because a
+    /// clumsy error still beats an empty one if the response shape ever moves.
+    ///
+    /// Used while building [`ClientError::OperationFailed`], where a failure to
+    /// fetch must never replace the failure being reported — which is why this
+    /// swallows errors and [`Client::operation_result_error`], which has a
+    /// caller to answer to, does not.
     fn operation_error(&self, id: &str) -> Option<String> {
         let params = yson_build::map([
             ("operation_id", yson_build::string(id)),
@@ -456,12 +1960,145 @@ impl Client {
         ]);
         let body = self
             .transport
-            .call(Method::Get, "get_operation", &params, Payload::None)
+            .call(
+                Method::Get,
+                "get_operation",
+                &params,
+                Payload::None,
+                Repeatable::Freely,
+            )
             .ok()?;
-        Some(crate::error::truncate(&String::from_utf8_lossy(&body), 600))
+
+        let summary = self
+            .strip_envelope(&body, "get_operation")
+            .ok()
+            .and_then(|envelope| {
+                let result = jobs::field(&envelope, "result")?;
+                jobs::error_summary(jobs::field(result, "error")?)
+            });
+
+        summary.or_else(|| Some(crate::error::truncate(&String::from_utf8_lossy(&body), 600)))
+    }
+
+    // ---------------------------------------------------------------- jobs
+
+    /// Lists an operation's jobs.
+    ///
+    /// `state` filters by job state — `failed`, `completed`, `running`, … — and
+    /// `limit` caps how many come back.
+    ///
+    /// The YTsaurus documentation warns that `list_jobs` can put significant
+    /// load on a cluster and asks that it not be part of a workflow without an
+    /// administrator's approval. This client calls it once per failed
+    /// operation, with a small limit; keep to that shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails or the response is not the
+    /// documented `{jobs=[…]}`.
+    pub fn list_jobs(
+        &self,
+        operation_id: &str,
+        state: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<JobInfo>> {
+        let mut params = yson_build::map([
+            ("operation_id", yson_build::string(operation_id)),
+            ("limit", yson_build::int(i64::from(limit))),
+        ]);
+        if let Some(state) = state {
+            yson_build::insert(&mut params, "state", yson_build::string(state));
+        }
+
+        let body = self.transport.call(
+            Method::Get,
+            "list_jobs",
+            &params,
+            Payload::None,
+            Repeatable::Freely,
+        )?;
+
+        let envelope = self.strip_envelope(&body, "list_jobs")?;
+        Ok(jobs::parse_jobs(&self.field_of(&envelope, "jobs")?))
+    }
+
+    /// Fetches what a job wrote to stderr.
+    ///
+    /// Returns raw bytes: stderr is whatever the process wrote, not necessarily
+    /// UTF-8. Empty if the cluster saved nothing — stderr is kept for failed
+    /// jobs and, when the spec asks for it, for successful ones.
+    ///
+    /// This is a *heavy* command, so an installation that separates light and
+    /// heavy proxies may want it sent to [`Client::heavy_proxy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails.
+    pub fn get_job_stderr(&self, operation_id: &str, job_id: &str) -> Result<Vec<u8>> {
+        let params = yson_build::map([
+            ("operation_id", yson_build::string(operation_id)),
+            ("job_id", yson_build::string(job_id)),
+        ]);
+        self.transport.call(
+            Method::Get,
+            "get_job_stderr",
+            &params,
+            Payload::None,
+            Repeatable::Never,
+        )
+    }
+
+    /// Best-effort report of why an operation's jobs failed.
+    ///
+    /// Every step here may fail quietly. This runs while an error is being
+    /// built, and a diagnostic that replaces the failure it was explaining is
+    /// worse than no diagnostic at all.
+    fn failed_jobs(&self, operation_id: &str) -> Vec<JobFailure> {
+        if !self.job_diagnostics {
+            return Vec::new();
+        }
+
+        self.list_jobs(operation_id, Some("failed"), REPORTED_JOBS)
+            .unwrap_or_default()
+            .iter()
+            .take(REPORTED_JOBS as usize)
+            .map(|job| JobFailure {
+                id: job.id.clone(),
+                address: job.address.clone(),
+                error: job.error.clone(),
+                stderr: self.stderr_excerpt(operation_id, job),
+            })
+            .collect()
+    }
+
+    /// The tail of a job's stderr, bounded and decoded lossily.
+    ///
+    /// Asks unconditionally rather than skipping jobs whose `stderr_size` is
+    /// zero: the local cluster reported `1` for a job whose stderr was several
+    /// hundred bytes, so the field cannot be trusted to mean "nothing to
+    /// fetch". One request against losing the whole diagnostic is a good trade
+    /// on a path that only runs when an operation has already failed.
+    fn stderr_excerpt(&self, operation_id: &str, job: &JobInfo) -> Option<String> {
+        let raw = self.get_job_stderr(operation_id, &job.id).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(crate::error::tail(
+            &String::from_utf8_lossy(&raw),
+            STDERR_EXCERPT,
+        ))
     }
 
     // -------------------------------------------------------------- helpers
+
+    /// A copy of this client that sends each request once.
+    ///
+    /// For best-effort work — the diagnostics on a failed operation — where
+    /// waiting out a backoff cannot improve the answer, and where the delay
+    /// lands after the caller's real result is already decided.
+    fn without_retries(&self) -> Self {
+        self.clone().with_retries(RetryPolicy::none())
+    }
 
     /// API v4 wraps every structured response in a dict. Unwraps one level.
     fn strip_envelope(&self, body: &[u8], command: &str) -> Result<YsonValue> {
@@ -499,6 +2136,138 @@ impl Client {
         let envelope = self.strip_envelope(body, key)?;
         self.field_of(&envelope, key)
     }
+}
+
+/// Finds a token the way the `yt` CLI finds one.
+///
+/// `YT_TOKEN`, then `YT_TOKEN_PATH`, then `~/.yt/token` — first one that has
+/// something in it wins. Nothing here fails: a cluster that wants no token is
+/// ordinary, and so is a home directory with no `.yt` in it.
+fn token_from_environment() -> Option<String> {
+    if let Some(token) = std::env::var("YT_TOKEN").ok().and_then(clean_token) {
+        return Some(token);
+    }
+
+    if let Ok(path) = std::env::var("YT_TOKEN_PATH")
+        && let Some(token) = read_token_file(std::path::Path::new(&path))
+    {
+        return Some(token);
+    }
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    read_token_file(&std::path::Path::new(&home).join(".yt").join("token"))
+}
+
+/// Reads a token out of a file, if there is one to read.
+fn read_token_file(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().and_then(clean_token)
+}
+
+/// A token with the whitespace taken off, or nothing if that leaves nothing.
+///
+/// The trailing newline is the point: `echo token > ~/.yt/token` writes one,
+/// and a header carrying it fails authentication with an error that never
+/// mentions the newline.
+fn clean_token(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Decodes a binary YSON list fragment into typed rows.
+///
+/// Shared by [`Client::read_table_rows`] and the tests that check what the row
+/// encoder produced, so the two halves of the round trip are the same code.
+fn decode_rows<T: serde::de::DeserializeOwned>(bytes: &[u8], path: &str) -> Result<Vec<T>> {
+    let mut rows = Vec::new();
+    let mut stream = ytsaurus_yson::StreamDeserializer::<T>::new(bytes, true);
+
+    loop {
+        match stream.next_item() {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => return Ok(rows),
+            Err(e) => {
+                return Err(ClientError::Decode {
+                    command: "read_table".to_owned(),
+                    reason: format!("{path}: row {}: {e}", rows.len()),
+                });
+            }
+        }
+    }
+}
+
+/// Reads the child names out of a `list` answer.
+///
+/// A truncated answer is an error rather than a short list. The cluster says so
+/// with `<incomplete=%true>` — an *attribute* on the list, not an error — and a
+/// caller who does not look gets a listing that is quietly missing entries.
+fn child_names(value: &YsonValue, path: &str) -> Result<Vec<String>> {
+    if matches!(
+        value.attr("incomplete").map(|v| &v.node),
+        Some(YsonNode::Boolean(true))
+    ) {
+        return Err(ClientError::Decode {
+            command: "list".to_owned(),
+            reason: format!(
+                "{path} has more children than the cluster would list at once, so the \
+                 answer it gave is not all of them"
+            ),
+        });
+    }
+
+    let YsonNode::List(items) = &value.node else {
+        return Err(ClientError::Decode {
+            command: "list".to_owned(),
+            reason: format!("{path}: the answer is not a list: {:?}", value.node),
+        });
+    };
+
+    items
+        .iter()
+        .map(|item| match &item.node {
+            YsonNode::String(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+            other => Err(ClientError::Decode {
+                command: "list".to_owned(),
+                reason: format!("{path}: a child name is not a string: {other:?}"),
+            }),
+        })
+        .collect()
+}
+
+/// Totals one custom statistic over the jobs that completed.
+///
+/// The cluster files a statistic as `$` → job state → job type → the
+/// aggregate, so the number a user means by "how many rows did we reject" is
+/// the `sum` of the `completed` jobs, added across job types. Captured from a
+/// local cluster:
+///
+/// ```text
+/// {"rows/rejected"={"$"={completed={map={count=1;max=3;min=3;sum=3}}}}}
+/// ```
+///
+/// A flatter shape is accepted too, so a cluster that reports a bare aggregate
+/// still yields a number rather than nothing.
+fn completed_total(statistic: &YsonValue) -> Option<i64> {
+    // `$` under a custom statistic, `$$` under a built-in one. The cluster
+    // spells the same idea two ways depending on which tree you are in.
+    let by_state = jobs::field(statistic, "$").or_else(|| jobs::field(statistic, "$$"));
+    let Some(by_state) = by_state else {
+        return jobs::field(statistic, "sum").and_then(YsonValue::as_i64);
+    };
+
+    let completed = jobs::field(by_state, "completed")?;
+    let YsonNode::Map(by_type) = &completed.node else {
+        return None;
+    };
+
+    let mut total: Option<i64> = None;
+    for per_type in by_type.values() {
+        if let Some(sum) = jobs::field(per_type, "sum").and_then(YsonValue::as_i64) {
+            total = Some(total.unwrap_or(0) + sum);
+        }
+    }
+    total
 }
 
 /// Verifies that `data` is a whole binary YSON list fragment.
@@ -541,6 +2310,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_get_answer_decodes_straight_into_the_type_asked_for() {
+        // What `get_as` does with the response body, without a cluster to ask.
+        // The point of the envelope struct: one pass over the document, and
+        // attributes the type does not mention are skipped rather than
+        // collected — which is what makes `//@`, with dozens of them, worth
+        // asking about at all.
+        #[derive(serde::Deserialize)]
+        struct Node {
+            account: String,
+            #[serde(rename = "type")]
+            node_type: String,
+        }
+
+        let body = br#"{"value"={"account"="tmp";"type"="table";"chunk_count"=3}}"#;
+        let envelope: Envelope<Node> = from_slice(body, YsonFormat::Text).expect("decodes");
+
+        assert_eq!(envelope.value.account, "tmp");
+        assert_eq!(envelope.value.node_type, "table");
+    }
+
+    #[test]
+    fn an_answer_that_does_not_fit_the_type_is_an_error_rather_than_a_default() {
+        #[derive(serde::Deserialize)]
+        struct Node {
+            #[allow(dead_code)]
+            account: String,
+        }
+
+        // No `account` at all: silently defaulting it would hand the caller a
+        // node that does not exist.
+        let body = br#"{"value"={"type"="table"}}"#;
+        assert!(from_slice::<Envelope<Node>>(body, YsonFormat::Text).is_err());
+    }
+
+    #[test]
     fn a_complete_fragment_is_accepted() {
         // {a=1};{a=1}
         let one = b"{\x01\x02a=\x02\x02}";
@@ -575,6 +2379,126 @@ mod tests {
 
         let err = check_complete_fragment(&data).expect_err("must reject");
         assert!(err.contains("cut short"), "{err}");
+    }
+
+    #[test]
+    fn a_token_file_written_with_echo_still_works() {
+        // `echo token > ~/.yt/token` is how these files get written, and the
+        // newline it leaves would fail authentication with an error that never
+        // mentions a newline.
+        let path = std::env::temp_dir().join(format!(
+            "ytsaurus-rs-token-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "  secret-token\n").expect("writes");
+
+        assert_eq!(read_token_file(&path).as_deref(), Some("secret-token"));
+
+        std::fs::write(&path, "\n \n").expect("writes");
+        assert_eq!(read_token_file(&path), None, "whitespace is not a token");
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            read_token_file(&path),
+            None,
+            "a missing file is no token, not an error"
+        );
+    }
+
+    #[test]
+    fn a_listing_is_the_names_in_the_order_given() {
+        let value = from_slice(br#"["t1";"t2";]"#, YsonFormat::Text).expect("valid YSON");
+        assert_eq!(child_names(&value, "//tmp/x").unwrap(), ["t1", "t2"]);
+    }
+
+    #[test]
+    fn a_truncated_listing_is_an_error_rather_than_a_short_list() {
+        // What `max_size` produces, and what a node with too many children
+        // produces on its own. The marker is an attribute on the list, so a
+        // caller who does not look gets a listing quietly missing entries.
+        let value =
+            from_slice(br#"<"incomplete"=%true;>["t1";]"#, YsonFormat::Text).expect("valid YSON");
+
+        let err = child_names(&value, "//tmp/x").expect_err("must not pass as a listing");
+        assert!(err.to_string().contains("not all of them"), "{err}");
+    }
+
+    /// What a local cluster answers `exists` with, captured verbatim.
+    const EXISTS_RESPONSE: &[u8] = br#"{"value"=%false;}"#;
+
+    #[test]
+    fn an_exists_answer_is_read_out_of_the_value_key() {
+        let client = Client::new("http://localhost:8000");
+
+        let value = client
+            .value_field(EXISTS_RESPONSE, "value")
+            .expect("the answer is an envelope around `value`");
+        assert!(matches!(value.node, YsonNode::Boolean(false)));
+
+        // The command's own name is not a key in its answer. Looking for it
+        // there failed every call to `exists` with a decode error, for as long
+        // as nothing in the crate called `exists`.
+        assert!(client.value_field(EXISTS_RESPONSE, "exists").is_err());
+    }
+
+    /// The exact document a local cluster returned for a job that reported
+    /// three statistics.
+    const CUSTOM_STATISTICS: &str = r#"{
+        "bytes/read" = {"$" = {completed = {map = {count=1;max=147;min=147;sum=147}}}};
+        "rows/read" = {"$" = {completed = {map = {count=1;max=7;min=7;sum=7}}}};
+        "rows/rejected" = {"$" = {completed = {map = {count=1;max=3;min=3;sum=3}}}};
+    }"#;
+
+    fn statistics() -> YsonValue {
+        from_slice(CUSTOM_STATISTICS.as_bytes(), YsonFormat::Text).expect("valid YSON")
+    }
+
+    #[test]
+    fn a_statistic_totals_over_completed_jobs() {
+        let all = statistics();
+
+        // The name keeps its slash: the cluster stores it as one key rather
+        // than nesting it, which a path-walking lookup would miss entirely.
+        assert_eq!(
+            jobs::field(&all, "rows/rejected").and_then(completed_total),
+            Some(3)
+        );
+        assert_eq!(
+            jobs::field(&all, "bytes/read").and_then(completed_total),
+            Some(147)
+        );
+        assert_eq!(jobs::field(&all, "rows").and_then(completed_total), None);
+    }
+
+    #[test]
+    fn job_types_are_summed_and_other_states_are_not() {
+        // A map-reduce reports one name from both phases; an aborted job's
+        // work is redone by its replacement, so counting it would double.
+        let value = from_slice(
+            br#"{"$" = {
+                    completed = {map = {sum=10}; partition_reduce = {sum=5}};
+                    aborted   = {map = {sum=99}};
+                }}"#,
+            YsonFormat::Text,
+        )
+        .expect("valid YSON");
+
+        assert_eq!(completed_total(&value), Some(15));
+    }
+
+    #[test]
+    fn a_flat_aggregate_still_yields_a_number() {
+        let value =
+            from_slice(b"{count=1;max=7;min=7;sum=7}", YsonFormat::Text).expect("valid YSON");
+        assert_eq!(completed_total(&value), Some(7));
+    }
+
+    #[test]
+    fn an_operation_whose_jobs_all_failed_totals_nothing() {
+        let value = from_slice(br#"{"$" = {failed = {map = {sum=4}}}}"#, YsonFormat::Text)
+            .expect("valid YSON");
+        assert_eq!(completed_total(&value), None);
     }
 
     #[test]

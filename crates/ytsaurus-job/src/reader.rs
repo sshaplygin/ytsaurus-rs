@@ -226,10 +226,11 @@ impl<R: Read> JobReader<R> {
             Pending::Row { len } => {
                 let start = self.pos;
                 let offset = self.base_offset + start as u64;
+                let row_index = self.row_index;
                 self.consume(len);
                 Ok(Some(Event::Row(Row {
                     table_index: self.table_index,
-                    row_index: self.row_index,
+                    row_index,
                     range_index: self.range_index,
                     bytes: &self.buf[start..start + len],
                     format: self.format,
@@ -341,6 +342,15 @@ impl<R: Read> JobReader<R> {
     /// Advances `pos` past a record that has been handed out.
     fn consume(&mut self, len: usize) {
         self.pos += len;
+        // YTsaurus emits `<row_index=N>#` only at discontinuities — the start
+        // of a range or chunk. Every row after it implicitly advances the
+        // index, so count the row that was just consumed, whether it was
+        // handed out or skipped.
+        if matches!(self.pending, Some(Pending::Row { .. }))
+            && let Some(index) = self.row_index.as_mut()
+        {
+            *index += 1;
+        }
         self.pending = None;
     }
 
@@ -392,9 +402,11 @@ impl<R: Read> JobReader<R> {
                 }
                 Classified::TableIndex(i) => {
                     self.table_index = i;
-                    // A new table restarts row numbering; drop the stale value
-                    // rather than reporting a row index from the old table.
+                    // A new table restarts row and range numbering; drop the
+                    // stale values rather than reporting them from the old
+                    // table.
                     self.row_index = None;
+                    self.range_index = None;
                     self.pos += len;
                 }
                 Classified::RowIndex(i) => {
@@ -674,11 +686,17 @@ impl<R: Read> Groups<'_, R> {
             Some(Pending::KeySwitch { .. }) => {
                 // Back-to-back switches: an empty group. YTsaurus does not emit
                 // these, but reporting one is more honest than dropping it.
+                //
+                // The group is born `done`, and `in_group` stays false: its
+                // boundary was the switch just consumed, so there is nothing to
+                // drain before the next group. A live group here would hand out
+                // the *next* group's rows under this group's (empty) key, and
+                // that group would never be seen.
                 self.reader.discard_pending();
-                self.in_group = true;
+                self.in_group = false;
                 Ok(Some(Group {
                     reader: self.reader,
-                    done: false,
+                    done: true,
                     key: GroupKey::default(),
                 }))
             }
@@ -740,10 +758,11 @@ impl<R: Read> Group<'_, R> {
             Some(Pending::Row { len }) => {
                 let start = self.reader.pos;
                 let offset = self.reader.base_offset + start as u64;
+                let row_index = self.reader.row_index;
                 self.reader.consume(len);
                 Ok(Some(Row {
                     table_index: self.reader.table_index,
-                    row_index: self.reader.row_index,
+                    row_index,
                     range_index: self.reader.range_index,
                     bytes: &self.reader.buf[start..start + len],
                     format: self.reader.format,

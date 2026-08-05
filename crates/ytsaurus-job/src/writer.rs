@@ -310,6 +310,11 @@ impl JobWriter {
     }
 
     fn check_table(&self, table: usize) -> Result<()> {
+        // A row accepted after finish() would sit in the buffer and vanish at
+        // exit — the short-table-under-exit-zero outcome finish() rules out.
+        if self.finished {
+            return Err(JobError::WriteAfterFinish { table });
+        }
         if table >= self.logical_tables {
             return Err(JobError::UnknownTable {
                 index: table,

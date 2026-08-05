@@ -1,5 +1,10 @@
 # ytsaurus-yson
 
+[![crates.io](https://img.shields.io/crates/v/ytsaurus-yson.svg)](https://crates.io/crates/ytsaurus-yson)
+[![docs.rs](https://img.shields.io/docsrs/ytsaurus-yson)](https://docs.rs/ytsaurus-yson)
+[![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 A [YSON](https://ytsaurus.tech/docs/en/user-guide/storage/yson) serializer and
 deserializer (text and binary) built on serde, for talking to
 [YTsaurus](https://ytsaurus.tech).

@@ -1,0 +1,28 @@
+[package]
+name = "ytsaurus-helpers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Derive macros for ytsaurus-client: infer a YTsaurus table schema from a Rust struct"
+readme = "README.md"
+keywords = ["ytsaurus", "schema", "derive", "macro"]
+categories = ["development-tools::procedural-macro-helpers"]
+
+[lib]
+proc-macro = true
+
+# The three crates every derive macro is built from. They are build-time only:
+# a proc-macro crate runs in the compiler and contributes nothing to the binary
+# a worker ships to the cluster.
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+[dev-dependencies]
+ytsaurus-client = { path = "../ytsaurus-client" }
+ytsaurus-yson.workspace = true
