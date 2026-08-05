@@ -237,6 +237,32 @@ impl<R: Read> Decoder<R> {
         Ok(Some((index, row)))
     }
 
+    /// Advances past the next row without building it, returning its table
+    /// index, or `None` at a clean end of stream.
+    ///
+    /// Framing, schema and limit checks are the ones [`Self::next_row`]
+    /// applies, so a stream this accepts is exactly a stream that decodes.
+    /// What it does not do is allocate: no `Vec` per blob, no `Box` per
+    /// variant, no `Value` tree to throw away. That is the difference between
+    /// asking whether a stream is a whole number of rows and decoding it to
+    /// find out — the first question is the one a caller validating a table
+    /// write is asking.
+    pub fn skip_row(&mut self) -> Result<Option<usize>, CodecError> {
+        let Some(first) = read_first_byte(&mut self.input)? else {
+            return Ok(None);
+        };
+        let mut table_tag = [first, 0];
+        read_exact(&mut self.input, &mut table_tag[1..], "table Variant16 tag")?;
+        let index = usize::from(u16::from_le_bytes(table_tag));
+        let schema = self
+            .format
+            .table_schema(index)
+            .map_err(CodecError::InvalidSchema)?;
+        let mut budget = RowBudget::new(self.max_blob_bytes, self.max_row_bytes);
+        skip_value(&mut self.input, schema, &mut budget)?;
+        Ok(Some(index))
+    }
+
     /// Returns the wrapped input reader.
     #[must_use]
     pub fn into_inner(self) -> R {
@@ -498,6 +524,89 @@ fn decode_value<R: Read>(
             Ok(Value::Tuple(values))
         }
     }
+}
+
+/// The wire width and truncation context of a fixed-size type.
+///
+/// The contexts match [`decode_value`]'s, so a truncated stream reports the
+/// same field whichever way it was read.
+const fn fixed_width(wire_type: WireType) -> Option<(u64, &'static str)> {
+    match wire_type {
+        WireType::Boolean => Some((1, "boolean")),
+        WireType::Int8 => Some((1, "int8")),
+        WireType::Int16 => Some((2, "int16")),
+        WireType::Int32 => Some((4, "int32")),
+        WireType::Int64 => Some((8, "int64")),
+        WireType::Int128 => Some((16, "int128")),
+        WireType::Int256 => Some((32, "int256")),
+        WireType::Uint8 => Some((1, "uint8")),
+        WireType::Uint16 => Some((2, "uint16")),
+        WireType::Uint32 => Some((4, "uint32")),
+        WireType::Uint64 => Some((8, "uint64")),
+        WireType::Double => Some((8, "double")),
+        _ => None,
+    }
+}
+
+fn skip_value<R: Read>(
+    input: &mut R,
+    schema: &Schema,
+    budget: &mut RowBudget,
+) -> Result<(), CodecError> {
+    // Charged as decode_value charges, so the two accept the same rows. A
+    // stream that skips is a stream the decoder can read, which is the whole
+    // value of asking the cheap question.
+    budget.charge(size_of::<Value>())?;
+    if let Some((width, context)) = fixed_width(schema.wire_type) {
+        return skip_exact(input, width, context);
+    }
+    match schema.wire_type {
+        WireType::Nothing => Ok(()),
+        WireType::String32 | WireType::Yson32 => {
+            skip_blob(input, schema.wire_type, budget)?;
+            Ok(())
+        }
+        WireType::Variant8 | WireType::Variant16 => {
+            let tag = read_variant_tag(input, schema.wire_type)?;
+            skip_value(input, variant_child(schema, tag)?, budget)
+        }
+        WireType::RepeatedVariant8 | WireType::RepeatedVariant16 => loop {
+            let tag = read_variant_tag(input, schema.wire_type)?;
+            if is_repeated_variant_end(schema.wire_type, tag) {
+                return Ok(());
+            }
+            skip_value(input, variant_child(schema, tag)?, budget)?;
+        },
+        WireType::Tuple => {
+            for child in &schema.children {
+                skip_value(input, child, budget)?;
+            }
+            Ok(())
+        }
+        // Every fixed-width type is answered above.
+        _ => unreachable!("fixed_width covers the remaining wire types"),
+    }
+}
+
+fn skip_blob<R: Read>(
+    input: &mut R,
+    wire_type: WireType,
+    budget: &mut RowBudget,
+) -> Result<(), CodecError> {
+    let length = usize::try_from(u32::from_le_bytes(read_array(input, "blob length")?))
+        .expect("u32 always fits usize on supported Rust targets");
+    check_blob_length(wire_type, length, budget.max_blob_bytes)?;
+    budget.charge(length)?;
+    skip_exact(input, length as u64, "blob payload")
+}
+
+fn skip_exact<R: Read>(input: &mut R, count: u64, context: &'static str) -> Result<(), CodecError> {
+    let skipped = std::io::copy(&mut input.by_ref().take(count), &mut std::io::sink())
+        .map_err(CodecError::Read)?;
+    if skipped != count {
+        return Err(CodecError::Truncated { context });
+    }
+    Ok(())
 }
 
 fn variant_child(schema: &Schema, tag: u16) -> Result<&Schema, CodecError> {

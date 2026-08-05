@@ -2531,15 +2531,21 @@ fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue>
     ))
 }
 
-/// Decodes all rows solely to ensure a returned or submitted Skiff stream is
-/// complete. The dynamic codec applies its 128 MiB per-blob bound here too.
+/// Checks that a returned or submitted Skiff stream is a whole number of rows.
+///
+/// Walks the rows without building them: `skip_row` applies the same framing,
+/// schema and limit checks the decoder does — including the per-blob bound —
+/// and allocates nothing. Decoding instead would build a `Value` tree for
+/// every row of the caller's whole table only to drop it, which on the write
+/// path is a second copy of the table in memory before the request is even
+/// made. The YSON counterpart walks record boundaries the same way.
 fn check_complete_skiff_stream(
     data: &[u8],
     format: &SkiffFormat,
 ) -> std::result::Result<(), String> {
     let mut decoder = SkiffDecoder::new(data, format.clone());
     while decoder
-        .next_row()
+        .skip_row()
         .map_err(|error| format!("not a complete Skiff stream: {error}"))?
         .is_some()
     {}

@@ -353,6 +353,77 @@ fn an_encoder_accepts_exactly_what_a_format_can_declare() {
 }
 
 #[test]
+fn skipping_a_row_agrees_with_decoding_it_at_every_byte() {
+    let schema = Schema::tuple([
+        Schema::named("flag", WireType::Boolean),
+        Schema::named("blob", WireType::String32),
+        Schema {
+            wire_type: WireType::Variant8,
+            name: Some("choice".to_owned()),
+            children: vec![
+                Schema::leaf(WireType::Nothing),
+                Schema::leaf(WireType::Uint64),
+            ],
+        },
+        Schema {
+            wire_type: WireType::RepeatedVariant8,
+            name: Some("items".to_owned()),
+            children: vec![Schema::tuple([
+                Schema::leaf(WireType::Int16),
+                Schema::leaf(WireType::String32),
+            ])],
+        },
+        Schema {
+            wire_type: WireType::Tuple,
+            name: Some("nested".to_owned()),
+            children: vec![
+                Schema::leaf(WireType::Yson32),
+                Schema::leaf(WireType::Double),
+            ],
+        },
+    ]);
+    let row = Value::Tuple(vec![
+        Value::Boolean(true),
+        Value::Bytes(b"ab".to_vec()),
+        Value::Variant {
+            tag: 1,
+            value: Box::new(Value::Uint64(5)),
+        },
+        Value::RepeatedVariants(vec![Variant {
+            tag: 0,
+            value: Value::Tuple(vec![Value::Int16(-1), Value::Bytes(b"x".to_vec())]),
+        }]),
+        Value::Tuple(vec![Value::Yson(vec![b'#']), Value::Double(0.5)]),
+    ]);
+    let mut encoder = Encoder::new(Vec::new(), schema.clone()).unwrap();
+    encoder.write(&row).unwrap();
+    let complete = encoder.into_inner().unwrap();
+
+    // The claim skip_row makes is that it accepts exactly what next_row
+    // accepts, so it is worth nothing unless the two are compared on the same
+    // bytes - including every truncation, where a cheaper reader is most
+    // likely to be more forgiving than the real one.
+    for cut in 0..=complete.len() {
+        let bytes = complete[..cut].to_vec();
+        let decoded = Decoder::new(Cursor::new(bytes.clone()), format(schema.clone())).next_row();
+        let skipped = Decoder::new(Cursor::new(bytes), format(schema.clone())).skip_row();
+
+        match (decoded, skipped) {
+            (Ok(Some((decoded_index, _))), Ok(Some(skipped_index))) => {
+                assert_eq!(decoded_index, skipped_index, "cut at {cut}");
+            }
+            (Ok(None), Ok(None)) => {}
+            (Err(decoding), Err(skipping)) => {
+                assert_eq!(decoding.to_string(), skipping.to_string(), "cut at {cut}");
+            }
+            (decoded, skipped) => {
+                panic!("cut at {cut}: decoding said {decoded:?}, skipping said {skipped:?}")
+            }
+        }
+    }
+}
+
+#[test]
 fn rejects_an_unknown_variant_tag() {
     let schema = Schema::tuple([Schema {
         wire_type: WireType::Variant8,
