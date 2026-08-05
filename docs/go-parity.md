@@ -104,8 +104,9 @@ bodies, which is the "RPC proxy (custom binary protocol), protobuf row format"
 non-goal twice over.
 
 **Tracing** — `tracing`. The backlog ranked it P3 #15 with the note "only worth
-doing if a user asks", and the recorded status is that nobody has. Worth
-separating if that changes: emitting a `traceparent` header is a small,
+doing if a user asks". **One has**, and it is now the first item of the pinned
+parity issue: a production deployment cannot be run blind. The two halves are
+still worth separating — emitting a `traceparent` header is a small,
 dependency-free change to the transport, while an OpenTelemetry exporter is a
 dependency tree.
 

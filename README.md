@@ -33,7 +33,7 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
 | [crates/ytsaurus-helpers/](crates/ytsaurus-helpers/) | Derive macros: a table schema read off the struct the rows have. |
 | [examples/](examples/) | Worker binaries built on `ytsaurus-job`. |
-| [docs/](docs/) | Guides, including how to write and launch a job. |
+| [docs/](docs/) | Guides: writing a job, benchmarks, and how this compares to the official C++ and Go clients. |
 | [tests/e2e/](tests/e2e/) | End-to-end scripts against a local YTsaurus cluster. |
 
 ## A job in full
@@ -88,7 +88,7 @@ walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 ## Build and test
 
 ```sh
-cargo test --workspace          # 301 tests
+cargo test --workspace          # 343 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```
@@ -111,17 +111,25 @@ streaming table I/O. Every item ends with an example that checks itself on a
 cluster — [`tests/e2e/README.md`](tests/e2e/README.md) is the list of what has
 actually been run, with its output.
 
-**Measured against the Go SDK.** There is no official Rust SDK, but there is an
-official Go one, and its twelve examples are what an SDK for this cluster is
-expected to do. [`docs/go-parity.md`](docs/go-parity.md) maps every one of them
-onto this workspace: six have a Rust counterpart that runs on a cluster, six are
-a recorded decision not to. Three of the twelve asked for something this client
-could not do — typed rows in and out, typed nodes, and reading a successful
-job's stderr — and it can now.
+**Measured against the official clients.** There is no official Rust SDK, but
+there are a C++ one and a Go one, and what they do is what an SDK for this
+cluster is expected to do.
 
-What remains open needs a human: publishing, an API review, upstreaming, and
-whether to build a Skiff codec. All are described in [AGENTS.md](AGENTS.md),
-which is also the project context for contributors and coding agents.
+- [`docs/sdk-comparison.md`](docs/sdk-comparison.md) puts all three side by side,
+  area by area — transport, Cypress, tables, operations, transactions — and says
+  where this client is ahead, where it is behind, and where the two official
+  ones differ more from each other than either does from this one.
+- [`docs/go-parity.md`](docs/go-parity.md) maps the Go SDK's twelve examples onto
+  this workspace: six have a Rust counterpart that runs on a cluster, six are a
+  recorded decision not to. Three of the twelve asked for something this client
+  could not do — typed rows in and out, typed nodes, and reading a successful
+  job's stderr — and it can now.
+
+What is still needed to match them, in the order it matters for production use,
+is tracked in the pinned parity issue. What remains open needs a human:
+publishing, an API review, upstreaming, and whether to build a Skiff codec. All
+are described in [AGENTS.md](AGENTS.md), which is also the project context for
+contributors and coding agents.
 
 **Verified against a real cluster.** A local YTsaurus in Docker ran the identity
 map (output table byte-identical to the input, 309 688 bytes), a two-input /

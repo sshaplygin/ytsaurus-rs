@@ -20,7 +20,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
 | `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`) plus their e2e tests. |
-| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo). |
+| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
 
@@ -579,7 +579,10 @@ before adding client API**: it also lists what the Go SDK can do and this cannot
 where the next real gap is.
 
 **What is left of the backlog is not code.** P3 #15 (tracing spans) is written
-down as "only worth doing if a user asks", and nobody has. TLS is the one part
+down as "only worth doing if a user asks" — **and one has**: tracing, together
+with logging, is now the first item of the pinned parity issue, ahead of
+everything else, because a production deployment needs to see what the client is
+doing. That supersedes the P3 ranking. TLS is the one part
 of P3 #14 a local cluster cannot exercise. Everything else needs a human — see
 below.
 
