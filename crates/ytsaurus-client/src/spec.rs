@@ -252,6 +252,11 @@ impl MapSpec {
 #[derive(Debug, Clone)]
 pub struct MapReduceSpec {
     mapper: Option<UserJob>,
+    /// The mapper's formats, for the same reason and by the same route as the
+    /// files below: the mapper may not exist yet when they are chosen. Keeping
+    /// them here and applying them at render time is what makes
+    /// `with_mapper_formats` before `with_mapper` mean what it says, without a
+    /// second copy on the phase that both methods would have to keep in step.
     mapper_formats: Option<(DataFormat, DataFormat)>,
     reducer: UserJob,
     /// Files and the memory limit are promised "to both phases", so they live
@@ -300,11 +305,7 @@ impl MapReduceSpec {
     /// Adds a mapper phase.
     #[must_use]
     pub fn with_mapper(mut self, command: impl Into<String>) -> Self {
-        let mut mapper = UserJob::new(command);
-        if let Some((input, output)) = &self.mapper_formats {
-            mapper.with_formats(input.clone(), output.clone());
-        }
-        self.mapper = Some(mapper);
+        self.mapper = Some(UserJob::new(command));
         self
     }
 
@@ -314,10 +315,7 @@ impl MapReduceSpec {
     /// be called before or after [`Self::with_mapper`].
     #[must_use]
     pub fn with_mapper_formats(mut self, input: DataFormat, output: DataFormat) -> Self {
-        self.mapper_formats = Some((input.clone(), output.clone()));
-        if let Some(mapper) = &mut self.mapper {
-            mapper.with_formats(input, output);
-        }
+        self.mapper_formats = Some((input, output));
         self
     }
 
@@ -381,9 +379,12 @@ impl MapReduceSpec {
         self
     }
 
-    /// A phase's job spec, with the spec-level files and memory limit applied.
-    fn phase(&self, job: &UserJob) -> YsonValue {
+    /// A phase's job spec, with the spec-level settings applied.
+    fn phase(&self, job: &UserJob, formats: Option<&(DataFormat, DataFormat)>) -> YsonValue {
         let mut job = job.clone();
+        if let Some((input, output)) = formats {
+            job.with_formats(input.clone(), output.clone());
+        }
         job.files.extend(self.files.iter().cloned());
         if job.memory_limit.is_none() {
             job.memory_limit = self.memory_limit;
@@ -423,14 +424,18 @@ impl MapReduceSpec {
     #[must_use]
     pub fn to_yson(&self) -> YsonValue {
         let mut spec = map([
-            ("reducer", self.phase(&self.reducer)),
+            ("reducer", self.phase(&self.reducer, None)),
             ("input_table_paths", list(self.inputs.iter().map(string))),
             ("output_table_paths", list(self.outputs.iter().map(string))),
             ("reduce_by", list(self.reduce_by.iter().map(string))),
         ]);
 
         if let Some(mapper) = &self.mapper {
-            insert(&mut spec, "mapper", self.phase(mapper));
+            insert(
+                &mut spec,
+                "mapper",
+                self.phase(mapper, self.mapper_formats.as_ref()),
+            );
         }
 
         let sort_by = if self.sort_by.is_empty() {
@@ -1020,6 +1025,28 @@ mod tests {
             2,
             "{out}"
         );
+    }
+
+    /// Formats are chosen for a phase that may not exist yet, so the two call
+    /// orders have to render the same spec.
+    #[test]
+    fn a_mapper_added_last_still_gets_its_formats() {
+        let before = render(
+            &MapReduceSpec::new("./r", ["//in"], ["//out"], ["k"])
+                .with_mapper_skiff_formats(skiff_format("map_input"), skiff_format("map_output"))
+                .with_mapper("./m")
+                .to_yson(),
+        );
+        let after = render(
+            &MapReduceSpec::new("./r", ["//in"], ["//out"], ["k"])
+                .with_mapper("./m")
+                .with_mapper_skiff_formats(skiff_format("map_input"), skiff_format("map_output"))
+                .to_yson(),
+        );
+
+        assert_eq!(before, after);
+        assert!(before.contains("name=map_input"), "{before}");
+        assert!(before.contains("name=map_output"), "{before}");
     }
 
     #[test]
