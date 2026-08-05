@@ -8,6 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Schema and streaming codec for the YTsaurus Skiff format (work in progress)"
+# Pre-release: the README says so, and the Skiff ship gates in
+# docs/skiff-compatibility.md are not all green. Publishing needs a human.
+publish = false
 readme = "README.md"
 keywords = ["ytsaurus", "skiff", "serialization", "mapreduce"]
 categories = ["encoding"]
