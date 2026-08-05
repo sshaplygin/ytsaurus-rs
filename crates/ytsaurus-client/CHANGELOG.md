@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Builder order stopped mattering in `MapReduceSpec`
+
+- **Fixed** `with_local_file`, `with_local_file_named` and `with_memory_limit`
+  reaching the mapper only when `with_mapper` had been called *first*. They
+  copied onto the phases as the calls arrived, so
+  `.with_local_file("//tmp/w").with_mapper("./w map")` produced a mapper with
+  no files and no memory limit — silently, since the reducer still had both.
+  Files and the limit now live on the spec and reach each phase when it is
+  rendered, so the same calls mean the same program in any order.
+
 ### A table transfer is no longer on a two-minute clock
 
 - **Fixed** the 120-second request timeout applying end to end to streaming

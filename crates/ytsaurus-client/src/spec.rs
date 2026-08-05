@@ -225,6 +225,12 @@ impl MapSpec {
 pub struct MapReduceSpec {
     mapper: Option<UserJob>,
     reducer: UserJob,
+    /// Files and the memory limit are promised "to both phases", so they live
+    /// on the spec and reach each phase at render time. Holding them on the
+    /// phases instead would make `with_local_file` before `with_mapper` a
+    /// silently different program from the same calls the other way round.
+    files: Vec<YsonValue>,
+    memory_limit: Option<i64>,
     inputs: Vec<String>,
     outputs: Vec<String>,
     reduce_by: Vec<String>,
@@ -248,6 +254,8 @@ impl MapReduceSpec {
         Self {
             mapper: None,
             reducer: UserJob::new(reducer),
+            files: Vec::new(),
+            memory_limit: None,
             inputs: inputs.into_iter().map(Into::into).collect(),
             outputs: outputs.into_iter().map(Into::into).collect(),
             reduce_by: reduce_by.into_iter().map(Into::into).collect(),
@@ -269,7 +277,9 @@ impl MapReduceSpec {
     /// Adds a Cypress file to both phases.
     ///
     /// One binary usually serves both, dispatching on `argv[1]`, so attaching
-    /// it to each phase separately would only be a way to forget one.
+    /// it to each phase separately would only be a way to forget one. Order
+    /// relative to [`MapReduceSpec::with_mapper`] does not matter: files are
+    /// handed to the phases when the spec is rendered.
     #[must_use]
     pub fn with_local_file(self, path: impl Into<String>) -> Self {
         self.attach(string(path.into()))
@@ -284,21 +294,28 @@ impl MapReduceSpec {
     }
 
     fn attach(mut self, file: YsonValue) -> Self {
-        if let Some(mapper) = &mut self.mapper {
-            mapper.files.push(file.clone());
-        }
-        self.reducer.files.push(file);
+        self.files.push(file);
         self
     }
 
     /// Sets the memory limit for both phases, in bytes.
+    ///
+    /// As with the files, order relative to [`MapReduceSpec::with_mapper`]
+    /// does not matter.
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: i64) -> Self {
-        if let Some(mapper) = &mut self.mapper {
-            mapper.memory_limit = Some(bytes);
-        }
-        self.reducer.memory_limit = Some(bytes);
+        self.memory_limit = Some(bytes);
         self
+    }
+
+    /// A phase's job spec, with the spec-level files and memory limit applied.
+    fn phase(&self, job: &UserJob) -> YsonValue {
+        let mut job = job.clone();
+        job.files.extend(self.files.iter().cloned());
+        if job.memory_limit.is_none() {
+            job.memory_limit = self.memory_limit;
+        }
+        job.to_yson()
     }
 
     /// Sets the sort columns, when they differ from the reduce columns.
@@ -333,14 +350,14 @@ impl MapReduceSpec {
     #[must_use]
     pub fn to_yson(&self) -> YsonValue {
         let mut spec = map([
-            ("reducer", self.reducer.to_yson()),
+            ("reducer", self.phase(&self.reducer)),
             ("input_table_paths", list(self.inputs.iter().map(string))),
             ("output_table_paths", list(self.outputs.iter().map(string))),
             ("reduce_by", list(self.reduce_by.iter().map(string))),
         ]);
 
         if let Some(mapper) = &self.mapper {
-            insert(&mut spec, "mapper", mapper.to_yson());
+            insert(&mut spec, "mapper", self.phase(mapper));
         }
 
         let sort_by = if self.sort_by.is_empty() {
@@ -899,6 +916,31 @@ mod tests {
             out.matches(r#"file_paths=["//tmp/w"]"#).count(),
             2,
             "the binary must be attached to both phases: {out}"
+        );
+    }
+
+    /// Builder order must not change the program: a file or memory limit added
+    /// before `with_mapper` reaches the mapper all the same. They used to be
+    /// copied onto the phases as the calls arrived, so this exact sequence
+    /// produced a mapper with no files and no limit — silently.
+    #[test]
+    fn a_mapper_added_last_still_gets_the_files_and_the_limit() {
+        let out = render(
+            &MapReduceSpec::new("./w reduce", ["//in"], ["//out"], ["k"])
+                .with_local_file("//tmp/w")
+                .with_memory_limit(512 * 1024 * 1024)
+                .with_mapper("./w map")
+                .to_yson(),
+        );
+        assert_eq!(
+            out.matches(r#"file_paths=["//tmp/w"]"#).count(),
+            2,
+            "the binary must reach both phases whatever the call order: {out}"
+        );
+        assert_eq!(
+            out.matches("memory_limit=536870912").count(),
+            2,
+            "the limit must reach both phases whatever the call order: {out}"
         );
     }
 
