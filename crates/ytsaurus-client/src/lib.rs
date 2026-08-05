@@ -116,7 +116,6 @@ pub use ytsaurus_skiff::{
 
 use crate::http::{Method, Payload, Transport};
 use crate::retry::Repeatable;
-use ytsaurus_format::YsonFormat as SharedYsonFormat;
 use ytsaurus_skiff::Decoder as SkiffDecoder;
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
@@ -1261,7 +1260,7 @@ impl Client {
         &self,
         path: &TablePath,
         rows: &[u8],
-        format: SharedYsonFormat,
+        format: YsonFormat,
     ) -> Result<()> {
         let params = yson_build::map([
             ("path", path.to_yson()),
@@ -1358,7 +1357,7 @@ impl Client {
         }
     }
 
-    fn read_yson_table(&self, path: &str, format: SharedYsonFormat) -> Result<Vec<u8>> {
+    fn read_yson_table(&self, path: &str, format: YsonFormat) -> Result<Vec<u8>> {
         let params = yson_build::map([
             ("path", yson_build::string(path)),
             ("output_format", DataFormat::yson(format).to_yson()),
@@ -2426,7 +2425,7 @@ fn check_complete_fragment(data: &[u8]) -> std::result::Result<(), String> {
 /// Verifies that `data` is a whole YSON list fragment in `format`.
 fn check_complete_yson_fragment(
     mut data: &[u8],
-    format: SharedYsonFormat,
+    format: YsonFormat,
 ) -> std::result::Result<(), String> {
     use ytsaurus_yson::{Scan, scan_value};
 
