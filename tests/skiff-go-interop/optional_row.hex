@@ -1,0 +1,7 @@
+# Go SDK v0.0.33 / Rust Skiff optional-field corpus.
+#
+# One Variant16 table-0 prefix, then variant8<nothing;string32> fields:
+# absent (tag 0), present (tag 1) with bytes [0xff, 'a'].
+00 00
+00
+01 02 00 00 00 ff 61

@@ -1,0 +1,16 @@
+[package]
+name = "ytsaurus-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Shared YTsaurus table and worker data-format selection"
+keywords = ["ytsaurus", "yson", "skiff"]
+categories = ["encoding"]
+
+[dependencies]
+ytsaurus-yson.workspace = true
+ytsaurus-skiff.workspace = true

@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "crates/ytsaurus-yson",
+    "crates/ytsaurus-skiff",
+    "crates/ytsaurus-format",
     "crates/ytsaurus-job",
     "crates/ytsaurus-client",
     "crates/ytsaurus-helpers",
@@ -19,6 +21,8 @@ authors = ["Sam Shaplygin <semyuon@gmail.com>"]
 
 [workspace.dependencies]
 ytsaurus-yson = { path = "crates/ytsaurus-yson", version = "0.2.0" }
+ytsaurus-skiff = { path = "crates/ytsaurus-skiff", version = "0.2.0" }
+ytsaurus-format = { path = "crates/ytsaurus-format", version = "0.2.0" }
 ytsaurus-job = { path = "crates/ytsaurus-job", version = "0.2.0" }
 ytsaurus-client = { path = "crates/ytsaurus-client", version = "0.2.0" }
 ytsaurus-helpers = { path = "crates/ytsaurus-helpers", version = "0.2.0" }

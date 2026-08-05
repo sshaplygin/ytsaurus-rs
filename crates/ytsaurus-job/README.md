@@ -12,6 +12,15 @@ A job is an executable: rows arrive on fd 0 as binary
 to fds 1, 4, 7…, and the exit code decides whether the job passed. This crate
 turns that into a loop over rows.
 
+`WorkerReader` and `WorkerWriter` use the shared `DataFormat` enum to select
+binary/text YSON or experimental dynamic, schema-driven Skiff at the process
+boundary. Their row representations remain explicit (`WorkerRow::YsonRaw` or
+`WorkerRow::Skiff`), so pass-through stays byte-exact and Skiff stays schema
+checked. `JobReader` / `JobWriter` and `SkiffJobReader` / `SkiffJobWriter`
+remain available as format-specific conveniences. Typed Skiff rows are not yet
+part of the public job API; see the
+[compatibility contract](../../docs/skiff-compatibility.md).
+
 Start with the guide: [docs/writing-a-job.md](../../docs/writing-a-job.md).
 
 ```rust

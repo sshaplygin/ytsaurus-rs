@@ -1,0 +1,18 @@
+# Go SDK v0.0.33 / Rust Skiff shared scalar-row corpus.
+#
+# One Variant16 table-0 prefix, then:
+# bool true; i8 -8; i16 -16; i32 -32; i64 -64;
+# u8 8; u16 16; u32 32; u64 64; f64 -1.5; string32 [0xff, 'a'].
+00 00
+01
+f8
+f0 ff
+e0 ff ff ff
+c0 ff ff ff ff ff ff ff
+08
+10 00
+20 00 00 00
+40 00 00 00 00 00 00 00
+00 00 00 00 00 00 f8 bf
+02 00 00 00
+ff 61

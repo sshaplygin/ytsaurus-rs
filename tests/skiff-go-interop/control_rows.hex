@@ -1,0 +1,18 @@
+# Go SDK v0.0.33 / Rust Skiff job-control corpus.
+#
+# Two table-0 rows with fields:
+# $key_switch:boolean; $row_index:variant8<nothing;int64>;
+# $range_index:variant8<nothing;int64>; count:uint64.
+#
+# Row 1: key_switch=false, row_index=2, range_index unchanged, count=7.
+# Row 2: key_switch=true, row_index increments, range_index=3, count=11.
+00 00
+00
+01 02 00 00 00 00 00 00 00
+00
+07 00 00 00 00 00 00 00
+00 00
+01
+00
+01 03 00 00 00 00 00 00 00
+0b 00 00 00 00 00 00 00

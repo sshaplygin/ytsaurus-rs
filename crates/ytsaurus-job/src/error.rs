@@ -1,6 +1,7 @@
 //! Errors a job can fail with.
 
 use thiserror::Error;
+use ytsaurus_skiff::CodecError;
 use ytsaurus_yson::YsonError;
 
 /// Shorthand for a job result.
@@ -76,6 +77,63 @@ pub enum JobError {
         offset: u64,
         /// What was wrong with it.
         reason: String,
+    },
+
+    /// The Skiff stream could not be framed or decoded.
+    #[error("invalid Skiff job stream: {0}")]
+    Skiff(#[source] CodecError),
+
+    /// The operation's Skiff schema put system fields in an invalid layout.
+    #[error("invalid Skiff system schema for table {table}: {reason}")]
+    BadSkiffSchema {
+        /// The input-table schema that is malformed.
+        table: usize,
+        /// What violates the job-format rules.
+        reason: String,
+    },
+
+    /// A Skiff system field carried a value that does not have its prescribed shape.
+    #[error("malformed Skiff {column} field for table {table}: {reason}")]
+    BadSkiffControl {
+        /// The input table that supplied the bad row.
+        table: usize,
+        /// The system field name.
+        column: &'static str,
+        /// What is malformed about its value.
+        reason: String,
+    },
+
+    /// The number of Skiff output descriptors did not match the format's table schemas.
+    #[error("Skiff output has {sinks} descriptor(s), but its format has {schemas} table schema(s)")]
+    SkiffOutputSchemaCount {
+        /// Number of output descriptors supplied by the caller.
+        sinks: usize,
+        /// Number of schemas supplied by the output format.
+        schemas: usize,
+    },
+
+    /// Writing or flushing a Skiff output table failed.
+    #[error("writing Skiff output table {table}: {source}")]
+    SkiffWrite {
+        /// The output table that failed.
+        table: usize,
+        /// The framing, validation, or I/O failure.
+        #[source]
+        source: CodecError,
+    },
+
+    /// This version of the worker runtime does not know a future
+    /// [`ytsaurus_format::DataFormat`] variant yet.
+    #[error("this ytsaurus-job version does not support the selected data format")]
+    UnsupportedDataFormat,
+
+    /// A row's representation did not match the writer's selected format.
+    #[error("cannot write a {row} row through a {writer} output")]
+    WorkerRowFormatMismatch {
+        /// Format selected by the writer.
+        writer: &'static str,
+        /// Representation supplied by the caller.
+        row: &'static str,
     },
 
     /// A row was written to an output table the job does not have.
@@ -170,6 +228,13 @@ impl JobError {
             JobError::TruncatedRecord { .. } => "truncated_record",
             JobError::RecordTooLarge { .. } => "record_too_large",
             JobError::BadControlRecord { .. } => "bad_control_record",
+            JobError::Skiff(_) => "invalid_skiff",
+            JobError::BadSkiffSchema { .. } => "bad_skiff_schema",
+            JobError::BadSkiffControl { .. } => "bad_skiff_control",
+            JobError::SkiffOutputSchemaCount { .. } => "skiff_output_schema_count",
+            JobError::SkiffWrite { .. } => "skiff_write_failed",
+            JobError::UnsupportedDataFormat => "unsupported_data_format",
+            JobError::WorkerRowFormatMismatch { .. } => "worker_row_format_mismatch",
             JobError::UnknownTable { .. } => "unknown_table",
             JobError::Serialize { .. } => "serialize_failed",
             JobError::TooManyStatistics { .. } => "too_many_statistics",
@@ -204,6 +269,13 @@ impl JobError {
             | JobError::TruncatedRecord { .. }
             | JobError::RecordTooLarge { .. }
             | JobError::BadControlRecord { .. }
+            | JobError::Skiff(_)
+            | JobError::BadSkiffSchema { .. }
+            | JobError::BadSkiffControl { .. }
+            | JobError::SkiffOutputSchemaCount { .. }
+            | JobError::SkiffWrite { .. }
+            | JobError::UnsupportedDataFormat
+            | JobError::WorkerRowFormatMismatch { .. }
             | JobError::UnknownTable { .. }
             // Neither is about a row: one says the job asked for more
             // statistics than it may have, the other that reporting them

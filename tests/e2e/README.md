@@ -38,6 +38,23 @@ asserts the output table reads back identical to the input, repeats with two
 input and two output tables to exercise table switching, and finishes with a
 `wordcount` map-reduce checked against a hand-computed result.
 
+### Dynamic Skiff map
+
+The Skiff path is exercised offline by
+[`examples/tests/skiff_cat_e2e.rs`](../../examples/tests/skiff_cat_e2e.rs): it
+runs the real `skiff_cat` worker with non-UTF-8 `string32` data. With the local
+cluster running, the equivalent client-driven cluster check is:
+
+```sh
+./scripts/build-worker.sh skiff_cat
+YT_PROXY=http://localhost:8000 cargo run -p ytsaurus-client --example skiff_launch
+```
+
+It writes and reads raw Skiff streams through the HTTP client, launches a map
+whose mapper format is Skiff, and verifies decoded output rows. This is not yet
+a CI or captured-cluster fixture; run it against a real cluster before treating
+the dynamic Skiff layer as release-ready.
+
 The comparison is input-table read-back against output-table read-back, not
 against the uploaded file. **The cluster re-encodes rows on ingest** — 309 676
 bytes uploaded came back as 309 688 — so comparing against the upload would fail

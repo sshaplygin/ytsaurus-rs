@@ -1,6 +1,7 @@
 # ytsaurus-rs
 
 [![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![ytsaurus-skiff](https://img.shields.io/badge/ytsaurus--skiff-WIP-lightgrey.svg)](docs/skiff-compatibility.md)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
 
@@ -29,6 +30,8 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | Path | What it is |
 | --- | --- |
 | [crates/ytsaurus-yson/](crates/ytsaurus-yson/) | YSON serializer/deserializer (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
+| [crates/ytsaurus-skiff/](crates/ytsaurus-skiff/) | Schema model and compatibility suite for YTsaurus Skiff. **Implementation in progress; not published.** |
+| [crates/ytsaurus-format/](crates/ytsaurus-format/) | Shared `DataFormat` selection used by client specs/table I/O and worker I/O. |
 | [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. |
 | [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
 | [crates/ytsaurus-helpers/](crates/ytsaurus-helpers/) | Derive macros: a table schema read off the struct the rows have. |
@@ -125,11 +128,17 @@ cluster is expected to do.
   could not do — typed rows in and out, typed nodes, and reading a successful
   job's stderr — and it can now.
 
-What is still needed to match them, in the order it matters for production use,
-is tracked in the pinned parity issue. What remains open needs a human:
-publishing, an API review, upstreaming, and whether to build a Skiff codec. All
-are described in [AGENTS.md](AGENTS.md), which is also the project context for
-contributors and coding agents.
+**Skiff.** Implementation has started against a pinned Go SDK compatibility
+baseline; the supported surface and the test gates are in [the Skiff
+compatibility contract](docs/skiff-compatibility.md). `DataFormat` is the common
+public selector for binary/text YSON and dynamic Skiff across launchers and
+workers; the existing format-specific methods remain convenience APIs.
+
+What is still needed to match the official clients, in the order it matters for
+production use, is tracked in the pinned parity issue. What remains open needs a
+human: publishing, an API review, and upstreaming. All are described in
+[AGENTS.md](AGENTS.md), which is also the project context for contributors and
+coding agents.
 
 **Verified against a real cluster.** A local YTsaurus in Docker ran the identity
 map (output table byte-identical to the input, 309 688 bytes), a two-input /
@@ -150,8 +159,8 @@ RSS at all** — 46.6 MiB before and after on Linux CI, 1.9 → 2.0 MiB on macOS
 platform; the invariant is that it does not grow). Streaming a 67.7 MiB table
 out of a cluster costs **1.0 MiB** of peak RSS against 70.9 MiB to read it into
 memory. Decoding YSON is **~10 %** of the pilot job's time on a cluster, against
-66 % for a job that does nothing but decode — which is why the Skiff question is
-parked rather than pressing. Fuzzing ran 6.5 M iterations across both YSON
+66 % for a job that does nothing but decode — which is the measurement Skiff has
+to beat to be worth switching to. Fuzzing ran 6.5 M iterations across both YSON
 formats without a crash.
 
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
@@ -163,6 +172,13 @@ the `yson-rs` name belongs to its upstream author and will never be claimed here
 
 Every protocol fact in this repository is taken from the official YTsaurus
 documentation and cited at the point of use, then checked against a real cluster.
+
+## Acknowledgements
+
+[@AzazKamaz](https://gist.github.com/AzazKamaz/711234fde6c17cfe04c83702bced19d9)
+shared the initial job-level Skiff framing example that prompted this work. It
+is retained as a useful reference vector; compatibility is defined by the
+official protocol, the pinned Go SDK, and cluster tests.
 
 ## Licence
 
