@@ -686,11 +686,17 @@ impl<R: Read> Groups<'_, R> {
             Some(Pending::KeySwitch { .. }) => {
                 // Back-to-back switches: an empty group. YTsaurus does not emit
                 // these, but reporting one is more honest than dropping it.
+                //
+                // The group is born `done`, and `in_group` stays false: its
+                // boundary was the switch just consumed, so there is nothing to
+                // drain before the next group. A live group here would hand out
+                // the *next* group's rows under this group's (empty) key, and
+                // that group would never be seen.
                 self.reader.discard_pending();
-                self.in_group = true;
+                self.in_group = false;
                 Ok(Some(Group {
                     reader: self.reader,
-                    done: false,
+                    done: true,
                     key: GroupKey::default(),
                 }))
             }

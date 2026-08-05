@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### An empty reduce group stays empty
+
+- **Fixed** back-to-back key switches producing a "empty" group that was
+  actually live: it handed out the *next* group's rows under the empty
+  group's (absent) key, and that group was never seen at all. An empty group
+  now comes out with no rows, and the group after it keeps its rows and its
+  key. YTsaurus does not emit consecutive switches today, which is why this
+  had not bitten; the iterator no longer depends on that staying true.
+
 ### A late row is refused, not lost
 
 - **Fixed** `JobWriter` accepting rows after `finish()`. Such a row went into

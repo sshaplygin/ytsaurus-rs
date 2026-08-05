@@ -604,6 +604,51 @@ fn groups_work_when_split_across_reads() {
     }
 }
 
+/// Back-to-back key switches mean an empty group. It must come out empty —
+/// the old code returned a live group that then read the *next* group's rows
+/// under the empty group's key, and that group was never seen.
+#[test]
+fn an_empty_group_does_not_swallow_the_group_after_it() {
+    let a = bin_row_str(b"k", b"a");
+    let b = bin_row_str(b"k", b"b");
+
+    let input = fragment(&[
+        a.clone(),
+        bin_control_bool(b"key_switch", true),
+        bin_control_bool(b"key_switch", true),
+        b.clone(),
+    ]);
+
+    assert_eq!(
+        collect_groups(&input),
+        vec![vec![a], vec![], vec![b]],
+        "the middle group is empty and b's group survives"
+    );
+
+    // The same shape through groups_by: the non-empty groups keep their keys.
+    let a = bin_row_str(b"k", b"a");
+    let b = bin_row_str(b"k", b"b");
+    let input = fragment(&[
+        a,
+        bin_control_bool(b"key_switch", true),
+        bin_control_bool(b"key_switch", true),
+        b,
+    ]);
+    let mut reader = JobReader::binary(input.as_slice());
+    let mut groups = reader.groups_by(["k"]);
+
+    let mut keys = Vec::new();
+    while let Some(mut group) = groups.next_group().expect("group reads") {
+        keys.push(group.key().bytes("k").map(<[u8]>::to_vec));
+        while group.next_row().expect("row reads").is_some() {}
+    }
+    assert_eq!(
+        keys,
+        vec![Some(b"a".to_vec()), None, Some(b"b".to_vec())],
+        "an empty group has no key; the groups around it keep theirs"
+    );
+}
+
 /// Control records interleaved inside a group must not end it.
 #[test]
 fn control_records_inside_a_group_do_not_split_it() {
