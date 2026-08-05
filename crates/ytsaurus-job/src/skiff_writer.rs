@@ -94,8 +94,21 @@ impl SkiffJobWriter {
     }
 
     /// Writes one dynamic Skiff row to an output table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::WriteAfterFinish`] once [`Self::finish`] has run,
+    /// [`JobError::UnknownTable`] for a table this writer cannot address, and
+    /// [`JobError::SkiffWrite`] if the row does not match the table schema or
+    /// the descriptor rejects the bytes.
     pub fn write(&mut self, table: impl Into<TableId>, row: &Value) -> Result<()> {
         let table = table.into().index();
+        // A row accepted after finish() would sit in the 256 KiB descriptor
+        // buffer and vanish in Drop, which returns early once finished — the
+        // short-table-under-exit-zero outcome finish() exists to rule out.
+        if self.finished {
+            return Err(JobError::WriteAfterFinish { table });
+        }
         let count = self.tables.len();
         let encoder = self
             .tables

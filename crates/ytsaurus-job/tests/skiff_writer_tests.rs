@@ -64,6 +64,35 @@ fn routes_each_output_to_its_own_single_table_skiff_stream() {
 }
 
 #[test]
+fn refuses_a_row_written_after_finish() {
+    let sink = SharedBuffer::default();
+    let mut writer =
+        SkiffJobWriter::from_writers(vec![Box::new(sink.clone())], format([counts()])).unwrap();
+
+    writer
+        .write(0, &Value::Tuple(vec![Value::Uint64(7)]))
+        .expect("writes");
+    writer.finish().expect("flushes");
+    let after_finish = sink.0.borrow().clone();
+
+    let err = writer
+        .write(0, &Value::Tuple(vec![Value::Uint64(9)]))
+        .expect_err("a late row must not be accepted");
+    assert_eq!(err.kind(), "write_after_finish");
+    assert!(
+        !err.is_row_local(),
+        "every later row would fail the same way"
+    );
+
+    drop(writer);
+    assert_eq!(
+        *sink.0.borrow(),
+        after_finish,
+        "the refused row must not reach the table"
+    );
+}
+
+#[test]
 fn rejects_input_only_system_fields_in_an_output_format() {
     let schema = Schema::tuple([Schema::named("$key_switch", WireType::Boolean)]);
 
