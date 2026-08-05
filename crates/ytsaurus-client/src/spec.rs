@@ -19,6 +19,38 @@ fn named_file(path: impl Into<String>, name: impl AsRef<str>) -> YsonValue {
     with_attributes(string(path.into()), [("file_name", string(name.as_ref()))])
 }
 
+/// Describes a Skiff format applied to a different number of tables than it
+/// has schemas, or `None` when the format is YSON or the counts agree.
+///
+/// A Skiff format is positional: schema `k` describes table `k`, which is why
+/// YTsaurus needs one per table and a YSON selection needs none. `tables` is
+/// how many tables the format will actually meet, and `kind` names them for the
+/// message.
+fn skiff_table_mismatch(
+    what: &str,
+    format: &DataFormat,
+    tables: usize,
+    kind: &str,
+) -> Option<String> {
+    let schemas = format.as_skiff()?.table_schemas().len();
+    if schemas == tables {
+        return None;
+    }
+    Some(format!(
+        "{what} declares {}, but this operation has {}",
+        plural(schemas, "Skiff table schema"),
+        plural(tables, kind)
+    ))
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
 /// The kind of operation to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationType {
@@ -212,6 +244,33 @@ impl MapSpec {
     pub fn with_job_count(mut self, count: i64) -> Self {
         self.job_count = Some(count);
         self
+    }
+
+    /// Describes a Skiff format that does not match this spec's table lists.
+    ///
+    /// A Skiff format needs one table schema per table, in order. Get the count
+    /// wrong and the operation is submitted anyway: the cluster may refuse it,
+    /// or the job may read a table the format does not describe and fail
+    /// mid-stream, after it has already written output.
+    /// [`Client::start_map`](crate::Client::start_map) checks this before
+    /// sending the spec; check it here if you render the spec yourself with
+    /// [`MapSpec::to_yson`].
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        skiff_table_mismatch(
+            "the mapper's input_format",
+            &self.mapper.input_format,
+            self.inputs.len(),
+            "input table",
+        )
+        .or_else(|| {
+            skiff_table_mismatch(
+                "the mapper's output_format",
+                &self.mapper.output_format,
+                self.outputs.len(),
+                "output table",
+            )
+        })
     }
 
     /// Sets any spec field this builder does not model.
@@ -411,6 +470,50 @@ impl MapReduceSpec {
     pub fn without_key_switch(mut self) -> Self {
         self.key_switch = false;
         self
+    }
+
+    /// Describes a Skiff format that does not match this spec's table lists.
+    ///
+    /// Only the counts this builder can know. What the mapper writes and what
+    /// the reducer reads are shuffle streams, and how the output tables are
+    /// split between the phases depends on `mapper_output_table_count`, which
+    /// this builder does not model — a spec that sets it through
+    /// [`Self::with_raw`] therefore has its output side left to the cluster
+    /// rather than guessed at. The Go SDK declines to check its reduce phase
+    /// for the same reason.
+    ///
+    /// See [`MapSpec::skiff_table_mismatch`] for what an unchecked mismatch
+    /// costs. [`Client::start_map_reduce`](crate::Client::start_map_reduce)
+    /// checks this before sending the spec.
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        let split_outputs = self
+            .extra
+            .iter()
+            .any(|(key, _)| key == "mapper_output_table_count");
+
+        self.mapper
+            .as_ref()
+            .and(self.mapper_formats.as_ref())
+            .and_then(|(input, _)| {
+                skiff_table_mismatch(
+                    "the mapper's input_format",
+                    input,
+                    self.inputs.len(),
+                    "input table",
+                )
+            })
+            .or_else(|| {
+                if split_outputs {
+                    return None;
+                }
+                skiff_table_mismatch(
+                    "the reducer's output_format",
+                    &self.reducer.output_format,
+                    self.outputs.len(),
+                    "output table",
+                )
+            })
     }
 
     /// Sets any spec field this builder does not model.
@@ -615,6 +718,32 @@ impl ReduceSpec {
     pub fn without_key_switch(mut self) -> Self {
         self.key_switch = false;
         self
+    }
+
+    /// Describes a Skiff format that does not match this spec's table lists.
+    ///
+    /// A reduce merges its input tables into one sorted stream but keeps them
+    /// distinguishable, so the input format describes every input table, as the
+    /// Go SDK's `setupSkiffInputFormat` also requires. See
+    /// [`MapSpec::skiff_table_mismatch`] for what an unchecked mismatch costs.
+    /// [`Client::start_reduce`](crate::Client::start_reduce) checks this before
+    /// sending the spec.
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        skiff_table_mismatch(
+            "the reducer's input_format",
+            &self.reducer.input_format,
+            self.inputs.len(),
+            "input table",
+        )
+        .or_else(|| {
+            skiff_table_mismatch(
+                "the reducer's output_format",
+                &self.reducer.output_format,
+                self.outputs.len(),
+                "output table",
+            )
+        })
     }
 
     /// Sets any spec field this builder does not model.
@@ -911,6 +1040,23 @@ impl VanillaSpec {
             .map(|task| task.name.as_str())
     }
 
+    /// Describes a task whose Skiff output format does not match its outputs.
+    ///
+    /// See [`MapSpec::skiff_table_mismatch`] for what an unchecked mismatch
+    /// costs. [`Client::start_vanilla`](crate::Client::start_vanilla) checks
+    /// this before sending the spec.
+    #[must_use]
+    pub fn skiff_table_mismatch(&self) -> Option<String> {
+        self.tasks.iter().find_map(|task| {
+            skiff_table_mismatch(
+                &format!("task {:?}'s output_format", task.name),
+                &task.job.output_format,
+                task.outputs.len(),
+                "output table",
+            )
+        })
+    }
+
     /// Sets any spec field this builder does not model.
     #[must_use]
     pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
@@ -952,6 +1098,112 @@ mod tests {
             WireType::Uint64,
         )]))])
         .expect("a named tuple is a table schema")
+    }
+
+    fn skiff_tables(columns: &[&str]) -> SkiffFormat {
+        SkiffFormat::new(
+            columns
+                .iter()
+                .map(|column| {
+                    SchemaRef::Inline(Schema::tuple([Schema::named(*column, WireType::Uint64)]))
+                })
+                .collect(),
+        )
+        .expect("named tuples are table schemas")
+    }
+
+    #[test]
+    fn a_map_skiff_format_needs_one_schema_per_table() {
+        let two_in_one_out = MapSpec::new("./w", ["//a", "//b"], ["//out"]);
+
+        let short_input = two_in_one_out
+            .clone()
+            .with_skiff_formats(skiff_tables(&["source"]), skiff_tables(&["result"]));
+        let reason = short_input
+            .skiff_table_mismatch()
+            .expect("one schema cannot describe two input tables");
+        assert!(reason.contains("input_format"), "{reason}");
+        assert!(reason.contains("1 Skiff table schema,"), "{reason}");
+        assert!(reason.contains("2 input tables"), "{reason}");
+
+        let long_output = two_in_one_out.clone().with_skiff_formats(
+            skiff_tables(&["a", "b"]),
+            skiff_tables(&["x", "y"]),
+        );
+        let reason = long_output
+            .skiff_table_mismatch()
+            .expect("two schemas cannot describe one output table");
+        assert!(reason.contains("output_format"), "{reason}");
+
+        assert!(
+            two_in_one_out
+                .clone()
+                .with_skiff_formats(skiff_tables(&["a", "b"]), skiff_tables(&["x"]))
+                .skiff_table_mismatch()
+                .is_none()
+        );
+        // A YSON selection applies to every table, so it has nothing to count.
+        assert!(two_in_one_out.skiff_table_mismatch().is_none());
+    }
+
+    #[test]
+    fn a_reduce_skiff_format_needs_one_schema_per_table() {
+        let spec = ReduceSpec::new("./w", ["//a", "//b"], ["//out"], ["key"]);
+
+        let reason = spec
+            .clone()
+            .with_skiff_formats(skiff_tables(&["source"]), skiff_tables(&["result"]))
+            .skiff_table_mismatch()
+            .expect("a reduce input format describes every input table");
+        assert!(reason.contains("input_format"), "{reason}");
+
+        assert!(
+            spec.with_skiff_formats(skiff_tables(&["a", "b"]), skiff_tables(&["x"]))
+                .skiff_table_mismatch()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn map_reduce_checks_the_counts_it_knows_and_leaves_the_shuffle_alone() {
+        let spec = MapReduceSpec::new("./r", ["//a", "//b"], ["//out"], ["key"])
+            .with_mapper("./m")
+            .with_mapper_skiff_formats(skiff_tables(&["one"]), skiff_tables(&["shuffle"]));
+        let reason = spec
+            .skiff_table_mismatch()
+            .expect("the mapper still reads the operation's input tables");
+        assert!(reason.contains("input_format"), "{reason}");
+
+        // Two schemas for what this builder renders as one shuffle stream is
+        // exactly the count it refuses to guess at.
+        let shuffle = MapReduceSpec::new("./r", ["//a"], ["//out"], ["key"])
+            .with_mapper("./m")
+            .with_mapper_skiff_formats(skiff_tables(&["one"]), skiff_tables(&["x", "y"]))
+            .with_reducer_skiff_formats(skiff_tables(&["x", "y"]), skiff_tables(&["out"]));
+        assert!(shuffle.skiff_table_mismatch().is_none());
+    }
+
+    #[test]
+    fn a_vanilla_task_skiff_output_needs_one_schema_per_output() {
+        let spec = VanillaSpec::new(
+            VanillaTask::new("worker", "./w", 1)
+                .with_outputs(["//one"])
+                .with_skiff_output_format(skiff_tables(&["a", "b"])),
+        );
+        let reason = spec
+            .skiff_table_mismatch()
+            .expect("two schemas cannot describe one output table");
+        assert!(reason.contains(r#"task "worker""#), "{reason}");
+
+        assert!(
+            VanillaSpec::new(
+                VanillaTask::new("worker", "./w", 1)
+                    .with_outputs(["//one"])
+                    .with_skiff_output_format(skiff_tables(&["a"])),
+            )
+            .skiff_table_mismatch()
+            .is_none()
+        );
     }
 
     #[test]

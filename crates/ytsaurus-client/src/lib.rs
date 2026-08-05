@@ -1663,6 +1663,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_map(&self, spec: &MapSpec) -> Result<String> {
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::Map, &spec.to_yson())
     }
 
@@ -1672,6 +1673,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_map_reduce(&self, spec: &MapReduceSpec) -> Result<String> {
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::MapReduce, &spec.to_yson())
     }
 
@@ -1685,6 +1687,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn start_reduce(&self, spec: &ReduceSpec) -> Result<String> {
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::Reduce, &spec.to_yson())
     }
 
@@ -1719,6 +1722,7 @@ impl Client {
             )));
         }
 
+        refuse_skiff_table_mismatch(spec.skiff_table_mismatch())?;
         self.start_operation(OperationType::Vanilla, &spec.to_yson())
     }
 
@@ -2472,6 +2476,20 @@ fn unsupported_data_format() -> ClientError {
 ///
 /// The path's own attributes are kept: a Skiff write to an appending
 /// [`TablePath`] has to append, exactly as the YSON one does.
+/// Refuses a spec whose Skiff format does not describe the tables it will meet.
+///
+/// Refused here rather than sent, for the reason the duplicate-task check
+/// above is: the cluster's answer to this is a rejected operation at best, and
+/// at worst a job that reads a table its format does not describe and fails
+/// part-way through, having already written output that now has to be cleaned
+/// up.
+fn refuse_skiff_table_mismatch(mismatch: Option<String>) -> Result<()> {
+    match mismatch {
+        Some(reason) => Err(ClientError::Config(reason)),
+        None => Ok(()),
+    }
+}
+
 fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue> {
     if format.table_schemas().len() != 1 {
         return Err(ClientError::Config(format!(
