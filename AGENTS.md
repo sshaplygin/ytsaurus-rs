@@ -16,11 +16,13 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Path | What it is |
 | --- | --- |
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
-| `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. |
+| `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. Reads and writes YSON or Skiff. |
+| `crates/ytsaurus-skiff/` | Skiff schema, format and bounded streaming codec. Pre-release, `publish = false`; see [docs/skiff-compatibility.md](docs/skiff-compatibility.md). |
+| `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, `publish = false`. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
-| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`) plus their e2e tests. |
-| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one). |
+| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`, `skiff_cat`) plus their e2e tests. |
+| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
 
@@ -32,7 +34,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Crate names | `ytsaurus-*` prefix: `ytsaurus-yson`, `ytsaurus-job`; later `ytsaurus-skiff`, `ytsaurus-client` if needed |
 | YSON foundation | fork of ss123she/yson-rs pinned to `ba2044c711cefa65259e25122fea21c36f451093` (2026-04-01, v0.1.3) |
 | Licence | **Apache-2.0** for this project. Upstream yson-rs is MIT OR Apache-2.0; we elect Apache-2.0 and keep upstream's licence files and notices. |
-| Job data format | binary YSON (`<format=binary>yson`); Skiff only after benchmarks |
+| Job data format | binary YSON (`<format=binary>yson`) remains the **default** everywhere. Skiff is implemented and selectable through `DataFormat`, and is pre-release: making it the default is still the benchmark question below, not something this decision has been changed to allow. |
 | Worker builds | `x86_64-unknown-linux-musl`, fully static; `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — the last **only** for worker binaries, never for library crates |
 | Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
@@ -607,8 +609,16 @@ below.
 
 ### Parked — needs a human and a real cluster
 
-- **Skiff go/no-go.** Job-path benchmarks exist
-  ([`docs/benchmarking.md`](docs/benchmarking.md)) but the decision needs a
+- **Skiff go/no-go — now about the default, not about the crate.**
+  `ytsaurus-skiff` and `ytsaurus-format` exist and Skiff is selectable end to
+  end: worker I/O, operation specs and direct table I/O. Binary YSON is still
+  what every spec renders unless a caller asks otherwise, both crates are
+  `publish = false`, and which compatibility gates are still open is
+  [`docs/skiff-compatibility.md`](docs/skiff-compatibility.md). The reference
+  implementation is the `skiff` package in the
+  [Go SDK](https://pkg.go.dev/go.ytsaurus.tech/yt/go), pinned at v0.0.33.
+  Making it the default is what still needs a human: job-path benchmarks exist
+  ([`docs/benchmarking.md`](docs/benchmarking.md)) but that decision needs a
   ≥ 10 GB table and C++/Python baselines. Decoding is 66 % of job CPU for a job
   that does nothing else, which is the worst case for YSON, not a verdict — and
   **~10 % for the pilot**, a job that does something with its rows, measured on
@@ -620,9 +630,6 @@ below.
   the maintainers' stance in ytsaurus#6 is "PRs welcome". **Do not start without
   a go-ahead.**
 - **Contacting the yson-rs author** about co-ownership or publishing.
-- **`ytsaurus-skiff`**, only if the benchmarks justify it — see
-  [`docs/benchmarking.md`](docs/benchmarking.md). Reference implementation: the
-  `skiff` package in the [Go SDK](https://pkg.go.dev/go.ytsaurus.tech/yt/go).
 
 A test cluster with real data is needed from a human for the Skiff comparison;
 a local Docker cluster is enough for everything else.
