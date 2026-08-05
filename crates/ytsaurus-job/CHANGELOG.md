@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Row numbering matches the cluster's
+
+- **Fixed** `Row::row_index` standing still between control records. YTsaurus
+  emits `<row_index=N>#` only at discontinuities — the start of a range or a
+  chunk — and every row after it implicitly advances the index; the reader now
+  counts rows the way the Go, C++ and Python SDKs do, instead of stamping every
+  row of a run with the same `N`. Rows skipped by `Groups` draining a group
+  advance the index too, since they are still rows of the table.
+- **Fixed** a table switch leaving `range_index` stale: `<table_index=…>#`
+  now drops the previous table's range index along with its row index, so a row
+  of the new table never reports a range it was not read from.
+
 ### A job can report its own numbers
 
 - **Added** `JobStatistics`. The cluster measures a job from the outside — CPU,
