@@ -83,8 +83,17 @@ fn supported_features(client: &Client) -> Result<(), ClientError> {
     // What comes back is the response body as the proxy sent it. Decoding it is
     // the caller's job, because the crate has no idea what it means: this is
     // the price of the door, and the whole of it.
+    //
+    // The envelope is keyed by what the command returns, not by a fixed name:
+    // `exists` answers `{value=…}` and this one answers `{features=…}`. Reading
+    // the wrong key is the mistake that failed every `exists` call for two
+    // releases, so the key is named here rather than assumed.
     let answer = decode(&body, "get_supported_features")?;
-    let features = field(&answer, "value").unwrap_or(answer);
+    let features = field(&answer, "features").ok_or_else(|| ClientError::Decode {
+        command: "get_supported_features".to_owned(),
+        reason: format!("no \"features\" key in {}", String::from_utf8_lossy(&body)),
+    })?;
+
     let named = match &features.node {
         YsonNode::Map(m) => m
             .keys()
@@ -94,8 +103,21 @@ fn supported_features(client: &Client) -> Result<(), ClientError> {
     };
 
     check(
-        &format!("the cluster described its features: {}", named.join(", ")),
+        &format!("the cluster described: {}", named.join(", ")),
         !named.is_empty(),
+    )?;
+
+    // One of them read out in full, so the answer is shown to be an answer and
+    // not merely a well-formed document.
+    let codecs = field(&features, "compression_codecs")
+        .map(|c| match &c.node {
+            YsonNode::List(items) => items.len(),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    check(
+        &format!("this build offers {codecs} compression codecs"),
+        codecs > 0,
     )
 }
 

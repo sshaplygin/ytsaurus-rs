@@ -82,7 +82,7 @@ cargo run -p ytsaurus-client --example abort        # stopping an operation, and
 cargo run --release -p ytsaurus-client --example append  # adding rows, against rewriting them
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
-cargo run -p ytsaurus-client --example raw          # commands the crate does not model  [not yet run here]
+cargo run -p ytsaurus-client --example raw          # commands the crate does not model
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
 cargo run --release -p ytsaurus-client --example profile     # what the pilot spends on decoding
 
@@ -458,6 +458,48 @@ the controller agent forgets its jobs and this cluster has no job archive.
 That document is why the client does not walk `rows/rejected` as a path: the
 name is one key, and `$` → job state → job type sits below it. The operation
 *succeeded* — the only sign three rows went missing is the statistic.
+
+### Commands the crate does not model
+
+`cargo run -p ytsaurus-client --example raw`, on the same cluster on
+2026-08-06. Four commands with no method on `Client`, sent through
+`Client::raw_command` and its three siblings:
+
+```text
+== A command with no parameters at all
+   ok the cluster described: compression_codecs, erasure_codecs, node_flavors,
+      operation_statistics_descriptions, primitive_types,
+      query_memory_limit_in_tablet_nodes, require_password_in_authentication_commands,
+      structured_web_json, user_tokens_metadata
+   ok this build offers 71 compression codecs
+== A file, uploaded and streamed back
+   ok 4000000 bytes came back, byte-for-byte what went up
+   ok the reader counted the same 4000000 bytes
+== A raw command joins the transaction it was sent through
+   ok the node is invisible outside the transaction
+   ok and there once the transaction commits
+== A read the caller marks as safe to repeat
+   ok the scheduler answered with 8 keys
+== What it will not send
+   ok a command name that would change the URL is refused
+   ok a payload on a GET is refused rather than dropped
+```
+
+Three things the cluster settled that could not be settled by reading:
+
+- **`get_supported_features` answers `{features=…}`, not `{value=…}`.** The v4
+  envelope is keyed by what the command returns, which is the same trap that
+  made `exists` read the wrong key for two releases. The example names the key
+  rather than assuming one, and there are 71 compression codecs behind it.
+- **`write_file` and `read_file` round-trip through the raw door**, 4 MB
+  byte-for-byte, with neither direction holding the file: the upload came from
+  a reader and the download was summed as it arrived. `read_file` is not
+  modelled by this crate, so this is the whole of how a file is read back
+  today.
+- **A raw command is genuinely inside the transaction it was sent through.**
+  The staged node is invisible to a second client until the commit, which is
+  the claim that would be silently false if the raw door bypassed
+  `Transport::in_transaction`.
 
 ## Refreshing the golden fixtures
 

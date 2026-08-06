@@ -286,6 +286,17 @@ per command. Cluster facts:
 - `list_operations`, `check_permission`, `read_file` and
   `get_supported_features` are all registered and none is modelled here; they
   are the natural first users of the raw door.
+- **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
+  envelope is keyed by what the command returns, the same trap that made
+  `exists` read the wrong key for two releases. Captured from a local cluster:
+  `compression_codecs` (71 of them), `erasure_codecs`, `node_flavors`,
+  `operation_statistics_descriptions`, `primitive_types`,
+  `query_memory_limit_in_tablet_nodes`,
+  `require_password_in_authentication_commands`, `structured_web_json`,
+  `user_tokens_metadata`.
+- **`read_file` streams and `write_file` takes a chunked body**, verified with
+  a 4 MB round trip through `Client::raw_command_streaming` and
+  `raw_command_upload` — neither direction holds the file.
 
 ### Authentication and compression
 
