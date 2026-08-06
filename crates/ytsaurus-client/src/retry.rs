@@ -22,13 +22,30 @@ use std::time::Duration;
 use crate::error::{ClientError, Result};
 
 /// How a command may be repeated.
+///
+/// The classification is the cluster's, not this crate's: each command declares
+/// whether it mutates and whether it is heavy, and the rules at the top of this
+/// module follow from those two bits. A modelled command has its answer written
+/// into its call site; [`Client::raw_command_with`](crate::Client::raw_command_with)
+/// is where a caller supplies one for a command this crate does not model.
+///
+/// **[`Repeatable::Never`] is the safe answer and the default there.** A retry
+/// of something that turned out to be mutating applies it twice, and a
+/// `mutation_id` only prevents that where the master's mutation cache covers
+/// the command — it does not cover the scheduler, which is why
+/// [`Client::abort_operation`](crate::Client::abort_operation) is `Never`
+/// despite being both light and mutating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Repeatable {
+pub enum Repeatable {
     /// Non-mutating and light: repeat the request unchanged.
     Freely,
     /// Mutating and light: repeat it tagged with a `mutation_id`.
+    ///
+    /// The cluster keeps the first response for five to ten minutes and hands
+    /// it back rather than applying the change twice. See [`MutationId`].
     WithMutationId,
-    /// Heavy. Sent once, whatever happens.
+    /// Heavy, or mutating outside the master's mutation cache. Sent once,
+    /// whatever the policy says.
     Never,
 }
 

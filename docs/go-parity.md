@@ -134,23 +134,31 @@ an example, which is exactly why they had not been noticed.
    `impl Into<TablePath>` so a `&str` still means what it always did. Go's
    `ypath.Rich` also carries `Columns` and `Ranges`; those are read-side and are
    not modelled, which is why the type exists rather than a second write method.
-3. **No escape hatch.** `Transport::call` is `pub(crate)`, so a command this
-   crate does not model cannot be sent at all: the answer to "can I do X" is
-   "fork it". `Client::start_operation` taking a raw spec already sets the
-   precedent that a raw door is acceptable here.
+3. ~~**No escape hatch.**~~ **Built.** `Client::raw_command(method, command,
+   params, payload)` sends a command this crate does not model, with
+   `raw_command_streaming` and `raw_command_upload` for the two heavy shapes,
+   and `Method`/`Repeatable` public so a caller can classify a command the
+   crate has never heard of. `Client::start_operation` taking a raw spec had
+   already set the precedent; this generalises it from one command to all of
+   them. The door keeps everything that is not about the command's meaning —
+   the token, the timeout, TLS, the `X-YT-Error` check, and the client's
+   transaction — and gives up only the parameters and the answer, which is the
+   whole of what "raw" costs. `cargo run -p ytsaurus-client --example raw`.
 4. **No web UI links.** Three Go examples print `yt.WebUIOperationURL(...)`.
    Deliberately not built: the URL is `https://<host>/<cluster>/operations/<id>`
    and the cluster name is not derivable from a proxy address, so the choice is
    between asking the caller for something they would have to look up and
    printing a link that might be wrong.
 
-The first two were the ones worth doing, and doing them turned up two things
+The first three were the ones worth doing, and doing them turned up three things
 neither Go example mentions: **aborting is not idempotent** — an operation the
 scheduler has finished with answers `No such operation`, where
-`abort_transaction` would shrug — and **appending to a sorted table is a checked
-operation**, refused with `Sort order violation` if a key arrives out of order.
-The remaining two are noted so the next person reading the Go SDK does not have
-to find them again.
+`abort_transaction` would shrug — **appending to a sorted table is a checked
+operation**, refused with `Sort order violation` if a key arrives out of order,
+and **`whoami` is not an API v4 command at all**: the Go SDK sends it as an
+auth call to a different endpoint, which is why the raw door cannot reach it
+and `get_supported_features` is what the examples use instead. The last one is
+noted so the next person reading the Go SDK does not have to find it again.
 
 ## Running the Rust side
 
@@ -163,6 +171,7 @@ tests/e2e/run_local_cluster.sh
 scripts/build-worker.sh
 
 cargo run -p ytsaurus-client --example cluster_info
+cargo run -p ytsaurus-client --example raw
 cargo run -p ytsaurus-client --example table_usage
 cargo run -p ytsaurus-client --example schema
 cargo run -p ytsaurus-client --example sort_reduce

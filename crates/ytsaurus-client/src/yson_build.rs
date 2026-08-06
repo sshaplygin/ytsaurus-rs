@@ -61,6 +61,20 @@ pub fn map<K: AsRef<[u8]>>(entries: impl IntoIterator<Item = (K, YsonValue)>) ->
     }
 }
 
+/// An empty YSON dict — the parameters of a command that takes none.
+///
+/// `map([])` cannot express this: the key type has nothing to be inferred from,
+/// and `map` takes its entries as an `impl Trait` argument, so a turbofish is
+/// not allowed either. A command like `get_supported_features` still has to
+/// send `{}` in `X-YT-Parameters`, so the shorthand exists.
+#[must_use]
+pub fn empty_map() -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::Map(BTreeMap::new()),
+    }
+}
+
 /// Attaches attributes to a value, as in `<format=binary>yson`.
 #[must_use]
 pub fn with_attributes<K: AsRef<[u8]>>(
@@ -100,6 +114,17 @@ pub(crate) fn insert(target: &mut YsonValue, key: impl AsRef<[u8]>, value: YsonV
 mod tests {
     use super::*;
     use ytsaurus_yson::{YsonFormat, to_string};
+
+    #[test]
+    fn no_parameters_still_encodes_as_a_dict() {
+        // `X-YT-Parameters` is a YSON dict on every command, including the ones
+        // that take nothing. An empty *list* or a missing header would be a
+        // different statement to the proxy.
+        assert_eq!(
+            to_string(&empty_map(), YsonFormat::Text).expect("encodes"),
+            "{}"
+        );
+    }
 
     #[test]
     fn builds_the_documents_the_api_expects() {

@@ -94,17 +94,18 @@ mod worker;
 pub mod yson_build;
 
 pub use crate::error::{ClientError, Result};
+pub use crate::http::Method;
 pub use crate::jobs::{JobFailure, JobInfo};
 pub use crate::lock::{Lock, LockMode};
 pub use crate::path::TablePath;
-pub use crate::retry::{MutationId, RetryPolicy};
+pub use crate::retry::{MutationId, Repeatable, RetryPolicy};
 pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
 // The derive and the trait share a name, as `serde::Serialize` does: they live
 // in different namespaces, and a user wants both under one import.
 pub use crate::spec::{
     MapReduceSpec, MapSpec, OperationType, ReduceSpec, SortSpec, VanillaSpec, VanillaTask,
 };
-pub use crate::stream::TableReader;
+pub use crate::stream::{ResponseReader, TableReader};
 pub use crate::transaction::Transaction;
 pub use ytsaurus_format::DataFormat;
 #[cfg(feature = "derive")]
@@ -114,8 +115,7 @@ pub use ytsaurus_skiff::{
     WireType as SkiffWireType,
 };
 
-use crate::http::{Method, Payload, Transport};
-use crate::retry::Repeatable;
+use crate::http::{Payload, Transport};
 use ytsaurus_skiff::Decoder as SkiffDecoder;
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
@@ -1473,7 +1473,7 @@ impl Client {
                 reason: format!("{path}: {reason}"),
             });
         }
-        sent
+        sent.map(|_| ())
     }
 
     /// Reads a whole table as typed rows.
@@ -1649,7 +1649,8 @@ impl Client {
             ("input_format", yson_build::binary_yson_format()),
         ]);
         self.transport
-            .upload(Method::Put, "write_table", &params, &mut rows)
+            .upload(Method::Put, "write_table", &params, &mut rows)?;
+        Ok(())
     }
 
     // ---------------------------------------------------------- operations
@@ -2233,6 +2234,217 @@ impl Client {
         ))
     }
 
+    // ------------------------------------------------------------------ raw
+
+    /// Sends a command this crate does not model, and hands back the answer.
+    ///
+    /// Every other method here is a command the crate has an opinion about:
+    /// parameters built for you, the response decoded into a type. This is the
+    /// door to the rest of API v4 — the commands this crate has not grown yet,
+    /// and the ones it never will. It is the same door
+    /// [`Client::start_operation`] opens for a hand-built spec, widened from
+    /// one command to all of them, and it means the answer to "can I do X
+    /// against my cluster?" stops being "fork the crate".
+    ///
+    /// `params` is the `X-YT-Parameters` dict — build it with [`yson_build`].
+    /// `payload` is the request body, for a command that takes one. What comes
+    /// back is the response body, exactly as the proxy sent it; API v4 wraps a
+    /// structured answer in a one-key dict, so most commands answer
+    /// `{key=…}` in text YSON.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, Method, yson_build};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::from_env()?;
+    ///
+    /// // `get_supported_features` is not modelled here and takes no
+    /// // parameters. It answers with what this cluster's build can do —
+    /// // codecs, compression, primitive types — which is exactly the question
+    /// // a crate that models a quarter of the API cannot answer for you.
+    /// let body = client.raw_command(
+    ///     Method::Get,
+    ///     "get_supported_features",
+    ///     &yson_build::empty_map(),
+    ///     None,
+    /// )?;
+    ///
+    /// println!("{}", String::from_utf8_lossy(&body));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # What this still does for you
+    ///
+    /// Everything that is not about the command's meaning: the token, the
+    /// timeout, TLS, the header encoding, the `X-YT-Error` check that turns a
+    /// cluster failure into a [`ClientError::Cluster`] with the innermost
+    /// message — and the client's transaction. A raw command is stamped with
+    /// `transaction_id` like every other, so a command sent through
+    /// [`Transaction`] is *in* that transaction rather than quietly outside it.
+    /// The exceptions are the same: a command that names its own transaction
+    /// keeps it, and the scheduler commands are not stamped at all.
+    ///
+    /// # What it does not
+    ///
+    /// **It is sent once.** A command this crate does not model cannot be
+    /// assumed non-mutating, and a retry that applied an unknown mutation twice
+    /// would be a far worse failure than one lost to a flaky proxy — so the
+    /// retry policy is ignored here, whatever it says.
+    /// [`Client::raw_command_with`] is where a caller who knows better says so.
+    ///
+    /// Nor does it know the verb: see [`Method`] for the cluster's own rule for
+    /// picking one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if `command` is not a bare command name,
+    /// or if a body is passed with [`Method::Get`] — which carries none, so it
+    /// would be dropped in silence. Otherwise [`ClientError`] as any command
+    /// fails.
+    pub fn raw_command(
+        &self,
+        method: Method,
+        command: &str,
+        params: &YsonValue,
+        payload: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        self.raw_command_with(method, command, params, payload, Repeatable::Never, None)
+    }
+
+    /// As [`Client::raw_command`], saying how the command may be repeated.
+    ///
+    /// The judgement this needs is the cluster's, not a guess: a command
+    /// declares whether it mutates and whether it is heavy, and [`Repeatable`]
+    /// is how that reaches the retry policy. [`Repeatable::Freely`] for a read,
+    /// [`Repeatable::WithMutationId`] for a light mutation the master's
+    /// mutation cache covers, [`Repeatable::Never`] otherwise.
+    ///
+    /// "Light and mutating" is not by itself enough for a mutation ID: the
+    /// cache lives in the master, and a command that goes to the **scheduler**
+    /// is not covered by it. Verified for `abort_operation` — a second send of
+    /// the same ID, flagged as a retry, is answered `No such operation` rather
+    /// than with the first response, so the retry turns an abort that worked
+    /// into an error the caller believes. Whether every scheduler command
+    /// behaves that way was not checked; treat it as the working assumption
+    /// and prefer `Never` when in doubt.
+    ///
+    /// `mutation_id` is for the guarantee a single process cannot give itself:
+    /// persist it, and after a crash the same call is deduplicated against the
+    /// one that already ran instead of applying twice. See [`MutationId`].
+    ///
+    /// An ID given here is stamped on the request **whatever `repeatable`
+    /// says**, including under [`Repeatable::Never`] — the two answer different
+    /// questions. `repeatable` decides whether *this* call may be sent twice;
+    /// a mutation ID decides whether a *later* call, from a process that has
+    /// since restarted, is recognised as the same mutation. A command that must
+    /// not be retried in-process can still be worth making replayable across
+    /// one, and this is how.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::raw_command`].
+    pub fn raw_command_with(
+        &self,
+        method: Method,
+        command: &str,
+        params: &YsonValue,
+        payload: Option<&[u8]>,
+        repeatable: Repeatable,
+        mutation_id: Option<&MutationId>,
+    ) -> Result<Vec<u8>> {
+        check_command_name(command)?;
+        refuse_body_on_get(method, command, payload.is_some())?;
+
+        let payload = match payload {
+            Some(bytes) => Payload::Bytes(bytes),
+            None => Payload::None,
+        };
+
+        self.transport
+            .call_with(method, command, params, payload, repeatable, mutation_id)
+    }
+
+    /// Sends a command this crate does not model and hands back its response
+    /// **unread**.
+    ///
+    /// For a command whose answer is the data — `read_file`, `read_blob_table`,
+    /// anything the cluster declares heavy on the way out. [`Client::raw_command`]
+    /// would put all of it in memory first, which for those is the thing worth
+    /// avoiding.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, Method, yson_build};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::from_env()?;
+    /// // `read_file` is not modelled here: files can be written and not read
+    /// // back. Until that changes, this is how one is read — and it never
+    /// // holds more of the file than a buffer.
+    /// let mut file = client.raw_command_streaming(
+    ///     Method::Get,
+    ///     "read_file",
+    ///     &yson_build::map([("path", yson_build::string("//tmp/worker"))]),
+    /// )?;
+    ///
+    /// std::io::copy(&mut file, &mut std::fs::File::create("worker")?)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Sent once, and never retried: this is the shape a heavy command takes,
+    /// and the documentation is explicit that heavy commands are not repeated.
+    /// The request carries no body — [`Client::raw_command_upload`] is the
+    /// other direction.
+    ///
+    /// The streaming timeout applies, so the transfer itself is not on the
+    /// request clock; see [`Client::with_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if `command` is not a bare command name,
+    /// and [`ClientError`] if the request fails. Failures *during* the read
+    /// arrive from the reader, not from here — and a body cut short by a
+    /// mid-stream failure ends quietly, for the reason [`ResponseReader`]
+    /// describes.
+    pub fn raw_command_streaming(
+        &self,
+        method: Method,
+        command: &str,
+        params: &YsonValue,
+    ) -> Result<ResponseReader> {
+        check_command_name(command)?;
+        let body = self.transport.open(method, command, params)?;
+        Ok(ResponseReader::new(body))
+    }
+
+    /// Sends a command this crate does not model, streaming its request body.
+    ///
+    /// The counterpart of [`Client::raw_command_streaming`], for a command that
+    /// takes an input data stream — the PUT commands, in the cluster's own
+    /// rule. `body` is read to its end and sent as it is read, so what is
+    /// uploaded never has to fit in memory.
+    ///
+    /// This is one attempt and can never be more: a reader that has been
+    /// consumed cannot be sent again. A transaction is what makes such a write
+    /// safe to fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] if `command` is not a bare command name,
+    /// or if the verb is [`Method::Get`], which carries no body. Otherwise
+    /// [`ClientError`] if the request fails, including when `body` itself fails
+    /// to read.
+    pub fn raw_command_upload(
+        &self,
+        method: Method,
+        command: &str,
+        params: &YsonValue,
+        mut body: impl std::io::Read,
+    ) -> Result<Vec<u8>> {
+        check_command_name(command)?;
+        refuse_body_on_get(method, command, true)?;
+        self.transport.upload(method, command, params, &mut body)
+    }
+
     // -------------------------------------------------------------- helpers
 
     /// A copy of this client that sends each request once.
@@ -2280,6 +2492,56 @@ impl Client {
         let envelope = self.strip_envelope(body, key)?;
         self.field_of(&envelope, key)
     }
+}
+
+/// Refuses a command name that would address something other than a command.
+///
+/// A name goes straight into `/api/v4/{command}`, and every modelled command
+/// puts a literal there. The raw door takes one from a caller, so a name
+/// carrying `/`, `?`, `#` or whitespace could reach a different path, append a
+/// query string, or truncate the URL — none of which the caller would see,
+/// because what came back would still be a plausible answer from *something*.
+///
+/// Command names in the driver's registry are lowercase words joined by
+/// underscores, so this accepts a superset of them and nothing that changes the
+/// shape of the URL. A name this refuses that a future cluster accepts is a
+/// one-line change here; the reverse is a bug nobody can see.
+fn check_command_name(command: &str) -> Result<()> {
+    if command.is_empty() {
+        return Err(ClientError::Config(
+            "a raw command needs a command name, e.g. \"get_supported_features\"".to_owned(),
+        ));
+    }
+
+    if let Some(bad) = command
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '_')
+    {
+        return Err(ClientError::Config(format!(
+            "{command:?} is not a command name: it contains {bad:?}, and the name \
+             goes into the request path as it is. A command is a bare name like \
+             \"get_supported_features\" — the path it acts on is a parameter."
+        )));
+    }
+
+    Ok(())
+}
+
+/// Refuses a request body on a verb that does not carry one.
+///
+/// `Transport::dispatch` sends a GET through `ureq`'s bodiless builder, which
+/// is right — every GET command has an empty input stream by definition. A
+/// caller who passes a payload anyway has picked the wrong verb, and the body
+/// would otherwise be dropped without a word. See [`Method`] for the rule that
+/// decides which verb a command wants.
+fn refuse_body_on_get(method: Method, command: &str, has_body: bool) -> Result<()> {
+    if has_body && matches!(method, Method::Get) {
+        return Err(ClientError::Config(format!(
+            "{command}: a GET carries no request body, so the payload would be \
+             dropped in silence. A command with an input data stream is a PUT."
+        )));
+    }
+    Ok(())
 }
 
 /// Finds a token the way the `yt` CLI finds one.
@@ -2740,6 +3002,152 @@ mod tests {
             request.contains("input_format=<format=text>yson"),
             "{request}"
         );
+    }
+
+    #[test]
+    fn a_raw_command_goes_where_it_says_with_the_parameters_it_was_given() {
+        let (proxy, request) = one_request_proxy(br#"{"value"={};}"#.to_vec());
+        let body = Client::new(&proxy)
+            .raw_command(
+                Method::Get,
+                "get_supported_features",
+                &yson_build::empty_map(),
+                None,
+            )
+            .expect("sends");
+
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with(b"GET /api/v4/get_supported_features HTTP/1.1\r\n"),
+            "{}",
+            String::from_utf8_lossy(&request)
+        );
+
+        let headers = String::from_utf8_lossy(&request);
+        assert!(headers.contains("x-yt-parameters: {}"), "{headers}");
+        // Handed back as it arrived. A raw command has no idea what the answer
+        // means, and decoding it would be this crate guessing.
+        assert_eq!(body, br#"{"value"={};}"#);
+    }
+
+    #[test]
+    fn a_raw_command_carries_its_payload_and_its_transaction() {
+        let (proxy, request) = one_request_proxy(Vec::new());
+        Client::new(&proxy)
+            .with_transaction("3-5d231-10001-db88")
+            .raw_command(
+                Method::Put,
+                "write_file",
+                &yson_build::map([("path", yson_build::string("//tmp/f"))]),
+                Some(b"payload"),
+            )
+            .expect("sends");
+
+        let request = request.join().unwrap();
+        let headers = String::from_utf8_lossy(&request);
+
+        assert!(
+            request.starts_with(b"PUT /api/v4/write_file HTTP/1.1\r\n"),
+            "{headers}"
+        );
+        assert!(request.ends_with(b"payload"), "{headers}");
+        // The whole point of routing this through `Transport` rather than
+        // handing out a bare `ureq` agent: a raw command inside a transaction
+        // is *in* it, not quietly beside it.
+        assert!(
+            headers.contains(r#"transaction_id="3-5d231-10001-db88""#),
+            "{headers}"
+        );
+    }
+
+    #[test]
+    fn a_raw_command_is_sent_once_unless_the_caller_says_otherwise() {
+        // A command this crate does not model cannot be assumed idempotent, so
+        // the default ignores the retry policy. Proved by serving one request
+        // from a listener that would accept a second: a retried request would
+        // hang here rather than fail.
+        let (proxy, request) = one_request_proxy(Vec::new());
+        let client = Client::new(&proxy).with_retries(RetryPolicy::none());
+        client
+            .raw_command(Method::Post, "concatenate", &yson_build::empty_map(), None)
+            .expect("sends");
+        request.join().unwrap();
+    }
+
+    #[test]
+    fn a_mutation_id_is_sent_even_when_the_command_is_not_retried() {
+        // The two answer different questions: `Repeatable` decides whether
+        // *this* call may go twice, a mutation ID whether a *later* call from a
+        // restarted process is recognised as the same mutation. A command too
+        // dangerous to retry in-process can still be worth making replayable
+        // across one, so the ID must not be dropped along with the retries.
+        let id = MutationId::new().as_retry();
+        let (proxy, request) = one_request_proxy(Vec::new());
+        Client::new(&proxy)
+            .raw_command_with(
+                Method::Post,
+                "concatenate",
+                &yson_build::empty_map(),
+                None,
+                Repeatable::Never,
+                Some(&id),
+            )
+            .expect("sends");
+
+        let headers = String::from_utf8_lossy(&request.join().unwrap()).into_owned();
+        assert!(
+            headers.contains(&format!(r#"mutation_id="{}""#, id.as_str())),
+            "{headers}"
+        );
+        // And it admits to being a replay, which is what the cluster refuses a
+        // duplicate for not doing.
+        assert!(headers.contains("retry=%true"), "{headers}");
+    }
+
+    #[test]
+    fn a_command_name_that_would_change_the_url_is_refused() {
+        // The name goes into `/api/v4/{command}` as it is. A caller that got
+        // one from configuration must not be able to address `//sys` or append
+        // a query string, because the answer would still look like an answer.
+        let client = Client::new("http://localhost:8000");
+        for bad in [
+            "",
+            "get/../../hosts",
+            "get?x=1",
+            "get#frag",
+            "get value",
+            "get%2f",
+        ] {
+            let error = client
+                .raw_command(Method::Get, bad, &yson_build::empty_map(), None)
+                .expect_err(&format!("{bad:?} was accepted as a command name"));
+            assert!(matches!(error, ClientError::Config(_)), "{bad:?}: {error}");
+        }
+
+        assert!(check_command_name("get_supported_features").is_ok());
+        assert!(check_command_name("start_tx").is_ok());
+        // A digit is fine: `v3`-era names carry them and a future command may.
+        assert!(check_command_name("read_table_partition2").is_ok());
+    }
+
+    #[test]
+    fn a_payload_on_a_get_is_refused_rather_than_dropped() {
+        // `dispatch` sends a GET through ureq's bodiless builder, so the bytes
+        // would go nowhere and the request would succeed. Silent is the one
+        // thing it must not be.
+        let error = Client::new("http://localhost:8000")
+            .raw_command(
+                Method::Get,
+                "read_table",
+                &yson_build::empty_map(),
+                Some(b"x"),
+            )
+            .expect_err("a GET with a body is a mistake");
+        assert!(matches!(error, ClientError::Config(_)), "{error}");
+
+        assert!(refuse_body_on_get(Method::Get, "get", false).is_ok());
+        assert!(refuse_body_on_get(Method::Put, "write_file", true).is_ok());
+        assert!(refuse_body_on_get(Method::Post, "create", true).is_ok());
     }
 
     fn one_request_proxy(body: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {

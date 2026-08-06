@@ -82,6 +82,7 @@ cargo run -p ytsaurus-client --example abort        # stopping an operation, and
 cargo run --release -p ytsaurus-client --example append  # adding rows, against rewriting them
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
+cargo run -p ytsaurus-client --example raw          # commands the crate does not model  [not yet run here]
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
 cargo run --release -p ytsaurus-client --example profile     # what the pilot spends on decoding
 
