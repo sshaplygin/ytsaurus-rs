@@ -111,8 +111,11 @@ pub fn binary_yson_format() -> YsonValue {
 
 /// Inserts into a value that is known to be a dict; panics otherwise.
 ///
-/// Only used on values this crate built, so the panic is unreachable in
-/// practice and a `Result` here would be noise at every call site.
+/// A `Result` here would be noise at every call site, so the invariant is kept
+/// by the callers instead: a builder reading back a value a caller supplied
+/// through `with_raw` passes it through `map_or_empty` first, and the raw
+/// command doors refuse parameters that are not a dict before anything is
+/// stamped onto them. Reach for one of those rather than widening this.
 pub(crate) fn insert(target: &mut YsonValue, key: impl AsRef<[u8]>, value: YsonValue) {
     match &mut target.node {
         YsonNode::Map(m) => {

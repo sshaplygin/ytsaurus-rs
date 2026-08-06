@@ -7,9 +7,9 @@
 - **Added** the rest of the operation lifecycle — `suspend_operation`,
   `resume_operation`, `complete_operation`, `update_operation_parameters`,
   `list_operations`, `list_operation_events`, `get_operation`,
-  `get_operation_by_alias`, `operation_suspended`, `get_job` and
-  `get_job_input` — and `Operation`, a handle over a client and an id, with the
-  same commands on it.
+  `get_operation_by_alias`, `operation_suspended`, `operation_status`,
+  `get_job` and `get_job_input` — and `Operation`, a handle over a client and
+  an id, with the same commands on it.
 
   **Both shapes, deliberately.** The flat `Client` methods are the primitives
   and nothing was taken away from them; the handle exists because an operation
@@ -27,7 +27,14 @@
   Four narrow readers — `operation_state`, `job_statistics`,
   `operation_result_error` and the private `operation_error` — were each
   building the same `get_operation` request. They are now one attribute of the
-  general one.
+  general one, and each one's *reading* is a function of the document that a
+  test runs against an answer a cluster actually sent.
+
+  `operation_status` reads the state and the suspension **together**, because
+  they are useless apart: suspension is not a state, so `state` says `running`
+  for a paused operation and only `suspended` says otherwise. It is what
+  `wait_for_operation` polls with, so a wait on a paused operation now reports
+  `running, suspended` instead of sitting silent until someone resumes it.
 
 - **Measured against a cluster**, because none of it is guessable from the
   command reference:
@@ -56,8 +63,14 @@
 - **Added** the four operation types the enum could not name — `Merge`,
   `Erase`, `RemoteCopy` and `JoinReduce` — with `MergeSpec`, `EraseSpec` and
   `RemoteCopySpec` beside them, and `start_merge`, `start_erase` and
-  `start_remote_copy`. A sorted merge with no `merge_by` is refused before the
-  request goes out, in the style of the duplicate-vanilla-task check.
+  `start_remote_copy`.
+
+  **A sorted merge does not need `merge_by`**, which took a cluster to find
+  out: sent without one, it is accepted and the key comes from the sort columns
+  the inputs already carry, with the output arriving `sorted_by` those. An
+  earlier draft of this refused such a spec locally on the assumption that the
+  cluster would; it does not, and the check blocked an ordinary operation. The
+  `lifecycle` example runs the case, so the claim cannot drift back.
 
   **`join_reduce` gets no spec builder**, and that is the answer rather than an
   omission: the current documentation no longer lists it among

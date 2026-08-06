@@ -21,9 +21,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ytsaurus_client::{
-    Client, ClientError, EraseSpec, MergeMode, MergeSpec, OperationFilter, OperationParameters,
-    TableRow, VanillaSpec, VanillaTask, yson_build,
+    Client, ClientError, EraseSpec, JobInfo, MergeMode, MergeSpec, OperationFilter,
+    OperationParameters, TableRow, VanillaSpec, VanillaTask, yson_build,
 };
+use ytsaurus_yson::{YsonNode, YsonValue};
 
 /// Where the tables of the second half live.
 const BASE: &str = "//tmp/ytsaurus_rs_lifecycle";
@@ -76,7 +77,7 @@ fn run() -> Result<(), ClientError> {
     let found = client.get_operation_by_alias(&alias, &["id", "state"])?;
     check(
         "the alias resolves to this operation",
-        text_field(&found, "id").as_deref() == Some(id.as_str()),
+        field(&found, "id").and_then(YsonValue::as_str) == Some(id.as_str()),
     )?;
 
     step("Pausing it");
@@ -86,13 +87,15 @@ fn run() -> Result<(), ClientError> {
         "the scheduler took the request in {:.0} ms",
         paused.elapsed().as_secs_f64() * 1000.0
     ));
-    check("and reports it suspended", op.suspended()?)?;
     // The one that catches people out. Suspension is not a state: a paused
     // operation still says `running`, so a loop watching the state alone waits
-    // out a pause without ever saying why.
+    // out a pause without ever saying why. `status` is both in one request,
+    // which is what a poll loop wants and what `wait_for_operation` uses.
+    let paused_status = op.status()?;
+    check("and reports it suspended", paused_status.suspended)?;
     check(
         "while its state is still `running` — suspension is not a state",
-        op.state()? == "running",
+        paused_status.state == "running",
     )?;
 
     step("Pausing it again");
@@ -181,10 +184,12 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Reading one of its jobs by id");
-    let jobs = op.jobs(Some("running"), 5)?;
-    let first = jobs
-        .first()
-        .ok_or_else(|| ClientError::Config("the operation has no running job".to_owned()))?;
+    // Polled, not asked once: an operation reports `running` as soon as the
+    // scheduler accepts it, which is before it has allocated a job — and the
+    // suspend and resume above gave it every reason to be slow about it. A
+    // single empty listing here means "not yet", never "this cluster is
+    // broken", and every other wait in this file is written the same way.
+    let first = wait_for_running_job(&op, PATIENCE)?;
     let job = op.job(&first.id)?;
     check(
         &format!(
@@ -283,18 +288,23 @@ fn merge_and_erase(client: &Client) -> Result<(), ClientError> {
     )?;
 
     step("A sorted merge that does not say what to merge by");
-    // Refused here rather than by the cluster, which says the same thing later
-    // and less clearly.
-    match client.start_merge(&MergeSpec::new([&monday], &week).with_mode(MergeMode::Sorted)) {
-        Ok(_) => return fail("a sorted merge with no merge_by was sent"),
-        Err(e) => {
-            check(
-                "is refused before a request is sent",
-                matches!(e, ClientError::Config(_)),
-            )?;
-            println!("   {}", first_line(&e.to_string()));
-        }
-    }
+    // `merge_by` is optional, and this is where that was found out. The client
+    // used to refuse this spec on the grounds that the cluster would; it does
+    // not — it takes the key from the sort columns the inputs already carry.
+    // Checking it here is what keeps the claim from drifting back.
+    let inferred = format!("{BASE}/inferred");
+    client.create("table", &inferred)?;
+    let id = client.start_merge(
+        &MergeSpec::new([&monday, &tuesday], &inferred).with_mode(MergeMode::Sorted),
+    )?;
+    client.wait_for_operation(&id)?;
+
+    let merged: Vec<Visit> = client.read_table_rows(&inferred)?;
+    let hosts: Vec<&str> = merged.iter().map(|v| v.host.as_str()).collect();
+    check(
+        &format!("the cluster accepts it and infers the key: {hosts:?}"),
+        hosts == ["alpha", "beta", "delta", "gamma"],
+    )?;
 
     step("Erasing the first two rows");
     // The range is part of the path — there is no parameter for it — and a
@@ -409,15 +419,35 @@ fn wait_for_state(
     )))
 }
 
-/// A string field of a YSON document, or `None` if it is not one.
-fn text_field(document: &ytsaurus_yson::YsonValue, key: &str) -> Option<String> {
+/// Waits for the operation to have a job running, and returns the first one.
+///
+/// A separate wait from [`wait_for_state`]: an operation is `running` before
+/// any of its jobs are, so the state says nothing about whether there is a job
+/// to ask about yet.
+fn wait_for_running_job(
+    op: &ytsaurus_client::Operation,
+    patience: Duration,
+) -> Result<JobInfo, ClientError> {
+    let started = Instant::now();
+
+    while started.elapsed() < patience {
+        if let Some(job) = op.jobs(Some("running"), 5)?.into_iter().next() {
+            return Ok(job);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(ClientError::Config(format!(
+        "operation {} had no running job within {:.0}s",
+        op.id(),
+        patience.as_secs_f64()
+    )))
+}
+
+/// One field of a YSON dict, or `None` if it is not a dict or has no such key.
+fn field<'a>(document: &'a YsonValue, key: &str) -> Option<&'a YsonValue> {
     match &document.node {
-        ytsaurus_yson::YsonNode::Map(m) => match &m.get(key.as_bytes())?.node {
-            ytsaurus_yson::YsonNode::String(bytes) => {
-                Some(String::from_utf8_lossy(bytes).into_owned())
-            }
-            _ => None,
-        },
+        YsonNode::Map(m) => m.get(key.as_bytes()),
         _ => None,
     }
 }
@@ -426,24 +456,16 @@ fn text_field(document: &ytsaurus_yson::YsonValue, key: &str) -> Option<String> 
 ///
 /// A weight sent at the top level is spread across every tree the operation
 /// runs in; a local cluster has exactly one, called `default`.
-fn weight_in_first_tree(document: &ytsaurus_yson::YsonValue) -> Option<f64> {
-    use ytsaurus_yson::YsonNode;
-
-    let map = |value: &ytsaurus_yson::YsonValue, key: &str| match &value.node {
-        YsonNode::Map(m) => m.get(key.as_bytes()).cloned(),
-        _ => None,
-    };
-
-    let trees = map(
-        &map(document, "runtime_parameters")?,
+fn weight_in_first_tree(document: &YsonValue) -> Option<f64> {
+    let trees = field(
+        field(document, "runtime_parameters")?,
         "scheduling_options_per_pool_tree",
     )?;
     let YsonNode::Map(trees) = &trees.node else {
         return None;
     };
-    let first = trees.values().next()?;
 
-    match map(first, "weight")?.node {
+    match field(trees.values().next()?, "weight")?.node {
         YsonNode::Double(w) => Some(w),
         _ => None,
     }

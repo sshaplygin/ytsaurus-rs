@@ -37,7 +37,21 @@ use crate::error::{ClientError, Result};
 /// despite being both light and mutating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeatable {
-    /// Non-mutating and light: repeat the request unchanged.
+    /// Safe to repeat unchanged, with no mutation ID to deduplicate by.
+    ///
+    /// A non-mutating light command, which is the common case — and also a
+    /// mutating one the cluster answers the same way however many times it
+    /// arrives, where the mutation cache would not have covered it anyway.
+    /// [`Client::suspend_operation`](crate::Client::suspend_operation) and
+    /// [`Client::update_operation_parameters`](crate::Client::update_operation_parameters)
+    /// are the two: suspending a suspended operation is accepted, and setting
+    /// a pool assigns rather than increments.
+    ///
+    /// **Idempotent is not the same as consequence-free.** A retry sent after
+    /// the scheduler has let the operation go is answered `No such operation`,
+    /// so a change that was applied can still be reported as an error. Each of
+    /// those two commands says so; a mutating command classified here needs the
+    /// same reasoning written down beside it.
     Freely,
     /// Mutating and light: repeat it tagged with a `mutation_id`.
     ///

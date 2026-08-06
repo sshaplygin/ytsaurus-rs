@@ -30,8 +30,9 @@
 //!
 //! - **Suspension is not a state.** A suspended operation still reports
 //!   `running`; `suspended` is a separate attribute, which is what
-//!   [`Operation::suspended`] reads. Polling the state will never tell you an
-//!   operation is paused.
+//!   [`Operation::suspended`] reads — and [`Operation::status`] reads beside
+//!   the state, in one request, because a poll loop needs both. Polling the
+//!   state alone will never tell you an operation is paused.
 //! - **Suspend is idempotent, resume is not.** Suspending a suspended operation
 //!   answers `{}`; resuming one that is not suspended fails with code 201,
 //!   `Operation is in "running" state`.
@@ -44,7 +45,7 @@
 
 use ytsaurus_yson::{YsonNode, YsonValue};
 
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 use crate::jobs::{JobInfo, field, text};
 use crate::stream::ResponseReader;
 use crate::{Client, yson_build};
@@ -100,7 +101,8 @@ impl Operation {
     /// The current state, e.g. `running` or `completed`.
     ///
     /// Note that a **suspended operation still reports `running`**; ask
-    /// [`Operation::suspended`] about that.
+    /// [`Operation::suspended`] about that, or [`Operation::status`] about
+    /// both at once.
     ///
     /// # Errors
     ///
@@ -116,6 +118,18 @@ impl Operation {
     /// Returns [`ClientError`](crate::ClientError) if the request fails.
     pub fn suspended(&self) -> Result<bool> {
         self.client.operation_suspended(&self.id)
+    }
+
+    /// The state and the suspension together. See [`Client::operation_status`].
+    ///
+    /// What a poll loop wants: the two are useless apart, and this asks for
+    /// them in one request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    pub fn status(&self) -> Result<OperationStatus> {
+        self.client.operation_status(&self.id)
     }
 
     /// Polls until the operation finishes. See [`Client::wait_for_operation`].
@@ -299,6 +313,20 @@ pub struct OperationInfo {
     ///
     /// Worth having beside `state`, because a suspended operation still reports
     /// `running` there.
+    pub suspended: bool,
+}
+
+/// What an operation is doing, as [`Client::operation_status`] reports it.
+///
+/// The pair rather than either alone: suspension is not a state, so `state`
+/// says `running` for an operation that is paused and `suspended` is the only
+/// thing that says otherwise. Reading them together also costs one request
+/// instead of two, which a poll loop notices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationStatus {
+    /// `running`, `completed`, `failed`, `aborted`, `pending`, …
+    pub state: String,
+    /// Whether it is paused. Never visible in `state`.
     pub suspended: bool,
 }
 
@@ -526,17 +554,18 @@ impl OperationParameters {
     ///
     /// For an installation with more than one pool tree, where the operation
     /// should move in one of them and stay where it is in the others.
+    ///
+    /// Adds to what the tree's entry already holds rather than replacing it:
+    /// `update_operation_parameters` assigns, so an entry that arrived here
+    /// with a `weight` in it and left with only a `pool` would reset that
+    /// weight on the cluster and report success.
     #[must_use]
     pub fn with_pool_in_tree(mut self, tree: impl AsRef<str>, pool: impl AsRef<str>) -> Self {
-        let mut trees = match tree_options(&self.params) {
-            Some(existing) => existing.clone(),
-            None => yson_build::empty_map(),
-        };
-        yson_build::insert(
-            &mut trees,
-            tree.as_ref(),
-            yson_build::map([("pool", yson_build::string(pool.as_ref()))]),
-        );
+        let mut trees = map_or_empty(tree_options(&self.params));
+        let mut options = map_or_empty(field(&trees, tree.as_ref()));
+
+        yson_build::insert(&mut options, "pool", yson_build::string(pool.as_ref()));
+        yson_build::insert(&mut trees, tree.as_ref(), options);
         yson_build::insert(&mut self.params, "scheduling_options_per_pool_tree", trees);
         self
     }
@@ -573,20 +602,42 @@ fn tree_options(params: &YsonValue) -> Option<&YsonValue> {
     field(params, "scheduling_options_per_pool_tree")
 }
 
+/// A value if it is a dict, and a fresh empty dict otherwise.
+///
+/// What lets a builder read back and add to what is already under a key without
+/// trusting its shape: [`yson_build::insert`] panics on anything that is not a
+/// dict, and `with_raw` puts whatever the caller passes wherever they name.
+fn map_or_empty(value: Option<&YsonValue>) -> YsonValue {
+    match value {
+        Some(existing) if matches!(existing.node, YsonNode::Map(_)) => existing.clone(),
+        _ => yson_build::empty_map(),
+    }
+}
+
 /// Reads the `operations` list of a `list_operations` response.
 ///
 /// An operation with no id is dropped, as a job with no id is: there is nothing
-/// to ask the cluster about it afterwards.
-pub(crate) fn parse_operations(response: &YsonValue) -> OperationList {
-    let operations = match field(response, "operations").map(|ops| &ops.node) {
-        Some(YsonNode::List(items)) => items.iter().filter_map(parse_operation).collect(),
-        _ => Vec::new(),
+/// to ask the cluster about it afterwards. A response with no `operations` list
+/// at all is an error rather than an empty list — "the cluster has no operations
+/// running" is a conclusion a supervisor acts on, and a shape it does not
+/// recognise must not be able to say that.
+pub(crate) fn parse_operations(response: &YsonValue) -> Result<OperationList> {
+    let Some(YsonNode::List(items)) = field(response, "operations").map(|ops| &ops.node) else {
+        return Err(ClientError::Decode {
+            command: "list_operations".to_owned(),
+            reason: format!(
+                "the answer carries no `operations` list: {}",
+                // Truncated: a listing is large, and a wrong-shaped one is no
+                // smaller for being wrong.
+                crate::error::truncate(&format!("{:?}", response.node), 300)
+            ),
+        });
     };
 
-    OperationList {
-        operations,
+    Ok(OperationList {
+        operations: items.iter().filter_map(parse_operation).collect(),
         incomplete: flag(field(response, "incomplete")).unwrap_or(false),
-    }
+    })
 }
 
 fn parse_operation(operation: &YsonValue) -> Option<OperationInfo> {
@@ -597,8 +648,10 @@ fn parse_operation(operation: &YsonValue) -> Option<OperationInfo> {
         // `type` is the documented key; `operation_type` is the same value
         // under the name API v4 also answers with.
         kind: field(operation, "type")
-            .or_else(|| field(operation, "operation_type"))
             .and_then(text)
+            // Decoded before falling back, not merely present: a `type` that is
+            // there but unreadable must still let `operation_type` answer.
+            .or_else(|| field(operation, "operation_type").and_then(text))
             .unwrap_or_default(),
         state: field(operation, "state").and_then(text).unwrap_or_default(),
         user: field(operation, "authenticated_user").and_then(text),
@@ -612,12 +665,32 @@ fn parse_operation(operation: &YsonValue) -> Option<OperationInfo> {
 ///
 /// The answer is a **bare list**, with none of the one-key envelope the rest of
 /// API v4 wraps a structured response in — verified against a cluster, which is
-/// the only way anyone would know.
-pub(crate) fn parse_events(response: &YsonValue) -> Vec<OperationEvent> {
-    let YsonNode::List(items) = &response.node else {
-        return Vec::new();
+/// the only way anyone would know. That cluster has no operations archive and
+/// so answers `[]` every time, which means only the *empty* bare list was ever
+/// seen; the `{events=[…]}` envelope is accepted too, rather than betting the
+/// whole command on which of the two an installation with an archive sends.
+///
+/// Anything else is an error. An empty list is a legitimate answer here — it is
+/// what a cluster with no archive gives — so a shape this does not recognise
+/// must not be able to spell itself "no events".
+pub(crate) fn parse_events(response: &YsonValue) -> Result<Vec<OperationEvent>> {
+    let items = match &response.node {
+        YsonNode::List(items) => items,
+        _ => match field(response, "events").map(|events| &events.node) {
+            Some(YsonNode::List(items)) => items,
+            _ => {
+                return Err(ClientError::Decode {
+                    command: "list_operation_events".to_owned(),
+                    reason: format!(
+                        "expected a list of events, or a dict holding one under \
+                         `events`: {}",
+                        crate::error::truncate(&format!("{:?}", response.node), 300)
+                    ),
+                });
+            }
+        },
     };
-    items.iter().filter_map(parse_event).collect()
+    Ok(items.iter().filter_map(parse_event).collect())
 }
 
 fn parse_event(event: &YsonValue) -> Option<OperationEvent> {
@@ -634,6 +707,69 @@ pub(crate) fn flag(value: Option<&YsonValue>) -> Option<bool> {
         YsonNode::Boolean(b) => Some(b),
         _ => None,
     }
+}
+
+// The narrow readers of a `get_operation` document, as functions of the
+// document rather than methods on the client. Each one is a guess about where
+// an attribute sits, and a guess a test cannot reach is a guess nobody checks:
+// these are what `Client::operation_state` and its kin are, and what the
+// fixture test in `lib.rs` runs against a document a cluster actually sent.
+
+/// The `state` of a `get_operation` answer.
+pub(crate) fn state_of(document: &YsonValue) -> Result<String> {
+    match field(document, "state").map(|state| &state.node) {
+        Some(YsonNode::String(bytes)) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        other => Err(ClientError::Decode {
+            command: "get_operation".to_owned(),
+            reason: format!("state is missing or not a string: {other:?}"),
+        }),
+    }
+}
+
+/// Whether a `get_operation` answer says the operation is paused.
+///
+/// **Absent is `false`**, which is the honest answer rather than a decode
+/// failure: the scheduler reports `suspended` for an operation it still holds,
+/// and one resolved out of the operations archive may simply not carry it.
+/// [`parse_operation`] reads the same attribute the same way, and the two must
+/// not disagree about what absence means. A `suspended` that is *there* and not
+/// a boolean is a shape that moved, and does fail.
+pub(crate) fn suspended_of(document: &YsonValue) -> Result<bool> {
+    match field(document, "suspended") {
+        None => Ok(false),
+        Some(value) => flag(Some(value)).ok_or_else(|| ClientError::Decode {
+            command: "get_operation".to_owned(),
+            reason: format!("suspended is not a boolean: {:?}", value.node),
+        }),
+    }
+}
+
+/// Why an operation ended as it did, out of a document holding its `result`.
+///
+/// `None` for one that succeeded, and for one that has not finished.
+pub(crate) fn result_error_of(document: &YsonValue) -> Option<String> {
+    let error = field(document, "result").and_then(|result| field(result, "error"))?;
+
+    // An operation that succeeded still has an error document — code 0 with an
+    // empty message. Reporting that as `Some("")` would make `if let Some(why)`
+    // fire on every success and print nothing, which is the shape of bug that
+    // survives review because it looks like it works.
+    if field(error, "code").and_then(YsonValue::as_i64) == Some(0) {
+        return None;
+    }
+
+    crate::jobs::error_summary(error)
+}
+
+/// The `job_statistics` subtree of a document holding an operation's `progress`.
+///
+/// An empty dict when the cluster reports none, which is what an operation that
+/// has not run a job yet looks like.
+pub(crate) fn statistics_of(document: &YsonValue) -> YsonValue {
+    field(document, "progress")
+        .and_then(|progress| field(progress, "job_statistics"))
+        .cloned()
+        .unwrap_or_else(yson_build::empty_map)
 }
 
 #[cfg(test)]
@@ -653,9 +789,13 @@ mod tests {
     /// one operation running and one already completed.
     const LIST_OPERATIONS: &str = include_str!("../tests/fixtures/list_operations.yson");
 
+    fn operations(text: &str) -> OperationList {
+        parse_operations(&parse(text)).expect("a well-formed listing")
+    }
+
     #[test]
     fn reads_a_list_captured_from_a_cluster() {
-        let list = parse_operations(&parse(LIST_OPERATIONS));
+        let list = operations(LIST_OPERATIONS);
 
         assert_eq!(list.operations.len(), 2);
         assert!(!list.incomplete);
@@ -681,35 +821,44 @@ mod tests {
     /// operation that is paused still says `running`.
     #[test]
     fn suspension_is_read_from_its_own_field() {
-        let list = parse_operations(&parse(
-            r#"{"operations"=[{"id"="a-b-c-d";"state"="running";"suspended"=%true}]}"#,
-        ));
+        let list =
+            operations(r#"{"operations"=[{"id"="a-b-c-d";"state"="running";"suspended"=%true}]}"#);
         assert_eq!(list.operations[0].state, "running");
         assert!(list.operations[0].suspended);
     }
 
     #[test]
     fn an_operation_without_an_id_is_dropped() {
-        let list = parse_operations(&parse(
+        let list = operations(
             r#"{"operations"=[{"state"="running"};{"id"="a-b-c-d"}];"incomplete"=%true}"#,
-        ));
+        );
         assert_eq!(list.operations.len(), 1);
         assert_eq!(list.operations[0].id, "a-b-c-d");
         assert!(list.incomplete, "a truncated listing must say so");
     }
 
+    /// The listing a supervisor reads to decide whether its own operation is
+    /// still alive. An answer this cannot read must say so, rather than come
+    /// back as "the cluster is idle" and have a duplicate started on the
+    /// strength of it.
     #[test]
-    fn a_response_without_an_operation_list_yields_nothing() {
+    fn a_response_without_an_operation_list_is_an_error() {
+        assert!(parse_operations(&parse(r#"{"operations"=#}"#)).is_err());
+        assert!(parse_operations(&parse(r#""not a dict""#)).is_err());
         assert!(
-            parse_operations(&parse(r#"{"operations"=#}"#))
-                .operations
-                .is_empty()
+            parse_operations(&parse(r#"{"operations"=[]}"#)).is_ok(),
+            "an empty list is a cluster with nothing running, and stays Ok"
         );
-        assert!(
-            parse_operations(&parse(r#""not a dict""#))
-                .operations
-                .is_empty()
-        );
+    }
+
+    #[test]
+    fn the_type_falls_back_when_it_is_present_but_unreadable() {
+        // `or_else` on the field would short-circuit on presence and never
+        // reach the fallback, leaving the kind empty for an operation the
+        // cluster named perfectly well under its other key.
+        let list =
+            operations(r#"{"operations"=[{"id"="a-b-c-d";"type"=#;"operation_type"="map"}]}"#);
+        assert_eq!(list.operations[0].kind, "map");
     }
 
     /// The documented `TOperationEvent`: a timestamp, an event type, and the
@@ -722,7 +871,8 @@ mod tests {
                 {"timestamp"="2026-08-06T09:22:00.000000Z";"event_type"="incarnation_started";
                  "incarnation"="8fd0b4a1-…"};
             ]"#,
-        ));
+        ))
+        .expect("a bare list is the shape the cluster sent");
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "started_running");
@@ -730,12 +880,35 @@ mod tests {
         assert_eq!(events[1].incarnation.as_deref(), Some("8fd0b4a1-…"));
     }
 
+    /// The bare list is the shape the local cluster answers with, and the only
+    /// one anyone here has seen — it has no operations archive, so it is always
+    /// empty. An installation that has one may well wrap it, so both are read.
+    #[test]
+    fn an_enveloped_event_list_is_read_rather_than_dropped() {
+        let events = parse_events(&parse(r#"{"events"=[{"event_type"="started_running"}]}"#))
+            .expect("the enveloped shape is accepted too");
+        assert_eq!(events.len(), 1, "an envelope must not read as no events");
+    }
+
     /// A cluster with no operations archive answers with an empty list rather
     /// than an error, which is what the local one does.
     #[test]
     fn an_empty_event_list_is_not_a_failure() {
-        assert!(parse_events(&parse("[]")).is_empty());
-        assert!(parse_events(&parse(r#"{"events"=[]}"#)).is_empty());
+        assert!(
+            parse_events(&parse("[]"))
+                .expect("empty is fine")
+                .is_empty()
+        );
+    }
+
+    /// The one command here whose non-empty shape could not be checked against
+    /// a cluster. An answer that is neither shape must be an error: "no events"
+    /// is the normal answer, so a wrong shape that reads as one would be
+    /// indistinguishable from it forever.
+    #[test]
+    fn an_event_answer_of_neither_shape_is_an_error() {
+        assert!(parse_events(&parse(r#"{"event_list"=[]}"#)).is_err());
+        assert!(parse_events(&parse(r#""not a list""#)).is_err());
     }
 
     /// Compared whole rather than by `contains`: these values are fixed
@@ -787,6 +960,50 @@ mod tests {
         assert_eq!(
             out, "{scheduling_options_per_pool_tree={default={pool=fast};gpu={pool=research}}}",
             "the second tree must not replace the first: {out}"
+        );
+    }
+
+    /// `update_operation_parameters` assigns rather than merges, so an entry
+    /// that loses a field here loses it on the cluster too — and is answered
+    /// 200. The builder must add to the tree's options rather than replace
+    /// them, however they got there.
+    #[test]
+    fn a_pool_is_added_to_what_the_tree_already_carries() {
+        let out = rendered(
+            &OperationParameters::new()
+                .with_raw(
+                    "scheduling_options_per_pool_tree",
+                    yson_build::map([(
+                        "default",
+                        yson_build::map([("weight", yson_build::double(3.0))]),
+                    )]),
+                )
+                .with_pool_in_tree("default", "fast")
+                .to_yson(),
+        );
+        assert_eq!(
+            out, "{scheduling_options_per_pool_tree={default={pool=fast;weight=3.0}}}",
+            "the weight the caller set must survive: {out}"
+        );
+    }
+
+    /// `with_raw` is the documented escape hatch and takes any value, so the
+    /// builder cannot assume the shape of what it finds under a key. This used
+    /// to abort the caller's process inside `yson_build::insert`.
+    #[test]
+    fn a_tree_option_that_is_not_a_dict_is_replaced_rather_than_panicked_on() {
+        let out = rendered(
+            &OperationParameters::new()
+                .with_raw(
+                    "scheduling_options_per_pool_tree",
+                    yson_build::string("oops"),
+                )
+                .with_pool_in_tree("default", "fast")
+                .to_yson(),
+        );
+        assert_eq!(
+            out,
+            "{scheduling_options_per_pool_tree={default={pool=fast}}}"
         );
     }
 

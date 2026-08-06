@@ -909,7 +909,10 @@ pub enum MergeMode {
     Ordered,
     /// A sorted merge of sorted inputs, producing a sorted table.
     ///
-    /// Needs `merge_by`, and the inputs must already be sorted by it.
+    /// The inputs must already be sorted. `merge_by` is optional — measured
+    /// against a cluster, a sorted merge without it takes the key from the
+    /// inputs' own sort columns — and [`MergeSpec::with_merge_by`] is for
+    /// merging by fewer columns than that, or for saying so out loud.
     Sorted,
 }
 
@@ -979,7 +982,10 @@ impl MergeSpec {
 
     /// The columns a [`MergeMode::Sorted`] merge merges by.
     ///
-    /// The output table comes back sorted by these.
+    /// The output table comes back sorted by these. **Optional**: a sorted
+    /// merge sent without it is accepted, and the cluster uses the sort columns
+    /// the inputs already have. Naming them is how to merge by a prefix of
+    /// that, and how to make the assumption visible where it is being made.
     #[must_use]
     pub fn with_merge_by<K>(mut self, columns: K) -> Self
     where
@@ -1019,16 +1025,6 @@ impl MergeSpec {
     pub fn with_job_count(mut self, count: i64) -> Self {
         self.job_count = Some(count);
         self
-    }
-
-    /// Whether this spec asks for a sorted merge without saying by what.
-    ///
-    /// [`Client::start_merge`](crate::Client::start_merge) refuses one, for the
-    /// reason [`VanillaSpec::duplicate_task`] is checked before the request goes
-    /// out: the cluster's own refusal arrives later and says less.
-    #[must_use]
-    pub fn needs_merge_by(&self) -> bool {
-        self.mode == MergeMode::Sorted && self.merge_by.is_empty()
     }
 
     /// Sets any spec field this builder does not model — `data_size_per_job`,
@@ -1908,22 +1904,39 @@ mod tests {
         assert!(out.contains("merge_by=[host;day]"), "{out}");
         assert!(out.contains("combine_chunks=%true"), "{out}");
         assert!(out.contains("job_count=4"), "{out}");
-        assert!(!spec.needs_merge_by());
+        let _ = spec;
     }
 
-    /// The cluster refuses this too, later and in its own words.
-    /// `Client::start_merge` reads this and says which key is missing.
+    /// Measured against a cluster: this is accepted, the key is taken from the
+    /// sort columns the inputs already carry, and the output comes back sorted
+    /// by them. The spec must therefore render without `merge_by` rather than
+    /// having one invented for it.
     #[test]
-    fn a_sorted_merge_without_a_key_is_recognisable() {
-        assert!(
-            MergeSpec::new(["//tmp/a"], "//tmp/all")
+    fn a_sorted_merge_may_leave_its_key_to_the_cluster() {
+        let out = render(
+            &MergeSpec::new(["//tmp/a"], "//tmp/all")
                 .with_mode(MergeMode::Sorted)
-                .needs_merge_by()
+                .to_yson(),
         );
+
+        assert!(out.contains("mode=sorted"), "{out}");
         assert!(
-            !MergeSpec::new(["//tmp/a"], "//tmp/all").needs_merge_by(),
-            "an unordered merge has nothing to merge by"
+            !out.contains("merge_by"),
+            "an absent key is the request to infer one: {out}"
         );
+    }
+
+    /// `with_raw` is the escape hatch for what the builder does not model, and
+    /// a key set through it must reach the cluster like any other.
+    #[test]
+    fn a_key_set_through_the_escape_hatch_is_rendered() {
+        let out = render(
+            &MergeSpec::new(["//tmp/a"], "//tmp/all")
+                .with_mode(MergeMode::Sorted)
+                .with_raw("merge_by", list([string("host")]))
+                .to_yson(),
+        );
+        assert!(out.contains("merge_by=[host]"), "{out}");
     }
 
     /// Erase names one table with `table_path` — it reads and writes the same

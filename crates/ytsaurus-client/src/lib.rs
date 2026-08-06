@@ -126,6 +126,7 @@ pub use crate::jobs::{JobFailure, JobInfo};
 pub use crate::lock::{Lock, LockMode};
 pub use crate::operation::{
     Operation, OperationEvent, OperationFilter, OperationInfo, OperationList, OperationParameters,
+    OperationStatus,
 };
 pub use crate::path::TablePath;
 pub use crate::retry::{MutationId, Repeatable, RetryPolicy};
@@ -1757,24 +1758,18 @@ impl Client {
 
     /// Starts a merge operation, returning its ID.
     ///
+    /// A [`MergeMode::Sorted`] merge does **not** need
+    /// [`MergeSpec::with_merge_by`]: measured against a cluster, one sent
+    /// without it is accepted and the key is taken from the sort columns the
+    /// inputs already carry, with the output coming back sorted by them.
+    /// Naming the columns is how to merge by fewer of them than the inputs are
+    /// sorted by, or to state the assumption where a reader can see it.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if the spec asks for a sorted merge
-    /// without saying what to merge by, and [`ClientError`] if the request
-    /// fails.
+    /// Returns [`ClientError`] if the request fails — including when a sorted
+    /// merge's inputs are not sorted, which only the cluster can tell.
     pub fn start_merge(&self, spec: &MergeSpec) -> Result<String> {
-        // Refused here rather than sent: a sorted merge with no `merge_by` is
-        // rejected by the cluster, late and in its own words, where the missing
-        // key is one sentence away from being named.
-        if spec.needs_merge_by() {
-            return Err(ClientError::Config(
-                "a sorted merge needs merge_by: the columns the output is sorted \
-                 by, and the ones the inputs are already sorted by. \
-                 MergeSpec::with_merge_by sets them"
-                    .to_owned(),
-            ));
-        }
-
         self.start_operation(OperationType::Merge, &spec.to_yson())
     }
 
@@ -2038,7 +2033,11 @@ impl Client {
     /// `{}` its neighbours send.
     ///
     /// Repeated freely, because it assigns rather than increments: sending the
-    /// same update twice leaves the operation where the first one put it.
+    /// same update twice leaves the operation where the first one put it. As
+    /// with [`Client::suspend_operation`], that holds only while the scheduler
+    /// still has the operation — if the answer to the first send is lost and
+    /// the operation ends during the backoff, the retry is answered `No such
+    /// operation` and this returns an error for an update that was applied.
     ///
     /// # Errors
     ///
@@ -2111,9 +2110,7 @@ impl Client {
         // No `{value=…}` envelope, and no one-key envelope either: the answer
         // is a dict of `operations` plus counters, which is why this reads the
         // document rather than unwrapping it.
-        Ok(operation::parse_operations(
-            &self.strip_envelope(&body, "list_operations")?,
-        ))
+        operation::parse_operations(&self.strip_envelope(&body, "list_operations")?)
     }
 
     /// An operation's event log.
@@ -2137,10 +2134,10 @@ impl Client {
         )?;
 
         // A bare list, with none of the one-key envelope the rest of API v4
-        // uses — the same surprise the file-cache commands hold.
-        Ok(operation::parse_events(
-            &self.strip_envelope(&body, "list_operation_events")?,
-        ))
+        // uses — the same surprise the file-cache commands hold. An envelope
+        // is read too; see `operation::parse_events` for why that is not
+        // over-caution.
+        operation::parse_events(&self.strip_envelope(&body, "list_operation_events")?)
     }
 
     /// A handle on an operation that is already running.
@@ -2160,9 +2157,18 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// **The id is trimmed**, for the reason the token file is: the documented
+    /// way to get one here is out of a file, `echo $ID > run.id` writes a
+    /// newline, and an id carrying one is answered `No such operation` by an
+    /// error that never mentions whitespace.
     #[must_use]
     pub fn attach_operation(&self, id: impl Into<String>) -> Operation {
-        Operation::new(self.clone(), id.into())
+        let mut id = id.into();
+        if id.trim().len() != id.len() {
+            id = id.trim().to_owned();
+        }
+        Operation::new(self.clone(), id)
     }
 
     /// The whole document the cluster keeps about an operation.
@@ -2225,7 +2231,17 @@ impl Client {
         )
     }
 
-    fn get_operation_inner(&self, mut params: YsonValue, attributes: &[&str]) -> Result<YsonValue> {
+    fn get_operation_inner(&self, params: YsonValue, attributes: &[&str]) -> Result<YsonValue> {
+        let body = self.get_operation_body(params, attributes)?;
+        self.strip_envelope(&body, "get_operation")
+    }
+
+    /// The bytes of a `get_operation` answer, before they are parsed.
+    ///
+    /// Split out for [`Client::operation_error`], which reports the raw body
+    /// when it cannot be parsed — the one caller for which a decode failure is
+    /// not the end of the story.
+    fn get_operation_body(&self, mut params: YsonValue, attributes: &[&str]) -> Result<Vec<u8>> {
         // Omitted rather than sent empty: `attributes=[]` is a request for no
         // attributes at all, and the cluster answers `{}` to it. Leaving the
         // parameter out is how the whole document is asked for.
@@ -2237,33 +2253,26 @@ impl Client {
             );
         }
 
-        let body = self.transport.call(
+        self.transport.call(
             Method::Get,
             "get_operation",
             &params,
             Payload::None,
             Repeatable::Freely,
-        )?;
-        self.strip_envelope(&body, "get_operation")
+        )
     }
 
     /// Fetches an operation's current state, e.g. `running` or `completed`.
     ///
     /// **A suspended operation still reports `running`.** See
-    /// [`Client::operation_suspended`].
+    /// [`Client::operation_suspended`], or [`Client::operation_status`] for
+    /// both in one request.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn operation_state(&self, id: &str) -> Result<String> {
-        let value = self.field_of(&self.get_operation(id, &["state"])?, "state")?;
-        match &value.node {
-            YsonNode::String(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
-            other => Err(ClientError::Decode {
-                command: "get_operation".to_owned(),
-                reason: format!("state is not a string: {other:?}"),
-            }),
-        }
+        operation::state_of(&self.get_operation(id, &["state"])?)
     }
 
     /// Whether an operation is paused.
@@ -2273,15 +2282,48 @@ impl Client {
     /// so a loop that watches the state alone will wait out a paused operation
     /// without ever saying why.
     ///
+    /// **An operation whose document does not carry the attribute is not
+    /// suspended**, rather than an error: the scheduler reports it for what it
+    /// still holds, and one resolved out of the operations archive may not
+    /// carry it at all.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, or if the cluster's answer
-    /// is not a boolean.
+    /// Returns [`ClientError`] if the request fails, or if the attribute is
+    /// there and is not a boolean.
     pub fn operation_suspended(&self, id: &str) -> Result<bool> {
-        let document = self.get_operation(id, &["suspended"])?;
-        operation::flag(jobs::field(&document, "suspended")).ok_or_else(|| ClientError::Decode {
-            command: "get_operation".to_owned(),
-            reason: "suspended is missing or not a boolean".to_owned(),
+        operation::suspended_of(&self.get_operation(id, &["suspended"])?)
+    }
+
+    /// An operation's state and whether it is paused, in one request.
+    ///
+    /// The pair a poll loop actually needs. Asking them separately is two
+    /// round trips for two attributes of one document, and a loop that asks
+    /// only for the state cannot tell a running operation from a paused one —
+    /// they both say `running`.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// # let id = String::new();
+    /// let status = client.operation_status(&id)?;
+    /// if status.suspended {
+    ///     println!("paused — it will sit at {} until it is resumed", status.state);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails or the answer cannot be
+    /// decoded.
+    pub fn operation_status(&self, id: &str) -> Result<OperationStatus> {
+        let document = self.get_operation(id, &["state", "suspended"])?;
+        Ok(OperationStatus {
+            state: operation::state_of(&document)?,
+            suspended: operation::suspended_of(&document)?,
         })
     }
 
@@ -2317,15 +2359,9 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails.
     pub fn job_statistics(&self, operation_id: &str) -> Result<YsonValue> {
-        let document = self.get_operation(operation_id, &["progress"])?;
-        let statistics = jobs::field(&document, "progress")
-            .and_then(|p| jobs::field(p, "job_statistics"))
-            .cloned();
-
-        Ok(statistics.unwrap_or(YsonValue {
-            attributes: None,
-            node: YsonNode::Map(std::collections::BTreeMap::new()),
-        }))
+        Ok(operation::statistics_of(
+            &self.get_operation(operation_id, &["progress"])?,
+        ))
     }
 
     /// The total of one **built-in** job statistic, e.g. `time/exec`.
@@ -2386,23 +2422,39 @@ impl Client {
 
     /// Polls until the operation reaches a terminal state.
     ///
+    /// **A suspended operation never reaches one**, and this says so rather
+    /// than sitting there: suspension is not a state, so a paused operation
+    /// goes on answering `running` for as long as it is paused. The progress
+    /// line reports it, which is the difference between a wait that looks hung
+    /// and one that names what it is waiting for. Resuming it — from another
+    /// process, or from the one that paused it — is what ends the wait.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::OperationFailed`] if it ends as anything other
     /// than `completed`, or [`ClientError`] if polling itself fails.
     pub fn wait_for_operation(&self, id: &str) -> Result<()> {
         let started = Instant::now();
-        let mut last_state = String::new();
+        let mut last_reported = String::new();
 
         loop {
-            let state = self.operation_state(id)?;
+            // Both attributes, in one request: a loop that watched the state
+            // alone could not tell a paused operation from a running one, and
+            // waiting for a resume that nobody knows is needed is the failure
+            // this whole pair of readers exists to prevent.
+            let OperationStatus { state, suspended } = self.operation_status(id)?;
 
-            if state != last_state {
+            let reported = if suspended {
+                format!("{state}, suspended")
+            } else {
+                state.clone()
+            };
+            if reported != last_reported {
                 eprintln!(
-                    "operation {id}: {state} ({:.0}s)",
+                    "operation {id}: {reported} ({:.0}s)",
                     started.elapsed().as_secs_f64()
                 );
-                last_state.clone_from(&state);
+                last_reported = reported;
             }
 
             match state.as_str() {
@@ -2448,21 +2500,9 @@ impl Client {
         // Asked for through `get_operation`, not through Cypress: an operation
         // is not a node under //sys/operations on every cluster, and a local
         // one answers `has no child with key` for an id that certainly exists.
-        let document = self.get_operation(id, &["result"])?;
-        let Some(error) = jobs::field(&document, "result").and_then(|r| jobs::field(r, "error"))
-        else {
-            return Ok(None);
-        };
-
-        // An operation that succeeded still has an error document — code 0 with
-        // an empty message. Reporting that as `Some("")` would make
-        // `if let Some(why)` fire on every success and print nothing, which is
-        // the shape of bug that survives review because it looks like it works.
-        if jobs::field(error, "code").and_then(YsonValue::as_i64) == Some(0) {
-            return Ok(None);
-        }
-
-        Ok(jobs::error_summary(error))
+        Ok(operation::result_error_of(
+            &self.get_operation(id, &["result"])?,
+        ))
     }
 
     /// Best-effort fetch of a failed operation's error document.
@@ -2475,17 +2515,29 @@ impl Client {
     /// swallows errors and [`Client::operation_result_error`], which has a
     /// caller to answer to, does not.
     fn operation_error(&self, id: &str) -> Option<String> {
-        let document = self.get_operation(id, &["result"]).ok()?;
+        // The raw body, not the parsed document: the fallback below is for the
+        // case where the shape moved, and a body that does not parse at all —
+        // an HTML page from an intermediary, a truncated stream — is the
+        // farthest it can move. Parsing first would throw away the only
+        // evidence in exactly the case the fallback exists for.
+        let body = self
+            .get_operation_body(
+                yson_build::map([("operation_id", yson_build::string(id))]),
+                &["result"],
+            )
+            .ok()?;
 
-        let summary = jobs::field(&document, "result")
-            .and_then(|result| jobs::error_summary(jobs::field(result, "error")?));
+        let summary = self
+            .strip_envelope(&body, "get_operation")
+            .ok()
+            .and_then(|document| {
+                jobs::field(&document, "result")
+                    .and_then(|result| jobs::error_summary(jobs::field(result, "error")?))
+            });
 
-        summary.or_else(|| {
-            // The document itself, rather than nothing: a clumsy error beats an
-            // empty one if the response shape ever moves.
-            let raw = ytsaurus_yson::to_string(&document, YsonFormat::Text).ok()?;
-            Some(crate::error::truncate(&raw, 600))
-        })
+        // Whatever the cluster said, rather than nothing: a clumsy error beats
+        // an empty one if the response shape ever moves.
+        summary.or_else(|| Some(crate::error::truncate(&String::from_utf8_lossy(&body), 600)))
     }
 
     // ---------------------------------------------------------------- jobs
@@ -2724,9 +2776,10 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if `command` is not a bare command name,
-    /// or if a body is passed with [`Method::Get`] — which carries none, so it
-    /// would be dropped in silence. Otherwise [`ClientError`] as any command
-    /// fails.
+    /// if `params` is not a YSON dict — every command's parameters are one, and
+    /// the client adds to them — or if a body is passed with [`Method::Get`],
+    /// which carries none, so it would be dropped in silence. Otherwise
+    /// [`ClientError`] as any command fails.
     pub fn raw_command(
         &self,
         method: Method,
@@ -2779,6 +2832,7 @@ impl Client {
         mutation_id: Option<&MutationId>,
     ) -> Result<Vec<u8>> {
         check_command_name(command)?;
+        refuse_non_dict_parameters(command, params)?;
         refuse_body_on_get(method, command, payload.is_some())?;
 
         let payload = match payload {
@@ -2838,6 +2892,7 @@ impl Client {
         params: &YsonValue,
     ) -> Result<ResponseReader> {
         check_command_name(command)?;
+        refuse_non_dict_parameters(command, params)?;
         let body = self.transport.open(method, command, params)?;
         Ok(ResponseReader::new(body))
     }
@@ -2867,6 +2922,7 @@ impl Client {
         mut body: impl std::io::Read,
     ) -> Result<Vec<u8>> {
         check_command_name(command)?;
+        refuse_non_dict_parameters(command, params)?;
         refuse_body_on_get(method, command, true)?;
         self.transport.upload(method, command, params, &mut body)
     }
@@ -2950,6 +3006,26 @@ fn check_command_name(command: &str) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+/// Refuses parameters that are not a dict.
+///
+/// `X-YT-Parameters` is a dict on every command, including the ones that take
+/// none — [`yson_build::empty_map`] is the spelling for those. The client also
+/// *adds* to what it is given: a transaction id, a mutation id and its retry
+/// flag are all inserted into the caller's parameters on the way out, and
+/// inserting into a value that is not a dict panics. A caller who passes a list
+/// or a string here has made a mistake the cluster would report in its own
+/// words at best, and which would otherwise abort their process.
+fn refuse_non_dict_parameters(command: &str, params: &YsonValue) -> Result<()> {
+    if !matches!(params.node, YsonNode::Map(_)) {
+        return Err(ClientError::Config(format!(
+            "{command}: command parameters are a YSON dict, and this is a \
+             {:?}. A command that takes no parameters sends `yson_build::empty_map()`.",
+            params.node
+        )));
+    }
     Ok(())
 }
 
@@ -3252,37 +3328,92 @@ mod tests {
     const GET_OPERATION: &str = include_str!("../tests/fixtures/get_operation.yson");
 
     /// The narrow readers are each one attribute of `get_operation`, and each
-    /// assumes where that attribute sits. A response shape is a guess until a
-    /// call site pins it, so this pins all four against a captured document.
+    /// assumes where that attribute sits. A response shape is a guess until
+    /// something runs against a real answer, so this calls the readers
+    /// themselves — the ones `operation_state`, `operation_suspended`,
+    /// `operation_status` and `operation_result_error` are — on a document a
+    /// cluster sent. Re-implementing the field access here instead would pass
+    /// just as happily after a reader started looking somewhere else.
+    ///
+    /// Three of the four attributes: the capture does not include `progress`,
+    /// so `job_statistics` is pinned separately below against a shape that is
+    /// stated to be a guess rather than pretending otherwise.
     #[test]
     fn the_narrow_readers_agree_with_a_document_a_cluster_sent() {
         let document = from_slice(GET_OPERATION.as_bytes(), YsonFormat::Text).expect("valid YSON");
 
         assert_eq!(
-            jobs::field(&document, "state").and_then(|s| match &s.node {
-                YsonNode::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-                _ => None,
-            }),
-            Some("completed".to_owned()),
-            "operation_state reads `state` from the top level"
+            operation::state_of(&document).expect("the capture carries a state"),
+            "completed"
         );
-
-        assert_eq!(
-            operation::flag(jobs::field(&document, "suspended")),
-            Some(false),
-            "operation_suspended reads a boolean, not a state"
+        assert!(
+            !operation::suspended_of(&document).expect("and a boolean beside it"),
+            "suspension is read from its own attribute, not from the state"
         );
 
         // The case `operation_result_error` exists to get right: an operation
         // that succeeded still has an error document, code 0 with an empty
         // message. Reporting that as `Some("")` would fire on every success.
-        let error = jobs::field(&document, "result")
-            .and_then(|result| jobs::field(result, "error"))
-            .expect("a finished operation has a result error document");
         assert_eq!(
-            jobs::field(error, "code").and_then(YsonValue::as_i64),
-            Some(0)
+            operation::result_error_of(&document),
+            None,
+            "a completed operation's code-0 error document is not a failure"
         );
+    }
+
+    /// The deepest of the four guesses — `progress` → `job_statistics` — and
+    /// the one the captured document cannot pin, because it was fetched
+    /// without `progress`. Written out here so the assumption is at least
+    /// visible and breaks a test when the reader stops matching it.
+    #[test]
+    fn job_statistics_are_read_from_under_progress() {
+        let document = from_slice(
+            br#"{"progress"={"job_statistics"={"time"={"exec"={"$$"={"completed"={"map"={"sum"=744}}}}}}}}"#,
+            YsonFormat::Text,
+        )
+        .expect("valid YSON");
+
+        let statistics = operation::statistics_of(&document);
+        assert!(
+            jobs::field(&statistics, "time").is_some(),
+            "the subtree, not the progress node that holds it: {statistics:?}"
+        );
+
+        // And the empty answer, which is what an operation that has not run a
+        // job yet gives — distinct from a failure to find the attribute.
+        let empty = from_slice(br#"{"progress"={}}"#, YsonFormat::Text).expect("valid YSON");
+        assert!(matches!(
+            operation::statistics_of(&empty).node,
+            YsonNode::Map(ref m) if m.is_empty()
+        ));
+    }
+
+    /// The client inserts a transaction id, a mutation id and a retry flag
+    /// into the parameters it is handed, and inserting into anything that is
+    /// not a dict panics. A caller's mistake must be an error rather than the
+    /// end of their process.
+    #[test]
+    fn raw_parameters_that_are_not_a_dict_are_refused() {
+        let client = Client::new("http://localhost:8000").with_retries(RetryPolicy::none());
+        let not_a_dict = yson_build::list([yson_build::string("get_supported_features")]);
+
+        let refused = client.raw_command(Method::Get, "get_supported_features", &not_a_dict, None);
+        assert!(
+            matches!(refused, Err(ClientError::Config(_))),
+            "a list of parameters is a mistake to report, not to panic on"
+        );
+        assert!(refuse_non_dict_parameters("c", &yson_build::empty_map()).is_ok());
+    }
+
+    /// An id that came out of a file the way the documentation shows keeps its
+    /// newline, and the cluster answers a whitespace-carrying id with an error
+    /// that never mentions whitespace.
+    #[test]
+    fn an_attached_id_is_trimmed() {
+        let client = Client::new("http://localhost:8000");
+        assert_eq!(client.attach_operation("1-2-3-4\n").id(), "1-2-3-4");
+        assert_eq!(client.attach_operation("  1-2-3-4  ").id(), "1-2-3-4");
+        assert_eq!(client.attach_operation("1-2-3-4").id(), "1-2-3-4");
     }
 
     #[test]

@@ -53,7 +53,7 @@ cargo run -p ytsaurus-client --example launch
 | Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_merge`, `start_erase`, `start_remote_copy`, `start_operation`, `operation_state`, `wait_for_operation`, `operation_result_error` |
-| Lifecycle | `abort_operation`, `suspend_operation`, `resume_operation`, `complete_operation`, `update_operation_parameters`, `operation_suspended`, `attach_operation` → `Operation` |
+| Lifecycle | `abort_operation`, `suspend_operation`, `resume_operation`, `complete_operation`, `update_operation_parameters`, `operation_suspended`, `operation_status`, `attach_operation` → `Operation` |
 | Finding one | `list_operations`, `get_operation`, `get_operation_by_alias`, `list_operation_events` |
 | Jobs | `list_jobs`, `get_job`, `get_job_stderr`, `get_job_input`, `custom_statistics`, `statistic_sum`, `job_statistics`, `job_statistic_sum` |
 | Transactions | `start_transaction`, `with_transaction`, `Transaction::{commit, abort, ping}` |
@@ -384,10 +384,13 @@ that started it.
 Everything on the handle is also on `Client`, taking the id — the handle is for
 passing an operation around, not for reaching anything the flat API cannot.
 
-Four things about this the cluster does not document and this crate measured:
+Five things about this the cluster does not document and this crate measured:
 
 - **Suspension is not a state.** A suspended operation still reports `running`.
-  `operation_suspended` is the question that gets a straight answer.
+  `operation_suspended` is the question that gets a straight answer, and
+  `operation_status` asks it together with the state in one request — which is
+  what `wait_for_operation` polls with, so a wait on a paused operation says
+  `running, suspended` rather than nothing at all.
 - **Suspend is idempotent; resume is not.** A second suspend is accepted, so it
   is the one mutating scheduler command here that is retried. A resume of
   something that is not suspended is refused with code 201.
@@ -396,6 +399,8 @@ Four things about this the cluster does not document and this crate measured:
   told the work succeeded.
 - **An update that changes nothing is refused here**, because the cluster
   accepts one with 200 and does nothing.
+- **A sorted merge does not need `merge_by`.** Sent without one it is accepted,
+  and the key comes from the sort columns the inputs already carry.
 
 An alias set in the spec can now be looked up:
 `get_operation_by_alias("*nightly-load", &["state"])`, which sends the

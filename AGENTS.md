@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 469 tests
+cargo test --workspace            # 479 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -382,7 +382,16 @@ per command. Cluster facts:
   newer `job_statistics_v2`, so the statistics readers are unaffected.
 - **`list_operation_events` answers a bare list**, with no envelope at all — the
   same surprise the file-cache commands hold — and it is **empty on a cluster
-  with no operations archive**, which is what a local one is.
+  with no operations archive**, which is what a local one is. Only the *empty*
+  bare list has ever been seen here, then: the shape of a non-empty answer is a
+  guess, so the parser reads `{events=[…]}` too and refuses anything else rather
+  than reporting a shape it does not know as "no events".
+- **A sorted merge does not need `merge_by`.** Measured: two tables sorted by
+  `host`, merged with `mode=sorted` and no `merge_by`, are accepted and the
+  operation completes with the output `sorted_by=[host]` — the cluster takes the
+  key from the inputs' own sort columns. `start_merge` used to refuse this spec
+  on the assumption that the cluster would; it does not, and the refusal blocked
+  an ordinary operation.
 - **`get_job` answers the job document unwrapped** and calls the id `job_id`,
   where `list_jobs` wraps in `{jobs=[…]}` and calls it `id`. One parser reads
   both.
