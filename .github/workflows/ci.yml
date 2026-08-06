@@ -88,16 +88,38 @@ jobs:
       # cross-compiler, and a worker should carry only what it runs on. Neither
       # is off by accident — `examples/` takes the client with
       # `default-features = false` — so this asserts the invariant rather than
-      # trusting it. `-i` exits non-zero when the crate is not in the graph,
-      # which is the passing case.
+      # trusting it.
+      #
+      # Listed once and searched, rather than three `cargo tree -i` calls whose
+      # *failure* was the passing signal. `-i` exits 101 both when the crate is
+      # absent and when cargo itself could not run — a typo'd `-p`, a manifest
+      # or lockfile error, an unreachable registry — so reading the exit code
+      # turned every one of those into a silent pass. The message does not
+      # separate them either: `-i` is resolved before `-p`, so a misspelled
+      # package prints the same "did not match any packages" as an absent
+      # crate. One invocation that must succeed puts all of that on the failing
+      # side of `set -e` and leaves a plain membership test.
       - name: Assert the worker graph has no tracing and no TLS
         run: |
           set -euo pipefail
+          graph=$(cargo tree -p ytsaurus-examples \
+                    --target x86_64-unknown-linux-musl \
+                    --prefix none --no-dedupe | awk 'NF {print $1}' | sort -u)
+
+          # A graph that lost the client is a graph this step is not reading,
+          # and every absence below would be vacuously true.
+          echo "$graph" | grep -qx ytsaurus-client || {
+            echo "ERROR: the worker graph does not contain ytsaurus-client"
+            echo "$graph"; exit 1; }
+
           for crate in tracing rustls ring; do
-            if cargo tree -p ytsaurus-examples \
-                 --target x86_64-unknown-linux-musl -i "$crate" 2>/dev/null; then
-              echo "ERROR: $crate reached the worker build"; exit 1
+            if echo "$graph" | grep -qx "$crate"; then
+              echo "ERROR: $crate reached the worker build"
+              cargo tree -p ytsaurus-examples \
+                --target x86_64-unknown-linux-musl -i "$crate"
+              exit 1
             fi
+            echo "OK: no $crate in the worker graph"
           done
 
       - name: Build worker binaries

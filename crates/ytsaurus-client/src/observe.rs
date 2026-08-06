@@ -8,8 +8,11 @@
 //!   still explains the pause.
 //! - **on**: every attempt runs inside a span carrying the command, the attempt
 //!   number and how long it took, and the retry message becomes a `WARN` event
-//!   carrying the same facts as fields rather than a line on stderr. The
-//!   subscriber decides where any of it goes.
+//!   carrying the same facts as fields. The subscriber decides where any of it
+//!   goes — and if there is no subscriber, the stderr line is printed after
+//!   all. The feature adds a way of saying this; it does not take the old one
+//!   away, because whether it is on is not entirely up to whoever built the
+//!   program. Cargo unifies features across the graph.
 //!
 //! The retry event is *not* inside the attempt's span, and cannot be: the
 //! attempt it is complaining about has already ended, and the wait it is
@@ -80,6 +83,11 @@ pub(crate) fn attempt<T>(
 
 /// Announces that `command` failed and is about to be sent again.
 ///
+/// `attempt` is the one that just failed and `of` is how many are allowed, the
+/// same counting the span's `attempt` field uses — so an event and the span
+/// beside it never disagree about which try this was, and `attempt == of` means
+/// what it says.
+///
 /// Called only when the policy says to — see [`RetryPolicy::quiet`], and the
 /// muting it does inside a job. That muting covers both spellings of this: a
 /// job's stderr is a bounded buffer the cluster shows in its UI, and a
@@ -96,15 +104,126 @@ pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attem
         error = %error,
         "the command failed; retrying"
     );
+
+    if let Some(line) = stderr_fallback(command, error, wait, attempt, of) {
+        eprintln!("{line}");
+    }
+}
+
+/// What to print on stderr after emitting the event, if anything.
+///
+/// A feature is supposed to add, and this one would otherwise take something
+/// away. Cargo unifies features across the whole graph, so any crate anywhere
+/// in a build can turn `tracing` on for everybody: a launcher that never asked
+/// for it, and so installed no subscriber, would find the stderr message simply
+/// gone and a fifteen-second pause looking like a hang — with nothing in its
+/// own manifest to explain why. Falling back keeps the default build's
+/// behaviour available in every build.
+///
+/// `None` when a subscriber is installed. The event is the message then, and
+/// saying it twice would be worse than either way of saying it once.
+///
+/// Returns the line rather than printing it so that the decision is something a
+/// test can hold: `eprintln!` writes to a file descriptor no test in this
+/// process can read back, so a fallback that printed directly could be deleted
+/// wholesale and every test would still pass.
+#[cfg(feature = "tracing")]
+fn stderr_fallback(
+    command: &str,
+    error: &ClientError,
+    wait: Duration,
+    attempt: u32,
+    of: u32,
+) -> Option<String> {
+    // `NoSubscriber` is what `tracing` falls back to when none was set, so
+    // asking whether the current dispatcher is that one — globally or for this
+    // thread — is asking whether the event just emitted went anywhere.
+    let listening = !tracing::dispatcher::get_default(
+        tracing::Dispatch::is::<tracing::subscriber::NoSubscriber>,
+    );
+
+    (!listening).then(|| retry_message(command, error, wait, attempt, of))
 }
 
 #[cfg(not(feature = "tracing"))]
 pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attempt: u32, of: u32) {
-    eprintln!(
+    eprintln!("{}", retry_message(command, error, wait, attempt, of));
+}
+
+/// The retry announcement as a line of text.
+///
+/// Split from the `eprintln!` so that it can be asserted on. It used to be
+/// inlined into the `#[cfg(not(feature = "tracing"))]` arm, where no test could
+/// reach it: the tests below are compiled exactly when that arm is not, so the
+/// message every default build prints was checked by nothing at all, and
+/// swapping `attempt` for `of` or dropping the reason left CI green.
+fn retry_message(
+    command: &str,
+    error: &ClientError,
+    wait: Duration,
+    attempt: u32,
+    of: u32,
+) -> String {
+    format!(
         "ytsaurus-client: {command} failed ({error}); \
-         retrying in {:.1}s ({attempt}/{of})",
+         retrying in {:.1}s (attempt {attempt} of {of})",
         wait.as_secs_f64()
-    );
+    )
+}
+
+/// The stderr spelling, which is what a default build prints.
+///
+/// Not gated on the feature — that is the whole point. The module below is
+/// compiled only with `tracing` on, so everything it asserts is about the half
+/// of this file that most users never build.
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+
+    fn unavailable() -> ClientError {
+        ClientError::Cluster {
+            command: "get".to_owned(),
+            code: 105,
+            message: "Master is not connected".to_owned(),
+            raw: r#"{"code":105}"#.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_message_names_the_command_the_reason_the_wait_and_the_try() {
+        let line = retry_message(
+            "start_operation",
+            &unavailable(),
+            Duration::from_millis(1500),
+            2,
+            5,
+        );
+
+        assert!(line.contains("start_operation"), "{line}");
+        // The reason is what makes the message worth having; a pause with no
+        // explanation is the thing it exists to avoid.
+        assert!(line.contains("Master is not connected"), "{line}");
+        assert!(line.contains("1.5s"), "the wait is not in seconds: {line}");
+        // Counted the same way the span's `attempt` field is, and in that
+        // order: swapping the two reads as a retry budget four times too big.
+        assert!(line.contains("attempt 2 of 5"), "{line}");
+    }
+
+    #[test]
+    fn the_wait_is_rounded_rather_than_spelled_out() {
+        // A backoff is a float, and an unrounded one puts sixteen digits in a
+        // line whose whole job is to be read at a glance.
+        let line = retry_message(
+            "get",
+            &unavailable(),
+            Duration::from_nanos(1_234_567_891),
+            1,
+            3,
+        );
+
+        assert!(line.contains("1.2s"), "{line}");
+        assert!(!line.contains("1.234"), "{line}");
+    }
 }
 
 /// What a subscriber is handed, checked against what the client promises.
@@ -345,12 +464,43 @@ mod tests {
 
         assert_eq!(retries.len(), 2, "three attempts, two retries: {lines:?}");
         assert!(retries[0].contains("command=get"), "{}", retries[0]);
+        // Attempts, not retries — the same counting the span uses, so that the
+        // two can be read side by side. Three allowed attempts means the
+        // second retry says `attempt=2 of=3`, and nothing ever says `of=2`
+        // next to a span whose `attempt` reached 3.
         assert!(retries[0].contains("attempt=1"), "{}", retries[0]);
-        assert!(retries[0].contains("of=2"), "{}", retries[0]);
+        assert!(retries[0].contains("of=3"), "{}", retries[0]);
+        assert!(retries[1].contains("attempt=2"), "{}", retries[1]);
+        assert!(retries[1].contains("of=3"), "{}", retries[1]);
         assert!(
             retries[0].contains("Master is not connected"),
             "the reason is what makes the message worth having: {}",
             retries[0]
+        );
+    }
+
+    #[test]
+    fn the_stderr_message_survives_the_feature_being_turned_on_for_us() {
+        // Cargo unifies features across the graph, so `tracing` can be turned
+        // on for this crate by some unrelated dependency of a launcher that
+        // installed no subscriber. Replacing the `eprintln!` outright would
+        // then delete that launcher's only sign of a retry, with nothing in
+        // its own manifest to explain the silence — so the fallback is what
+        // makes this feature additive rather than substitutive.
+        let fallback = || stderr_fallback("get", &unavailable(), Duration::from_secs(2), 1, 3);
+
+        // No subscriber: the event went nowhere, so the line is still owed.
+        let unheard = fallback().expect("nothing is listening, so stderr is the fallback");
+        assert!(unheard.contains("get"), "{unheard}");
+        assert!(unheard.contains("attempt 1 of 3"), "{unheard}");
+        assert!(unheard.contains("Master is not connected"), "{unheard}");
+
+        // A subscriber: the event *is* the message, and saying it twice on a
+        // subscriber that writes to stderr is the noise `quiet` exists to stop.
+        let heard = tracing::subscriber::with_default(Arc::new(Recorder::default()), fallback);
+        assert_eq!(
+            heard, None,
+            "a subscriber is installed and the message would be printed twice"
         );
     }
 

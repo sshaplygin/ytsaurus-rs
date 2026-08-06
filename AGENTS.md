@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 495 tests
+cargo test --workspace            # 508 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -100,8 +100,14 @@ Its **`tracing` feature is off by default** and must stay that way, for the
 second half of the same reason: a worker binary should carry only what it runs
 on, and `default-features = false` in `examples/Cargo.toml` is what keeps it
 out of the musl build. CI asserts that rather than trusting it — the musl job
-fails if `tracing`, `rustls` or `ring` appears in
-`cargo tree -p ytsaurus-examples --target x86_64-unknown-linux-musl -i <crate>`.
+lists the worker's dependency graph with `cargo tree -p ytsaurus-examples
+--target x86_64-unknown-linux-musl --prefix none` and fails if `tracing`,
+`rustls` or `ring` is in it. Listed and searched rather than probed with
+`-i <crate>`: `-i` exits non-zero both when the crate is absent (the pass) and
+when cargo could not run at all, and it resolves `-i` before `-p`, so even a
+misspelled package prints the same "did not match any packages". Reading that
+exit code turned every cargo failure into a silent pass. **Do not go back to
+it** — a guard that cannot fail asserts nothing.
 The observability that costs no dependency — the `traceparent` header — is
 always compiled in.
 
@@ -774,8 +780,11 @@ What shipped is two halves with different prices. `TraceContext` and
 dependency and is always compiled in — the cluster is the instrumented party,
 and this only tells it which trace to join. The `tracing` feature adds a span
 per attempt and is **off by default and absent from musl worker builds**, for
-the reason `tls` is. The retry reporting goes through whichever is compiled and
-still mutes itself inside a job; that muting is load-bearing and covers both.
+the reason `tls` is — but it *adds*: with it on and no subscriber installed,
+the stderr line is still printed, because Cargo unifies features across the
+graph and a launcher does not get to decide alone whether this is on. The retry
+reporting goes through whichever is compiled and still mutes itself inside a
+job; that muting is load-bearing and covers both.
 See *Tracing* under *Protocol reference* for what was read out of the cluster's
 source.
 

@@ -132,6 +132,7 @@ pub mod stream;
 /// The trace a request belongs to.
 pub mod trace;
 mod transaction;
+mod unique;
 mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
 pub mod yson_build;
@@ -399,7 +400,7 @@ impl Client {
     /// commit that hung is one of the things a trace is for.
     #[must_use]
     pub fn with_trace_context(mut self, context: &TraceContext) -> Self {
-        self.transport.set_trace(Some(context.header()));
+        self.transport.set_trace(context);
         self
     }
 
@@ -407,6 +408,13 @@ impl Client {
     #[must_use]
     pub fn traceparent(&self) -> Option<&str> {
         self.transport.trace()
+    }
+
+    /// The `tracestate` header this client sends, if the context it joined
+    /// carried one. See [`TraceContext::with_tracestate`].
+    #[must_use]
+    pub fn tracestate(&self) -> Option<&str> {
+        self.transport.tracestate()
     }
 
     /// Starts a transaction, and keeps it alive while the handle lives.

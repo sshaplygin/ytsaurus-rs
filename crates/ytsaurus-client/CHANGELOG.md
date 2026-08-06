@@ -112,7 +112,25 @@ at, and that is the first thing a production deployment needs.
   `TraceContext::new` starts one for a program nobody called. A malformed
   header is **refused rather than sent**: the proxy drops one it cannot parse
   without saying so, and the trace would then be quietly missing the half that
-  mattered.
+  mattered. A header from a *later version* of the standard is not malformed,
+  though — the standard's versioning rule is to read the four fields version 00
+  defines and ignore whatever follows, which is the only thing that keeps this
+  parser working against a caller that has moved on, and the documented usage
+  `?`-propagates a refusal into a failed request.
+
+  The span id is carried through as it arrived, so the cluster's spans hang
+  under the span the *caller* named. A fully instrumented forwarder would
+  substitute its own; this crate emits no spans a collector would know about,
+  so an invented id would name a parent that does not exist. The work lands in
+  the right trace, one level up from where it would otherwise sit.
+
+- **Added** `TraceContext::with_tracestate`, which carries the `tracestate`
+  header the standard pairs with `traceparent`. A participant that forwards one
+  is required to forward the other unmodified: it is where a vendor keeps a
+  sampling decision or a correlation key, and dropping it on this hop costs the
+  caller's own backend — the proxy itself has no opinion about it. Not
+  rewritten on the way through, because rewriting the list means claiming a
+  vendor entry, and this client has none.
 
   `TraceContext::yt_trace_id` spells the id the way the cluster does —
   `8e9bcc43-5c2be9b4-56f18c4e-117ea314` rather than 32 undivided hex digits —
@@ -138,13 +156,21 @@ at, and that is the first thing a production deployment needs.
   `tracing`, its `pin-project-lite`, and `tracing-core` — plus `once_cell`,
   which a default build already has by way of `rustls` and a build without
   TLS does not. The facade is taken without its `attributes` feature:
-  `#[instrument]` is a proc macro, and the three spans here are opened by
-  hand.
+  `#[instrument]` is a proc macro, and the one span here is opened by hand, at
+  the single seam every command already passes through.
 
-  Nothing is emitted without a subscriber, which is what makes it a facade —
-  so a build that turns this on and installs none has traded the retry line on
-  stderr for silence. That is the trade the issue asked for ("routed through
-  it"), and it is why the feature is opt-in rather than the default.
+  Nothing is emitted without a subscriber, which is what makes it a facade — so
+  **the stderr line is printed after all when none is installed**. Cargo
+  unifies features across the whole graph, which means any crate anywhere in a
+  build can turn this on for everybody: a launcher that never asked for it
+  would otherwise find its only sign of a retry gone, a fifteen-second pause
+  looking like a hang, and nothing in its own manifest to explain the silence.
+  A feature should add a way of saying this, not take the old one away.
+
+  The event and the span agree on their counting. `attempt` is the try that
+  just failed and `of` is how many are allowed, in both — so `attempt == of`
+  means the last one, and an event never reads `4 of 4` beside a span that says
+  `attempt=5`.
 
 - **Kept**: the retry reporting still mutes itself inside a job. `RetryPolicy`
   decides whether a retry is announced at all, and that decision now covers

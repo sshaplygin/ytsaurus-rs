@@ -397,6 +397,91 @@ fn a_trace_context_travels_as_a_traceparent_header() {
 }
 
 #[test]
+fn a_tracestate_travels_beside_the_traceparent() {
+    // The standard pairs the two, and a participant that forwards one is
+    // required to forward the other unmodified. The proxy ignores `tracestate`;
+    // the caller's own backend is what keys off it, so dropping it here would
+    // cost the sampling decision or the correlation key of everything
+    // downstream of this hop and nothing would say so.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent")
+        .with_tracestate("vendora=t61rcWkgMzE,vendorb=x9");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+
+        assert_eq!(client.tracestate(), Some("vendora=t61rcWkgMzE,vendorb=x9"));
+
+        let _ = client.exists("//tmp");
+    });
+
+    assert_eq!(
+        header_value(&head, "tracestate").as_deref(),
+        Some("vendora=t61rcWkgMzE,vendorb=x9"),
+        "the tracestate was dropped on the way to the cluster:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "traceparent").as_deref(),
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        "a tracestate must not displace the traceparent it belongs to:\n{head}"
+    );
+}
+
+#[test]
+fn a_traced_client_sends_no_tracestate_it_was_not_given() {
+    // A `tracestate` naming no vendor is not a smaller version of one; it is a
+    // header the caller's backend has to decide what to do with.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+        let _ = client.exists("//tmp");
+    });
+
+    assert!(
+        !head.to_lowercase().contains("tracestate"),
+        "a tracestate appeared from nowhere:\n{head}"
+    );
+}
+
+#[test]
+fn a_transaction_inherits_the_clients_trace() {
+    // The doc on `with_trace_context` promises this, and it holds only because
+    // `Transaction::start` clones the client rather than rebuilding one from
+    // its parts — which is a plausible refactor, since it immediately overrides
+    // the retries and the timeout on the ping client. A commit or a ping that
+    // hung is named in that doc as the thing the trace is for, so the claim is
+    // load-bearing and nothing else here would notice it breaking.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+        // The reply is an `exists` answer rather than a transaction id, so the
+        // start fails to decode and no ping thread outlives this. The request
+        // is what is under test.
+        let _ = client.start_transaction();
+    });
+
+    assert!(
+        head.starts_with("POST /api/v4/start_transaction"),
+        "the captured request is not the transaction start:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "traceparent").as_deref(),
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        "a transaction started from a traced client left the trace:\n{head}"
+    );
+}
+
+#[test]
 fn a_client_without_a_trace_context_sends_no_traceparent() {
     // Sampling costs the cluster something, so a client that was not asked to
     // join a trace must not start one on its own.

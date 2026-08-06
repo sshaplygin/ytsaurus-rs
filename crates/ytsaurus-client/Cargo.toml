@@ -45,7 +45,8 @@ serde_json = "1.0"
 md5 = "0.8"
 ytsaurus-helpers = { workspace = true, optional = true }
 # The facade only, and without `attributes`: `#[instrument]` is a proc macro,
-# and the spans here are opened by hand at three call sites. What is left is
+# and the one span here is opened by hand, at the single seam (`retry::run`)
+# that every command passes through. What is left is
 # `tracing` with its `pin-project-lite`, and `tracing-core` with its
 # `once_cell` — three crates more to compile on a default build, which already
 # has `once_cell` by way of `rustls`, and four without TLS.

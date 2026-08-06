@@ -49,9 +49,8 @@
 //! answered 200 with an id the proxy invented, which is the whole reason
 //! [`TraceContext::parse`] refuses one rather than passing it on.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use crate::error::{ClientError, Result};
+use crate::unique::word;
 
 /// Bit 0 of the flags: this trace is being recorded.
 const SAMPLED: u8 = 0x01;
@@ -94,6 +93,9 @@ pub struct TraceContext {
     /// of.
     span_id: String,
     flags: u8,
+    /// The `tracestate` that arrived beside the `traceparent`, if any, carried
+    /// unmodified. See [`TraceContext::with_tracestate`].
+    tracestate: Option<String>,
 }
 
 impl TraceContext {
@@ -109,6 +111,7 @@ impl TraceContext {
             trace_id: format!("{:016x}{:016x}", word(0), word(1)),
             span_id: format!("{:016x}", word(2)),
             flags: SAMPLED,
+            tracestate: None,
         }
     }
 
@@ -118,6 +121,18 @@ impl TraceContext {
     /// `00-<trace>-<span>-<flags>` and the version-less three-part form the Go
     /// SDK sends. Hex digits may be upper or lower case on the way in; what
     /// this client sends is always lowercase, as the standard requires.
+    ///
+    /// The span id is carried through **as it arrived**, so the cluster's spans
+    /// hang under the span the *caller* named rather than under one belonging
+    /// to this process. That is what a client with nothing of its own to point
+    /// at can honestly do: the W3C wording asks a forwarder to substitute the
+    /// id of its own current span, and this crate emits no spans the collector
+    /// would know about — an invented id would name a parent that does not
+    /// exist. The work still lands in the right trace, one level up from where
+    /// a fully instrumented service would put it.
+    ///
+    /// A `tracestate` that arrived beside the header is not in it, and is
+    /// passed on separately — see [`TraceContext::with_tracestate`].
     ///
     /// # Errors
     ///
@@ -129,10 +144,29 @@ impl TraceContext {
         let header = header.trim();
         let parts: Vec<&str> = header.split('-').collect();
 
-        // The three-part form has no version, and the proxy reads it as zero.
         let [version, trace_id, span_id, flags] = match parts[..] {
-            [trace_id, span_id, flags] => ["00", trace_id, span_id, flags],
+            // The three-part form has no version, and the proxy reads it as
+            // zero. Recognised by the trace id rather than by the count, so
+            // that a four-part header with its flags cut off is not silently
+            // read as this one — see the arm below.
+            [trace_id, span_id, flags] if is_hex(trace_id, 32) => ["00", trace_id, span_id, flags],
+            // Version, trace, span, and nothing where the flags should be.
+            // Destructured as the version-less form this would report the
+            // *version* as a bad trace id, sending whoever is debugging a
+            // truncated header to a field that is perfectly well formed.
+            [version, trace_id, _] if is_hex(version, 2) && is_hex(trace_id, 32) => {
+                return Err(malformed(header, "the flags are missing"));
+            }
             [version, trace_id, span_id, flags] => [version, trace_id, span_id, flags],
+            // A version this client does not know may define fields after the
+            // flags, and the standard's versioning rule is to read the four
+            // that version 00 defines and ignore the rest — that rule is the
+            // only reason a version-00 parser keeps working against a
+            // version-01 sender. Version 00 itself defines exactly four, so a
+            // fifth group there is malformed rather than from the future.
+            [version, trace_id, span_id, flags, ..] if !version.eq_ignore_ascii_case("00") => {
+                [version, trace_id, span_id, flags]
+            }
             _ => {
                 return Err(malformed(
                     header,
@@ -169,7 +203,43 @@ impl TraceContext {
             trace_id: trace_id.to_ascii_lowercase(),
             span_id: span_id.to_ascii_lowercase(),
             flags: u8::from_str_radix(flags, 16).unwrap_or_default(),
+            tracestate: None,
         })
+    }
+
+    /// Carries a `tracestate` header alongside the `traceparent`.
+    ///
+    /// The standard pairs the two, and asks a participant that forwards one to
+    /// forward the other unmodified: `tracestate` is where a vendor puts the
+    /// sampling decision or the correlation key that its own backend reads, and
+    /// dropping it on this hop loses that for everything downstream. The proxy
+    /// itself has no opinion about it — this is for the caller's backend, not
+    /// the cluster's.
+    ///
+    /// Not modified on the way through, deliberately: rewriting the list means
+    /// claiming a vendor entry of one's own, and this client has none.
+    ///
+    /// ```
+    /// use ytsaurus_client::{Client, TraceContext};
+    ///
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    /// let context = TraceContext::parse(incoming)?.with_tracestate("vendora=t61,vendorb=x9");
+    ///
+    /// let client = Client::new("http://localhost:8000").with_trace_context(&context);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_tracestate(mut self, state: impl Into<String>) -> Self {
+        self.tracestate = Some(state.into());
+        self
+    }
+
+    /// The `tracestate` this context carries, if it was given one.
+    #[must_use]
+    pub fn tracestate(&self) -> Option<&str> {
+        self.tracestate.as_deref()
     }
 
     /// The trace, as the header spells it: 32 lowercase hex digits.
@@ -199,12 +269,16 @@ impl TraceContext {
     /// ```
     #[must_use]
     pub fn yt_trace_id(&self) -> String {
-        let groups: Vec<&str> = self
-            .trace_id
-            .as_bytes()
-            .chunks(8)
+        // Sliced from the string rather than reassembled from its bytes: the
+        // trace id is 32 ASCII hex digits by construction — `parse` checks it
+        // and `new` formats it — so there is no decoding to fail. Going
+        // through `from_utf8` needed a fallback for a case that cannot happen,
+        // and the only cheap fallback was a wrong id, which is worse than an
+        // error: an id that is off by one group matches nothing in the proxy
+        // log and says nothing about why.
+        let groups: Vec<&str> = (0..4)
             .map(|group| {
-                let group = std::str::from_utf8(group).unwrap_or("0");
+                let group = &self.trace_id[group * 8..group * 8 + 8];
                 // The cluster prints one to eight digits per group, so a group
                 // that is all zeros keeps a single one.
                 let trimmed = group.trim_start_matches('0');
@@ -260,31 +334,6 @@ fn is_hex(text: &str, digits: usize) -> bool {
 
 fn is_zero(text: &str) -> bool {
     text.bytes().all(|b| b == b'0')
-}
-
-/// Counts calls, so two ids made in the same nanosecond still differ.
-static IDS: AtomicU64 = AtomicU64::new(0);
-
-/// Sixty-four bits unlikely to have been produced before.
-///
-/// The entropy is `RandomState`'s, which the standard library seeds from the OS
-/// once per process, mixed with a counter and the clock — the same source
-/// [`MutationId`](crate::MutationId) draws on, and for the same reason: an id
-/// has to be *unique*, not unpredictable, and that is a poor reason to add a
-/// random-number crate to a dependency list this short.
-fn word(salt: u64) -> u64 {
-    use std::hash::{BuildHasher, Hasher, RandomState};
-
-    let counter = IDS.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(counter);
-    hasher.write_u64(nanos);
-    hasher.write_u64(salt);
-    hasher.finish()
 }
 
 #[cfg(test)]
@@ -356,6 +405,91 @@ mod tests {
 
         assert!(context.is_sampled());
         assert!(context.header().ends_with("-03"));
+    }
+
+    #[test]
+    fn a_version_from_the_future_is_read_as_far_as_it_is_understood() {
+        // The standard's versioning rule, and the only thing that keeps a
+        // version-00 parser working against a later sender: read the four
+        // fields version 00 defines, ignore whatever follows. Refusing the
+        // whole header instead would turn "this client is older than the
+        // caller" into a failed request, because the documented usage
+        // `?`-propagates the refusal.
+        let context =
+            TraceContext::parse("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-af00")
+                .expect("a later version is read as far as it is understood");
+
+        assert_eq!(context.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(context.span_id(), "00f067aa0ba902b7");
+        assert!(context.is_sampled());
+        // Sent on as the version this client actually speaks, not the one it
+        // was handed: claiming 01 would promise fields it did not carry.
+        assert_eq!(
+            context.header(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn version_zero_has_exactly_four_fields() {
+        // The other half of the rule: 00 defines four groups and no more, so a
+        // fifth is a malformed header rather than a newer one.
+        assert!(
+            TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-af00")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_truncated_header_says_which_field_is_missing() {
+        // Three groups, and the first is a version rather than a trace id —
+        // this is the four-part form cut short, not the version-less form the
+        // Go SDK sends. Read as the latter it would report a 32-digit trace id
+        // as "not 32 hex digits", which is the wrong field and a genuinely
+        // confusing thing to be told.
+        let refusal = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7")
+            .expect_err("the flags are not optional");
+
+        let reason = refusal.to_string();
+        assert!(reason.contains("flags"), "{reason}");
+        assert!(
+            !reason.contains("trace id"),
+            "the trace id in this header is perfectly well formed: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_tracestate_is_carried_beside_the_traceparent_untouched() {
+        // The standard pairs the two and asks a forwarder to pass the second
+        // on unmodified: it is where a vendor keeps its sampling decision or
+        // its correlation key, and this hop losing it costs the caller's own
+        // backend, not the cluster's.
+        let context =
+            TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .expect("parses")
+                .with_tracestate("vendora=t61rcWkgMzE,vendorb=x9");
+
+        assert_eq!(
+            context.tracestate(),
+            Some("vendora=t61rcWkgMzE,vendorb=x9"),
+            "not rewritten: this client has no vendor entry of its own to add"
+        );
+        // And it is not smuggled into the traceparent, which has no room for it.
+        assert_eq!(
+            context.header(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn a_context_without_a_tracestate_has_none() {
+        assert_eq!(TraceContext::new().tracestate(), None);
+        assert_eq!(
+            TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .expect("parses")
+                .tracestate(),
+            None
+        );
     }
 
     #[test]

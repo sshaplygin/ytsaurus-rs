@@ -312,10 +312,18 @@ traceparent is refused rather than sent: the proxy drops one it cannot parse
 without saying so, and the trace would then be quietly missing the part that
 mattered.
 
+A `tracestate` that arrived beside the header goes on too, via
+`with_tracestate()` — the standard pairs the two and asks a forwarder to pass
+the second on unmodified. The proxy ignores it; the caller's own backend is
+what reads it.
+
 That is the cluster's side. For this process's own side there is the `tracing`
 feature, off by default, which puts every attempt in a span carrying the
 command, the attempt number and the elapsed time, and turns the retry message
-into a `WARN` event instead of a line on stderr.
+into a `WARN` event. If nothing is subscribed the stderr line is printed after
+all: Cargo unifies features across the graph, so another crate can turn this on
+for a program that never asked, and a feature should not take away the only
+sign a launcher had that anything was retrying.
 
 A retry announces itself in whichever of the two forms is compiled — a launcher
 that pauses for fifteen seconds should say why — and in both it goes quiet

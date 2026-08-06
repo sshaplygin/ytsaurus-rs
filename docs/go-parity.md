@@ -108,7 +108,9 @@ doing if a user asks". **One did**, it became the first item of the pinned
 parity issue — a production deployment cannot be run blind — and it is built.
 The two halves stayed separate, which was the point of separating them:
 `TraceContext` and `Client::with_trace_context` emit the same `traceparent` the
-Go example's `ytotel.TraceFn` produces, with no dependency at all, while the
+Go example's `ytotel.TraceFn` produces, with no dependency at all — plus the
+`tracestate` the standard pairs with it, which the Go example does not carry —
+while the
 `tracing` feature that spans this client's own attempts is off by default and
 kept out of musl worker builds.
 
