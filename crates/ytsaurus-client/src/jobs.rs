@@ -60,7 +60,12 @@ pub(crate) fn parse_jobs(jobs: &YsonValue) -> Vec<JobInfo> {
     items.iter().filter_map(parse_job).collect()
 }
 
-fn parse_job(job: &YsonValue) -> Option<JobInfo> {
+/// Reads one job, from either `list_jobs` or `get_job`.
+///
+/// `get_job` answers the job document **unwrapped** — no `{jobs=[…]}` around it
+/// — and calls the id `job_id` where `list_jobs` calls it `id`. Both are read
+/// here, so one parser serves both commands.
+pub(crate) fn parse_job(job: &YsonValue) -> Option<JobInfo> {
     // `list_jobs` calls it `id`, `get_job` calls it `job_id`. Same value.
     let id = text(field(job, "id").or_else(|| field(job, "job_id"))?)?;
 
@@ -104,7 +109,7 @@ pub(crate) fn field<'a>(value: &'a YsonValue, key: &str) -> Option<&'a YsonValue
 
 /// A string field. YSON strings are byte strings, so this decodes lossily
 /// rather than refusing a name the cluster is happy with.
-fn text(value: &YsonValue) -> Option<String> {
+pub(crate) fn text(value: &YsonValue) -> Option<String> {
     match &value.node {
         YsonNode::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
         _ => None,
@@ -211,6 +216,29 @@ mod tests {
         // The cluster said one byte; the job's stderr was several hundred. The
         // client asks for stderr regardless, and this is why.
         assert_eq!(jobs[0].stderr_size, Some(1));
+    }
+
+    /// A real `get_job` answer, captured from the local cluster. It differs
+    /// from a `list_jobs` entry in two ways that matter: there is no
+    /// `{jobs=[…]}` around it, and the id is called `job_id`.
+    const GET_JOB: &str = include_str!("../tests/fixtures/get_job.yson");
+
+    #[test]
+    fn reads_a_single_job_captured_from_a_cluster() {
+        let job = parse_job(&parse(GET_JOB)).expect("the answer names a job");
+
+        assert_eq!(job.id, "c1b61a6-156b50eb-10384-1000001");
+        assert_eq!(job.state, "running");
+        assert_eq!(job.address.as_deref(), Some("localhost:24403"));
+        assert_eq!(
+            job.error, None,
+            "a job that has not failed has no error to report"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_names_no_job_is_not_a_job() {
+        assert!(parse_job(&parse(r#"{"state"="running"}"#)).is_none());
     }
 
     #[test]

@@ -52,6 +52,10 @@ fn plural(count: usize, noun: &str) -> String {
 }
 
 /// The kind of operation to start.
+///
+/// All nine the cluster registers. Five have a spec builder here; `merge`,
+/// `erase` and `remote_copy` gained one with this enum, and `join_reduce` did
+/// not — see its variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationType {
     /// A map operation.
@@ -64,6 +68,34 @@ pub enum OperationType {
     Sort,
     /// An operation with no input tables.
     Vanilla,
+    /// A merge of several tables into one. See [`MergeSpec`].
+    Merge,
+    /// Deletion of rows from one table. See [`EraseSpec`].
+    Erase,
+    /// A copy of a table from another cluster. See [`RemoteCopySpec`].
+    RemoteCopy,
+    /// A reduce that joins foreign tables — **the older spelling**.
+    ///
+    /// There is no `JoinReduceSpec`, and that is deliberate. The cluster still
+    /// registers the type, but the current documentation no longer lists it
+    /// among `start_operation`'s `operation_type` values, and describes the same
+    /// work as a [reduce with foreign
+    /// tables](https://ytsaurus.tech/docs/en/user-guide/data-processing/operations/reduce):
+    /// a `reduce` whose spec carries `join_by` and `enable_key_guarantee=%false`.
+    /// Build that with [`ReduceSpec::with_raw`]:
+    ///
+    /// ```
+    /// use ytsaurus_client::{ReduceSpec, yson_build};
+    ///
+    /// let spec = ReduceSpec::new("./j", ["//tmp/primary"], ["//tmp/out"], ["host"])
+    ///     .with_raw("join_by", yson_build::list([yson_build::string("host")]))
+    ///     .with_raw("enable_key_guarantee", yson_build::boolean(false));
+    /// ```
+    ///
+    /// The variant exists so a caller who *does* want the older type can name it
+    /// through [`Client::start_operation`](crate::Client::start_operation),
+    /// which is what the enum is for.
+    JoinReduce,
 }
 
 impl OperationType {
@@ -76,6 +108,10 @@ impl OperationType {
             OperationType::Reduce => "reduce",
             OperationType::Sort => "sort",
             OperationType::Vanilla => "vanilla",
+            OperationType::Merge => "merge",
+            OperationType::Erase => "erase",
+            OperationType::RemoteCopy => "remote_copy",
+            OperationType::JoinReduce => "join_reduce",
         }
     }
 }
@@ -861,6 +897,360 @@ impl SortSpec {
     }
 }
 
+/// How a merge combines its inputs.
+///
+/// Reference:
+/// <https://ytsaurus.tech/docs/en/user-guide/data-processing/operations/merge>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMode {
+    /// Rows in no particular order. The cluster's own default, and the cheapest.
+    Unordered,
+    /// Rows in the order of the input tables, each table's order preserved.
+    Ordered,
+    /// A sorted merge of sorted inputs, producing a sorted table.
+    ///
+    /// Needs `merge_by`, and the inputs must already be sorted by it.
+    Sorted,
+}
+
+impl MergeMode {
+    /// The wire name, as the spec's `mode` expects it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeMode::Unordered => "unordered",
+            MergeMode::Ordered => "ordered",
+            MergeMode::Sorted => "sorted",
+        }
+    }
+}
+
+/// A merge operation: several tables into one, with no user job.
+///
+/// What a sort does for order, a merge does for chunk layout — and in
+/// [`MergeMode::Sorted`] it is the cheap way to combine tables that are already
+/// sorted, because nothing has to be sorted again.
+///
+/// ```
+/// use ytsaurus_client::{MergeMode, MergeSpec};
+///
+/// let spec = MergeSpec::new(["//tmp/monday", "//tmp/tuesday"], "//tmp/week")
+///     .with_mode(MergeMode::Sorted)
+///     .with_merge_by(["host"]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct MergeSpec {
+    inputs: Vec<String>,
+    output: String,
+    mode: MergeMode,
+    merge_by: Vec<String>,
+    combine_chunks: Option<bool>,
+    force_transform: Option<bool>,
+    job_count: Option<i64>,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl MergeSpec {
+    /// Merges `inputs` into `output`, unordered.
+    #[must_use]
+    pub fn new<I>(inputs: I, output: impl Into<String>) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        Self {
+            inputs: inputs.into_iter().map(Into::into).collect(),
+            output: output.into(),
+            mode: MergeMode::Unordered,
+            merge_by: Vec::new(),
+            combine_chunks: None,
+            force_transform: None,
+            job_count: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Chooses how the inputs are combined.
+    #[must_use]
+    pub fn with_mode(mut self, mode: MergeMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// The columns a [`MergeMode::Sorted`] merge merges by.
+    ///
+    /// The output table comes back sorted by these.
+    #[must_use]
+    pub fn with_merge_by<K>(mut self, columns: K) -> Self
+    where
+        K: IntoIterator,
+        K::Item: Into<String>,
+    {
+        self.merge_by = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Asks the cluster to combine small chunks while it merges.
+    ///
+    /// This is most of why a merge is worth running on one table: a table
+    /// written in many small pieces reads faster afterwards.
+    #[must_use]
+    pub fn with_combine_chunks(mut self, combine: bool) -> Self {
+        self.combine_chunks = Some(combine);
+        self
+    }
+
+    /// Runs the jobs even when the merge could be done by moving chunks.
+    ///
+    /// A merge that has nothing to do normally just relinks chunks. Set this
+    /// when the point is the *rewrite* — a change of compression codec or
+    /// erasure coding, which only happens where rows are actually copied.
+    #[must_use]
+    pub fn with_force_transform(mut self, force: bool) -> Self {
+        self.force_transform = Some(force);
+        self
+    }
+
+    /// Asks for a particular number of jobs.
+    ///
+    /// Takes precedence over `data_size_per_job`, which the cluster otherwise
+    /// uses to decide.
+    #[must_use]
+    pub fn with_job_count(mut self, count: i64) -> Self {
+        self.job_count = Some(count);
+        self
+    }
+
+    /// Whether this spec asks for a sorted merge without saying by what.
+    ///
+    /// [`Client::start_merge`](crate::Client::start_merge) refuses one, for the
+    /// reason [`VanillaSpec::duplicate_task`] is checked before the request goes
+    /// out: the cluster's own refusal arrives later and says less.
+    #[must_use]
+    pub fn needs_merge_by(&self) -> bool {
+        self.mode == MergeMode::Sorted && self.merge_by.is_empty()
+    }
+
+    /// Sets any spec field this builder does not model — `data_size_per_job`,
+    /// `schema_inference_mode` and the rest.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    /// Renders the spec.
+    #[must_use]
+    pub fn to_yson(&self) -> YsonValue {
+        let mut spec = map([
+            ("input_table_paths", list(self.inputs.iter().map(string))),
+            // Singular, as in a sort: a merge writes one table.
+            ("output_table_path", string(&self.output)),
+            ("mode", string(self.mode.as_str())),
+        ]);
+
+        if !self.merge_by.is_empty() {
+            insert(
+                &mut spec,
+                "merge_by",
+                list(self.merge_by.iter().map(string)),
+            );
+        }
+        if let Some(combine) = self.combine_chunks {
+            insert(&mut spec, "combine_chunks", boolean(combine));
+        }
+        if let Some(force) = self.force_transform {
+            insert(&mut spec, "force_transform", boolean(force));
+        }
+        if let Some(count) = self.job_count {
+            insert(&mut spec, "job_count", int(count));
+        }
+
+        for (key, value) in &self.extra {
+            insert(&mut spec, key, value.clone());
+        }
+        spec
+    }
+}
+
+/// An erase operation: rows out of one table, in place.
+///
+/// **The rows to delete are named by the path**, as a row range —
+/// `//tmp/log[#10:#100]` — and a path with no range erases every row while
+/// leaving the table and its schema where they are.
+///
+/// ```
+/// use ytsaurus_client::EraseSpec;
+///
+/// let all = EraseSpec::new("//tmp/log");
+/// let first_ten = EraseSpec::new("//tmp/log[#0:#10]");
+/// ```
+#[derive(Debug, Clone)]
+pub struct EraseSpec {
+    table: String,
+    combine_chunks: Option<bool>,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl EraseSpec {
+    /// Erases the rows `table` names.
+    ///
+    /// Ranges are written into the path itself: [`TablePath`](crate::TablePath)
+    /// models the write-side attributes, not read-side ranges, so this takes the
+    /// path as text.
+    #[must_use]
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            combine_chunks: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Asks the cluster to combine what is left into larger chunks.
+    #[must_use]
+    pub fn with_combine_chunks(mut self, combine: bool) -> Self {
+        self.combine_chunks = Some(combine);
+        self
+    }
+
+    /// Sets any spec field this builder does not model.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    /// Renders the spec.
+    #[must_use]
+    pub fn to_yson(&self) -> YsonValue {
+        // `table_path`, not `input_table_paths`: erase reads and writes the same
+        // table, and names it once.
+        let mut spec = map([("table_path", string(&self.table))]);
+
+        if let Some(combine) = self.combine_chunks {
+            insert(&mut spec, "combine_chunks", boolean(combine));
+        }
+        for (key, value) in &self.extra {
+            insert(&mut spec, key, value.clone());
+        }
+        spec
+    }
+}
+
+/// A remote-copy operation: a table from another cluster onto this one.
+///
+/// The only operation whose input lives somewhere else. `cluster_name` is the
+/// **source**, as this cluster's configuration names it; the operation runs
+/// here, and the output path is here too.
+///
+/// ```
+/// use ytsaurus_client::RemoteCopySpec;
+///
+/// let spec = RemoteCopySpec::new("hahn", ["//tmp/theirs"], "//tmp/ours")
+///     .with_copy_attributes(true);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RemoteCopySpec {
+    cluster_name: String,
+    inputs: Vec<String>,
+    output: String,
+    network_name: Option<String>,
+    copy_attributes: Option<bool>,
+    attribute_keys: Vec<String>,
+    extra: Vec<(String, YsonValue)>,
+}
+
+impl RemoteCopySpec {
+    /// Copies `inputs` from the cluster `cluster_name` into `output` here.
+    #[must_use]
+    pub fn new<I>(cluster_name: impl Into<String>, inputs: I, output: impl Into<String>) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        Self {
+            cluster_name: cluster_name.into(),
+            inputs: inputs.into_iter().map(Into::into).collect(),
+            output: output.into(),
+            network_name: None,
+            copy_attributes: None,
+            attribute_keys: Vec::new(),
+            extra: Vec::new(),
+        }
+    }
+
+    /// Uses a named network to reach the source cluster.
+    ///
+    /// Installations that separate networks need this; one that does not
+    /// answers fine without it.
+    #[must_use]
+    pub fn with_network_name(mut self, network: impl Into<String>) -> Self {
+        self.network_name = Some(network.into());
+        self
+    }
+
+    /// Copies the source table's attributes along with its rows.
+    ///
+    /// Off in the cluster's default, so a copy otherwise arrives with the rows
+    /// and none of what was said about them.
+    #[must_use]
+    pub fn with_copy_attributes(mut self, copy: bool) -> Self {
+        self.copy_attributes = Some(copy);
+        self
+    }
+
+    /// Copies only these attributes, rather than all of them.
+    ///
+    /// Only meaningful with [`RemoteCopySpec::with_copy_attributes`].
+    #[must_use]
+    pub fn with_attribute_keys<K>(mut self, keys: K) -> Self
+    where
+        K: IntoIterator,
+        K::Item: Into<String>,
+    {
+        self.attribute_keys = keys.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets any spec field this builder does not model — `cluster_connection`,
+    /// `schema_inference_mode`, `allow_unfrozen_input_tables`.
+    #[must_use]
+    pub fn with_raw(mut self, key: impl Into<String>, value: YsonValue) -> Self {
+        self.extra.push((key.into(), value));
+        self
+    }
+
+    /// Renders the spec.
+    #[must_use]
+    pub fn to_yson(&self) -> YsonValue {
+        let mut spec = map([
+            ("cluster_name", string(&self.cluster_name)),
+            ("input_table_paths", list(self.inputs.iter().map(string))),
+            ("output_table_path", string(&self.output)),
+        ]);
+
+        if let Some(network) = &self.network_name {
+            insert(&mut spec, "network_name", string(network));
+        }
+        if let Some(copy) = self.copy_attributes {
+            insert(&mut spec, "copy_attributes", boolean(copy));
+        }
+        if !self.attribute_keys.is_empty() {
+            insert(
+                &mut spec,
+                "attribute_keys",
+                list(self.attribute_keys.iter().map(string)),
+            );
+        }
+
+        for (key, value) in &self.extra {
+            insert(&mut spec, key, value.clone());
+        }
+        spec
+    }
+}
+
 /// One task of a vanilla operation: a group of identical jobs.
 ///
 /// Tasks are what makes a vanilla operation a distributed process rather than
@@ -1461,6 +1851,9 @@ mod tests {
         assert!(out.contains("max_failed_job_count=3"), "{out}");
     }
 
+    /// All nine the cluster registers. The four at the bottom were unreachable
+    /// until this enum could name them — not even through a hand-built spec,
+    /// because the type is a parameter of the command and not part of the spec.
     #[test]
     fn operation_type_wire_names() {
         assert_eq!(OperationType::Map.as_str(), "map");
@@ -1468,6 +1861,134 @@ mod tests {
         assert_eq!(OperationType::Reduce.as_str(), "reduce");
         assert_eq!(OperationType::Sort.as_str(), "sort");
         assert_eq!(OperationType::Vanilla.as_str(), "vanilla");
+        assert_eq!(OperationType::Merge.as_str(), "merge");
+        assert_eq!(OperationType::Erase.as_str(), "erase");
+        assert_eq!(OperationType::RemoteCopy.as_str(), "remote_copy");
+        assert_eq!(OperationType::JoinReduce.as_str(), "join_reduce");
+    }
+
+    #[test]
+    fn merge_mode_wire_names() {
+        assert_eq!(MergeMode::Unordered.as_str(), "unordered");
+        assert_eq!(MergeMode::Ordered.as_str(), "ordered");
+        assert_eq!(MergeMode::Sorted.as_str(), "sorted");
+    }
+
+    /// A merge writes **one** table and names it `output_table_path`, the
+    /// singular spelling a sort uses — the plural is rejected.
+    #[test]
+    fn a_merge_spec_names_one_output() {
+        let out = render(&MergeSpec::new(["//tmp/a", "//tmp/b"], "//tmp/all").to_yson());
+
+        assert!(
+            out.contains(r#"input_table_paths=["//tmp/a";"//tmp/b"]"#),
+            "{out}"
+        );
+        assert!(out.contains(r#"output_table_path="//tmp/all""#), "{out}");
+        assert!(
+            out.contains("mode=unordered"),
+            "the cheapest mode is the default, and it is sent rather than \
+             assumed: {out}"
+        );
+        assert!(!out.contains("merge_by"), "{out}");
+    }
+
+    #[test]
+    fn a_sorted_merge_carries_its_key() {
+        let spec = MergeSpec::new(["//tmp/a"], "//tmp/all")
+            .with_mode(MergeMode::Sorted)
+            .with_merge_by(["host", "day"])
+            .with_combine_chunks(true)
+            .with_job_count(4);
+        let out = render(&spec.to_yson());
+
+        assert!(out.contains("mode=sorted"), "{out}");
+        // Unquoted: the text writer drops the quotes around a string that
+        // looks like an identifier, and both spellings are valid YSON.
+        assert!(out.contains("merge_by=[host;day]"), "{out}");
+        assert!(out.contains("combine_chunks=%true"), "{out}");
+        assert!(out.contains("job_count=4"), "{out}");
+        assert!(!spec.needs_merge_by());
+    }
+
+    /// The cluster refuses this too, later and in its own words.
+    /// `Client::start_merge` reads this and says which key is missing.
+    #[test]
+    fn a_sorted_merge_without_a_key_is_recognisable() {
+        assert!(
+            MergeSpec::new(["//tmp/a"], "//tmp/all")
+                .with_mode(MergeMode::Sorted)
+                .needs_merge_by()
+        );
+        assert!(
+            !MergeSpec::new(["//tmp/a"], "//tmp/all").needs_merge_by(),
+            "an unordered merge has nothing to merge by"
+        );
+    }
+
+    /// Erase names one table with `table_path` — it reads and writes the same
+    /// one — and the rows to delete are a range **on the path**.
+    #[test]
+    fn an_erase_spec_names_the_table_once() {
+        let out = render(&EraseSpec::new("//tmp/log[#0:#10]").to_yson());
+
+        assert_eq!(out, r#"{table_path="//tmp/log[#0:#10]"}"#);
+    }
+
+    #[test]
+    fn an_erase_spec_can_ask_for_compaction() {
+        let out = render(
+            &EraseSpec::new("//tmp/log")
+                .with_combine_chunks(true)
+                .to_yson(),
+        );
+        assert!(out.contains("combine_chunks=%true"), "{out}");
+    }
+
+    #[test]
+    fn a_remote_copy_spec_names_the_source_cluster() {
+        let spec = RemoteCopySpec::new("hahn", ["//tmp/theirs"], "//tmp/ours")
+            .with_network_name("fastbone")
+            .with_copy_attributes(true)
+            .with_attribute_keys(["expiration_time"]);
+        let out = render(&spec.to_yson());
+
+        assert!(out.contains("cluster_name=hahn"), "{out}");
+        assert!(
+            out.contains(r#"input_table_paths=["//tmp/theirs"]"#),
+            "{out}"
+        );
+        assert!(out.contains(r#"output_table_path="//tmp/ours""#), "{out}");
+        assert!(out.contains("network_name=fastbone"), "{out}");
+        assert!(out.contains("copy_attributes=%true"), "{out}");
+        assert!(out.contains("attribute_keys=[expiration_time]"), "{out}");
+    }
+
+    #[test]
+    fn the_new_specs_take_raw_fields_too() {
+        let merge = render(
+            &MergeSpec::new(["//i"], "//o")
+                .with_raw("schema_inference_mode", string("from_output"))
+                .to_yson(),
+        );
+        assert!(
+            merge.contains("schema_inference_mode=from_output"),
+            "{merge}"
+        );
+
+        let erase = render(
+            &EraseSpec::new("//t")
+                .with_raw("schema_inference_mode", string("auto"))
+                .to_yson(),
+        );
+        assert!(erase.contains("schema_inference_mode=auto"), "{erase}");
+
+        let copy = render(
+            &RemoteCopySpec::new("c", ["//i"], "//o")
+                .with_raw("allow_unfrozen_input_tables", boolean(true))
+                .to_yson(),
+        );
+        assert!(copy.contains("allow_unfrozen_input_tables=%true"), "{copy}");
     }
 
     /// The mirror of the map-reduce trap: a reduce has one job type, so its

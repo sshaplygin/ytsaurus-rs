@@ -2,6 +2,75 @@
 
 ## Unreleased
 
+### An operation is no longer a string and four commands
+
+- **Added** the rest of the operation lifecycle — `suspend_operation`,
+  `resume_operation`, `complete_operation`, `update_operation_parameters`,
+  `list_operations`, `list_operation_events`, `get_operation`,
+  `get_operation_by_alias`, `operation_suspended`, `get_job` and
+  `get_job_input` — and `Operation`, a handle over a client and an id, with the
+  same commands on it.
+
+  **Both shapes, deliberately.** The flat `Client` methods are the primitives
+  and nothing was taken away from them; the handle exists because an operation
+  is a thing to pass around and, more to the point, a thing to *reattach* to.
+  `Client::attach_operation(id)` is that door — C++'s `AttachOperation`, Go's
+  `Track(id)` — and it is what a supervised pipeline needs after a restart: the
+  id is the durable name, so a process that did not start an operation can
+  still pause, reprice, wait for or finish it. `start_map` and its siblings
+  still return a `String`, so no existing call site changed.
+
+  Unlike `Transaction`, **dropping an `Operation` does nothing**. A transaction
+  is a scope and loses its work when the handle goes; an operation is meant to
+  outlive the process that started it, which is the whole point.
+
+  Four narrow readers — `operation_state`, `job_statistics`,
+  `operation_result_error` and the private `operation_error` — were each
+  building the same `get_operation` request. They are now one attribute of the
+  general one.
+
+- **Measured against a cluster**, because none of it is guessable from the
+  command reference:
+
+  - **suspension is not a state.** A suspended operation still reports
+    `running`; `operation_suspended` reads the attribute that actually says so.
+  - **suspend is idempotent and resume is not** — a second suspend is accepted,
+    a resume of something that is not suspended is refused with code 201. So
+    suspend is the one mutating scheduler command here that is retried, on its
+    own idempotency rather than under a mutation ID the master's cache would not
+    honour. An abort *causes* the scheduler to let go, so its retry always
+    fails; a repeated suspend just says the same thing twice.
+  - **complete is not idempotent**, exactly as abort is not.
+  - `update_operation_parameters` carries its parameters in the header, not a
+    body, whatever the command reference says — and answers with an empty body.
+    It assigns rather than increments, so it is repeated freely; an update that
+    would change nothing is refused here, because the cluster answers 200 and
+    does nothing.
+  - an alias needs `include_runtime=%true` or the cluster refuses to resolve it.
+    An alias could be **set** through `with_raw` before this and never found
+    again.
+  - `get_operation` with no attributes named asks for the whole document, which
+    was **119 KB** for a one-job vanilla operation. `attributes=[]` asks for
+    nothing at all.
+
+- **Added** the four operation types the enum could not name — `Merge`,
+  `Erase`, `RemoteCopy` and `JoinReduce` — with `MergeSpec`, `EraseSpec` and
+  `RemoteCopySpec` beside them, and `start_merge`, `start_erase` and
+  `start_remote_copy`. A sorted merge with no `merge_by` is refused before the
+  request goes out, in the style of the duplicate-vanilla-task check.
+
+  **`join_reduce` gets no spec builder**, and that is the answer rather than an
+  omission: the current documentation no longer lists it among
+  `start_operation`'s types and describes the same work as a reduce with
+  `join_by` and `enable_key_guarantee=%false`, which `ReduceSpec::with_raw`
+  builds today. The variant is there so the older type can still be named.
+
+- **Added** the `lifecycle` example, which runs all of the above against a
+  cluster and checks the answers: it starts a long vanilla operation under an
+  alias, attaches to it, finds it by that alias, pauses and resumes it, reprices
+  it, lists it back, reads one of its jobs by id, finishes it early, and then
+  merges two sorted tables and erases a row range from the result.
+
 ### The cluster end-to-end test no longer needs Python
 
 - **Added** the `e2e` example, which runs all three checks

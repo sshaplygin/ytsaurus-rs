@@ -30,6 +30,18 @@ pub fn int(value: i64) -> YsonValue {
     }
 }
 
+/// A YSON double.
+///
+/// The type a scheduler weight has: `update_operation_parameters` takes
+/// `weight=2.5`, and an int64 in its place is a different YSON value.
+#[must_use]
+pub fn double(value: f64) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::Double(value),
+    }
+}
+
 /// A YSON boolean.
 #[must_use]
 pub fn boolean(value: bool) -> YsonValue {

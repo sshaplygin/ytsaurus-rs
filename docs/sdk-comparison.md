@@ -102,20 +102,31 @@ Skiff is parked here pending the benchmark in
 
 | | C++ | Go | Rust |
 | --- | --- | --- | --- |
-| Operation types | **9** | 9 | **5** — map, reduce, sort, map-reduce, vanilla |
-| What you get back | `IOperationPtr`, 12+ methods | thin `Operation` — `ID`, `Wait` | **a `String` id** |
-| Suspend / resume / complete | yes | yes | **no** |
-| Update parameters while running | yes | yes | no |
-| List operations, look up by alias | yes | yes | no |
-| Reattach to another process's operation | `AttachOperation` | `Track(id)` | no object to attach to |
+| Operation types | 9 | 9 | **9** — spec builders for 8 of them |
+| What you get back | `IOperationPtr`, 12+ methods | thin `Operation` — `ID`, `Wait` | **a `String` id, and an `Operation` handle over it** |
+| Suspend / resume / complete | yes | yes | **yes** — and which of them are idempotent is measured |
+| Update parameters while running | yes | yes | **yes** |
+| List operations, look up by alias | yes | yes | **yes** |
+| Reattach to another process's operation | `AttachOperation` | `Track(id)` | **`attach_operation(id)`** |
 | Abort | yes | yes | **yes** — and documented as not idempotent |
+| One job by id, and its input | yes | yes | **yes** — `get_job`, `get_job_input` |
 | How job code reaches the node | `Y_SAVELOAD_JOB` | `gob` + `SecureVault` | **argv and environment** |
 | Binary upload | automatic | automatic, md5-cached | manual, md5-cached |
 | Failure explains itself with stderr | yes | only when the message matches | **always, up to 3 jobs** |
 | Custom job statistics | yes | **no** | **yes** |
 
-The Rust `OperationType` enum has no variant for merge, erase, remote-copy or
-join-reduce, so those four cannot be named even through the raw-spec door.
+`OperationType` now names all nine, `MergeSpec`, `EraseSpec` and
+`RemoteCopySpec` join the five that had builders, and `join_reduce` deliberately
+has none: the current documentation no longer lists it under `start_operation`
+and describes the same work as a reduce with `join_by` and
+`enable_key_guarantee=%false`, which `ReduceSpec::with_raw` builds.
+
+Where this now goes further than either official client is in **saying which of
+these commands may be repeated, and why**. Suspend is retried and resume is not,
+because a second suspend is accepted and a second resume is refused with code
+201; complete and abort are sent once, because the second is answered `No such
+operation`. Each of those was measured against a cluster rather than assumed
+from the fact that all four are "mutating and light".
 
 ## Transactions and locks
 
@@ -167,8 +178,10 @@ Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues) — logging
-and tracing first, then the operation object and its lifecycle, `read_file`,
-batch requests, read-side column and range selection, and transaction `Detach`.
+and tracing first, then `read_file`, batch requests, read-side column and range
+selection, and transaction `Detach`. *(The operation object and its lifecycle
+were second on that list and are now built; the table above is what they came
+to.)*
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,

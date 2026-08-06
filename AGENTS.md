@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 427 tests
+cargo test --workspace            # 469 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -283,9 +283,10 @@ per command. Cluster facts:
   not to `/api/v4/`. `get_supported_features` is the real "no parameters,
   small answer" command — `Null` in, `Structured` out, non-volatile,
   non-heavy — and is what the doctest and the `raw` example use.
-- `list_operations`, `check_permission`, `read_file` and
-  `get_supported_features` are all registered and none is modelled here; they
-  are the natural first users of the raw door.
+- `check_permission`, `read_file` and `get_supported_features` are all
+  registered and none is modelled here; they are the natural first users of the
+  raw door. *(`list_operations` was on this list until the operation lifecycle
+  landed; it has a method now.)*
 - **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
   envelope is keyed by what the command returns, the same trap that made
   `exists` read the wrong key for two releases. Captured from a local cluster:
@@ -315,7 +316,7 @@ per command. Cluster facts:
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
 
-### Stopping an operation
+### The operation lifecycle
 
 - `abort_operation` takes `operation_id` and an optional `abort_message`, and
   answers `{}`. The message is folded into the operation's **error document**,
@@ -332,8 +333,61 @@ per command. Cluster facts:
   turns an abort that worked into an error the caller believes. `Repeatable::Never`.
 - The call is acknowledged in ~350 ms and the operation is **already `aborted`**
   by then. The `aborting` state exists but the request outlives it.
-- `suspend_operation`, `resume_operation`, `complete_operation` and
-  `update_operation_parameters` exist in the API and are not modelled.
+
+#### Pausing, repricing and finishing one — all measured
+
+- **Suspension is not a state.** A suspended operation still reports `running`;
+  the cluster keeps it in a separate `suspended` attribute. A poll loop that
+  watches the state alone will never learn that an operation is paused, which is
+  why `Client::operation_suspended` exists beside `operation_state`.
+- **`suspend_operation` is idempotent, `resume_operation` is not.** Suspending a
+  suspended operation answers `{}`; resuming one that is not suspended is
+  refused with code 201, `Operation is in "running" state`. So suspend is the
+  one mutating scheduler command here that is **retried** — and on its own
+  idempotency, not under a mutation ID, which the master's cache would not cover
+  anyway. The distinction from abort is what makes that safe: an abort *causes*
+  the scheduler to let go, so its retry is guaranteed to fail, where a repeated
+  suspend simply says the same thing twice.
+- **`complete_operation` is not idempotent** — the second is answered code 200,
+  `No such operation`, exactly as a second abort is. It ends the operation as
+  `completed` rather than `aborted`, so its output is published and a waiting
+  launcher is told the work succeeded.
+- Once the scheduler has let go, *every* one of these answers `No such
+  operation`. The rule is "the scheduler still has it", not "it has not
+  finished".
+- **`update_operation_parameters` takes its parameters in the header**, not in a
+  body: the cluster's registry declares its input as `null`, though the command
+  reference says "structured". It answers with **Content-Length: 0** — an empty
+  body, where its neighbours send `{}`. It **assigns**, so the same update twice
+  is the same as once; the client repeats it freely on that basis.
+- A top-level `{weight=2.5}` is **spread into every pool tree**, landing at
+  `runtime_parameters/scheduling_options_per_pool_tree/<tree>/weight`. An empty
+  `parameters={}` is accepted with 200 and changes nothing, so the client
+  refuses one rather than reporting success for a no-op.
+
+#### Finding an operation again
+
+- **`get_operation` accepts `operation_alias`** and refuses it without
+  `include_runtime=%true`: *"Operation alias cannot be resolved without using
+  runtime information"*. With it, a live alias resolves; a stale one falls
+  through to `//sys/operations_archive/operation_aliases`, which a local cluster
+  does not have. An alias is a spec field and must start with `*`.
+- **`attributes=[]` asks for nothing** and is answered `{}`. Leaving the
+  parameter out is what asks for everything — and everything is large: the full
+  document for a one-job vanilla operation measured **119 KB**, mostly the
+  resolved spec and the progress tree.
+- **`list_operations` answers a flat multi-key document**, not the one-key
+  envelope: `{operations=[…]; incomplete=%false; pool_tree_counts={}; …;
+  failed_jobs_count=0}`. `progress` still carries `job_statistics` beside the
+  newer `job_statistics_v2`, so the statistics readers are unaffected.
+- **`list_operation_events` answers a bare list**, with no envelope at all — the
+  same surprise the file-cache commands hold — and it is **empty on a cluster
+  with no operations archive**, which is what a local one is.
+- **`get_job` answers the job document unwrapped** and calls the id `job_id`,
+  where `list_jobs` wraps in `{jobs=[…]}` and calls it `id`. One parser reads
+  both.
+- **`get_job_input` never answers for a vanilla job**: 30 s, zero bytes. A
+  vanilla operation has no input tables, and the cluster does not say so.
 
 ### Appending to a table
 
