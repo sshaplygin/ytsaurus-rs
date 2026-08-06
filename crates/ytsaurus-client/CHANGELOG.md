@@ -6,28 +6,68 @@
 
 - **Fixed** a credential-carrying request being redirected and arriving
   unauthenticated. A control proxy does not refuse a heavy *read*: it answers
-  `307 Temporary Redirect` naming a data proxy on **another host**, and `ureq`
-  drops the `Authorization` header when it follows one — its default is
-  `RedirectAuthHeaders::Never`. The read then arrived without a token and the
-  cluster answered `cluster error 111: Client is missing credentials`, which
-  sent the user to check their token, their token file and their permissions.
-  None of them was at fault.
+  `307 Temporary Redirect` naming a data proxy on **another host** — the
+  [HTTP proxy reference][return-codes] gives that row as *"Redirecting heavy
+  queries from light to heavy proxies"* — and `ureq` drops the `Authorization`
+  header when it follows one; its default is `RedirectAuthHeaders::Never`. The
+  read then arrived without a token and the cluster answered `cluster error
+  111: Client is missing credentials`, which sent the user to check their
+  token, their token file and their permissions. None of them was at fault.
 
-  A transport carrying a token now follows no redirect at all and fails with
-  **`ClientError::Redirected`**, naming the status and where it pointed. The
-  alternative — re-attaching the credentials and going — hands a bearer token
-  to whichever host answered, which on a balanced installation is a host the
-  caller never chose and cannot see; a `Location` header is not a reason to
-  trust someone with a credential. The deliberate route to a data proxy is
-  `Client::heavy_proxy`, and the error says so.
+  A request whose redirect **changes origin** — scheme, host or port — now
+  fails with **`ClientError::Redirected`** when it carries credentials, naming
+  the status and where it pointed. The alternative, re-attaching the
+  credentials and going, would follow an unsolicited instruction that arrived
+  mid-flight, on a request addressed somewhere else. Asking the cluster for a
+  data proxy is the deliberate route to the same place, `Client::heavy_proxy`,
+  and the error says so — but only to a command that could use one. A `create`
+  that met a balancer's `301` is not told to go and find a heavy proxy.
 
-  A transport with **no** token still follows redirects: it has nothing to
-  lose, and the rule here is about credentials rather than about redirects.
+  The error stops short of telling anyone their token is good: a gateway in
+  front of the cluster may answer an expired token with a redirect of its own,
+  so it reports only what this client is certain of — the credentials were not
+  sent to the host that answered.
+
+  A redirect that **stays on the same origin** is followed, token and all.
+  Nothing new learns the credential by it, and a balancer canonicalising its
+  own host would otherwise break every command against that installation. The
+  `Location` is resolved against the address the request went to
+  ([RFC 3986 §4.2][rfc3986]), so `Location: /api/v4/exists` is placed on the
+  host that sent it rather than reported as a path with no host in it.
 
   `redirect_auth_headers(RedirectAuthHeaders::SameHost)` is **not** the fix and
   the source says why where someone would reach for it: the redirect is
   deliberately cross-host, which is exactly the case that setting does not
   cover.
+
+- **Changed** a redirected request that carries a **body** now fails, with or
+  without a token. This closes a silent data loss that predates the fix above:
+  a redirect rewrites a `POST` or `PUT` into a `GET` and drops the body, the
+  cluster answers that empty request on its own terms, and `write_table`
+  returned `Ok(())` having written no rows at all. A write that quietly wrote
+  nothing is worse than one that failed. Callers that relied on a redirected
+  write appearing to succeed — there is no correct such caller — now see
+  `ClientError::Redirected { refusal: RedirectRefusal::Body, .. }`.
+
+- **Added** `RedirectRefusal`, the reason a redirect was refused:
+  `Credentials`, `Body` or `TooMany`. It is a field on
+  `ClientError::Redirected`, and it renders the clause the message carries.
+
+  `ureq` now follows **no** redirect for any transport (`max_redirects(0)`) and
+  this client follows them itself, because the answer turns on the credentials,
+  the origin and the body at once, and no combination of `max_redirects` and
+  `redirect_auth_headers` expresses that. A chain longer than ten hops is a
+  loop rather than a route, and is refused as one.
+
+- **Breaking** `ClientError` is now `#[non_exhaustive]`. A `match` over it must
+  carry a `_` arm. The ways a cluster can refuse are the cluster's to add and
+  not this crate's to freeze — every release so far has added one — so the
+  attribute goes on while the release is source-breaking anyway rather than
+  after. Naming a variant, constructing one and destructuring one are
+  unaffected.
+
+[return-codes]: https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes
+[rfc3986]: https://www.rfc-editor.org/rfc/rfc3986#section-4.2
 
 ### An operation is no longer a string and four commands
 

@@ -137,7 +137,7 @@ mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
 pub mod yson_build;
 
-pub use crate::error::{ClientError, Result};
+pub use crate::error::{ClientError, RedirectRefusal, Result};
 pub use crate::http::Method;
 pub use crate::jobs::{JobFailure, JobInfo};
 pub use crate::lock::{Lock, LockMode};

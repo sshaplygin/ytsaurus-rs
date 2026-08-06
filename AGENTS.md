@@ -331,17 +331,34 @@ per command. Cluster facts:
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
 - **A heavy read through a control proxy is answered with a cross-host `307`**
-  naming a data proxy, and `ureq` drops the `Authorization` header when it
-  follows one (`RedirectAuthHeaders::Never`). The request then arrives
-  unauthenticated and the cluster blames the token: `cluster error 111: Client
-  is missing credentials`, about a token that is fine. So a transport carrying
-  one **follows no redirect at all** — `max_redirects(0)` — and fails with
-  `ClientError::Redirected`, naming where it was pointed. Re-attaching the
-  token instead would hand a bearer credential to a host the caller never
-  chose. **`redirect_auth_headers(RedirectAuthHeaders::SameHost)` is not the
-  fix**: the redirect is deliberately cross-host, which is precisely what that
-  setting does not cover. A transport with no token keeps following redirects —
-  it has nothing to lose. Reproduced offline in
+  naming a data proxy. The
+  [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)
+  gives the row outright — *"307 | Redirecting heavy queries from light to
+  heavy proxies"* — so this is documented routing rather than a balancer's
+  quirk. `ureq` drops the `Authorization` header when it follows one
+  (`RedirectAuthHeaders::Never`). The request then arrives unauthenticated and
+  the cluster blames the token: `cluster error 111: Client is missing
+  credentials`, about a token that is fine.
+  **`redirect_auth_headers(RedirectAuthHeaders::SameHost)` is not the fix**:
+  the redirect is deliberately cross-host, which is precisely what that setting
+  does not cover.
+- **`ureq` therefore follows nothing — `max_redirects(0)` for every transport —
+  and the client follows redirects itself**, because the answer turns on three
+  things no combination of `ureq` settings expresses:
+  - a redirect that **changes origin** (scheme, host or port) is refused when
+    the request carries credentials, with `ClientError::Redirected`, naming
+    where it pointed. One that stays on the same origin is followed, token and
+    all: nothing new learns it, and refusing would break every command against
+    a balancer that canonicalises its own host.
+  - a redirect on a request with a **body** is refused whatever it carries.
+    A redirect rewrites a `POST`/`PUT` into a `GET` and drops the body, so a
+    `write_table` came back `Ok(())` having written no rows. That costs data
+    rather than a credential, so it does not wait for a token to be present.
+  - a chain longer than `MAX_REDIRECTS` is a loop, not a route.
+
+  `Location` is resolved against the address the request went to (RFC 3986
+  §4.2), so a relative one still names a host in the error and in the origin
+  comparison. Reproduced offline in
   `crates/ytsaurus-client/tests/redirect_credentials.rs`; a local cluster runs
   one proxy and redirects nothing.
 

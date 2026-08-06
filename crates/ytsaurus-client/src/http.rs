@@ -34,16 +34,45 @@ use ureq::http::HeaderMap;
 use ureq::{AsSendBody, SendBody};
 use ytsaurus_yson::{YsonFormat, YsonValue, to_string};
 
-use crate::error::{ClientError, Result, truncate};
+use crate::error::{ClientError, RedirectRefusal, Result, truncate};
 use crate::retry::{MutationId, Repeatable, RetryPolicy};
 use crate::yson_build::{boolean, insert, string};
 
 const HEADER_FORMAT: &str = "X-YT-Header-Format";
 const PARAMETERS: &str = "X-YT-Parameters";
 const ERROR: &str = "X-YT-Error";
-/// Where a redirect points. Read rather than followed — see
-/// [`Transport::redirect_refused`].
+/// Where a redirect points. Read by this client rather than by `ureq` — see
+/// [`Transport::redirect`].
 const LOCATION: &str = "Location";
+/// How many redirects one request may follow before the chain is called a loop.
+///
+/// `ureq`'s own default, kept so that turning the following over to this client
+/// changed the policy and not the numbers.
+const MAX_REDIRECTS: usize = 10;
+
+/// The commands that carry a data stream, and so belong on a heavy proxy.
+///
+/// The
+/// [command reference](https://ytsaurus.tech/docs/en/api/commands) draws the
+/// line for us — *"light commands only transmit command parameters within a
+/// query, but heavy commands write or read the data stream"* — and marks each
+/// of `read_table`, `write_table`, `read_file`, `write_file` and
+/// `read_blob_table` **Heavy**. `get_job_input` is here on the same definition
+/// rather than on a row of its own: its answer *is* the data stream, which is
+/// why this crate reads it through [`Transport::open`].
+///
+/// Used for one thing only — whether a refused redirect is told to go to a
+/// heavy proxy. A command sent through
+/// [`Client::raw_command`](crate::Client::raw_command) that is heavy and not
+/// listed here loses the advice, not the refusal.
+const HEAVY: &[&str] = &[
+    "read_table",
+    "write_table",
+    "read_file",
+    "write_file",
+    "read_blob_table",
+    "get_job_input",
+];
 /// The W3C trace context, in the spelling the proxy parses. See
 /// [`TraceContext`](crate::TraceContext).
 const TRACEPARENT: &str = "traceparent";
@@ -160,10 +189,7 @@ impl Transport {
         };
 
         let mut transport = Self {
-            // A transport that carries a token does not follow redirects; one
-            // that carries none has nothing to lose by following them. See
-            // [`Transport::redirect_refused`].
-            agent: build_agent(timeout, token.is_none()),
+            agent: build_agent(timeout),
             base,
             token,
             retries,
@@ -183,11 +209,11 @@ impl Transport {
 
     pub(crate) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
-        // The redirect policy is decided by the token, not by the timeout, and
-        // it has to be carried over: this is the one place the agent is built
-        // twice, and so the one place the policy could be dropped by a caller
-        // doing nothing more suspicious than `with_timeout`.
-        self.agent = build_agent(timeout, self.token.is_none());
+        // Through `build_agent` rather than by editing the config in place:
+        // this is the one place the agent is built twice, and so the one place
+        // the redirect policy could be dropped by a caller doing nothing more
+        // suspicious than `with_timeout`.
+        self.agent = build_agent(timeout);
     }
 
     pub(crate) fn set_transaction(&mut self, id: Option<String>) {
@@ -457,22 +483,36 @@ impl Transport {
             return Err(error);
         }
 
-        let url = format!("{}{path}", self.base);
+        let first = format!("{}{path}", self.base);
 
         crate::retry::run(self.retries, Repeatable::Freely, what, |_| {
-            let mut response = with_headers!(self.agent.get(&url), &self.caller)
-                .call()
-                .map_err(|e| ClientError::Transport {
-                    command: what.to_owned(),
-                    source: Box::new(e),
-                })?;
+            let mut url = first.clone();
+            let mut hops = 0;
 
             // `/hosts` is where a redirect would be most tempting to follow —
             // it is a lookup, not a command — and it carries the token like
-            // everything else does.
-            if let Some(refusal) = self.redirect_refused(what, &response) {
-                return Err(refusal);
-            }
+            // everything else does. It goes through the same rules as a
+            // command, and for the same reasons. The loop ends because
+            // `redirect` refuses past [`MAX_REDIRECTS`].
+            let mut response = loop {
+                let response = with_headers!(self.agent.get(&url), &self.caller)
+                    .call()
+                    .map_err(|e| ClientError::Transport {
+                        command: what.to_owned(),
+                        source: Box::new(e),
+                    })?;
+
+                match self.redirect(what, &response, &url, Method::Get, hops)? {
+                    Some(next) => {
+                        if let Some(error) = tls_unavailable(&next) {
+                            return Err(error);
+                        }
+                        url = next;
+                        hops += 1;
+                    }
+                    None => break response,
+                }
+            };
 
             let status = response.status().as_u16();
             let body = response
@@ -521,7 +561,7 @@ impl Transport {
             return Err(error);
         }
 
-        let url = format!("{}/api/v4/{command}", self.base);
+        let mut url = format!("{}/api/v4/{command}", self.base);
 
         let encoded = to_string(parameters, YsonFormat::Text).map_err(|e| ClientError::Decode {
             command: command.to_owned(),
@@ -539,65 +579,87 @@ impl Transport {
             ("Content-Type", "application/octet-stream".to_owned()),
         ];
 
-        let sent = match method {
-            // A GET carries no body in `ureq`'s type system, which is also true
-            // of every command this client sends as one.
-            Method::Get => with_headers!(
-                self.scoped(self.agent.get(&url), streaming),
-                &headers,
-                &self.caller
-            )
-            .call(),
-            Method::Post => with_headers!(
-                self.scoped(self.agent.post(&url), streaming),
-                &headers,
-                &self.caller
-            )
-            .send(body),
-            Method::Put => with_headers!(
-                self.scoped(self.agent.put(&url), streaming),
-                &headers,
-                &self.caller
-            )
-            .send(body),
-        };
+        // Held in an `Option` because the loop below can send more than once
+        // and a body can be sent only the once — a `SendBody` may be a reader
+        // that has already been drained. Nothing but a GET is ever followed
+        // (see [`Transport::redirect`]), so nothing that has a body reaches a
+        // second attempt.
+        let mut body = Some(body);
+        // The loop ends because `redirect` refuses past [`MAX_REDIRECTS`].
+        let mut hops = 0;
 
-        let response = sent.map_err(|e| ClientError::Transport {
-            command: command.to_owned(),
-            source: Box::new(e),
-        })?;
+        loop {
+            let sent = match method {
+                // A GET carries no body in `ureq`'s type system, which is also
+                // true of every command this client sends as one.
+                Method::Get => with_headers!(
+                    self.scoped(self.agent.get(&url), streaming),
+                    &headers,
+                    &self.caller
+                )
+                .call(),
+                Method::Post => with_headers!(
+                    self.scoped(self.agent.post(&url), streaming),
+                    &headers,
+                    &self.caller
+                )
+                .send(body.take().expect("a request with a body is sent once")),
+                Method::Put => with_headers!(
+                    self.scoped(self.agent.put(&url), streaming),
+                    &headers,
+                    &self.caller
+                )
+                .send(body.take().expect("a request with a body is sent once")),
+            };
 
-        // Before the cluster's own error, because a redirect is not the
-        // cluster reporting a failure — it is this client declining to go
-        // somewhere, which is a fact no `X-YT-Error` could carry.
-        if let Some(refusal) = self.redirect_refused(command, &response) {
-            return Err(refusal);
+            let response = sent.map_err(|e| ClientError::Transport {
+                command: command.to_owned(),
+                source: Box::new(e),
+            })?;
+
+            // Before the cluster's own error, because a redirect is not the
+            // cluster reporting a failure — it is this client deciding where a
+            // request goes, which is a fact no `X-YT-Error` could carry.
+            if let Some(next) = self.redirect(command, &response, &url, method, hops)? {
+                // The same guard the first address got: a same-origin redirect
+                // cannot change the scheme, but nothing here assumes that.
+                if let Some(error) = tls_unavailable(&next) {
+                    return Err(error);
+                }
+                url = next;
+                hops += 1;
+                continue;
+            }
+
+            // The cluster's own error, which is far more useful than the status.
+            if let Some(raw) = header_value(response.headers(), ERROR) {
+                return Err(ClientError::from_yt_error(
+                    command,
+                    response.status().as_u16(),
+                    &raw,
+                ));
+            }
+
+            return Ok(response);
         }
-
-        // The cluster's own error, which is far more useful than the status.
-        if let Some(raw) = header_value(response.headers(), ERROR) {
-            return Err(ClientError::from_yt_error(
-                command,
-                response.status().as_u16(),
-                &raw,
-            ));
-        }
-
-        Ok(response)
     }
 
-    /// The redirect a request carrying credentials does not follow.
+    /// What becomes of a `3xx`: `Ok(Some(url))` to go there, `Ok(None)` to
+    /// treat the response as an ordinary one, `Err` to refuse.
     ///
     /// A control proxy does not refuse a heavy *read*. It answers `307
-    /// Temporary Redirect` naming a data proxy on a **different host**:
+    /// Temporary Redirect` naming a data proxy on a **different host** — the
+    /// [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)
+    /// lists that code as *"Redirecting heavy queries from light to heavy
+    /// proxies"*:
     ///
     /// ```text
     /// HTTP/1.1 307 Temporary Redirect
     /// Location: http://data-proxy-01.example.net:80/api/v4/read_table?path=…
     /// ```
     ///
-    /// `ureq` follows that by default and, also by default
-    /// (`RedirectAuthHeaders::Never`), drops the `Authorization` header on the
+    /// `ureq` would follow that by default and, also by default
+    /// (`RedirectAuthHeaders::Never`), drop the `Authorization` header on the
     /// way. The second request therefore arrives unauthenticated and the
     /// cluster answers `Client is missing credentials` — about a token that is
     /// perfectly valid. The user then checks the token, the token file and
@@ -611,13 +673,26 @@ impl Transport {
     /// would be dropped exactly as before — and the next reader would conclude
     /// the problem lay somewhere else entirely.
     ///
-    /// That leaves two honest options: re-attach the credentials for the host
-    /// the *proxy* named, or refuse to go. This client refuses. An
-    /// `Authorization` header is a bearer token, and following a cross-host
-    /// redirect with one attached hands it to whichever host answered — on a
-    /// balanced installation, a host the caller never chose, cannot see, and
-    /// would not learn about. A `Location` header is not a reason to trust
-    /// someone with a credential.
+    /// So the rules are here instead, and there are three of them.
+    ///
+    /// **A redirect that leaves the origin is refused when the request carries
+    /// credentials.** That leaves the honest choice — re-attach for the host
+    /// the *proxy* named, or go nowhere — settled at "go nowhere". A
+    /// `Location` arrives mid-flight, on a request addressed somewhere else;
+    /// asking `/hosts` and addressing the answer is a question this client put
+    /// deliberately, before the request was built. Same origin, and it is
+    /// followed: nothing new learns the token by it, and a balancer
+    /// canonicalising its own host would otherwise break every command.
+    ///
+    /// **A redirect on a request with a body is refused whatever it carries.**
+    /// A redirect rewrites a `POST` or `PUT` into a `GET` and drops the body;
+    /// the cluster answers that empty request on its own terms, and a
+    /// `write_table` that arrived with no rows comes back looking like a write
+    /// that worked. That one costs data rather than a credential, so it does
+    /// not wait for a token to be present.
+    ///
+    /// **A chain that does not end is refused.** [`MAX_REDIRECTS`] hops, then
+    /// it is a loop rather than a route.
     ///
     /// The deliberate way to reach a data proxy is to ask the cluster for one
     /// — `/hosts`, [`Client::heavy_proxy`](crate::Client::heavy_proxy) — and
@@ -625,26 +700,57 @@ impl Transport {
     /// redirect altogether; this is the half that holds when something is
     /// redirected anyway.
     ///
-    /// A transport carrying no token has no credentials to lose and follows
-    /// redirects as it always has: the agent it was built with says so, and
-    /// this returns `None` for it. A `3xx` that names no `Location` is not a
-    /// redirect that was refused — it is a proxy answering something odd, and
-    /// it stays an ordinary [`ClientError::Http`].
-    fn redirect_refused(
+    /// A `3xx` that names no `Location`, or one this client cannot resolve
+    /// into an address, is not a redirect that was refused — it is a proxy
+    /// answering something odd, and it stays an ordinary
+    /// [`ClientError::Http`].
+    fn redirect(
         &self,
         command: &str,
         response: &ureq::http::Response<ureq::Body>,
-    ) -> Option<ClientError> {
+        request_url: &str,
+        method: Method,
+        hops: usize,
+    ) -> Result<Option<String>> {
         let status = response.status();
-        if self.token.is_none() || !status.is_redirection() {
-            return None;
+        if !status.is_redirection() {
+            return Ok(None);
         }
 
-        Some(ClientError::Redirected {
-            command: command.to_owned(),
-            status: status.as_u16(),
-            location: header_value(response.headers(), LOCATION)?,
-        })
+        let Some(location) = header_value(response.headers(), LOCATION) else {
+            return Ok(None);
+        };
+        // Resolved before anything is decided about it, so the origin
+        // comparison has an origin to work with and the message names a host
+        // even when the proxy sent `Location: /api/v4/…`.
+        let Some(target) = resolve(request_url, &location) else {
+            return Ok(None);
+        };
+
+        let refused = |refusal| {
+            Err(ClientError::Redirected {
+                command: command.to_owned(),
+                status: status.as_u16(),
+                location: target.clone(),
+                refusal,
+                heavy: HEAVY.contains(&command),
+            })
+        };
+
+        // Credentials first: it is the one a caller most needs the reason for,
+        // and the one a heavy `write_table` would otherwise be told the wrong
+        // thing about.
+        if self.token.is_some() && !same_origin(request_url, &target) {
+            return refused(RedirectRefusal::Credentials);
+        }
+        if !matches!(method, Method::Get) {
+            return refused(RedirectRefusal::Body);
+        }
+        if hops >= MAX_REDIRECTS {
+            return refused(RedirectRefusal::TooMany);
+        }
+
+        Ok(Some(target))
     }
 
     /// The headers that say who is asking rather than what is being asked.
@@ -707,24 +813,29 @@ impl Transport {
 /// The one place the agent is configured, so a timeout change rebuilds it the
 /// same way it was first built.
 ///
-/// `follow_redirects` is false for a transport that carries a token. A note
-/// for whoever arrives here meaning to reach for
+/// **`ureq` follows nothing.** Not because this client refuses redirects — it
+/// follows plenty — but because the answer depends on three things at once:
+/// the credentials the request carries, whether the redirect leaves the origin
+/// the request was addressed to, and whether there is a body a redirect would
+/// drop. No combination of `max_redirects` and `redirect_auth_headers`
+/// expresses that, so the following is done in [`Transport::redirect`], where
+/// all three are in hand. `max_redirects(0)` does not mean "fail on a
+/// redirect": it hands the `3xx` back as an ordinary response, which is what
+/// gives that decision something to read.
+///
+/// A note for whoever arrives here meaning to reach for
 /// `redirect_auth_headers(RedirectAuthHeaders::SameHost)`: **it does not
 /// help.** The redirect this exists for is a control proxy pointing at a data
 /// proxy on **another** host, which is precisely the case `SameHost` does not
-/// cover. The reasoning, and the decision to refuse rather than re-attach, is
-/// on [`Transport::redirect_refused`].
-fn build_agent(timeout: Duration, follow_redirects: bool) -> ureq::Agent {
+/// cover — it would drop the header and go anyway.
+fn build_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         // Keep non-2xx as ordinary responses so the X-YT-Error header can be
         // read off them; ureq would otherwise collapse them to a status code
         // and discard the cluster's explanation.
         .http_status_as_error(false)
-        // 10 is `ureq`'s own default. 0 does not mean "fail on a redirect": it
-        // hands the 3xx back as an ordinary response, which is what lets the
-        // refusal quote the `Location` the caller needs to see.
-        .max_redirects(if follow_redirects { 10 } else { 0 })
+        .max_redirects(0)
         .build()
         .into()
 }
@@ -782,6 +893,114 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+/// Resolves a `Location` against the address the request went to.
+///
+/// `Location` was required to be absolute until RFC 7231 relaxed it, and
+/// balancers took the permission: `Location: /api/v4/exists?path=…` is an
+/// ordinary answer. Reporting that back as "redirected to /api/v4/exists"
+/// names no host, and comparing it against one decides nothing — so it is made
+/// absolute first, and everything downstream sees an address.
+///
+/// The four forms of [RFC 3986 §4.2](https://www.rfc-editor.org/rfc/rfc3986#section-4.2),
+/// in the order they are tried: an absolute URI keeps its own scheme and
+/// authority; a network-path reference (`//host/path`) keeps the scheme; an
+/// absolute-path reference (`/path`) keeps scheme and authority; anything else
+/// is relative to the directory of the request's path.
+///
+/// `None` for a `Location` this cannot place — an empty one, or a request
+/// address with no `scheme://`. The caller treats that as "not a redirect this
+/// client acts on" rather than inventing a host for it.
+fn resolve(request: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
+    }
+    if has_scheme(location) {
+        return Some(location.to_owned());
+    }
+
+    let (scheme, rest) = request.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    if authority.is_empty() {
+        return None;
+    }
+
+    if let Some(elsewhere) = location.strip_prefix("//") {
+        return Some(format!("{scheme}://{elsewhere}"));
+    }
+    if location.starts_with('/') {
+        return Some(format!("{scheme}://{authority}{location}"));
+    }
+
+    // Relative to the directory the request's path is in, with the query
+    // string dropped: it belonged to the old path.
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let directory = path.rsplit_once('/').map_or("", |(head, _)| head);
+    Some(format!("{scheme}://{authority}{directory}/{location}"))
+}
+
+/// Whether a string begins with a URI scheme — `ALPHA *( ALPHA / DIGIT / "+" /
+/// "-" / "." ) ":"`, and the colon must come before any path, query or
+/// fragment. `//host/x` and `/x:y` are not absolute; `HTTPS://h` is.
+fn has_scheme(url: &str) -> bool {
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    let scheme = &url[..colon];
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Whether two absolute URLs share an origin: scheme, host and port.
+///
+/// The comparison a credential-carrying redirect turns on, so it is made to be
+/// unfooled rather than to be brief. Userinfo is not part of an origin, and
+/// dropping it is what stops `http://real.example.net@evil.example.net/` from
+/// reading as `real.example.net`. A missing port is the scheme's default, so
+/// `https://h` and `https://h:443` are one origin and `http://h` is not.
+///
+/// Fails closed: a URL either side cannot be split into an origin is not the
+/// same origin as anything, including itself.
+fn same_origin(one: &str, other: &str) -> bool {
+    match (origin(one), origin(other)) {
+        (Some(one), Some(other)) => one == other,
+        _ => false,
+    }
+}
+
+fn origin(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        // An origin needs a port, and a scheme this client does not speak has
+        // no default to supply one.
+        _ => return None,
+    };
+
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+
+    // `[::1]:8080` splits at the last colon; `[::1]` has colons and no port.
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, given)) if !given.is_empty() && given.bytes().all(|b| b.is_ascii_digit()) => {
+            (host, given.parse().ok()?)
+        }
+        _ => (host_port, port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    Some((scheme, host.to_ascii_lowercase(), port))
 }
 
 #[cfg(test)]
@@ -878,14 +1097,13 @@ mod tests {
     }
 
     #[test]
-    fn a_transport_with_a_token_follows_no_redirects() {
-        // Not a preference: the redirect this meets is cross-host, so following
-        // it either hands the token to a host the caller did not pick or drops
-        // it and earns `Client is missing credentials` about a token that is
-        // fine. See `Transport::redirect_refused`.
+    fn ureq_follows_no_redirect_for_any_transport() {
+        // Not "this client refuses redirects" — it follows same-origin ones.
+        // It is that the answer depends on the credentials, the origin and the
+        // body all at once, which no `ureq` setting combines, so the 3xx has to
+        // come back unfollowed for `Transport::redirect` to read.
         assert_eq!(authenticated().agent.config().max_redirects(), 0);
-        // One with nothing to lose is left as it was.
-        assert!(transport(None).agent.config().max_redirects() > 0);
+        assert_eq!(transport(None).agent.config().max_redirects(), 0);
     }
 
     #[test]
@@ -901,5 +1119,90 @@ mod tests {
             transport.agent.config().timeouts().global,
             Some(Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn a_location_is_resolved_against_the_address_it_came_from() {
+        let request = "http://proxy.example.net:8000/api/v4/exists?path=//tmp";
+
+        // Absolute: taken as it stands.
+        assert_eq!(
+            resolve(request, "https://data.example.net/api/v4/read_table").as_deref(),
+            Some("https://data.example.net/api/v4/read_table")
+        );
+        // Network-path reference: the scheme survives, the host does not.
+        assert_eq!(
+            resolve(request, "//data.example.net/api/v4").as_deref(),
+            Some("http://data.example.net/api/v4")
+        );
+        // Absolute path: the balancer's canonical form of the same request.
+        assert_eq!(
+            resolve(request, "/api/v4/exists?path=//tmp").as_deref(),
+            Some("http://proxy.example.net:8000/api/v4/exists?path=//tmp")
+        );
+        // Relative path: against the directory, and the old query goes.
+        assert_eq!(
+            resolve(request, "read_table").as_deref(),
+            Some("http://proxy.example.net:8000/api/v4/read_table")
+        );
+        // Whitespace is header padding, not part of the address.
+        assert_eq!(
+            resolve(request, "  /hosts  ").as_deref(),
+            Some("http://proxy.example.net:8000/hosts")
+        );
+        // Nothing to place.
+        assert_eq!(resolve(request, ""), None);
+        assert_eq!(resolve("proxy.example.net", "/hosts"), None);
+    }
+
+    #[test]
+    fn a_scheme_is_told_from_a_path() {
+        assert!(has_scheme("https://h/x"));
+        assert!(has_scheme("HTTP://h/x"));
+        // A colon inside a path is not a scheme, and neither is one after it.
+        assert!(!has_scheme("/api/v4/read:table"));
+        assert!(!has_scheme("//h/x"));
+        assert!(!has_scheme("read_table"));
+        assert!(!has_scheme("://h"));
+        // A scheme cannot start with a digit.
+        assert!(!has_scheme("8000:80"));
+    }
+
+    #[test]
+    fn an_origin_is_scheme_host_and_port() {
+        assert!(same_origin(
+            "http://proxy.example.net/api/v4/exists",
+            "http://proxy.example.net/api/v4/read_table?path=//tmp"
+        ));
+        // A default port is the port.
+        assert!(same_origin("https://h/x", "https://h:443/x"));
+        assert!(same_origin(
+            "http://H.example.net/x",
+            "http://h.example.net/x"
+        ));
+        // Everything an origin is made of, one at a time.
+        assert!(!same_origin("http://h/x", "https://h/x"));
+        assert!(!same_origin("http://h/x", "http://other/x"));
+        assert!(!same_origin("http://h/x", "http://h:8000/x"));
+        // The one that reads as `real.example.net` and connects to the other.
+        assert!(!same_origin(
+            "http://real.example.net/x",
+            "http://real.example.net@evil.example.net/x"
+        ));
+        // Fails closed rather than calling two unparseable things equal.
+        assert!(!same_origin("not a url", "not a url"));
+        assert!(!same_origin("ftp://h/x", "ftp://h/x"));
+    }
+
+    #[test]
+    fn the_heavy_commands_are_the_ones_that_carry_a_stream() {
+        // The advice a refused redirect ends with is "go to a heavy proxy",
+        // which only a heavy command can act on.
+        for command in ["read_table", "write_table", "write_file", "get_job_input"] {
+            assert!(HEAVY.contains(&command), "{command}");
+        }
+        for command in ["create", "exists", "start_operation", "hosts"] {
+            assert!(!HEAVY.contains(&command), "{command}");
+        }
     }
 }

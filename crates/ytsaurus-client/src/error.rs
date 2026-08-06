@@ -8,7 +8,13 @@ use crate::jobs::JobFailure;
 pub type Result<T, E = ClientError> = std::result::Result<T, E>;
 
 /// Something went wrong talking to the cluster.
+///
+/// **Non-exhaustive.** A `match` over this must carry a `_` arm: the ways a
+/// cluster can refuse are the cluster's to add, not this crate's to freeze, and
+/// every release so far has added one. Naming a variant, constructing one and
+/// destructuring one all work as before.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClientError {
     /// The request could not be made, or the connection failed.
     #[error("{command}: transport error: {source}")]
@@ -49,32 +55,50 @@ pub enum ClientError {
         body: String,
     },
 
-    /// A request carrying credentials was redirected, and refused rather than
-    /// followed.
+    /// A redirect was refused rather than followed.
     ///
     /// A control proxy does not refuse a heavy *read*: it answers `307
-    /// Temporary Redirect` naming a data proxy on another host. Following that
-    /// with the `Authorization` header attached hands a bearer token to a host
-    /// the caller never chose; following it *without* — which is what `ureq`
-    /// does by default — makes the request arrive unauthenticated, and the
-    /// cluster then reports `Client is missing credentials` about a token that
-    /// is perfectly valid. This error is the third answer: go nowhere, and say
+    /// Temporary Redirect` naming a data proxy on another host — the
+    /// [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)
+    /// gives that row as *"307 | Redirecting heavy queries from light to heavy
+    /// proxies"*. Following it *without* the `Authorization` header — which is
+    /// what `ureq` does by default — makes the request arrive unauthenticated,
+    /// and the cluster then reports `Client is missing credentials` about a
+    /// token that may be perfectly valid. Re-attaching it and going would
+    /// follow an instruction the client never asked for, on a request already
+    /// addressed elsewhere. This error is the third answer: go nowhere, and say
     /// where the proxy pointed.
+    ///
+    /// The message stops short of declaring the token good. It cannot know
+    /// that — a gateway in front of the cluster may answer an expired token
+    /// with a redirect of its own — so it reports the one thing this client is
+    /// certain of: the credentials never reached the host that answered.
+    ///
+    /// Not every redirect ends here. One that stays on the origin the request
+    /// was addressed to is followed, credentials and all, because nothing new
+    /// learns the token by it; `refusal` says which rule this redirect met.
     #[error(
         "{command}: the proxy answered HTTP {status} and redirected to {location}, \
-         which this client did not follow because the request carries \
-         credentials — a redirect chooses the host they would be sent to, and \
-         the caller did not. The token is not at fault. Heavy commands belong \
-         on a heavy proxy: ask the cluster for one (`Client::heavy_proxy`) and \
-         address it directly."
+         which this client did not follow: {refusal}{}",
+        redirect_advice(.heavy)
     )]
     Redirected {
         /// The API command that was redirected.
         command: String,
         /// The redirect status the proxy answered with — `307` in practice.
         status: u16,
-        /// Where it pointed. Usually a data proxy on a different host.
+        /// Where it pointed, resolved against the address the request went to,
+        /// so a relative `Location` still names a host. Usually a data proxy on
+        /// a different one.
         location: String,
+        /// Which rule the redirect met.
+        refusal: RedirectRefusal,
+        /// Whether the redirected command reads or writes a data stream.
+        ///
+        /// Only those belong on a heavy proxy, so only those are told to go to
+        /// one: a `create` that met a balancer's `301` cannot use that advice
+        /// and is not given it.
+        heavy: bool,
     },
 
     /// A response could not be decoded.
@@ -127,6 +151,63 @@ pub enum ClientError {
     /// The environment did not describe a cluster to talk to.
     #[error("{0}")]
     Config(String),
+}
+
+/// Why a redirect was refused rather than followed.
+///
+/// The rules live with the transport that applies them; this is the half of
+/// them a caller can branch on. Each variant renders the clause the error
+/// message carries, so `refusal.to_string()` is what the user is told.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RedirectRefusal {
+    /// The request carries credentials, and the redirect leaves the origin
+    /// they were addressed to.
+    ///
+    /// The one this crate exists to report. A same-origin redirect is followed
+    /// instead: the token reaches no host it was not already going to.
+    #[error(
+        "the request carries credentials and the redirect leaves the host they \
+         were addressed to. Following it drops the `Authorization` header — \
+         `ureq` does that by default — and the cluster then answers with a \
+         credentials failure about a token that may be perfectly good. The \
+         token was not sent to the host that answered, so start with the \
+         redirect rather than with the token."
+    )]
+    Credentials,
+
+    /// The request carries a body.
+    ///
+    /// A redirect rewrites a `POST` or a `PUT` into a `GET` and drops what it
+    /// carried, and the cluster answers that empty `GET` on its own terms. A
+    /// `write_table` that lost its rows on the way is the expensive case: it
+    /// comes back `Ok`, having written nothing.
+    #[error(
+        "the request carries a body. A redirect rewrites it into a `GET` and \
+         drops the body with it, and a write that arrived carrying no rows is \
+         answered much like one that succeeded — which is worse than failing."
+    )]
+    Body,
+
+    /// The redirects did not end.
+    ///
+    /// This client follows a bounded number of same-origin hops; a balancer
+    /// pointing at itself is a loop, not a route.
+    #[error(
+        "the redirects did not end. This client follows a bounded number of \
+         them and that bound was reached, which is a loop rather than a route."
+    )]
+    TooMany,
+}
+
+/// The sentence only a heavy command can act on. See [`ClientError::Redirected`].
+fn redirect_advice(heavy: &bool) -> &'static str {
+    if *heavy {
+        " Heavy commands belong on a heavy proxy: ask the cluster for one \
+         (`Client::heavy_proxy`) and address it directly."
+    } else {
+        ""
+    }
 }
 
 fn body_hint(body: &str) -> String {
