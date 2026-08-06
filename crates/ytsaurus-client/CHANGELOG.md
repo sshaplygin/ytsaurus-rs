@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### A token no longer follows a redirect to a host nobody chose
+
+- **Fixed** a credential-carrying request being redirected and arriving
+  unauthenticated. A control proxy does not refuse a heavy *read*: it answers
+  `307 Temporary Redirect` naming a data proxy on **another host**, and `ureq`
+  drops the `Authorization` header when it follows one — its default is
+  `RedirectAuthHeaders::Never`. The read then arrived without a token and the
+  cluster answered `cluster error 111: Client is missing credentials`, which
+  sent the user to check their token, their token file and their permissions.
+  None of them was at fault.
+
+  A transport carrying a token now follows no redirect at all and fails with
+  **`ClientError::Redirected`**, naming the status and where it pointed. The
+  alternative — re-attaching the credentials and going — hands a bearer token
+  to whichever host answered, which on a balanced installation is a host the
+  caller never chose and cannot see; a `Location` header is not a reason to
+  trust someone with a credential. The deliberate route to a data proxy is
+  `Client::heavy_proxy`, and the error says so.
+
+  A transport with **no** token still follows redirects: it has nothing to
+  lose, and the rule here is about credentials rather than about redirects.
+
+  `redirect_auth_headers(RedirectAuthHeaders::SameHost)` is **not** the fix and
+  the source says why where someone would reach for it: the redirect is
+  deliberately cross-host, which is exactly the case that setting does not
+  cover.
+
 ### An operation is no longer a string and four commands
 
 - **Added** the rest of the operation lifecycle — `suspend_operation`,

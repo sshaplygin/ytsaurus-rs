@@ -41,6 +41,9 @@ use crate::yson_build::{boolean, insert, string};
 const HEADER_FORMAT: &str = "X-YT-Header-Format";
 const PARAMETERS: &str = "X-YT-Parameters";
 const ERROR: &str = "X-YT-Error";
+/// Where a redirect points. Read rather than followed — see
+/// [`Transport::redirect_refused`].
+const LOCATION: &str = "Location";
 /// The W3C trace context, in the spelling the proxy parses. See
 /// [`TraceContext`](crate::TraceContext).
 const TRACEPARENT: &str = "traceparent";
@@ -157,7 +160,10 @@ impl Transport {
         };
 
         let mut transport = Self {
-            agent: build_agent(timeout),
+            // A transport that carries a token does not follow redirects; one
+            // that carries none has nothing to lose by following them. See
+            // [`Transport::redirect_refused`].
+            agent: build_agent(timeout, token.is_none()),
             base,
             token,
             retries,
@@ -177,7 +183,11 @@ impl Transport {
 
     pub(crate) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
-        self.agent = build_agent(timeout);
+        // The redirect policy is decided by the token, not by the timeout, and
+        // it has to be carried over: this is the one place the agent is built
+        // twice, and so the one place the policy could be dropped by a caller
+        // doing nothing more suspicious than `with_timeout`.
+        self.agent = build_agent(timeout, self.token.is_none());
     }
 
     pub(crate) fn set_transaction(&mut self, id: Option<String>) {
@@ -457,6 +467,13 @@ impl Transport {
                     source: Box::new(e),
                 })?;
 
+            // `/hosts` is where a redirect would be most tempting to follow —
+            // it is a lookup, not a command — and it carries the token like
+            // everything else does.
+            if let Some(refusal) = self.redirect_refused(what, &response) {
+                return Err(refusal);
+            }
+
             let status = response.status().as_u16();
             let body = response
                 .body_mut()
@@ -550,6 +567,13 @@ impl Transport {
             source: Box::new(e),
         })?;
 
+        // Before the cluster's own error, because a redirect is not the
+        // cluster reporting a failure — it is this client declining to go
+        // somewhere, which is a fact no `X-YT-Error` could carry.
+        if let Some(refusal) = self.redirect_refused(command, &response) {
+            return Err(refusal);
+        }
+
         // The cluster's own error, which is far more useful than the status.
         if let Some(raw) = header_value(response.headers(), ERROR) {
             return Err(ClientError::from_yt_error(
@@ -560,6 +584,67 @@ impl Transport {
         }
 
         Ok(response)
+    }
+
+    /// The redirect a request carrying credentials does not follow.
+    ///
+    /// A control proxy does not refuse a heavy *read*. It answers `307
+    /// Temporary Redirect` naming a data proxy on a **different host**:
+    ///
+    /// ```text
+    /// HTTP/1.1 307 Temporary Redirect
+    /// Location: http://data-proxy-01.example.net:80/api/v4/read_table?path=…
+    /// ```
+    ///
+    /// `ureq` follows that by default and, also by default
+    /// (`RedirectAuthHeaders::Never`), drops the `Authorization` header on the
+    /// way. The second request therefore arrives unauthenticated and the
+    /// cluster answers `Client is missing credentials` — about a token that is
+    /// perfectly valid. The user then checks the token, the token file and
+    /// their permissions, none of which is at fault.
+    ///
+    /// **`redirect_auth_headers(RedirectAuthHeaders::SameHost)` is not the
+    /// answer**, though it is the first thing that suggests itself and reads
+    /// like the setting this was missing. It re-attaches the header only when
+    /// the redirect stays on the same host and under https; this redirect is
+    /// deliberately cross-host, control proxy to data proxy, so the header
+    /// would be dropped exactly as before — and the next reader would conclude
+    /// the problem lay somewhere else entirely.
+    ///
+    /// That leaves two honest options: re-attach the credentials for the host
+    /// the *proxy* named, or refuse to go. This client refuses. An
+    /// `Authorization` header is a bearer token, and following a cross-host
+    /// redirect with one attached hands it to whichever host answered — on a
+    /// balanced installation, a host the caller never chose, cannot see, and
+    /// would not learn about. A `Location` header is not a reason to trust
+    /// someone with a credential.
+    ///
+    /// The deliberate way to reach a data proxy is to ask the cluster for one
+    /// — `/hosts`, [`Client::heavy_proxy`](crate::Client::heavy_proxy) — and
+    /// address it on purpose. Routing heavy commands there is what removes the
+    /// redirect altogether; this is the half that holds when something is
+    /// redirected anyway.
+    ///
+    /// A transport carrying no token has no credentials to lose and follows
+    /// redirects as it always has: the agent it was built with says so, and
+    /// this returns `None` for it. A `3xx` that names no `Location` is not a
+    /// redirect that was refused — it is a proxy answering something odd, and
+    /// it stays an ordinary [`ClientError::Http`].
+    fn redirect_refused(
+        &self,
+        command: &str,
+        response: &ureq::http::Response<ureq::Body>,
+    ) -> Option<ClientError> {
+        let status = response.status();
+        if self.token.is_none() || !status.is_redirection() {
+            return None;
+        }
+
+        Some(ClientError::Redirected {
+            command: command.to_owned(),
+            status: status.as_u16(),
+            location: header_value(response.headers(), LOCATION)?,
+        })
     }
 
     /// The headers that say who is asking rather than what is being asked.
@@ -621,13 +706,25 @@ impl Transport {
 
 /// The one place the agent is configured, so a timeout change rebuilds it the
 /// same way it was first built.
-fn build_agent(timeout: Duration) -> ureq::Agent {
+///
+/// `follow_redirects` is false for a transport that carries a token. A note
+/// for whoever arrives here meaning to reach for
+/// `redirect_auth_headers(RedirectAuthHeaders::SameHost)`: **it does not
+/// help.** The redirect this exists for is a control proxy pointing at a data
+/// proxy on **another** host, which is precisely the case `SameHost` does not
+/// cover. The reasoning, and the decision to refuse rather than re-attach, is
+/// on [`Transport::redirect_refused`].
+fn build_agent(timeout: Duration, follow_redirects: bool) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         // Keep non-2xx as ordinary responses so the X-YT-Error header can be
         // read off them; ureq would otherwise collapse them to a status code
         // and discard the cluster's explanation.
         .http_status_as_error(false)
+        // 10 is `ureq`'s own default. 0 does not mean "fail on a redirect": it
+        // hands the 3xx back as an ordinary response, which is what lets the
+        // refusal quote the `Location` the caller needs to see.
+        .max_redirects(if follow_redirects { 10 } else { 0 })
         .build()
         .into()
 }
@@ -696,6 +793,14 @@ mod tests {
         let mut transport = Transport::new("http://localhost:8000", None, Duration::from_secs(1));
         transport.set_transaction(transaction.map(str::to_owned));
         transport
+    }
+
+    fn authenticated() -> Transport {
+        Transport::new(
+            "http://localhost:8000",
+            Some("secret-token".to_owned()),
+            Duration::from_secs(1),
+        )
     }
 
     fn rendered(value: &YsonValue) -> String {
@@ -769,6 +874,32 @@ mod tests {
             transport(Some("3-5d231-10001-db88"))
                 .in_transaction("start_operation", &params)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn a_transport_with_a_token_follows_no_redirects() {
+        // Not a preference: the redirect this meets is cross-host, so following
+        // it either hands the token to a host the caller did not pick or drops
+        // it and earns `Client is missing credentials` about a token that is
+        // fine. See `Transport::redirect_refused`.
+        assert_eq!(authenticated().agent.config().max_redirects(), 0);
+        // One with nothing to lose is left as it was.
+        assert!(transport(None).agent.config().max_redirects() > 0);
+    }
+
+    #[test]
+    fn changing_the_timeout_keeps_the_redirect_policy() {
+        // `set_timeout` rebuilds the agent, which makes it the one place the
+        // policy can be lost — to a caller doing nothing more suspicious than
+        // `Client::with_timeout`.
+        let mut transport = authenticated();
+        transport.set_timeout(Duration::from_secs(30));
+
+        assert_eq!(transport.agent.config().max_redirects(), 0);
+        assert_eq!(
+            transport.agent.config().timeouts().global,
+            Some(Duration::from_secs(30))
         );
     }
 }

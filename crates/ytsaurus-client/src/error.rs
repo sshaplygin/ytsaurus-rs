@@ -49,6 +49,34 @@ pub enum ClientError {
         body: String,
     },
 
+    /// A request carrying credentials was redirected, and refused rather than
+    /// followed.
+    ///
+    /// A control proxy does not refuse a heavy *read*: it answers `307
+    /// Temporary Redirect` naming a data proxy on another host. Following that
+    /// with the `Authorization` header attached hands a bearer token to a host
+    /// the caller never chose; following it *without* — which is what `ureq`
+    /// does by default — makes the request arrive unauthenticated, and the
+    /// cluster then reports `Client is missing credentials` about a token that
+    /// is perfectly valid. This error is the third answer: go nowhere, and say
+    /// where the proxy pointed.
+    #[error(
+        "{command}: the proxy answered HTTP {status} and redirected to {location}, \
+         which this client did not follow because the request carries \
+         credentials — a redirect chooses the host they would be sent to, and \
+         the caller did not. The token is not at fault. Heavy commands belong \
+         on a heavy proxy: ask the cluster for one (`Client::heavy_proxy`) and \
+         address it directly."
+    )]
+    Redirected {
+        /// The API command that was redirected.
+        command: String,
+        /// The redirect status the proxy answered with — `307` in practice.
+        status: u16,
+        /// Where it pointed. Usually a data proxy on a different host.
+        location: String,
+    },
+
     /// A response could not be decoded.
     #[error("{command}: could not decode the response: {reason}")]
     Decode {

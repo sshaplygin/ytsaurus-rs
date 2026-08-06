@@ -330,6 +330,20 @@ per command. Cluster facts:
   a crate linked into musl worker binaries, which is a human's call.
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
+- **A heavy read through a control proxy is answered with a cross-host `307`**
+  naming a data proxy, and `ureq` drops the `Authorization` header when it
+  follows one (`RedirectAuthHeaders::Never`). The request then arrives
+  unauthenticated and the cluster blames the token: `cluster error 111: Client
+  is missing credentials`, about a token that is fine. So a transport carrying
+  one **follows no redirect at all** — `max_redirects(0)` — and fails with
+  `ClientError::Redirected`, naming where it was pointed. Re-attaching the
+  token instead would hand a bearer credential to a host the caller never
+  chose. **`redirect_auth_headers(RedirectAuthHeaders::SameHost)` is not the
+  fix**: the redirect is deliberately cross-host, which is precisely what that
+  setting does not cover. A transport with no token keeps following redirects —
+  it has nothing to lose. Reproduced offline in
+  `crates/ytsaurus-client/tests/redirect_credentials.rs`; a local cluster runs
+  one proxy and redirects nothing.
 
 ### The operation lifecycle
 
