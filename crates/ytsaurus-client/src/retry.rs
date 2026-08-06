@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::error::{ClientError, Result};
 
-/// How a command may be repeated.
+/// How a command may be repeated — and, for a heavy one, where it goes.
 ///
 /// The classification is the cluster's, not this crate's: each command declares
 /// whether it mutates and whether it is heavy, and the rules at the top of this
@@ -57,9 +57,28 @@ pub enum Repeatable {
     /// The cluster keeps the first response for five to ten minutes and hands
     /// it back rather than applying the change twice. See [`MutationId`].
     WithMutationId,
-    /// Heavy, or mutating outside the master's mutation cache. Sent once,
-    /// whatever the policy says.
+    /// Mutating outside the master's mutation cache. Sent once, whatever the
+    /// policy says, because there is nothing that would deduplicate a second
+    /// send and the first may already have been applied.
     Never,
+    /// **Heavy**: table and file data, in either direction.
+    ///
+    /// Sent once, like [`Repeatable::Never`] and for the documented reason —
+    /// the way to make a heavy command atomic is a transaction, not a retry.
+    ///
+    /// It also decides **where** the command goes. A large installation gives
+    /// its proxies roles and refuses a heavy request on a control proxy, so
+    /// the client asks `/hosts` for one that will take it, once per client
+    /// and only if a heavy command needs it. Nothing about the call site
+    /// changes: this is the same `isHeavy` bit of the cluster's command
+    /// registry that says the command cannot be repeated, and both answers
+    /// follow from writing it down once.
+    ///
+    /// `write_table`, `read_table`, `write_file`, `get_job_input` and
+    /// `get_job_stderr` are the modelled ones; a raw command that streams in
+    /// either direction is sent this way whatever the caller says, because
+    /// streaming *is* the heavy shape.
+    Heavy,
 }
 
 /// YTsaurus error codes worth a second attempt.
@@ -347,7 +366,7 @@ pub(crate) fn run<T>(
     mut action: impl FnMut(bool) -> Result<T>,
 ) -> Result<T> {
     let allowed = match repeatable {
-        Repeatable::Never => 1,
+        Repeatable::Never | Repeatable::Heavy => 1,
         _ => policy.attempts,
     };
 
@@ -483,19 +502,21 @@ mod tests {
 
     #[test]
     fn a_heavy_command_is_sent_once() {
-        let calls = std::cell::Cell::new(0);
+        for once in [Repeatable::Heavy, Repeatable::Never] {
+            let calls = std::cell::Cell::new(0);
 
-        let result: Result<()> = run(instant(5), Repeatable::Never, "write_table", |_| {
-            calls.set(calls.get() + 1);
-            Err(cluster_error(105, r#"{"code":105}"#))
-        });
+            let result: Result<()> = run(instant(5), once, "write_table", |_| {
+                calls.set(calls.get() + 1);
+                Err(cluster_error(105, r#"{"code":105}"#))
+            });
 
-        assert!(result.is_err());
-        assert_eq!(
-            calls.get(),
-            1,
-            "heavy commands cannot be retried, whatever the policy says"
-        );
+            assert!(result.is_err());
+            assert_eq!(
+                calls.get(),
+                1,
+                "{once:?}: heavy commands cannot be retried, whatever the policy says"
+            );
+        }
     }
 
     #[test]

@@ -1,11 +1,15 @@
 //! What the client actually puts on the wire.
 //!
 //! Everything else in this crate is checked against a cluster, which answers
-//! the same whether or not the request was well made. These serve one request
+//! the same whether or not the request was well made. These serve the request
 //! from a socket in-process and read the bytes the client sent, which is the
 //! only way to pin the things a cluster is too forgiving to notice:
 //! compression the client asks for, the token it carries, and the header the
 //! parameters travel in.
+//!
+//! The last section is a second question — not what a request looked like but
+//! *which address* it went to, which no single listener can answer. It uses
+//! two, and [`Proxy`] rather than [`capture`].
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -794,4 +798,337 @@ fn a_job_is_asked_for_by_operation_and_job() {
         parameters(&head),
         r#"{job_id="5-6-7-8";operation_id="1-2-3-4"}"#
     );
+}
+
+// ------------------------------------------- where a command is sent, and why
+//
+// A cluster answers a heavy command the same way whichever of its proxies was
+// asked — that is the point of the roles — so nothing about the *answers* here
+// could tell a routed client from an unrouted one. Two listeners and a record
+// of which one was spoken to can.
+
+/// A stand-in proxy that keeps serving, and remembers what it was asked.
+///
+/// [`capture`] serves exactly one request, which is all a wire *shape* needs.
+/// Routing is about which address a request went to and how many there were,
+/// so this keeps a list and stays up.
+struct Proxy {
+    address: std::net::SocketAddr,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Proxy {
+    /// A proxy that answers `/hosts` with `hosts`, or with 404 when given
+    /// `None` — the shape of a cluster that has no such endpoint.
+    fn new(hosts: Option<String>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("has an address");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let served = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let hosts = hosts.clone();
+                let seen = std::sync::Arc::clone(&served);
+                // One thread per connection: `ureq` pools them, and a client
+                // that opened a second while the first sat idle would deadlock
+                // against a server that answered them in turn.
+                std::thread::spawn(move || serve(stream, hosts, seen));
+            }
+        });
+
+        Self { address, seen }
+    }
+
+    /// The address to configure a client with.
+    fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// The address as `/hosts` names one: a bare host and port, no scheme.
+    fn host(&self) -> String {
+        self.address.to_string()
+    }
+
+    /// The request line of everything served so far.
+    fn requests(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .expect("nothing panicked holding it")
+            .iter()
+            .map(|head| head.lines().next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Everything served so far, headers and all.
+    fn heads(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .expect("nothing panicked holding it")
+            .clone()
+    }
+}
+
+/// Answers requests on one connection until the client hangs up.
+fn serve(
+    mut stream: std::net::TcpStream,
+    hosts: Option<String>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clones"));
+
+    loop {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) if line == "\r\n" => break,
+                Ok(_) => head.push_str(&line),
+                Err(_) => return,
+            }
+        }
+        if head.is_empty() {
+            return;
+        }
+
+        // The body first, for the reason `capture` gives: a request is only
+        // finished being sent when its body has been read.
+        if let Some(length) = content_length(&head) {
+            let mut body = vec![0_u8; length];
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
+        } else if head.to_lowercase().contains("transfer-encoding: chunked") {
+            drain_chunked(&mut reader);
+        }
+
+        let asked_where_to_go = head.starts_with("GET /hosts ");
+        seen.lock().expect("nothing panicked holding it").push(head);
+
+        let reply = match (asked_where_to_go, &hosts) {
+            (true, None) => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            (true, Some(list)) => reply(list.as_bytes()),
+            (false, _) => reply(br#"{"value"=%true}"#),
+        };
+
+        if stream.write_all(&reply).is_err() {
+            return;
+        }
+        stream.flush().ok();
+    }
+}
+
+/// A 200 carrying `body`, on a connection that stays open.
+fn reply(body: &[u8]) -> Vec<u8> {
+    let mut reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-yt-yson-text\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    reply.extend_from_slice(body);
+    reply
+}
+
+/// An address nothing is listening on, for a proxy that has gone away.
+fn nowhere() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+    let address = listener.local_addr().expect("has an address");
+    drop(listener);
+    address.to_string()
+}
+
+/// A client that discovers, though it is talking to a listener on loopback.
+///
+/// Discovery is off for a loopback address by default — a local cluster cannot
+/// be improved on and a tunnelled one cannot be followed — and every listener
+/// in this file is on loopback. So the tests that are *about* discovery say so
+/// explicitly, and the one that is about the default does not.
+fn discovering(proxy: &Proxy) -> Client {
+    Client::new(&proxy.url())
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(true)
+}
+
+#[test]
+fn a_heavy_command_goes_to_the_proxy_the_cluster_names() {
+    // The bug this file is the regression test for: every heavy command went
+    // to whatever `YT_PROXY` held, which on an installation that separates
+    // proxy roles is a control proxy, and a control proxy refuses one.
+    let heavy = Proxy::new(None);
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+
+    Client::with_token(&control.url(), "secret-token")
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(true)
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1"],
+        "the configured address served the upload itself"
+    );
+    assert_eq!(heavy.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+
+    // The other half of sending it elsewhere: it has to arrive dressed as a
+    // command. A heavy proxy that is handed a request with no token answers by
+    // blaming the caller's credentials.
+    let head = &heavy.heads()[0];
+    assert_eq!(
+        header_value(head, "authorization").as_deref(),
+        Some("OAuth secret-token"),
+        "the upload reached the heavy proxy without its token:\n{head}"
+    );
+    assert!(
+        parameters(head).contains(r#"path="//tmp/t""#),
+        "the upload lost its parameters on the way:\n{head}"
+    );
+}
+
+#[test]
+fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
+    // Buffered, streamed in, streamed out, and a job's stderr: four routes
+    // through the transport — `call`, `upload`, `open` — that each had their
+    // own way of choosing an address. And one lookup between them, because the
+    // answer is kept for the client's lifetime.
+    let heavy = Proxy::new(None);
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client = discovering(&control);
+
+    client.write_table("//tmp/t", b"").expect("buffered write");
+    client
+        .write_table_rows(
+            "//tmp/t",
+            [std::collections::BTreeMap::from([("n", 1_i64)])],
+        )
+        .expect("streamed write");
+    // The stub answers `{value=%true}`, which is not a table: these fail on
+    // the answer, having asked the question this is about.
+    let _ = client.read_table("//tmp/t");
+    let _ = client.read_table_streaming("//tmp/t");
+    let _ = client.get_job_stderr("1-2-3-4", "5-6-7-8");
+
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(
+        heavy.requests(),
+        [
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "GET /api/v4/read_table HTTP/1.1",
+            "GET /api/v4/read_table HTTP/1.1",
+            "GET /api/v4/get_job_stderr HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn a_light_command_stays_where_the_client_was_pointed() {
+    // Cypress, the scheduler and the master are the control proxy's own work.
+    // Sending them to a heavy proxy would be the same mistake pointing the
+    // other way, and asking `/hosts` before a `get` would put a round trip in
+    // front of every one of them.
+    let heavy = Proxy::new(None);
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client = discovering(&control);
+
+    let _ = client.exists("//tmp");
+    let _ = client.create("table", "//tmp/t");
+    let _ = client.abort_operation("1-2-3-4", None);
+
+    assert_eq!(
+        control.requests(),
+        [
+            "GET /api/v4/exists HTTP/1.1",
+            "POST /api/v4/create HTTP/1.1",
+            "POST /api/v4/abort_operation HTTP/1.1",
+        ]
+    );
+    assert!(
+        heavy.requests().is_empty(),
+        "a light command was routed away: {:?}",
+        heavy.requests()
+    );
+}
+
+#[test]
+fn a_cluster_that_names_no_heavy_proxy_keeps_serving_the_uploads_itself() {
+    // The fallback that keeps a single-node installation working, and every
+    // deployment that does not separate the roles. Asked once and then not
+    // again: an empty answer is an answer.
+    let control = Proxy::new(Some("[]".to_owned()));
+    let client = discovering(&control);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_file("//tmp/f", b"x").expect("writes");
+
+    assert_eq!(
+        control.requests(),
+        [
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_file HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn a_cluster_with_no_hosts_endpoint_is_not_asked_before_every_upload() {
+    // `absent`, not merely empty: 404 is deterministic, so asking again would
+    // cost a round trip per upload and buy nothing. A failure that might pass —
+    // a timeout, a restarting proxy — is judged the other way, by the same
+    // rule the retry policy uses.
+    let control = Proxy::new(None);
+    let client = discovering(&control);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        control.requests(),
+        [
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn a_heavy_proxy_that_cannot_be_reached_is_asked_about_again() {
+    // A proxy that is down, drained or banned stays broken for every upload
+    // that follows, so the answer is thrown away rather than kept for the
+    // client's lifetime. The failed command itself is *not* re-sent: heavy
+    // commands are not retried, and a streamed body is gone by then.
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, nowhere())));
+    let client = discovering(&control);
+
+    let first = client.write_table("//tmp/t", b"");
+    let second = client.write_table("//tmp/t", b"");
+
+    assert!(first.is_err() && second.is_err(), "nothing was listening");
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1", "GET /hosts HTTP/1.1"],
+        "the client kept an address it could not reach"
+    );
+}
+
+#[test]
+fn a_local_cluster_is_never_asked_where_to_send_a_heavy_command() {
+    // The no-regression test, and the reason the others have to ask for
+    // discovery explicitly. A cluster on loopback is this machine's own or a
+    // tunnel to one: the address such a cluster publishes for itself is not
+    // reachable from here, and following it would break every upload that
+    // works today. So the default sends the request straight there, with no
+    // lookup in front of it.
+    let control = Proxy::new(Some(r#"["heavy.example.net"]"#.to_owned()));
+
+    Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert_eq!(control.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
 }

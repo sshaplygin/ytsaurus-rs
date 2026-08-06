@@ -285,6 +285,10 @@ machine where the CLI already works needs nothing else. A token read from a file
 is trimmed — `echo token > ~/.yt/token` leaves a newline, and sending it fails
 authentication with an error that never mentions a newline.
 
+**Table and file data goes to a proxy that will accept it**, which is the one
+way a real installation differs from a local one that the caller would otherwise
+have to know about — see [where a heavy command goes](#where-a-heavy-command-goes).
+
 **Responses are compressed.** Every request carries `Accept-Encoding: gzip` and
 every answer is decompressed on the way in, including a streamed table read: on
 a local cluster 67.7 MiB of table arrived as 400 KiB. Uploads are not
@@ -532,12 +536,30 @@ cluster implements that:
 is explicit that they cannot be, and [a transaction](#all-at-once-or-not-at-all)
 is the way to make an upload atomic.
 
-## Limits worth knowing
+## Where a heavy command goes
 
-**Heavy commands go to the address you gave it.** Large installations separate
-light and heavy proxies and answer an upload on a light proxy with 503. Use
-[`Client::heavy_proxy`] to discover one and point a second client at it. A local
-cluster needs none of this.
+Table and file data — `write_table`, `read_table`, `write_file`,
+`upload_worker`, and the streaming form of each — is what YTsaurus calls a
+*heavy* command, and a large installation serves those on a separate set of
+proxies. **The client routes them itself**: the first heavy command asks
+`/hosts`, the answer is kept for the client's lifetime, and one that fails for a
+reason another proxy might not have throws it away so the next asks again. Light
+commands stay on the address you gave.
+
+A cluster that names no heavy proxy is answered by using that address, so a
+single-node installation is unaffected — and one reached at `localhost` is not
+asked at all, because the address a proxy publishes for itself is not reachable
+from the other end of a port mapping or a tunnel.
+`Client::with_proxy_discovery` overrides both, and [`Client::heavy_proxy`] still
+answers the question directly.
+
+Without this, the failure is not obvious: a control proxy refuses a heavy
+request with **HTTP 200** carrying `cluster error 1: Control proxy may not serve
+heavy requests with input data`, and a deployment behind a balancer is the case
+that breaks rather than the case that works — the balancer fronts the control
+proxies.
+
+## Limits worth knowing
 
 **Trailers are not read.** The proxy reports a failure discovered mid-stream in
 an `X-YT-Error` trailer, and `ureq` 3.3 exposes none — rechecked against its

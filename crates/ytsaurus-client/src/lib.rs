@@ -100,13 +100,33 @@
 //! event instead. It is off because this crate is linked into worker binaries
 //! cross-compiled to musl — the same reason `tls` is.
 //!
-//! # What this does not do
+//! # Heavy commands go where the cluster says
 //!
-//! Heavy commands are documented to require asking `/hosts` for a dedicated
-//! proxy, and this client does not: it sends everything to the address it was
-//! given. That is correct for a local cluster and for any deployment behind a
-//! balancer, but on a large installation an upload may be refused with 503. See
-//! [`Client::heavy_proxy`] for the escape hatch.
+//! Table and file data — [`Client::write_table`], [`Client::read_table`],
+//! [`Client::write_file`], [`Client::upload_worker`] and the streaming forms of
+//! each — is what YTsaurus calls a *heavy* command, and a large installation
+//! serves those on a separate set of proxies. This client asks `/hosts` for one
+//! the first time it sends a heavy command, keeps the answer for the rest of
+//! its life, and sends every later heavy command there. Light commands stay on
+//! the address it was configured with. A heavy command that fails for a reason
+//! another proxy might not have throws the answer away, so the next one asks
+//! again.
+//!
+//! **A cluster that names no heavy proxy is answered by using the configured
+//! address**, which is what leaves a single-node installation working exactly
+//! as it did. Nor is such a cluster asked in the first place when its address
+//! is on loopback: `localhost` is this machine's own cluster or a tunnel to
+//! one, and the address a far-side proxy publishes for itself is not reachable
+//! from either. [`Client::with_proxy_discovery`] overrides that in both
+//! directions, and [`Client::heavy_proxy`] answers the question directly.
+//!
+//! Getting this wrong does not look like a routing problem, which is why it is
+//! worth spelling out what it does look like. A control proxy refuses a heavy
+//! request with **HTTP 200** carrying a structured YTsaurus error — `cluster
+//! error 1: Control proxy may not serve heavy requests with input data` — and
+//! not with a 503, so there is no status code to grep for. And a deployment
+//! **behind a balancer is the case that breaks**, not the case that works: the
+//! balancer fronts the control proxies, so every upload arrives at one.
 
 #![warn(missing_docs)]
 
@@ -335,6 +355,30 @@ impl Client {
         self
     }
 
+    /// Overrides whether heavy commands ask the cluster where to go.
+    ///
+    /// They do by default, which is what makes an upload work on an
+    /// installation that separates proxy roles — unless the address this client
+    /// was given is on loopback, where the lookup can only cost a round trip or
+    /// name a host this process cannot reach. See the module documentation.
+    ///
+    /// Both overrides have a use:
+    ///
+    /// - `true` for a cluster reached at `localhost` that really does have
+    ///   heavy proxies this process can reach — a port-forward into a real
+    ///   installation, where the discovered addresses resolve;
+    /// - `false` to pin every command to the address given, which is what a
+    ///   balancer that already routes by role wants, and what to reach for if
+    ///   the lookup itself is the thing misbehaving.
+    ///
+    /// This does not disturb what a client it was cloned from has already
+    /// resolved.
+    #[must_use]
+    pub fn with_proxy_discovery(mut self, enabled: bool) -> Self {
+        self.transport.set_proxy_discovery(enabled);
+        self
+    }
+
     /// Turns the failed-job report in [`Client::wait_for_operation`] on or off.
     ///
     /// On by default: when an operation fails, the client asks the cluster
@@ -463,12 +507,18 @@ impl Client {
         Transaction::start(self, timeout)
     }
 
-    /// Returns the least-loaded heavy proxy the cluster reports, if any.
+    /// Asks the cluster for the least-loaded heavy proxy, if it has one.
     ///
-    /// Large installations separate light and heavy proxies and answer heavy
-    /// commands on a light proxy with 503. Point a second [`Client`] at this
-    /// address to do uploads there. A local cluster returns nothing useful, and
-    /// none of this is needed for it.
+    /// **The client already does this for itself.** Heavy commands — table and
+    /// file data, in either direction — resolve a heavy proxy on their own and
+    /// go there; see the module documentation for when, and for how long the
+    /// answer is kept. So this is no longer the way to make an upload work: it
+    /// is the way to *see* the address, or to hand it to something that is not
+    /// this client — a second [`Client`], another process, a `curl`.
+    ///
+    /// It asks every time and shares nothing with what the client resolved for
+    /// itself, so calling it neither costs nor changes anything the next
+    /// command does.
     ///
     /// # Errors
     ///
@@ -478,17 +528,10 @@ impl Client {
     /// allowed to look like, since the caller's next move is to stop looking.
     pub fn heavy_proxy(&self) -> Result<Option<String>> {
         // Through the transport, so this carries the token and honours the
-        // timeout, the retry policy and the TLS guard like every other request.
-        let body = self.transport.fetch("/hosts", "hosts")?;
-
-        let hosts: Vec<String> = serde_json::from_str(&body).map_err(|e| ClientError::Decode {
-            command: "hosts".to_owned(),
-            reason: format!(
-                "/hosts did not answer with a list of host names: {e}; body was {}",
-                crate::error::truncate(&body, 200)
-            ),
-        })?;
-        Ok(hosts.into_iter().next())
+        // timeout, the retry policy and the TLS guard like every other request
+        // — and so that the automatic routing and this read the same answer
+        // with the same parser.
+        Ok(self.transport.heavy_hosts()?.into_iter().next())
     }
 
     // ------------------------------------------------------------- Cypress
@@ -1284,7 +1327,7 @@ impl Client {
             "write_file",
             &params,
             Payload::Bytes(contents),
-            Repeatable::Never,
+            Repeatable::Heavy,
         )?;
         Ok(())
     }
@@ -1362,7 +1405,7 @@ impl Client {
             "write_table",
             &params,
             Payload::Bytes(rows),
-            Repeatable::Never,
+            Repeatable::Heavy,
         )?;
         Ok(())
     }
@@ -1409,7 +1452,7 @@ impl Client {
             "write_table",
             &params,
             Payload::Bytes(rows),
-            Repeatable::Never,
+            Repeatable::Heavy,
         )?;
         Ok(())
     }
@@ -1460,7 +1503,7 @@ impl Client {
             "read_table",
             &params,
             Payload::None,
-            Repeatable::Never,
+            Repeatable::Heavy,
         )?;
 
         check_complete_yson_fragment(&body, format).map_err(|reason| ClientError::Decode {
@@ -1496,7 +1539,7 @@ impl Client {
             "read_table",
             &params,
             Payload::None,
-            Repeatable::Never,
+            Repeatable::Heavy,
         )?;
 
         check_complete_skiff_stream(&body, format).map_err(|reason| ClientError::Decode {
@@ -2687,8 +2730,8 @@ impl Client {
     /// desk rather than on the cluster.
     ///
     /// This is a *heavy* command whose answer is the data, so it streams:
-    /// nothing here holds the job's input. An installation that separates light
-    /// and heavy proxies may want it sent to [`Client::heavy_proxy`].
+    /// nothing here holds the job's input, and on an installation that
+    /// separates light and heavy proxies it is sent to the heavy one.
     ///
     /// **A job with no input never answers.** Measured against a local cluster:
     /// the request for a vanilla job's input sat for 30 seconds without a byte.
@@ -2715,8 +2758,8 @@ impl Client {
     /// UTF-8. Empty if the cluster saved nothing — stderr is kept for failed
     /// jobs and, when the spec asks for it, for successful ones.
     ///
-    /// This is a *heavy* command, so an installation that separates light and
-    /// heavy proxies may want it sent to [`Client::heavy_proxy`].
+    /// This is a *heavy* command, so on an installation that separates light
+    /// and heavy proxies it goes to the heavy one, like a table read.
     ///
     /// # Errors
     ///
@@ -2731,7 +2774,7 @@ impl Client {
             "get_job_stderr",
             &params,
             Payload::None,
-            Repeatable::Never,
+            Repeatable::Heavy,
         )
     }
 
@@ -2860,7 +2903,9 @@ impl Client {
     /// declares whether it mutates and whether it is heavy, and [`Repeatable`]
     /// is how that reaches the retry policy. [`Repeatable::Freely`] for a read,
     /// [`Repeatable::WithMutationId`] for a light mutation the master's
-    /// mutation cache covers, [`Repeatable::Never`] otherwise.
+    /// mutation cache covers, [`Repeatable::Heavy`] for one that moves table or
+    /// file data — which also sends it to a proxy that will accept one —
+    /// [`Repeatable::Never`] otherwise.
     ///
     /// "Light and mutating" is not by itself enough for a mutation ID: the
     /// cache lives in the master, and a command that goes to the **scheduler**
@@ -2936,8 +2981,10 @@ impl Client {
     ///
     /// Sent once, and never retried: this is the shape a heavy command takes,
     /// and the documentation is explicit that heavy commands are not repeated.
-    /// The request carries no body — [`Client::raw_command_upload`] is the
-    /// other direction.
+    /// It is also sent **to a heavy proxy**, for the same reason and without
+    /// asking — a response that is the data is [`Repeatable::Heavy`] whatever
+    /// the command turns out to be called. The request carries no body —
+    /// [`Client::raw_command_upload`] is the other direction.
     ///
     /// The streaming timeout applies, so the transfer itself is not on the
     /// request clock; see [`Client::with_timeout`].
@@ -2970,7 +3017,8 @@ impl Client {
     ///
     /// This is one attempt and can never be more: a reader that has been
     /// consumed cannot be sent again. A transaction is what makes such a write
-    /// safe to fail.
+    /// safe to fail. And it goes to a heavy proxy, as
+    /// [`Client::raw_command_streaming`] does and for the same reason.
     ///
     /// # Errors
     ///

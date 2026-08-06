@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 508 tests
+cargo test --workspace            # 519 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -473,6 +473,31 @@ of the response, so one `curl` per case says what it did with the header.
   (response) are the documented, non-trace way to find a request in the proxy
   log. Not sent or read yet — and reading either would mean handing response
   headers back, which no method does today.
+
+### Where a heavy command goes
+
+Observed on a real multi-node installation rather than a local Docker one — see
+[#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30), which is where the
+strings below are quoted from.
+
+- **A control proxy refuses a heavy request, and the refusal is an HTTP 200.**
+  The body carries a structured YTsaurus error — `cluster error 1: Control
+  proxy may not serve heavy requests with input data`. There is no status code
+  to grep for, and the crate's documentation promised a 503 for two releases.
+- **A deployment behind a balancer is the case that breaks**, not the case that
+  works: the balancer fronts the *control* proxies, so every upload arrives at
+  one. Pointing `YT_PROXY` at an address from `/hosts` makes the same examples
+  pass unchanged, which is what proved the cause.
+- **`/hosts` answers a JSON list of bare host names**, best first, and defaults
+  to the `data` role — the one that serves heavy commands. No scheme and not
+  always a port, so the scheme comes from the address the caller configured.
+- The client asks once per client and keeps the answer (`Transport::base_for`);
+  an empty or absent list means "the configured address serves everything",
+  which is what a single-node cluster is. **A cluster on loopback is not asked
+  at all**: what it publishes for itself is an address behind the port mapping
+  or tunnel that `localhost` stands for, and following it would break every
+  upload that works today. That last point is reasoning, not a measurement —
+  no local cluster's `/hosts` answer has been captured here.
 
 ### Connections
 

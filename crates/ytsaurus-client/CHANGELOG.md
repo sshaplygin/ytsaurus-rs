@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Heavy commands go to a heavy proxy, without being asked to
+
+`Client::heavy_proxy` has always worked, and **nothing ever called it**. Every
+heavy command — `write_table`, `write_file`, `read_table`, `upload_worker`,
+`write_table_rows`, the streaming forms of each — went to whatever `YT_PROXY`
+held, which on an installation that separates proxy roles is a control proxy,
+and a control proxy refuses one. Run against a real multi-node cluster rather
+than a local Docker one, that failed **19 of the 21 shipped examples** at their
+first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
+
+- **Added** automatic routing. The first heavy command asks `/hosts`, the
+  answer is kept for the client's lifetime and shared by every clone of it, and
+  a heavy command that fails for a reason another proxy might not have throws
+  it away so that the next one asks again. The failed command itself is not
+  re-sent: heavy commands are not retried, and by then a streamed body is gone.
+
+- **The classification is the one the crate already had.** `Repeatable` encodes
+  the two bits the cluster's own command registry declares, `isVolatile` and
+  `isHeavy`, and `Repeatable::Never` was carrying both "heavy" and "mutating
+  where no mutation cache covers it". Those are now `Repeatable::Heavy` and
+  `Repeatable::Never`, so the heavy commands are the ones already marked heavy
+  rather than a second list beside the first, free to drift from it. The two
+  streaming seams — `Transport::open` and `Transport::upload` — are heavy by
+  construction, so a raw streaming command is routed too.
+
+- **A cluster that names no heavy proxy keeps serving them itself.** That is
+  what leaves a single-node installation working exactly as it did, and an
+  absent `/hosts` (404) is remembered as such so it is not asked again before
+  every upload. A lookup that failed for a reason that might pass is not
+  remembered, by the same judgement the retry policy uses.
+
+- **A cluster on loopback is not asked at all**, which is the other half of
+  leaving local alone: `localhost` is this machine's own cluster or a tunnel to
+  one, and the address a proxy publishes for itself is not reachable from the
+  near end of either. Following it would break every upload that works today,
+  and the round trip could not have helped in the first place.
+  **Added** `Client::with_proxy_discovery` to override that in both directions
+  — on for a port-forward into a real installation, off to pin everything to
+  the address given.
+
+- **Corrected** two things this crate's own documentation said about the gap,
+  both wrong in a way that cost time. It is **not a 503**: the response is HTTP
+  200 carrying a structured YTsaurus error, `cluster error 1: Control proxy may
+  not serve heavy requests with input data`, so there is no status to grep for.
+  And a deployment **behind a balancer is the case that breaks**, not the case
+  that works — the balancer fronts the control proxies. `heavy_proxy` remains,
+  no longer as the escape hatch that makes an upload work but as the way to see
+  the address or hand it to something that is not this client.
+
+- **Tested offline**, because none of it can be verified here: two listeners in
+  `tests/request_shape.rs`, one answering `/hosts` with the other's address, and
+  assertions about which one each command reached. A cluster answers a heavy
+  command the same way whichever proxy was asked, so nothing about the answers
+  could have caught this.
+
 ### An operation is no longer a string and four commands
 
 - **Added** the rest of the operation lifecycle — `suspend_operation`,

@@ -52,7 +52,7 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Token lookup | `Token`, `TokenPath`, `~/.yt/token` | `YT_TOKEN`; a file only with `ReadTokenFromFile` | `YT_TOKEN`, `YT_TOKEN_PATH`, `~/.yt/token` |
 | Other credentials | TVM, service tickets, impersonation | 5 implementations, swappable per call | OAuth only |
 | TLS | `UseTLS` | `UseTLS` + caller CA bundle | `tls` feature, system roots |
-| Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | **manual** — `heavy_proxy()` returns one host |
+| Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — one host, kept for the client's life and dropped when a heavy command cannot reach it; no ban list |
 | Compression | configurable, off by default | zstd both ways | gzip **inbound only** |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
 | Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
