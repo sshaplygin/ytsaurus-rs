@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### A command this crate does not model can now be sent
+
+- **Added** `Client::raw_command`, and with it the answer to "can I do X
+  against my cluster?" stops being "fork the crate". `Transport::call` was
+  `pub(crate)`, so a command with no method on `Client` could not be sent at
+  all — the transport under it would have carried the request perfectly well,
+  and there was no way in. `Client::start_operation` taking a hand-built spec
+  already set the precedent; this generalises it to every command.
+
+  Four entry points, because a raw command has the same three shapes a
+  modelled one does:
+
+  - `raw_command(method, command, params, payload)` — buffered, the common
+    case;
+  - `raw_command_with(…, repeatable, mutation_id)` — the same, with the retry
+    classification the caller knows and the crate cannot;
+  - `raw_command_streaming(method, command, params)` — the response handed
+    back unread, for a command whose answer is the data (`read_file`,
+    `read_blob_table`);
+  - `raw_command_upload(method, command, params, body)` — the request body
+    read as it is sent, for a command with an input data stream.
+
+- **Added** `Method` and `Repeatable` to the public API, since a caller cannot
+  choose either for a command the crate has never heard of. `Method` carries
+  the proxy's own rule for picking a verb: *input data stream → PUT, mutating
+  → POST, otherwise GET*.
+
+- **Added** `ResponseReader`, the response-body reader `raw_command_streaming`
+  hands back. `TableReader` is now a name for it — the same type, unchanged
+  for every existing caller, because nothing about reading a body as it
+  arrives was ever specific to tables.
+
+- **Added** `yson_build::empty_map`, for a command that takes no parameters.
+  `map([])` cannot express it: the key type has nothing to be inferred from,
+  and `map` takes its entries as an `impl Trait` argument, so a turbofish is
+  not allowed either.
+
+  Three decisions made deliberately rather than by default:
+
+  - **A raw command is sent once.** A command the crate does not model cannot
+    be assumed idempotent, and a retry that applied an unknown mutation twice
+    is a worse failure than one lost to a flaky proxy — so `raw_command`
+    ignores the retry policy whatever it says. `raw_command_with` is where a
+    caller who knows the command says otherwise.
+  - **It is stamped with the client's transaction**, exactly as every modelled
+    command is, so a raw command sent through a `Transaction` is *in* it
+    rather than quietly beside it. The `NO_TRANSACTION` exceptions apply
+    unchanged.
+  - **The command name is checked before the URL is built.** It goes into
+    `/api/v4/{command}` as it is, so a name carrying `/`, `?`, `#` or
+    whitespace is refused: the failure it would otherwise produce is not an
+    error but a plausible answer from the wrong place. A payload passed with
+    `Method::Get` is refused for the same reason — a GET carries no body, so
+    it would be dropped in silence.
+
 ### `remove` stopped being `rm -rf`
 
 - **Changed** `Client::remove`: it sent `recursive=%true; force=%true` on

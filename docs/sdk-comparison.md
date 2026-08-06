@@ -170,11 +170,21 @@ the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues) — logging
 and tracing first, then the operation object and its lifecycle, `read_file`,
 batch requests, read-side column and range selection, and transaction `Detach`.
 
-Behind all of them sits one structural gap: **`Transport::call` is
-`pub(crate)`**, so a command this crate does not model cannot be sent at all.
-Every entry above is unreachable even as a workaround until there is a public
-raw-command door — `Client::start_operation` taking a raw spec already sets the
-precedent that one is acceptable here.
+Behind all of them used to sit one structural gap: `Transport::call` was
+`pub(crate)`, so a command this crate does not model could not be sent at all,
+and every entry above was unreachable even as a workaround. **That is now
+`Client::raw_command`** — with `raw_command_streaming` and
+`raw_command_upload` for the heavy shapes — so each remaining entry is a
+question of ergonomics rather than of capability. `read_file` is the clearest
+case: still not modelled, and reachable today as
+`raw_command_streaming(Method::Get, "read_file", …)`, which never holds more of
+the file than a buffer. See `cargo run -p ytsaurus-client --example raw`.
+
+Whether either official client offers the same door was not checked for this
+document, and it matters less to them: both model far more of the API, so the
+set of commands a user has to reach around them for is much smaller. The door
+here is deliberately narrow — sent once unless the caller classifies the
+command, and refusing a command name that would change the request URL.
 
 ## What was not verified
 

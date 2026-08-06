@@ -325,18 +325,23 @@ impl Transport {
         Ok(response.into_body())
     }
 
-    /// Sends a command whose request body is read as it goes.
+    /// Sends a command whose request body is read as it goes, and returns the
+    /// answer.
     ///
     /// For `write_table` from something larger than memory. `rows` is read
     /// once, so this cannot be retried even in principle: a reader that has
     /// been consumed cannot be sent again.
+    ///
+    /// The response body has to be read whatever the caller wants with it (see
+    /// below), so it is handed back rather than dropped: `write_table` ignores
+    /// it, and a raw command has no one but the caller to interpret it.
     pub(crate) fn upload(
         &self,
         method: Method,
         command: &str,
         parameters: &YsonValue,
         rows: &mut dyn std::io::Read,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
@@ -354,17 +359,27 @@ impl Transport {
         // an upload that ignored its answer would open a fresh connection for
         // every table write, and leave the old one in TIME_WAIT. The benchmark
         // is what noticed: 11 623 of them after a few seconds of writing.
-        let body = response.body_mut().read_to_string().unwrap_or_default();
+        //
+        // Read as bytes rather than as a string: an upload's answer is a small
+        // structured document today, but a raw command sends whatever it was
+        // given, and lossily decoding a binary answer would be a silent
+        // corruption rather than a refusal.
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(512 * 1024 * 1024)
+            .read_to_vec()
+            .unwrap_or_default();
 
         if !(200..300).contains(&status) {
             return Err(ClientError::Http {
                 command: command.to_owned(),
                 status,
-                body: truncate(&body, 400),
+                body: truncate(&String::from_utf8_lossy(&body), 400),
             });
         }
 
-        Ok(())
+        Ok(body)
     }
 
     /// Fetches a path that is not an API v4 command.
@@ -546,10 +561,30 @@ fn tls_unavailable(_base: &str) -> Option<ClientError> {
     None
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum Method {
+/// The HTTP verb a command is sent with.
+///
+/// Which one a command wants is not a matter of taste. The
+/// [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference)
+/// gives the rule outright:
+///
+/// > If the command has an input data stream, then PUT. If the command is
+/// > mutating, then POST. Otherwise GET.
+///
+/// Those three properties are declared per command in the cluster's own driver
+/// registry, so the answer for a command this crate does not model is a lookup
+/// rather than a guess: `write_table` takes a data stream and is a PUT, `create`
+/// mutates and is a POST, `get` and `get_supported_features` do neither and are
+/// GETs.
+///
+/// Public because [`Client::raw_command`](crate::Client::raw_command) cannot
+/// choose for a command it has never heard of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    /// A command that neither mutates nor takes an input stream.
     Get,
+    /// A mutating command with no input stream — most of API v4.
     Post,
+    /// A command with an input data stream: `write_table`, `write_file`.
     Put,
 }
 

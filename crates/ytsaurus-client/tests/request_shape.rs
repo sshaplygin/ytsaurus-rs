@@ -11,8 +11,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 use ytsaurus_client::{
-    Client, ClientError, DataFormat, RetryPolicy, SkiffFormat, SkiffSchema, SkiffSchemaRef,
-    SkiffWireType, TablePath,
+    Client, ClientError, DataFormat, Method, RetryPolicy, SkiffFormat, SkiffSchema, SkiffSchemaRef,
+    SkiffWireType, TablePath, yson_build,
 };
 
 /// Serves exactly one request and returns its headers as text.
@@ -341,6 +341,44 @@ fn an_unauthenticated_client_sends_no_authorization_at_all() {
     assert!(
         !head.to_lowercase().contains("authorization:"),
         "an unauthenticated client sent an authorization header:\n{head}"
+    );
+}
+
+#[test]
+fn a_raw_command_is_dressed_like_every_other_command() {
+    // The reason the escape hatch is a `Client` method and not a bare `ureq`
+    // agent handed to the caller. A raw command has to arrive looking like a
+    // command — the token, the header format, the parameters header, the
+    // compression — or every user of it reimplements this crate's transport
+    // badly. A cluster answers the same either way, so nothing but this would
+    // notice a regression.
+    let head = capture(|proxy| {
+        let client = Client::with_token(proxy, "secret-token").with_retries(RetryPolicy::none());
+        let _ = client.raw_command(
+            Method::Get,
+            "get_supported_features",
+            &yson_build::empty_map(),
+            None,
+        );
+    });
+
+    let lowercase = head.to_lowercase();
+    assert!(
+        head.starts_with("GET /api/v4/get_supported_features HTTP/1.1"),
+        "the command name is the path, with nothing appended:\n{head}"
+    );
+    assert!(
+        lowercase.contains("authorization: oauth secret-token"),
+        "a raw command must carry the token:\n{head}"
+    );
+    assert!(
+        lowercase.contains("x-yt-header-format: <format=text>yson")
+            && lowercase.contains("x-yt-parameters: {}"),
+        "a raw command must encode its parameters the way the protocol says:\n{head}"
+    );
+    assert!(
+        lowercase.contains("accept-encoding: gzip"),
+        "a raw command must ask for compression like the rest:\n{head}"
     );
 }
 

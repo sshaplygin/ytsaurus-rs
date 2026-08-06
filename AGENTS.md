@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 343 tests
+cargo test --workspace            # 427 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -263,6 +263,40 @@ per command. Cluster facts:
   inside `Error resolving path …`.
 - `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
   handle pings its own transaction.
+
+### Picking a verb, and what is a command at all
+
+- **The proxy documents the rule outright**, so no command's verb is a guess:
+  *"If the command has an input data stream, then PUT. If the command is
+  mutating, then POST. Otherwise GET."* Both properties are declared per
+  command in the cluster's own registry —
+  `yt/yt/client/driver/driver.cpp`, `REGISTER_ALL(command, name, inDataType,
+  outDataType, isVolatile, isHeavy)`. Cross-checked against what this crate
+  already sends: `write_table` is `Tabular` in and volatile → PUT, `create` is
+  volatile → POST, `get` and `read_table` are neither → GET.
+- That registry is also where "is this command retriable, and is it heavy?"
+  is answered: `isVolatile` and `isHeavy` are the two bits `Repeatable`
+  encodes. `Client::raw_command` defaults to `Repeatable::Never` because it
+  cannot read them for a command it does not model.
+- **`whoami` is not an API v4 command.** It is easy to assume it is, and the
+  Go SDK's `WhoAmI` goes through `newAuthCall` to the proxy's auth endpoint,
+  not to `/api/v4/`. `get_supported_features` is the real "no parameters,
+  small answer" command — `Null` in, `Structured` out, non-volatile,
+  non-heavy — and is what the doctest and the `raw` example use.
+- `list_operations`, `check_permission`, `read_file` and
+  `get_supported_features` are all registered and none is modelled here; they
+  are the natural first users of the raw door.
+- **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
+  envelope is keyed by what the command returns, the same trap that made
+  `exists` read the wrong key for two releases. Captured from a local cluster:
+  `compression_codecs` (71 of them), `erasure_codecs`, `node_flavors`,
+  `operation_statistics_descriptions`, `primitive_types`,
+  `query_memory_limit_in_tablet_nodes`,
+  `require_password_in_authentication_commands`, `structured_web_json`,
+  `user_tokens_metadata`.
+- **`read_file` streams and `write_file` takes a chunked body**, verified with
+  a 4 MB round trip through `Client::raw_command_streaming` and
+  `raw_command_upload` — neither direction holds the file.
 
 ### Authentication and compression
 
@@ -595,9 +629,11 @@ of what has actually been run:
 six have a Rust counterpart that runs on a cluster, six are a decision recorded
 here not to. Three asked for something the client could not do — typed rows,
 typed nodes, and a successful job's stderr — and got it. **Read that document
-before adding client API**: it also lists what the Go SDK can do and this cannot
-(no `abort_operation`, no `<append=%true>`, no public escape hatch), which is
-where the next real gap is.
+before adding client API**: it also lists what the Go SDK can do and this
+cannot, which is where the next real gap is. Three of the four it listed are
+now built — `abort_operation`, `<append=%true>`, and the escape hatch
+(`Client::raw_command`); only the web UI links remain, and those are a
+deliberate no.
 
 **What is left of the backlog is not code.** P3 #15 (tracing spans) is written
 down as "only worth doing if a user asks" — **and one has**: tracing, together

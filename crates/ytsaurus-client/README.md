@@ -55,6 +55,7 @@ cargo run -p ytsaurus-client --example launch
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation`, `abort_operation`, `operation_result_error` |
 | Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum`, `job_statistics`, `job_statistic_sum` |
 | Transactions | `start_transaction`, `with_transaction`, `Transaction::{commit, abort, ping}` |
+| Anything else | `raw_command`, `raw_command_with`, `raw_command_streaming`, `raw_command_upload` |
 
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
 [`MapReduceSpec`] / [`VanillaSpec`], which model what launching a
@@ -446,6 +447,44 @@ mid-stream failure that still yields well-formed output would not be.
 `_with_format` and `_skiff_table` variants. They are for results a launcher
 inspects; `read_table_streaming` and `write_table_streaming` are for everything
 larger.
+
+## A command this crate does not model
+
+The table above is roughly a quarter of API v4, and the rest is reachable
+without forking the crate:
+
+```rust
+use ytsaurus_client::{Client, Method, yson_build};
+
+let client = Client::from_env()?;
+
+// Not modelled here, and needs no parameters: what this cluster's build can do.
+let body = client.raw_command(
+    Method::Get,
+    "get_supported_features",
+    &yson_build::empty_map(),
+    None,
+)?;
+```
+
+`raw_command_streaming` and `raw_command_upload` are the same door for a
+command whose answer is the data (`read_file`) or whose request is
+(`write_file`), so neither has to fit in memory.
+
+What you give up is the parameters and the answer — the crate has no opinion
+about either. What you keep is everything else: the token, the timeout, TLS,
+the header encoding, the `X-YT-Error` check, and **the client's transaction**,
+so a raw command sent through a `Transaction` is in it rather than beside it.
+
+Two deliberate defaults. A raw command is **sent once**, whatever the retry
+policy says, because a command the crate does not model cannot be assumed
+idempotent — `raw_command_with` takes a `Repeatable` from a caller who knows
+better. And the **command name is checked** before the URL is built: it goes
+into `/api/v4/{command}` as it is, so a name carrying `/` or `?` is refused
+rather than allowed to address something else. `Method` documents the proxy's
+own rule for choosing a verb.
+
+`cargo run -p ytsaurus-client --example raw` exercises all four entry points.
 
 ## Why not JSON
 

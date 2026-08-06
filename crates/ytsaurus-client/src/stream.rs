@@ -18,6 +18,10 @@ use std::io::Read;
 /// A YSON list fragment, in whatever format the read asked for — binary by
 /// default, which is what `ytsaurus_job::JobReader::binary` expects.
 ///
+/// This is [`ResponseReader`] under the name the table paths use; the type is
+/// the same, because nothing about reading a response body as it arrives is
+/// specific to tables.
+///
 /// # The check this gives up
 ///
 /// [`Client::read_table`](crate::Client::read_table) verifies that what came
@@ -30,12 +34,27 @@ use std::io::Read;
 /// does not parse, and `JobReader` fails on it rather than stopping quietly —
 /// which is the same protection, applied at the point where it can still be
 /// applied.
-pub struct TableReader {
+pub type TableReader = ResponseReader;
+
+/// A response body, arriving as it is read.
+///
+/// What [`Client::read_table_streaming`](crate::Client::read_table_streaming)
+/// hands back under the name [`TableReader`], and what
+/// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming)
+/// hands back for a command this crate does not model — `read_file`, or
+/// anything else whose answer is the data rather than a report about it.
+///
+/// Uncapped, unlike the buffered path: a stream has no size a client should
+/// presume. The trailer gap described on [`TableReader`] applies to every use
+/// of this, not only to tables — a body cut short by a mid-stream failure ends
+/// early and says nothing, so whatever consumes it has to be the thing that
+/// notices.
+pub struct ResponseReader {
     inner: ureq::BodyReader<'static>,
     read: u64,
 }
 
-impl TableReader {
+impl ResponseReader {
     pub(crate) fn new(body: ureq::Body) -> Self {
         Self {
             // A reader has no size cap, where `read_to_vec` — what the buffered
@@ -54,7 +73,7 @@ impl TableReader {
     }
 }
 
-impl Read for TableReader {
+impl Read for ResponseReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.read += n as u64;
@@ -62,9 +81,9 @@ impl Read for TableReader {
     }
 }
 
-impl std::fmt::Debug for TableReader {
+impl std::fmt::Debug for ResponseReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TableReader")
+        f.debug_struct("ResponseReader")
             .field("bytes_read", &self.read)
             .finish()
     }
