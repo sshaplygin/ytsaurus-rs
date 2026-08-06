@@ -18,8 +18,10 @@
 //!
 //! With one exception, which no cluster reports and only a client can know: a
 //! transport failure that is the TLS layer **rejecting the cluster's
-//! certificate** is a settled verdict, not a passing condition. It is reported
-//! at the first attempt — see [`rejected_the_certificate`].
+//! certificate for a reason this client's own configuration decided** is a
+//! settled verdict, not a passing condition. It is reported at the first
+//! attempt — see [`rejected_the_certificate`], and [`SETTLED_REJECTIONS`] for
+//! how few of the TLS layer's complaints that actually is.
 
 use std::time::Duration;
 
@@ -85,19 +87,41 @@ const RETRIABLE_CODES: &[i64] = &[
 /// document to judge by.
 const RETRIABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
 
-/// How `rustls` spells a certificate it would not accept.
+/// How `rustls` 0.23 introduces a verdict on the peer's certificate.
 ///
-/// Read out of `rustls` 0.23's `Display for Error` rather than collected from
-/// messages as they were seen: `InvalidCertificate` renders as `invalid peer
-/// certificate: <reason>`, `InvalidCertRevocationList` and
-/// `NoCertificatesPresented` as the other two. Those three are the whole of
-/// "the chain was not acceptable"; every other `rustls::Error` is about the
-/// protocol, not about who signed what.
-const CERTIFICATE_REJECTIONS: &[&str] = &[
-    "invalid peer certificate",
-    "invalid certificate revocation list",
-    "peer sent no certificates",
-];
+/// Read out of its `Display for Error` rather than collected from messages as
+/// they were seen: `InvalidCertificate(reason)` renders as `invalid peer
+/// certificate: ` followed by the `Debug` of a `CertificateError`. That reason
+/// is what decides whether waiting could help, so it is read rather than
+/// discarded — see [`SETTLED_REJECTIONS`].
+const CERTIFICATE_VERDICT: &str = "invalid peer certificate: ";
+
+/// The certificate verdicts a second attempt cannot change.
+///
+/// Deliberately two, and both decided **here** rather than at the cluster:
+///
+/// - `UnknownIssuer` — the chain does not end in a root this client trusts. The
+///   root store is the same one a second later; only `YT_CA_BUNDLE` or the
+///   `platform-verifier` feature changes it.
+/// - `NotValidForName` — the certificate does not cover the host that was
+///   asked for. The host is the same one a second later too. (It also matches
+///   `NotValidForNameContext { .. }`, which carries the names it compared.)
+///
+/// Everything else stays retriable, and the reason is the same in each case:
+/// the answer might genuinely differ next time.
+///
+/// - `Other(..)` is what `rustls-platform-verifier` — the whole point of the
+///   `platform-verifier` feature — maps a *platform* failure to: a revocation
+///   lookup that timed out, a trust store that could not be opened. Those are
+///   transient conditions of this machine, and classifying them here would
+///   turn the feature into a way of making the OS's bad afternoon permanent.
+/// - `Expired` and `NotValidYet` are a property of the certificate that
+///   answered, not of the fleet: a round-robin proxy set mid-rotation has some
+///   members already renewed, and the next connection may reach one of them.
+/// - `invalid certificate revocation list` is a CRL that could not be fetched
+///   or parsed — the same transient class as `Other`.
+/// - `peer sent no certificates` is a proxy that answered wrong once.
+const SETTLED_REJECTIONS: &[&str] = &["UnknownIssuer", "NotValidForName"];
 
 /// How often, and how patiently, a failed request is repeated.
 ///
@@ -327,10 +351,16 @@ pub(crate) fn is_retriable(error: &ClientError) -> bool {
 /// `ureq-proto` produces `InvalidData`, and a failed decompression has a
 /// variant of its own) and the text says which TLS failure it was.
 ///
-/// **Deliberately narrow.** A reset connection, a refused one, a timeout, a
-/// half-open socket: all stay retriable, because none of them is a verdict on
-/// the certificate. So does every other `rustls::Error` — a protocol-level
-/// disagreement mid-handshake may well be one busy proxy out of several.
+/// **Deliberately narrow, in three ways.** The kind confines it to the TLS
+/// layer; the prefix confines it to a verdict about the certificate rather than
+/// about the protocol — a disagreement mid-handshake may well be one busy proxy
+/// out of several; and the reason itself confines it to the two verdicts this
+/// client's own configuration decides, rather than to every unhappy thing a
+/// verifier can say. See [`SETTLED_REJECTIONS`], which is where that last
+/// narrowing is argued: an `Other(..)` from `rustls-platform-verifier` is a
+/// passing condition of this machine, and reading it as a verdict would make
+/// enabling the platform verifier a way of turning the operating system's bad
+/// afternoon into a permanent failure.
 fn rejected_the_certificate(error: &ureq::Error) -> bool {
     let ureq::Error::Io(io) = error else {
         return false;
@@ -341,9 +371,16 @@ fn rejected_the_certificate(error: &ureq::Error) -> bool {
     }
 
     let message = io.to_string();
-    CERTIFICATE_REJECTIONS
+    let Some((_, reason)) = message.split_once(CERTIFICATE_VERDICT) else {
+        return false;
+    };
+
+    // `starts_with` and not `contains`: `Other(..)` wraps a message this crate
+    // did not write, and one that happened to quote `UnknownIssuer` would
+    // otherwise be read as one.
+    SETTLED_REJECTIONS
         .iter()
-        .any(|rejection| message.contains(rejection))
+        .any(|settled| reason.starts_with(settled))
 }
 
 /// Looks for a retriable code anywhere in the error document.
@@ -518,14 +555,60 @@ mod tests {
         )));
 
         for rejection in [
-            "invalid peer certificate: Expired",
             "invalid peer certificate: NotValidForName",
-            "invalid certificate revocation list: ParseError",
-            "peer sent no certificates",
+            // The context-carrying form of the same verdict.
+            "invalid peer certificate: NotValidForNameContext { expected: DnsName(\"a\"), \
+             presented: [\"DnsName(\\\"b\\\")\"] }",
         ] {
             assert!(
                 !is_retriable(&transport_error(std::io::ErrorKind::InvalidData, rejection)),
                 "{rejection}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_platform_verifier_that_had_a_bad_afternoon_is_retried() {
+        // `rustls-platform-verifier` — which is what the `platform-verifier`
+        // feature turns on — maps every failure of the operating system's own
+        // machinery to `CertificateError::Other`, and that renders under the
+        // same `invalid peer certificate:` prefix as a verdict. A revocation
+        // lookup that timed out or a trust store that was momentarily
+        // unreadable is a condition, not a judgement, and reading it as one
+        // would make enabling the feature a way of turning the OS's bad
+        // afternoon into a permanent failure.
+        for message in [
+            "invalid peer certificate: Other(OtherError(TrustStoreUnavailable))",
+            "invalid peer certificate: Other(OtherError(RevocationLookupTimedOut))",
+            // Nor does quoting a settled reason inside one make it settled.
+            "invalid peer certificate: Other(OtherError(\"UnknownIssuer lookup failed\"))",
+        ] {
+            assert!(
+                is_retriable(&transport_error(std::io::ErrorKind::InvalidData, message)),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_certificate_that_may_be_one_proxy_out_of_several_is_retried() {
+        // A fleet answers round-robin, so these are properties of the member
+        // that happened to answer rather than of the installation. Mid-rotation
+        // some members are renewed and some are not; the next connection may
+        // reach a renewed one, and fifteen seconds is a cheap price for that
+        // against reporting a working cluster as broken.
+        for message in [
+            "invalid peer certificate: Expired",
+            "invalid peer certificate: NotValidYet",
+            "invalid peer certificate: Revoked",
+            // A revocation list that could not be fetched or parsed is the
+            // same transient class.
+            "invalid certificate revocation list: ParseError",
+            "peer sent no certificates",
+        ] {
+            assert!(
+                is_retriable(&transport_error(std::io::ErrorKind::InvalidData, message)),
+                "{message}"
             );
         }
     }
@@ -550,6 +633,12 @@ mod tests {
             (
                 std::io::ErrorKind::InvalidData,
                 "peer misbehaved: TooManyEmptyFragments",
+            ),
+            // The right words, the wrong layer: a body that decompressed to
+            // nonsense is not a handshake.
+            (
+                std::io::ErrorKind::Other,
+                "invalid peer certificate: UnknownIssuer",
             ),
         ] {
             assert!(is_retriable(&transport_error(kind, message)), "{message}");

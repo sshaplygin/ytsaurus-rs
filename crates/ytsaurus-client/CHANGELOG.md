@@ -27,8 +27,27 @@
   cluster reached over plain HTTP is not refused: there is no handshake for the
   bundle to have configured.
 
+  **And so is a `BEGIN CERTIFICATE` block that is not an X.509 certificate.**
+  PEM is only an envelope: the reader splits the sections and base64-decodes
+  them, and `rustls` then discards a block it cannot parse *without telling
+  anyone*. So a PKCS#7 `.p7b` re-armoured under that label — how a Windows-born
+  bundle usually arrives — was accepted here, produced an empty root store, and
+  failed every request with exactly the `UnknownIssuer` that naming a CA is
+  supposed to prevent, mentioning neither the file nor the variable. Every block
+  is now checked to be a certificate, and one that is not refuses the whole
+  file, naming it and saying how many blocks were wrong: a root store silently
+  shorter than the one the caller wrote down is the same failure a step later.
+
   The bundle wins where both are set. It is the more specific answer, and the
   one the caller went out of their way to give.
+
+  The file is read **once per process** and capped at 16 MB, and it must be a
+  regular file. `Client::new` cannot fail and the client's global timeout covers
+  requests rather than files, so there was nothing above the read to bound it: a
+  variable naming a FIFO hung the constructor for ever, and one naming something
+  enormous was paid for in memory before anyone could be told. Once per process
+  because an agent is rebuilt more often than it looks — `Client::with_timeout`
+  makes a new one, and a transaction's start and drop each build a client.
 
   **No new direct dependency, and the musl worker graph is unchanged.** `ureq`
   3.3 already offers both routes; both sit behind the `tls` feature, which
@@ -36,16 +55,25 @@
   now searches for `rustls-platform-verifier` alongside `tracing`, `rustls` and
   `ring`.
 
-- **Fixed** a certificate error being retried five times. A rejected chain is
+- **Fixed** a certificate error being retried five times. An unknown issuer is
   not a transient failure — the same roots reject the same certificate on the
   fifth attempt — but it arrived as a transport error, and every transport error
   was retriable, so a misconfigured CA took about fifteen seconds of doubling
   backoff to report. It is reported at the first attempt now.
 
-  Deliberately narrow: a reset connection, a refused one and a timeout are all
-  still retried, and so is every TLS failure that is not about the certificate,
-  since a protocol-level disagreement mid-handshake may well be one busy proxy
-  out of several.
+  Deliberately narrow, and narrower than "the certificate was rejected". Only
+  `UnknownIssuer` and `NotValidForName` are settled, because both are decided by
+  *this client's* root store and *this client's* URL, neither of which the next
+  attempt changes. Every other TLS complaint is still retried: an expired or
+  revoked certificate is a property of the fleet member that answered, and a
+  round-robin set mid-rotation may answer with a renewed one; a revocation list
+  that could not be fetched is transient by definition; and
+  `rustls-platform-verifier` — which the new `platform-verifier` feature turns
+  on — reports a failed revocation lookup or a momentarily unreadable trust
+  store as `Other(…)` under the same prefix, so classifying that would have made
+  enabling the feature a way of turning a bad afternoon on this machine into a
+  permanent failure. A reset connection, a refused one and a timeout are all
+  still retried, as is every protocol-level disagreement mid-handshake.
 
 ### An operation is no longer a string and four commands
 

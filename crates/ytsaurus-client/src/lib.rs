@@ -37,8 +37,13 @@
 //!
 //! `YT_CA_BUNDLE` names a PEM file of root certificates, for an installation
 //! whose certificate chains to a CA the Mozilla bundle has never heard of. It
-//! is read by every client, however it was built, and the `platform-verifier`
-//! feature is the same answer without a variable to set.
+//! is read by any build with the `tls` feature — which is the default, and the
+//! only kind that has a handshake to configure — and the `platform-verifier`
+//! feature is the same answer without a variable to set. Every block in the
+//! file must be an X.509 certificate: one that is not, a `.p7b` re-armoured
+//! under a `BEGIN CERTIFICATE` label being the usual case, refuses the whole
+//! file rather than becoming a root store quietly shorter than the caller
+//! wrote down.
 //!
 //! # When an operation fails
 //!

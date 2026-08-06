@@ -345,14 +345,34 @@ per command. Cluster facts:
   `UnknownIssuer`. Verified against a real multi-node installation with a
   three-deep, self-signed chain (#29); a local cluster is plain HTTP and cannot
   exercise any of it.
-- **A rejected certificate is not retried.** It arrives as `ureq::Error::Io` of
-  kind `InvalidData` wrapping a `rustls::Error` — the message is
-  `invalid peer certificate: …`, `invalid certificate revocation list: …` or
-  `peer sent no certificates` — and was retried five times as an ordinary
-  transport failure, which put ~15 s of backoff in front of a verdict that
-  cannot change. Read out of `rustls` 0.23's `Display` rather than from the one
-  message that was seen. Every other transport failure, and every other
-  `rustls::Error`, stays retriable.
+- **PEM is an envelope and proves nothing about what is inside it.**
+  `ureq::tls::parse_pem` splits the sections and base64-decodes them; the
+  `Certificate` it hands back is documented as unvalidated, and `rustls`'
+  `add_parsable_certificates` then **discards what it cannot parse and reports
+  the count to nobody**. So a PKCS#7 `.p7b` re-armoured under a
+  `BEGIN CERTIFICATE` label — how a Windows-born bundle usually arrives — was
+  accepted, produced an empty root store, and failed every request with the
+  same `UnknownIssuer` the variable exists to end. `http::is_x509` checks the
+  DER skeleton (`SEQUENCE { SEQUENCE, SEQUENCE, BIT STRING }`, and the head of
+  the `TBSCertificate` inside it) and **one bad block refuses the whole file**;
+  a `ContentInfo` parts company at its first member, which is an OBJECT
+  IDENTIFIER rather than the `tbsCertificate` sequence. The bundle is also
+  `stat`ed before it is opened, because opening a FIFO blocks for ever and
+  `Client::new` is infallible with nothing above it to time a file read out.
+- **A rejected certificate is not retried — for two of the reasons, not all of
+  them.** It arrives as `ureq::Error::Io` of kind `InvalidData` wrapping a
+  `rustls::Error`, rendered `invalid peer certificate: <Debug of
+  CertificateError>`, and was retried five times as an ordinary transport
+  failure, which put ~15 s of backoff in front of a verdict that cannot change.
+  Only `UnknownIssuer` and `NotValidForName` are that verdict: both are decided
+  by *this client's* roots and *this client's* URL, which the next attempt does
+  not change. Everything else stays retriable, and deliberately so —
+  `rustls-platform-verifier` maps a failed revocation lookup or an unreadable
+  trust store to `Other(…)` under the same prefix, and classifying those would
+  make enabling `platform-verifier` a way of turning a transient OS condition
+  into a permanent failure; `Expired` and `Revoked` are properties of the fleet
+  member that answered, and a round-robin set mid-rotation may answer with a
+  renewed one next time.
 
 ### The operation lifecycle
 

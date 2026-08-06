@@ -297,21 +297,33 @@ export YT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ```
 
 Every certificate in the file becomes a root; anything else in it — a private
-key, a comment, an HTML error page someone saved under that name — is not one.
-A file that yields no certificates at all is **refused**, with an error naming
-it, rather than quietly falling back to the Mozilla roots: that fallback would
-answer a deliberate request with the very handshake failure the variable exists
-to end. So is a file that cannot be read.
+key, a comment — is not one, and is skipped. A file that yields no certificates
+at all is **refused**, with an error naming it, rather than quietly falling back
+to the Mozilla roots: that fallback would answer a deliberate request with the
+very handshake failure the variable exists to end. So is a file that cannot be
+read, one that is not a regular file, and one larger than 16 MB.
+
+**A `BEGIN CERTIFICATE` block that is not an X.509 certificate refuses the whole
+file**, naming it and saying how many blocks were wrong. PEM is only an
+envelope, and `rustls` discards a block it cannot parse without telling anyone —
+so a PKCS#7 `.p7b` re-armoured under that label used to be accepted, produce an
+empty root store, and fail every request with the same `UnknownIssuer` this
+variable exists to end. `openssl pkcs7 -print_certs` converts one properly.
 
 The other way is the `platform-verifier` feature, which trusts whatever the
 operating system trusts and so needs nothing set — see *Features*. The bundle
 wins when both are there: it is the more specific answer, and the one the caller
 went out of their way to give.
 
-A refused certificate is reported **once**, not retried. It is not a transient
-failure — the same roots will reject the same chain on the fifth attempt — and
-retrying it only put fifteen seconds of doubling backoff in front of the same
-message. An ordinary reset connection is still retried.
+**An unknown issuer, or a certificate that does not cover the host asked for, is
+reported once rather than retried.** Neither is transient: both are decided by
+this client's own roots and its own URL, which are the same on the fifth attempt,
+and retrying only put fifteen seconds of doubling backoff in front of the same
+message. Every other TLS complaint is still retried — an expired certificate,
+because a round-robin fleet mid-rotation may answer with a renewed one next
+time, and a platform verifier's `Other(…)`, because that is how
+`rustls-platform-verifier` reports a revocation lookup or a trust store that was
+briefly unavailable. So is an ordinary reset connection.
 
 **Responses are compressed.** Every request carries `Accept-Encoding: gzip` and
 every answer is decompressed on the way in, including a streamed table read: on
