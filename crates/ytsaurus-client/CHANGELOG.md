@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### The cluster end-to-end test no longer needs Python
+
+- **Added** the `e2e` example, which runs all three checks
+  `tests/e2e/run_e2e.sh` runs — `cat` as an identity map compared
+  byte-for-byte, two input and two output tables with table switching, and a
+  `wordcount` map-reduce against a hand-computed reference — through this
+  crate alone. The shell script needs the `yt` CLI, which needs a Python
+  installation, which is the one thing this stack exists to avoid.
+
+  Nothing had to be added to the client for it: every command the script sends
+  already had a method, including the two `--spec` fragments that carry the
+  meaning (`enable_input_table_index`, and `enable_key_switch` under
+  `reduce_job_io` rather than `job_io`). The one difference is that the example
+  **creates its destination tables** — `yt map --dst` makes them, and this
+  crate does not, because an operation that made its own outputs would turn a
+  mistyped destination into a stray table rather than an error.
+
+  The script stays. It reads the same tables with the official Python client,
+  so it checks the worker's output against an implementation we did not write;
+  the example proves the client can drive a cluster unaided.
+
 ### A command this crate does not model can now be sent
 
 - **Added** `Client::raw_command`, and with it the answer to "can I do X
