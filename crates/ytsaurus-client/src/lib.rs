@@ -231,6 +231,21 @@ pub struct CachedFile {
     pub name: String,
     /// Whether this call had to upload it. `false` is a cache hit.
     pub uploaded: bool,
+    /// Whether [`CachedFile::path`] is inside the shared file cache.
+    ///
+    /// `true` for a cache hit and for an upload the cache accepted; `false`
+    /// only when the cache refused this caller and the worker went up under
+    /// `//tmp` instead — see [`Client::upload_worker_cached`].
+    ///
+    /// **This is the field to branch on before removing anything.** The two
+    /// are not the same question and neither answers the other: `uploaded`
+    /// alone says the bytes were sent, which is true of both destinations, so
+    /// a caller that tidies up after itself on that signal deletes the *shared
+    /// cache entry* on an ordinary cluster and evicts the binary for everyone
+    /// else. A caller that never tidies up leaks a node per launch on the
+    /// cluster where this is `false`, since nothing expires `//tmp` uploads —
+    /// which is the other half of why the fallback warns.
+    pub cached: bool,
 }
 
 /// What an upload through the file cache came to.
@@ -1140,6 +1155,11 @@ impl Client {
     /// handover to `put_file_to_cache`. Any other failure, including an
     /// `Access denied` on anything else, is returned.
     ///
+    /// [`CachedFile::cached`] is which of the two happened, and it is the field
+    /// to read before doing anything to [`CachedFile::path`]: on the fallback
+    /// path that node is this launch's own and nobody else's, while on the
+    /// ordinary path it is the installation's shared cache entry.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the file cannot be read or the upload fails.
@@ -1161,20 +1181,21 @@ impl Client {
                 path,
                 name,
                 uploaded: false,
+                cached: true,
             });
         }
 
-        let path = match self.upload_into_cache(&bytes, &digest)? {
+        let (path, cached) = match self.upload_into_cache(&bytes, &digest)? {
             Cached::At(path) => {
                 // Set on the cached path too: whether the attribute survives
                 // the move decides whether the job can exec at all, and it is
                 // cheap to be sure.
                 self.set_attribute(&path, "executable", yson_build::boolean(true))?;
-                path
+                (path, true)
             }
             Cached::Refused(denial) => {
                 observe::cache_refused(&self.file_cache, &denial);
-                self.upload_uncached(&digest, &bytes)?
+                (self.upload_uncached(&digest, &bytes)?, false)
             }
         };
 
@@ -1182,6 +1203,7 @@ impl Client {
             path,
             name,
             uploaded: true,
+            cached,
         })
     }
 
@@ -1265,6 +1287,25 @@ impl Client {
     /// together would take an exclusive lock on it in turn. The cost is a node
     /// per launch that no cache expiry will collect, which is the second reason
     /// the warning names [`Client::with_file_cache`].
+    ///
+    /// # What this node is not
+    ///
+    /// It is an ordinary `//tmp` node: it inherits whatever ACL `//tmp` carries
+    /// on the installation, it is given no expiry, and its name is unguessable
+    /// only as far as [`MutationId`] is — and the entropy it draws on says of
+    /// itself that its callers need an id to be *unique, not unpredictable*,
+    /// because what it was built for is deduplicating a retry rather than
+    /// withholding a name. On a cluster where
+    /// `//tmp` is shared scratch space, a co-tenant who can list it can also
+    /// **rewrite the worker's bytes between this upload and the job that execs
+    /// them**.
+    ///
+    /// That is the ordinary exposure of anything left in `//tmp`, and it is the
+    /// same exposure the shared file cache has — but the cache is at least a
+    /// path an installation curates, and this is the path taken *because* the
+    /// curated one was refused. A caller who cannot accept it should point
+    /// [`Client::with_file_cache`] at a directory of its own, which removes
+    /// both this node and the refusal that produced it.
     fn upload_uncached(&self, digest: &str, bytes: &[u8]) -> Result<String> {
         let remote = format!(
             "{UNCACHED_UPLOAD_DIR}/ytsaurus_rs_worker_{digest}_{}",
@@ -3173,14 +3214,25 @@ fn refused_or_reported(error: ClientError) -> Result<Cached> {
 /// catches a create that failed because the path is a table, or because
 /// somebody else holds a lock — failures a second attempt elsewhere would not
 /// fix and a caller needs to hear about.
+///
+/// The code is looked for **anywhere in the document**, as
+/// [`retry::is_retriable`] and `transaction_is_gone` look for theirs: an outer
+/// code is often a category — `Error resolving path`, `Request retries failed`
+/// — with the reason nested under it. Every transcript of this failure seen so
+/// far is flat, so the walk changes nothing that has been observed; it is here
+/// because the flat reading is the one that silently stops working the day a
+/// proxy wraps the answer, and a fallback that stopped firing would show up as
+/// a launch that used to work.
 fn denied(error: &ClientError, command: &str) -> bool {
     matches!(
         error,
         ClientError::Cluster {
             command: failed,
             code,
+            raw,
             ..
-        } if *code == ACCESS_DENIED && failed == command
+        } if failed == command
+            && (*code == ACCESS_DENIED || retry::raw_contains_code(raw, &[ACCESS_DENIED]))
     )
 }
 

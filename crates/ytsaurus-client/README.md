@@ -519,6 +519,14 @@ a `WARN` event with the `tracing` feature on — says so and names
 `with_file_cache`, because every launch re-sends the whole binary until the
 cache is pointed somewhere writable. Any other failure is still a failure.
 
+**`worker.cached` is which of the two happened, and it is the field to check
+before deleting anything.** `uploaded` is true on both paths, so it cannot tell
+them apart: a launcher that cleans up after itself on that signal removes the
+installation's *shared* cache entry on an ordinary cluster and evicts the binary
+for everyone. Where `cached` is false the node is this launch's own — and
+nothing collects it, so a launcher that never cleans up leaks one per launch
+there. That, and the re-sent bytes, is what the warning is about.
+
 ## Retries
 
 A shared cluster produces failures that pass on their own. Light commands are

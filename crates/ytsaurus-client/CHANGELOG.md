@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+### A cache that refuses you, and the upload that goes anyway
+
+- **Fixed** `Client::upload_worker_cached` dying at the first upload on an
+  installation that maintains `//tmp/yt_wrapper/file_storage` itself. The
+  `create` on the miss branch is answered `cluster error 901: Access denied for
+  user …: "write | modify_children" … is not allowed by any matching ACE`, and
+  four of the shipped examples never got past it — `vanilla`, `statistics`,
+  `cached_upload` and `profile` (#32). A 901 on the cache's **own** writes —
+  creating the cache directory, creating the staging node inside it, and the
+  handover to `put_file_to_cache` — now means "no cache for you": the worker
+  goes up under `//tmp` on a path of its own and the launch carries on.
+
+  Precisely those three. A 901 on the bytes themselves is about the node this
+  client has just created, not about the cache, and the same bytes sent
+  elsewhere would earn the same answer; a create that failed for a resolve
+  error or a lock held elsewhere is not a permission problem at all. Both are
+  returned as they always were, because a fallback that swallowed either would
+  upload twice and then report success.
+
+  The code is looked for anywhere in the error document rather than only at the
+  top, as the retry classifier and the transaction one already do: every
+  transcript seen so far is flat, and an outer code is routinely a category with
+  the reason nested under it.
+
+- **Breaking** `CachedFile` gained a `cached` field. Code that matches the
+  struct by name or reads its fields is unaffected; code that destructures every
+  field needs `..`.
+
+  It is there because `uploaded` was answering two questions with one bit. It is
+  true both for a file the cache accepted and for one that went to `//tmp`
+  because the cache would not, and `path` was the only difference — so a
+  launcher that cleans up after itself was deleting the installation's **shared
+  cache entry** on an ordinary cluster, evicting the binary for everyone else,
+  and one that does not clean up leaks a node per launch on the cluster where
+  the fallback fires, since nothing expires those. `cached` is the field to
+  branch on: true for a hit and for an accepted upload, false only for the
+  fallback.
+
+- **Added** a warning when that happens, on stderr and as a `WARN` event where
+  the `tracing` feature is on. The state is permanent until someone acts and
+  invisible otherwise — every launch re-sends the whole binary and leaves a node
+  behind. The message names the path that was refused, quotes the cluster so an
+  ACL failure is not mistaken for a flaky proxy, and names
+  `Client::with_file_cache`, which already existed and is the one line that puts
+  a cache back.
+
+- **Documented** what the fallback node is: an ordinary `//tmp` node with
+  whatever ACL `//tmp` carries, no expiry, and a name unguessable only as far
+  as a mutation ID is — the entropy behind one says of itself that its callers
+  need an id to be *unique, not unpredictable*, having been built to
+  deduplicate a retry rather than to withhold a name. On shared scratch space a
+  co-tenant can rewrite the worker's bytes between the upload and the job that
+  execs them. It is the ordinary exposure of anything left in `//tmp`, and it
+  is the reason to point `with_file_cache` at a directory of your own rather
+  than to accept the fallback as a settled state.
+
+**Not verified against a cluster.** A local cluster in Docker makes the caller
+`root` and can never answer `Access denied`, which is why this was found on a
+real multi-node installation and not before. `tests/file_cache.rs` scripts a
+cluster on a socket in-process and asserts the sequence of commands, which is
+what is actually under test: which call was refused, and what the client did
+next.
+
 ### An operation is no longer a string and four commands
 
 - **Added** the rest of the operation lifecycle — `suspend_operation`,

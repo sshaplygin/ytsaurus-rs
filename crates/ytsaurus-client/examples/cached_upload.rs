@@ -12,6 +12,11 @@
 //! ```
 //!
 //! Prints the time each call took, which is the whole point of the feature.
+//!
+//! On an installation whose cache is operator-managed there is no second call
+//! to time: the client warns, uploads outside the cache and carries on — a
+//! launch that works, and nothing to demonstrate. The example stops there and
+//! says so, rather than failing later at a check whose cause has scrolled off.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -75,11 +80,21 @@ fn run() -> Result<(), ClientError> {
     describe(&first, cold);
     check("the first call uploaded it", first.uploaded)?;
 
+    // `upload_worker_cached` is allowed to succeed *without* the cache, and on
+    // an installation that keeps its cache to itself that is what happens. The
+    // example has nothing to demonstrate then, and says so here rather than
+    // three checks downstream where the symptom is "the second call uploaded
+    // it too" and the cause is nowhere in the output.
+    if !first.cached {
+        return Err(nothing_to_demonstrate(&first));
+    }
+
     step("Second upload of the same binary");
     let (second, warm) = timed(|| client.upload_worker_cached(WORKER))?;
     describe(&second, warm);
 
     check("the second call skipped the upload", !second.uploaded)?;
+    check("and found it in the cache", second.cached)?;
     check("and found the same file", second.path == first.path)?;
     check(
         &format!(
@@ -125,15 +140,38 @@ fn timed<T>(
 
 fn describe(file: &CachedFile, took: std::time::Duration) {
     println!(
-        "   {} in {:.0} ms -> {}",
+        "   {} in {:.0} ms -> {}{}",
         if file.uploaded {
             "uploaded"
         } else {
             "cache hit"
         },
         took.as_secs_f64() * 1000.0,
-        file.path
+        file.path,
+        if file.cached { "" } else { "   (not cached)" }
     );
+}
+
+/// Why this example stops when the cache would not take the worker.
+///
+/// The client has already said what happened — it warns on stderr, names the
+/// cache and quotes the cluster's refusal — and then uploaded outside the
+/// cache, which is exactly right for a launcher and useless for a
+/// demonstration of caching: nothing was put in the cache, so the second call
+/// misses too and every check after it fails for a reason that is three steps
+/// upstream of where it is reported. The example's non-zero exit is a real
+/// finding about the installation, and this is it in words.
+fn nothing_to_demonstrate(first: &CachedFile) -> ClientError {
+    eprintln!("   FAIL nothing went into the cache, so there is no hit to demonstrate");
+    eprintln!("        the worker went to {} instead", first.path);
+    eprintln!("        every launch will send the whole binary again until that changes");
+    eprintln!("        the warning printed above names the cache that refused it and quotes");
+    eprintln!("        the cluster; Client::with_file_cache points this at a path you can");
+    eprintln!("        write to, and then the example has something to show");
+    ClientError::Config(
+        "the file cache would not take the worker, so there is no cache hit to demonstrate"
+            .to_owned(),
+    )
 }
 
 /// The same digest the client computes, so the example can clear the entry.

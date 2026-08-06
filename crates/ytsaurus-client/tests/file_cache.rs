@@ -52,6 +52,14 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
         uploaded.uploaded,
         "the fallback is an upload, and says so: {uploaded:?}"
     );
+    // And says *where*. `uploaded` is true on both paths, so it cannot be the
+    // signal a caller branches on: a launcher that tidies up after itself on
+    // that alone deletes the installation's shared cache entry on an ordinary
+    // cluster. This is the field that tells the two apart.
+    assert!(
+        !uploaded.cached,
+        "the fallback claims the cache took it: {uploaded:?}"
+    );
     assert!(
         !uploaded.path.starts_with(CACHE) && uploaded.path.starts_with("//tmp/"),
         "the worker went somewhere the caller cannot write: {}",
@@ -89,6 +97,42 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
 }
 
 #[test]
+fn a_refusal_the_cluster_wrapped_is_still_the_cache_refusing() {
+    // Every transcript of this failure seen so far is flat, so the fallback
+    // works today reading the outer code alone. It is the *next* transcript
+    // that is the problem: an outer code is routinely a category — `Error
+    // creating node`, `Request retries failed` — with the reason underneath,
+    // and a classifier that only reads the top would quietly stop firing on
+    // the day a proxy wrapped the answer. Both sibling classifiers in this
+    // crate walk the document; this one does too.
+    let cluster = cluster(|sent| match sent.command.as_str() {
+        "get_file_from_cache" => Answer::Body(MISS.to_owned()),
+        _ if sent.mentions(CACHE) => Answer::DeniedInside,
+        _ => Answer::Body("{}".to_owned()),
+    });
+
+    let worker = worker_file("wrapped");
+    let uploaded = cluster
+        .client()
+        .upload_worker_cached(&worker)
+        .expect("a refusal one level down is the same refusal");
+
+    assert!(!uploaded.cached, "{uploaded:?}");
+    assert_eq!(
+        commands(&cluster.sent()),
+        [
+            "get_file_from_cache",
+            "create",
+            "create",
+            "write_file",
+            "set"
+        ],
+        "the wrapped refusal was reported rather than fallen back from: {:?}",
+        cluster.sent()
+    );
+}
+
+#[test]
 fn a_cache_that_takes_the_bytes_and_refuses_the_handover_falls_back_too() {
     // The other half, and the more expensive one: `put_file_to_cache` is the
     // last call of the sequence, so by the time it is refused the whole binary
@@ -110,6 +154,10 @@ fn a_cache_that_takes_the_bytes_and_refuses_the_handover_falls_back_too() {
         !uploaded.path.starts_with(CACHE),
         "the path is the cache's, and the cache refused it: {}",
         uploaded.path
+    );
+    assert!(
+        uploaded.uploaded && !uploaded.cached,
+        "the bytes went up and the cache did not keep them: {uploaded:?}"
     );
 
     let sent = cluster.sent();
@@ -161,7 +209,9 @@ fn a_cluster_that_allows_the_cache_still_uses_it() {
         .expect("uploads");
 
     assert_eq!(uploaded.path, IN_THE_CACHE);
-    assert!(uploaded.uploaded);
+    // Uploaded *and* cached: the two are one answer only on this path, which is
+    // why the pair is asserted here as well as on the fallback.
+    assert!(uploaded.uploaded && uploaded.cached, "{uploaded:?}");
 
     let sent = cluster.sent();
     assert_eq!(
@@ -207,6 +257,11 @@ fn a_cache_hit_uploads_nothing_and_falls_back_to_nothing() {
 
     assert_eq!(uploaded.path, IN_THE_CACHE);
     assert!(!uploaded.uploaded, "a hit uploaded something: {uploaded:?}");
+    // The one case where the two fields disagree in the other direction:
+    // nothing was sent, and the file is the cache's all the same. A `cached`
+    // that merely echoed `uploaded` would read as "not in the cache" here, on
+    // the path where the answer came *from* the cache.
+    assert!(uploaded.cached, "a hit is not cached: {uploaded:?}");
     assert_eq!(commands(&cluster.sent()), ["get_file_from_cache"]);
 }
 
@@ -232,9 +287,16 @@ fn a_create_that_failed_for_some_other_reason_is_not_a_cache_to_give_up_on() {
         matches!(&error, ClientError::Cluster { code: 500, command, .. } if command == "create"),
         "{error:?}"
     );
-    assert!(
-        !cluster.sent().iter().any(|s| s.command == "write_file"),
-        "something was uploaded anyway: {:?}",
+    // The sequence, and not merely "nothing was uploaded". This stub refuses
+    // *every* `create`, including the fallback's own — so a client that had
+    // stopped checking the code and fell back on any failed `create` would
+    // fail here too, with the same variant, the same code and the same absent
+    // `write_file`, having quietly sent a second `create` on the way. The one
+    // observable difference is the command that is not there.
+    assert_eq!(
+        commands(&cluster.sent()),
+        ["get_file_from_cache", "create"],
+        "the failure was carried on from rather than reported: {:?}",
         cluster.sent()
     );
 }
@@ -298,6 +360,11 @@ impl Sent {
     }
 }
 
+/// The cluster's own words for the refusal this whole file is about.
+const ACCESS_DENIED: &str = "Access denied for user \"tester\": \"write | modify_children\" \
+                             permission for node //tmp/yt_wrapper/file_storage/new_cache \
+                             is not allowed by any matching ACE";
+
 /// What the stub answers with.
 enum Answer {
     /// 200, and this text-YSON body.
@@ -305,6 +372,10 @@ enum Answer {
     /// The refusal this whole file is about: cluster error 901, in the
     /// `X-YT-Error` header the client reads it from.
     Denied,
+    /// The same refusal, one level down — the outer error a category and the
+    /// reason nested under it, which is what a master that wrapped its own
+    /// answer sends.
+    DeniedInside,
     /// Any other cluster error.
     Failed(i64, &'static str),
 }
@@ -316,11 +387,15 @@ impl Answer {
             Answer::Body(body) => ("200 OK", None, body.clone()),
             Answer::Denied => (
                 "403 Forbidden",
-                Some(document(
-                    901,
-                    "Access denied for user \"tester\": \"write | modify_children\" \
-                     permission for node //tmp/yt_wrapper/file_storage/new_cache \
-                     is not allowed by any matching ACE",
+                Some(document(901, ACCESS_DENIED)),
+                String::new(),
+            ),
+            Answer::DeniedInside => (
+                "403 Forbidden",
+                Some(wrapping(
+                    1,
+                    "Error creating node //tmp/yt_wrapper/file_storage/new_cache",
+                    &document(901, ACCESS_DENIED),
                 )),
                 String::new(),
             ),
@@ -335,8 +410,19 @@ impl Answer {
 
 /// An `X-YT-Error` document, which is JSON even though everything else is YSON.
 fn document(code: i64, message: &str) -> String {
-    let escaped = message.replace('\\', r"\\").replace('"', "\\\"");
-    format!(r#"{{"code":{code},"message":"{escaped}"}}"#)
+    format!(r#"{{"code":{code},"message":"{}"}}"#, escape(message))
+}
+
+/// One error document carrying another, as `inner_errors` does.
+fn wrapping(code: i64, message: &str, inner: &str) -> String {
+    format!(
+        r#"{{"code":{code},"message":"{}","inner_errors":[{inner}]}}"#,
+        escape(message)
+    )
+}
+
+fn escape(message: &str) -> String {
+    message.replace('\\', r"\\").replace('"', "\\\"")
 }
 
 type Answering = Arc<dyn Fn(&Sent) -> Answer + Send + Sync>;

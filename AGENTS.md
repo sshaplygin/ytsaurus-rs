@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 515 tests
+cargo test --workspace            # 517 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -593,6 +593,16 @@ These cost time once. They are recorded so they do not cost it again.
   other error, still fails the upload. Neither branch has been run against a
   cluster that denies anything; `crates/ytsaurus-client/tests/file_cache.rs`
   scripts the refusals a socket in-process can.
+- **`CachedFile::cached`, not `uploaded`, is which node the caller is holding.**
+  `uploaded` is true both for a file the cache accepted and for one that went to
+  `//tmp` because the cache would not, so a launcher tidying up on that signal
+  deletes the installation's *shared* cache entry and evicts the binary for
+  everyone. The fallback node is an ordinary `//tmp` node — whatever ACL `//tmp`
+  carries, no expiry, and a name whose entropy is documented as *unique, not
+  unpredictable* — so a co-tenant who can list `//tmp` can rewrite the worker
+  between the upload and the exec. That is the ordinary exposure of `//tmp`, and
+  the reason `with_file_cache` pointed at a directory of your own beats
+  accepting the fallback as a settled state.
 - **A cached file keeps its name from the hash, not from the upload.** Reference
   it in `file_paths` as `<file_name="my_job">//tmp/.../ab/cdef…` or the job's
   command finds nothing to run.

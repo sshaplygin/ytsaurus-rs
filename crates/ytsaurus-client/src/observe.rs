@@ -168,24 +168,49 @@ pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attem
 /// once per upload rather than once per attempt, and it is said by a launcher —
 /// a job does not upload workers.
 ///
+/// **One body, not two `#[cfg]` arms.** This used to be written twice, and the
+/// default build's copy was an `eprintln!` and nothing else — a descriptor no
+/// test in this process can read back, in the half of the file the test module
+/// below is not compiled for. It could be emptied to `{}` with every test in
+/// the workspace green, and it is the whole of what a default build says about
+/// a cache it has given up on. Written once, the only thing left to empty is
+/// this, and emptying it takes the `WARN` event with it — which the tests do
+/// hold.
+///
 /// [`Client::with_file_cache`]: crate::Client::with_file_cache
 /// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
-#[cfg(feature = "tracing")]
 pub(crate) fn cache_refused(cache: &str, error: &ClientError) {
+    #[cfg(feature = "tracing")]
     tracing::warn!(
         cache = %cache,
         error = %error,
         "the file cache cannot be written to; uploading the worker uncached"
     );
 
-    if unheard() {
-        eprintln!("{}", cache_message(cache, error));
+    if let Some(line) = cache_fallback(cache, error) {
+        eprintln!("{line}");
     }
 }
 
+/// What to say on stderr about the cache, if anything.
+///
+/// [`stderr_fallback`]'s shape and, with the feature on, its reason: a build
+/// where Cargo turned `tracing` on for a launcher that never asked has no
+/// subscriber to hear the event, and must still say this somewhere.
+///
+/// Returning the decision rather than printing it is what makes it testable at
+/// all — and this one is tested in **both** feature configurations, because the
+/// default build is where the whole announcement lives.
+#[cfg(feature = "tracing")]
+fn cache_fallback(cache: &str, error: &ClientError) -> Option<String> {
+    unheard().then(|| cache_message(cache, error))
+}
+
 #[cfg(not(feature = "tracing"))]
-pub(crate) fn cache_refused(cache: &str, error: &ClientError) {
-    eprintln!("{}", cache_message(cache, error));
+fn cache_fallback(cache: &str, error: &ClientError) -> Option<String> {
+    // There is no subscriber in this build to have heard it, so the line is
+    // always owed.
+    Some(cache_message(cache, error))
 }
 
 /// The fallback announcement as a line of text.
@@ -294,6 +319,30 @@ mod message_tests {
         assert!(line.contains("Client::with_file_cache"), "{line}");
         // And what it costs until then, which is what makes it worth reading.
         assert!(line.contains("every launch"), "{line}");
+    }
+
+    #[test]
+    fn the_cache_warning_is_owed_to_stderr_when_nothing_else_carries_it() {
+        // The default build's entire announcement, and until this existed it
+        // was an `eprintln!` in a `#[cfg(not(feature = "tracing"))]` arm — a
+        // descriptor no test in this process can read back, in the half of the
+        // file this module is not compiled for. Emptying that body left every
+        // test green while a deployment uploading uncached for ever went back
+        // to being silent. Asserted here rather than in the module below
+        // because *here* is where the default build's copy is compiled.
+        let denied = ClientError::Cluster {
+            command: "create".to_owned(),
+            code: 901,
+            message: "Access denied for user \"robot\"".to_owned(),
+            raw: r#"{"code":901}"#.to_owned(),
+        };
+
+        let line = cache_fallback("//tmp/mine/cache", &denied)
+            .expect("no subscriber is installed, so stderr is the only way to say it");
+
+        assert!(line.contains("//tmp/mine/cache"), "{line}");
+        assert!(line.contains("Access denied"), "{line}");
+        assert!(line.contains("Client::with_file_cache"), "{line}");
     }
 
     #[test]
@@ -621,6 +670,18 @@ mod tests {
             "{warning}"
         );
         assert!(warning.contains("Access denied"), "{warning}");
+
+        // And said once. The event carries everything the stderr line does, so
+        // a subscriber that writes to stderr would otherwise print the warning
+        // twice — the same rule `stderr_fallback` follows for a retry.
+        assert_eq!(
+            tracing::subscriber::with_default(Arc::new(Recorder::default()), || cache_fallback(
+                "//tmp/yt_wrapper/file_storage/new_cache",
+                &denied
+            )),
+            None,
+            "a subscriber is installed and the warning would be printed twice"
+        );
     }
 
     #[test]
