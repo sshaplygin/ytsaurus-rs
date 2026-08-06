@@ -35,6 +35,11 @@
 //! needs nothing else. A bare host is assumed to be HTTPS; a local cluster is
 //! reached as `http://localhost:8000`.
 //!
+//! `YT_CA_BUNDLE` names a PEM file of root certificates, for an installation
+//! whose certificate chains to a CA the Mozilla bundle has never heard of. It
+//! is read by every client, however it was built, and the `platform-verifier`
+//! feature is the same answer without a variable to set.
+//!
 //! # When an operation fails
 //!
 //! [`Client::wait_for_operation`] does not stop at the state. It asks the

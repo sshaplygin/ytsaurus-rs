@@ -52,6 +52,15 @@ const TRACESTATE: &str = "tracestate";
 /// The parameter that puts a command inside a transaction.
 const TRANSACTION_ID: &str = "transaction_id";
 
+/// A PEM file of root certificates to verify the cluster against, instead of
+/// the Mozilla bundle `ureq` compiles in. See [`root_certs`].
+///
+/// Behind the feature like everything else it leads to: a build with no TLS in
+/// it has no handshake to configure, and reads the variable no more than it
+/// opens a socket for `https://`.
+#[cfg(feature = "tls")]
+const CA_BUNDLE: &str = "YT_CA_BUNDLE";
+
 /// Commands that have no transaction to be in.
 ///
 /// These go to the scheduler and the controller agents rather than to the
@@ -126,6 +135,14 @@ pub(crate) struct Transport {
     /// [`Transport::render_caller_headers`]. None of them changes between
     /// requests, so none of them is worth building again for each one.
     caller: Vec<(&'static str, String)>,
+    /// Why the TLS configuration this build was asked for could not be
+    /// assembled — a `YT_CA_BUNDLE` that names nothing readable, or nothing
+    /// that parsed. Carried rather than reported, because an agent is built
+    /// before there is a request to fail; see [`Transport::unusable`].
+    ///
+    /// A `String` and not a [`ClientError`] because a `Transport` is `Clone`
+    /// and an error holding an `io::Error` is not.
+    tls_refused: Option<String>,
 }
 
 impl std::fmt::Debug for Transport {
@@ -156,8 +173,10 @@ impl Transport {
             RetryPolicy::default().quiet()
         };
 
+        let (agent, tls_refused) = build_agent(timeout);
+
         let mut transport = Self {
-            agent: build_agent(timeout),
+            agent,
             base,
             token,
             retries,
@@ -166,6 +185,7 @@ impl Transport {
             trace: None,
             tracestate: None,
             caller: Vec::new(),
+            tls_refused,
         };
         transport.render_caller_headers();
         transport
@@ -177,7 +197,9 @@ impl Transport {
 
     pub(crate) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
-        self.agent = build_agent(timeout);
+        let (agent, tls_refused) = build_agent(timeout);
+        self.agent = agent;
+        self.tls_refused = tls_refused;
     }
 
     pub(crate) fn set_transaction(&mut self, id: Option<String>) {
@@ -439,11 +461,11 @@ impl Transport {
     ///
     /// `/hosts` is the only one, and it is not a command — but it wants
     /// everything a command gets: the token, the global timeout, the retry
-    /// policy, and the guard that turns an `https://` proxy in a build without
+    /// policy, and the guard that turns a proxy this build cannot reach over
     /// TLS into an explanation rather than a connection error. Building a bare
     /// `ureq` request here instead is how it came to miss all four.
     pub(crate) fn fetch(&self, path: &str, what: &str) -> Result<String> {
-        if let Some(error) = tls_unavailable(&self.base) {
+        if let Some(error) = self.unusable() {
             return Err(error);
         }
 
@@ -500,7 +522,7 @@ impl Transport {
         body: SendBody<'_>,
         streaming: bool,
     ) -> Result<ureq::http::Response<ureq::Body>> {
-        if let Some(error) = tls_unavailable(&self.base) {
+        if let Some(error) = self.unusable() {
             return Err(error);
         }
 
@@ -595,6 +617,30 @@ impl Transport {
         self.caller = headers;
     }
 
+    /// Why no request can be sent at all, if that was settled before any was.
+    ///
+    /// Two reasons, and both are about TLS rather than about the network: the
+    /// crate was built without the `tls` feature and the proxy is `https://`,
+    /// or [`CA_BUNDLE`] named something that could not be turned into root
+    /// certificates. Reported here so the caller reads a sentence naming the
+    /// cause instead of a handshake failure that explains nothing.
+    ///
+    /// A refused bundle only bites an `https://` proxy: over plain HTTP there
+    /// is no handshake for it to have configured, and a stale variable left in
+    /// an environment whose cluster is local costs nothing.
+    fn unusable(&self) -> Option<ClientError> {
+        if let Some(error) = tls_unavailable(&self.base) {
+            return Some(error);
+        }
+
+        match &self.tls_refused {
+            Some(why) if self.base.starts_with("https://") => {
+                Some(ClientError::Config(why.clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// Applies the streaming timeout override to one request.
     ///
     /// The end-to-end deadline comes off; every phase before the data — DNS,
@@ -621,15 +667,124 @@ impl Transport {
 
 /// The one place the agent is configured, so a timeout change rebuilds it the
 /// same way it was first built.
-fn build_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+///
+/// Hands back whatever it could not honour instead of failing: this runs while
+/// a client is being constructed, where there is no request to fail and no
+/// `Result` to fail into. See [`Transport::unusable`], which is where the
+/// refusal is finally spoken.
+fn build_agent(timeout: Duration) -> (ureq::Agent, Option<String>) {
+    #[allow(unused_mut)]
+    let mut builder = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         // Keep non-2xx as ordinary responses so the X-YT-Error header can be
         // read off them; ureq would otherwise collapse them to a status code
         // and discard the cluster's explanation.
-        .http_status_as_error(false)
-        .build()
-        .into()
+        .http_status_as_error(false);
+
+    #[allow(unused_mut)]
+    let mut refused = None;
+
+    #[cfg(feature = "tls")]
+    match root_certs() {
+        Ok(Some(tls)) => builder = builder.tls_config(tls),
+        Ok(None) => {}
+        Err(why) => refused = Some(why),
+    }
+
+    (builder.build().into(), refused)
+}
+
+/// Which roots the cluster's certificate is verified against.
+///
+/// `None` leaves `ureq`'s own default, the Mozilla bundle compiled in through
+/// `webpki-roots`. That is what a cluster with a publicly trusted certificate
+/// wants, and it stays the default here: a client may well run outside the
+/// network it is talking to, where the machine's own trust store is the less
+/// trustworthy of the two.
+///
+/// An on-premises installation behind a corporate CA is the case that needs
+/// changing, and there are two ways to do it — the same two the `yt` CLI and
+/// the Go SDK offer:
+///
+/// - **[`CA_BUNDLE`]** names a PEM file. No dependency at all, and nothing to
+///   rebuild.
+/// - the **`platform-verifier`** feature trusts whatever the operating system
+///   trusts, so a machine where `curl` already reaches the cluster needs
+///   nothing set.
+///
+/// The bundle wins when both are there. It is the more specific answer, and
+/// the one the caller went out of their way to give.
+#[cfg(feature = "tls")]
+fn root_certs() -> Result<Option<ureq::tls::TlsConfig>, String> {
+    roots_for(std::env::var(CA_BUNDLE).ok().as_deref())
+}
+
+/// The choice itself, split from the lookup so it can be tested without writing
+/// the process environment — which is global, and in edition 2024 unsafe to
+/// write.
+#[cfg(feature = "tls")]
+fn roots_for(named: Option<&str>) -> Result<Option<ureq::tls::TlsConfig>, String> {
+    match named {
+        // An empty variable is not a bundle: `YT_CA_BUNDLE=` in a shell profile
+        // means "I turned that off", not "trust a file called nothing".
+        Some(path) if !path.trim().is_empty() => bundle(path).map(Some),
+        _ => Ok(platform_roots()),
+    }
+}
+
+/// What to trust when nothing named a bundle.
+///
+/// `None` is `ureq`'s own default and this crate's: the Mozilla roots.
+#[cfg(feature = "tls")]
+fn platform_roots() -> Option<ureq::tls::TlsConfig> {
+    #[cfg(feature = "platform-verifier")]
+    {
+        return Some(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        );
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Reads a PEM file into the roots to trust, or says why it could not.
+///
+/// Split from [`roots_for`] so the reading and the refusal can be tested
+/// against a file of their own.
+///
+/// **A bundle that yields no certificates is refused, not ignored.** Falling
+/// back to the compiled-in roots would answer a deliberate request with the
+/// very handshake failure this variable exists to end — and it would do it
+/// silently, naming neither the file nor the reason. The same goes for a file
+/// that cannot be read: `YT_CA_BUNDLE` pointing at a typo is a mistake worth
+/// hearing about at the first request rather than at the first `UnknownIssuer`.
+#[cfg(feature = "tls")]
+fn bundle(path: &str) -> Result<ureq::tls::TlsConfig, String> {
+    use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig, parse_pem};
+
+    let pem = std::fs::read(path)
+        .map_err(|e| format!("{CA_BUNDLE} names {path}, which could not be read: {e}"))?;
+
+    let certs: Vec<Certificate<'static>> = parse_pem(&pem)
+        .filter_map(|item| match item {
+            Ok(PemItem::Certificate(cert)) => Some(cert),
+            _ => None,
+        })
+        .collect();
+
+    if certs.is_empty() {
+        return Err(format!(
+            "{CA_BUNDLE} names {path}, which holds no PEM certificates: expected at least one \
+             -----BEGIN CERTIFICATE----- block"
+        ));
+    }
+
+    Ok(TlsConfig::builder()
+        .root_certs(RootCerts::new_with_certs(&certs))
+        .build())
 }
 
 /// Refuses an `https://` proxy when the crate was built without TLS.
@@ -757,6 +912,191 @@ mod tests {
                 "{command} was stamped with a transaction id"
             );
         }
+    }
+
+    /// A real self-signed CA, generated for these tests with `openssl req
+    /// -x509`. A made-up base64 blob would parse just as well — the PEM reader
+    /// only splits sections — but then the fixture would prove nothing about
+    /// the shape of the thing an installation would actually hand us.
+    #[cfg(feature = "tls")]
+    const CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDHTCCAgWgAwIBAgIUf6mwbBS7JGIyvPDkCpiBRHp914cwDQYJKoZIhvcNAQEL
+BQAwHjEcMBoGA1UEAwwTeXRzYXVydXMtcnMgdGVzdCBDQTAeFw0yNjA4MDYyMDM4
+MTJaFw00NjA4MDEyMDM4MTJaMB4xHDAaBgNVBAMME3l0c2F1cnVzLXJzIHRlc3Qg
+Q0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDqPTrcPPGiHlv4aV8v
+AdrNtzvlhHciQbd7Pz0tLCmn8OGCjwt3Q/V22h6HSWijIleHPqn6bTSMYfPGAxRe
+mAiqSsMLpM+GYWZAg8Kz7VSsK4f0s4dW6i82QYFVk/+04N/0RUJ3A9RTloxSl8+a
+HT5MF2x4LGr1eBgpz4UEsC5cJtkzA8OCM2a2TtNiuo/PtKzZx2TuvEk+Ub5Gn/lt
+tZn8m9z6o8n51D3vEIfHfXPyFre2+cz+Ao680kc0KP8PWlG89mhvMZ2VYGJG2T/Z
+6Ddpj7aXM+jKCCjBTLMkLYaIuNO9//72kmBYsVgaBAMNYMBaBqQX1TOjwxbiBbv5
+fbJnAgMBAAGjUzBRMB0GA1UdDgQWBBSniLAZD6er7hHpwg12hIX57PHb2TAfBgNV
+HSMEGDAWgBSniLAZD6er7hHpwg12hIX57PHb2TAPBgNVHRMBAf8EBTADAQH/MA0G
+CSqGSIb3DQEBCwUAA4IBAQBsR5VKflwEwRTNY1dobAWKS6kLTszpRFlQN2qBMTv+
+NhS0i7mrNUzKadZkmlQuOMIhZl6gR4mB0XVPgkJKJ+ch8SfuaBW3Po4dTdrKfB6K
+CgCTM54UB3QQAlAjpVhLCS7aCT8hgKEX1+1OD1SmBNQ/Jj9OOoKxVkq9prjSzILW
+pXeT/OKKRqZ7tjG2jh55XPgE+GWLCfo3VsPqcleAoxQEWATryTF4fwKI9tuAgJ8p
+pN1M6UxJFatwx23InC/jVPR6wBu5h1SyCjIxuW/j8pgriTm8wR3XaTly49j6VQDH
+8KGhyM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHY
+-----END CERTIFICATE-----
+";
+
+    /// The key half of a pair. A file holding only this is the mistake the
+    /// empty-parse refusal is for: it is PEM, it is a well-formed section, and
+    /// it contains no root to trust.
+    #[cfg(feature = "tls")]
+    const KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgt4eMMaSBwIKAgwrT
+zzKo64LyF0YMvm3I61+EK3DDRDmhRANCAAS3XrEb3d5QdjQGGuAny4phX9xstUpp
+B7b7J0xB2R7nPBn3+4PRz/35FJrHFmNkKD47D6ZMldYk7ykxNLNBGzIU
+-----END PRIVATE KEY-----
+";
+
+    /// A file in the temp directory, removed when the test is done with it.
+    ///
+    /// `YT_CA_BUNDLE` names a path, so the thing under test reads one; there is
+    /// nothing to inject. The name carries a
+    /// [`unique::word`](crate::unique::word) because the test binary runs its
+    /// tests in threads, and two of these writing one path would be two tests
+    /// reading each other's bundle.
+    #[cfg(feature = "tls")]
+    struct TempPem(std::path::PathBuf);
+
+    #[cfg(feature = "tls")]
+    impl TempPem {
+        fn new(contents: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("ytsaurus-rs-ca-{:x}.pem", crate::unique::word(0)));
+            std::fs::write(&path, contents).expect("writes the bundle");
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().expect("a utf-8 temp path")
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    impl Drop for TempPem {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_bundle_becomes_the_roots_and_its_private_key_is_left_alone() {
+        // Two certificates and a key in one file: the shape of
+        // `/etc/ssl/certs/ca-certificates.crt` next to a deployment that keeps
+        // everything in one PEM. Only the certificates are roots.
+        let file = TempPem::new(&format!("{CA_PEM}{KEY_PEM}{CA_PEM}"));
+        let config = bundle(file.path()).expect("a bundle with certificates in it");
+
+        match config.root_certs() {
+            ureq::tls::RootCerts::Specific(certs) => assert_eq!(certs.len(), 2),
+            other => panic!("the bundle did not become the roots: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_bundle_that_parses_to_nothing_is_refused() {
+        // Not "and then we quietly used Mozilla's roots": that answers a
+        // deliberate request with `UnknownIssuer`, which is the failure the
+        // variable exists to end, and names neither the file nor the reason.
+        for (what, contents) in [
+            ("a key and no certificate", KEY_PEM),
+            ("an empty file", ""),
+            ("the cluster's HTML login page", "<html>Sign in</html>\n"),
+        ] {
+            let file = TempPem::new(contents);
+            let refusal = bundle(file.path()).expect_err(what);
+
+            assert!(refusal.contains(CA_BUNDLE), "{what}: {refusal}");
+            assert!(refusal.contains(file.path()), "{what}: {refusal}");
+            assert!(refusal.contains("no PEM certificates"), "{what}: {refusal}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_bundle_beats_whatever_the_build_would_have_trusted() {
+        // The precedence, and the whole reason the feature is not simply
+        // "trust the OS": a bundle is the more specific answer and the one the
+        // caller went out of their way to give. With `platform-verifier` off
+        // this says the bundle beats the Mozilla roots; with it on, that it
+        // beats the platform verifier too, which is the case worth pinning.
+        let file = TempPem::new(CA_PEM);
+        let chosen = roots_for(Some(file.path()))
+            .expect("a readable bundle")
+            .expect("some roots");
+
+        assert!(
+            matches!(chosen.root_certs(), ureq::tls::RootCerts::Specific(_)),
+            "{:?}",
+            chosen.root_certs()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_variable_that_names_nothing_is_not_a_bundle() {
+        // `export YT_CA_BUNDLE=` is how a shell profile turns one off. Read as
+        // a path it would be a refusal on every request.
+        for named in [None, Some(""), Some("   ")] {
+            let chosen = roots_for(named).expect("no bundle was named");
+            let roots = chosen.as_ref().map(ureq::tls::TlsConfig::root_certs);
+
+            // With `platform-verifier` on, an unset variable is what asks for
+            // the operating system's own trust store.
+            #[cfg(feature = "platform-verifier")]
+            assert!(
+                matches!(roots, Some(ureq::tls::RootCerts::PlatformVerifier)),
+                "{roots:?}"
+            );
+
+            // Without it, nothing is configured at all and `ureq` keeps the
+            // Mozilla bundle it compiles in.
+            #[cfg(not(feature = "platform-verifier"))]
+            assert!(roots.is_none(), "{roots:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_bundle_that_cannot_be_read_is_refused_rather_than_ignored() {
+        let missing = std::env::temp_dir().join("ytsaurus-rs-no-such-bundle.pem");
+        let refusal =
+            bundle(missing.to_str().expect("a utf-8 temp path")).expect_err("nothing to read");
+
+        assert!(refusal.contains(CA_BUNDLE), "{refusal}");
+        assert!(refusal.contains("could not be read"), "{refusal}");
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_refused_bundle_is_reported_instead_of_the_first_request() {
+        // The refusal is discovered while the agent is being built, where
+        // there is nothing to fail; it waits here for something that is.
+        let mut transport =
+            Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
+        transport.tls_refused = Some("YT_CA_BUNDLE names /etc/no-such-file".to_owned());
+
+        let error = transport.unusable().expect("a refusal");
+        assert!(matches!(error, ClientError::Config(_)), "{error}");
+        assert!(error.to_string().contains("YT_CA_BUNDLE"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_bundle_does_not_stop_a_cluster_reached_over_plain_http() {
+        // No handshake, so nothing the bundle would have configured. A stale
+        // variable in a shell profile is not a reason to refuse a local
+        // cluster.
+        let mut transport = transport(None);
+        transport.tls_refused = Some("YT_CA_BUNDLE names /etc/no-such-file".to_owned());
+
+        assert!(transport.unusable().is_none());
     }
 
     #[test]

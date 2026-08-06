@@ -15,6 +15,11 @@
 //! list (`get_retriable_errors` in `yt/python/yt/wrapper/http_helpers.py`):
 //! transport failures, request timeouts, an unavailable or overloaded proxy,
 //! and a banned one.
+//!
+//! With one exception, which no cluster reports and only a client can know: a
+//! transport failure that is the TLS layer **rejecting the cluster's
+//! certificate** is a settled verdict, not a passing condition. It is reported
+//! at the first attempt — see [`rejected_the_certificate`].
 
 use std::time::Duration;
 
@@ -79,6 +84,20 @@ const RETRIABLE_CODES: &[i64] = &[
 /// HTTP statuses worth a second attempt, when the cluster sent no error
 /// document to judge by.
 const RETRIABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
+
+/// How `rustls` spells a certificate it would not accept.
+///
+/// Read out of `rustls` 0.23's `Display for Error` rather than collected from
+/// messages as they were seen: `InvalidCertificate` renders as `invalid peer
+/// certificate: <reason>`, `InvalidCertRevocationList` and
+/// `NoCertificatesPresented` as the other two. Those three are the whole of
+/// "the chain was not acceptable"; every other `rustls::Error` is about the
+/// protocol, not about who signed what.
+const CERTIFICATE_REJECTIONS: &[&str] = &[
+    "invalid peer certificate",
+    "invalid certificate revocation list",
+    "peer sent no certificates",
+];
 
 /// How often, and how patiently, a failed request is repeated.
 ///
@@ -279,14 +298,52 @@ fn generate() -> String {
 pub(crate) fn is_retriable(error: &ClientError) -> bool {
     match error {
         // The request never got an answer: a refused connection, a reset, a
-        // timeout. Nothing about it says the command was wrong.
-        ClientError::Transport { .. } => true,
+        // timeout. Nothing about it says the command was wrong — unless it was
+        // the certificate that was refused, which no amount of waiting mends.
+        ClientError::Transport { source, .. } => !rejected_the_certificate(source),
         ClientError::Http { status, .. } => RETRIABLE_STATUSES.contains(status),
         ClientError::Cluster { code, raw, .. } => {
             RETRIABLE_CODES.contains(code) || raw_contains_retriable_code(raw)
         }
         _ => false,
     }
+}
+
+/// Whether the TLS layer refused the cluster's certificate.
+///
+/// A rejected chain is a settled question: the same roots will reject the same
+/// certificate a second later, and a third time after that. Retrying it turns a
+/// configuration mistake into fifteen seconds of doubling backoff before the
+/// same sentence — which is what a cluster behind a private CA cost, five
+/// attempts at a time, until `YT_CA_BUNDLE` existed to answer it.
+///
+/// It arrives as `ureq::Error::Io` rather than as one of `ureq`'s TLS variants:
+/// `rustls` wraps its own error in an `io::Error` of kind `InvalidData`
+/// (`ConnectionCommon::complete_io`) and `ureq` passes it through untouched.
+/// Reading the `rustls::Error` back out would mean depending on `rustls`
+/// directly, which this crate deliberately does not — `ureq` is its only door
+/// to TLS, and the whole `tls` feature is one line in a manifest because of it.
+/// So the kind narrows the error to the TLS layer (neither `ureq` nor
+/// `ureq-proto` produces `InvalidData`, and a failed decompression has a
+/// variant of its own) and the text says which TLS failure it was.
+///
+/// **Deliberately narrow.** A reset connection, a refused one, a timeout, a
+/// half-open socket: all stay retriable, because none of them is a verdict on
+/// the certificate. So does every other `rustls::Error` — a protocol-level
+/// disagreement mid-handshake may well be one busy proxy out of several.
+fn rejected_the_certificate(error: &ureq::Error) -> bool {
+    let ureq::Error::Io(io) = error else {
+        return false;
+    };
+
+    if io.kind() != std::io::ErrorKind::InvalidData {
+        return false;
+    }
+
+    let message = io.to_string();
+    CERTIFICATE_REJECTIONS
+        .iter()
+        .any(|rejection| message.contains(rejection))
 }
 
 /// Looks for a retriable code anywhere in the error document.
@@ -438,6 +495,91 @@ mod tests {
         assert!(is_retriable(&http(429)));
         assert!(!is_retriable(&http(404)));
         assert!(!is_retriable(&http(401)));
+    }
+
+    /// A transport failure carrying the `io::Error` `ureq` would have carried.
+    fn transport_error(kind: std::io::ErrorKind, message: &str) -> ClientError {
+        ClientError::Transport {
+            command: "get".to_owned(),
+            source: Box::new(ureq::Error::Io(std::io::Error::new(kind, message))),
+        }
+    }
+
+    #[test]
+    fn a_rejected_certificate_is_not_retried() {
+        // Exactly what a cluster behind a corporate CA answered with, before
+        // there was any way to name that CA: `rustls` wraps its own error in an
+        // `io::Error` of kind `InvalidData`, and `ureq` hands it through. Five
+        // attempts of this is fifteen seconds spent proving that the same roots
+        // still do not contain the same issuer.
+        assert!(!is_retriable(&transport_error(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer"
+        )));
+
+        for rejection in [
+            "invalid peer certificate: Expired",
+            "invalid peer certificate: NotValidForName",
+            "invalid certificate revocation list: ParseError",
+            "peer sent no certificates",
+        ] {
+            assert!(
+                !is_retriable(&transport_error(std::io::ErrorKind::InvalidData, rejection)),
+                "{rejection}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_transport_failure_is_still_retried() {
+        // The narrowness is the point. A reset connection is the ordinary case
+        // this whole module exists for, and a TLS error that is not about the
+        // certificate may well be one busy proxy out of several.
+        for (kind, message) in [
+            (
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ),
+            (std::io::ErrorKind::ConnectionRefused, "connection refused"),
+            (std::io::ErrorKind::TimedOut, "operation timed out"),
+            (std::io::ErrorKind::UnexpectedEof, "unexpected end of file"),
+            (
+                std::io::ErrorKind::InvalidData,
+                "received corrupt message of type Handshake",
+            ),
+            (
+                std::io::ErrorKind::InvalidData,
+                "peer misbehaved: TooManyEmptyFragments",
+            ),
+        ] {
+            assert!(is_retriable(&transport_error(kind, message)), "{message}");
+        }
+
+        // And a failure that never reached the TLS layer at all.
+        assert!(is_retriable(&ClientError::Transport {
+            command: "get".to_owned(),
+            source: Box::new(ureq::Error::HostNotFound),
+        }));
+    }
+
+    #[test]
+    fn a_rejected_certificate_costs_one_attempt_and_not_five() {
+        let calls = std::cell::Cell::new(0);
+
+        let result: Result<()> = run(instant(5), Repeatable::Freely, "get", |_| {
+            calls.set(calls.get() + 1);
+            Err(transport_error(
+                std::io::ErrorKind::InvalidData,
+                "invalid peer certificate: UnknownIssuer",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            1,
+            "a certificate is no likelier to be accepted on the fifth try"
+        );
     }
 
     #[test]

@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### A cluster behind a private CA is reachable
+
+- **Added** `YT_CA_BUNDLE`, a PEM file of root certificates to verify the
+  cluster against instead of the Mozilla bundle `ureq` compiles in, and the
+  **`platform-verifier`** feature, which trusts whatever the operating system
+  trusts. Both are off by default and the default is unchanged: a client may be
+  running outside the network it is talking to, where the machine's own trust
+  store is the less trustworthy of the two.
+
+  Until now there was no way to name a CA at all, so an on-premises
+  installation whose chain ends at a corporate root was simply unreachable over
+  `https://` — which is the scheme a bare host name in `YT_PROXY` selects.
+  `curl` reaches the same URL, because it reads the OS trust store. There was no
+  workaround in this crate's public API. Both official clients and the `yt` CLI
+  let a deployment point at its own CA; this is that (#29).
+
+  **A bundle that yields no certificates is refused**, with an error naming the
+  file, rather than quietly becoming the Mozilla roots — a fallback would answer
+  a deliberate request with the very `UnknownIssuer` the variable exists to end,
+  and name neither the file nor the reason. So is one that cannot be read. The
+  refusal is discovered while the agent is being built, where there is nothing
+  to fail, so it waits for the first request that would have needed it. A
+  cluster reached over plain HTTP is not refused: there is no handshake for the
+  bundle to have configured.
+
+  The bundle wins where both are set. It is the more specific answer, and the
+  one the caller went out of their way to give.
+
+  **No new direct dependency, and the musl worker graph is unchanged.** `ureq`
+  3.3 already offers both routes; both sit behind the `tls` feature, which
+  `examples/` — what `build-worker.sh` cross-compiles — turns off. The CI guard
+  now searches for `rustls-platform-verifier` alongside `tracing`, `rustls` and
+  `ring`.
+
+- **Fixed** a certificate error being retried five times. A rejected chain is
+  not a transient failure — the same roots reject the same certificate on the
+  fifth attempt — but it arrived as a transport error, and every transport error
+  was retriable, so a misconfigured CA took about fifteen seconds of doubling
+  backoff to report. It is reported at the first attempt now.
+
+  Deliberately narrow: a reset connection, a refused one and a timeout are all
+  still retried, and so is every TLS failure that is not about the certificate,
+  since a protocol-level disagreement mid-handshake may well be one busy proxy
+  out of several.
+
 ### An operation is no longer a string and four commands
 
 - **Added** the rest of the operation lifecycle — `suspend_operation`,
