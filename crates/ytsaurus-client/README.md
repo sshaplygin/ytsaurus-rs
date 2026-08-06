@@ -291,12 +291,56 @@ a local cluster 67.7 MiB of table arrived as 400 KiB. Uploads are not
 compressed, though the proxy would accept it — that costs a compression
 dependency in a crate that gets cross-compiled to musl.
 
+## Seeing what it did
+
+The cluster traces itself: its proxy opens a span for every request it serves.
+A request that carries a `traceparent` has its span put inside the caller's
+trace rather than starting an orphan, so naming the trace is the whole of it —
+no dependency, one header:
+
+```rust
+// A service passing on the trace it was called in.
+let client = Client::from_env()?
+    .with_trace_context(&TraceContext::parse(incoming_traceparent)?);
+```
+
+`TraceContext::new()` starts a trace for a program nobody called;
+`yt_trace_id()` prints its id the way the cluster does —
+`8e9bcc43-5c2be9b4-56f18c4e-117ea314` — which is the spelling in the proxy log,
+in the `X-YT-Trace-Id` response header and in the UI. A header that is not a
+traceparent is refused rather than sent: the proxy drops one it cannot parse
+without saying so, and the trace would then be quietly missing the part that
+mattered.
+
+That is the cluster's side. For this process's own side there is the `tracing`
+feature, off by default, which puts every attempt in a span carrying the
+command, the attempt number and the elapsed time, and turns the retry message
+into a `WARN` event instead of a line on stderr.
+
+A retry announces itself in whichever of the two forms is compiled — a launcher
+that pauses for fifteen seconds should say why — and in both it goes quiet
+inside a job, where stderr is the cluster's own bounded diagnostic buffer.
+`RetryPolicy::loud()` puts it back. With the feature on the announcement is an
+event and not a line, so it goes wherever your subscriber sends it, and nowhere
+at all if you install none.
+
 ## Features
 
 `tls` (default) brings in `rustls`, and with it `https://` proxies. Turning it
 off leaves a client that speaks plain HTTP and needs no C toolchain — which is
 how a binary that is both launcher and job gets cross-compiled to musl. Without
 it, an `https://` proxy fails with an error naming the feature.
+
+`tracing` (off) adds the spans above. Off for the same reason: a worker binary
+should carry only what it runs on, and `examples/` — what `build-worker.sh`
+cross-compiles — takes this crate with `default-features = false`. It costs
+three more crates to compile (`tracing`, its `pin-project-lite`, and
+`tracing-core`) plus `once_cell`, which a default build already has through
+`rustls`. The facade is taken without `attributes`, since `#[instrument]` is a
+proc macro and these spans are opened by hand.
+
+`derive` (off) brings `#[derive(TableRow)]`, which reads a table schema off the
+struct the rows already have.
 
 ## When an operation fails
 

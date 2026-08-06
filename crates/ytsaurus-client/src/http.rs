@@ -41,6 +41,9 @@ use crate::yson_build::{boolean, insert, string};
 const HEADER_FORMAT: &str = "X-YT-Header-Format";
 const PARAMETERS: &str = "X-YT-Parameters";
 const ERROR: &str = "X-YT-Error";
+/// The W3C trace context, in the spelling the proxy parses. See
+/// [`TraceContext`](crate::TraceContext).
+const TRACEPARENT: &str = "traceparent";
 
 /// The parameter that puts a command inside a transaction.
 const TRANSACTION_ID: &str = "transaction_id";
@@ -107,6 +110,9 @@ pub(crate) struct Transport {
     timeout: Duration,
     /// Stamped onto every command, when the client is bound to a transaction.
     transaction: Option<String>,
+    /// The `traceparent` header, rendered once, when the client was given a
+    /// trace to belong to.
+    trace: Option<String>,
 }
 
 impl std::fmt::Debug for Transport {
@@ -144,6 +150,7 @@ impl Transport {
             retries,
             timeout,
             transaction: None,
+            trace: None,
         }
     }
 
@@ -162,6 +169,14 @@ impl Transport {
 
     pub(crate) fn transaction(&self) -> Option<&str> {
         self.transaction.as_deref()
+    }
+
+    pub(crate) fn set_trace(&mut self, header: Option<String>) {
+        self.trace = header;
+    }
+
+    pub(crate) fn trace(&self) -> Option<&str> {
+        self.trace.as_deref()
     }
 
     /// Executes a command, repeating it when the failure looks transient.
@@ -310,20 +325,25 @@ impl Transport {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
-        let response = self.dispatch(method, command, parameters, SendBody::none(), true)?;
-        let status = response.status().as_u16();
+        // Not `retry::run`, which is where every other command gets its span:
+        // this one is sent once, so there is one attempt to time, and the
+        // reader it hands back is read after the span has closed.
+        crate::observe::attempt(command, 1, || {
+            let response = self.dispatch(method, command, parameters, SendBody::none(), true)?;
+            let status = response.status().as_u16();
 
-        if !(200..300).contains(&status) {
-            let mut response = response;
-            let body = response.body_mut().read_to_string().unwrap_or_default();
-            return Err(ClientError::Http {
-                command: command.to_owned(),
-                status,
-                body: truncate(&body, 400),
-            });
-        }
+            if !(200..300).contains(&status) {
+                let mut response = response;
+                let body = response.body_mut().read_to_string().unwrap_or_default();
+                return Err(ClientError::Http {
+                    command: command.to_owned(),
+                    status,
+                    body: truncate(&body, 400),
+                });
+            }
 
-        Ok(response.into_body())
+            Ok(response.into_body())
+        })
     }
 
     /// Sends a command whose request body is read as it goes, and returns the
@@ -346,6 +366,23 @@ impl Transport {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
+        // Sent once — a reader that has been consumed cannot be sent again —
+        // so one attempt, and unlike `open` the span covers the whole
+        // transfer: the body is read here, as it goes.
+        crate::observe::attempt(command, 1, || {
+            self.send_upload(method, command, parameters, rows)
+        })
+    }
+
+    /// One upload attempt, split out so it can be wrapped. See
+    /// [`Transport::upload`].
+    fn send_upload(
+        &self,
+        method: Method,
+        command: &str,
+        parameters: &YsonValue,
+        rows: &mut dyn std::io::Read,
+    ) -> Result<Vec<u8>> {
         let mut response = self.dispatch(
             method,
             command,
@@ -396,10 +433,7 @@ impl Transport {
         }
 
         let url = format!("{}{path}", self.base);
-        let mut headers: Vec<(&str, String)> = Vec::new();
-        if let Some(token) = &self.token {
-            headers.push(("Authorization", format!("OAuth {token}")));
-        }
+        let headers = self.caller_headers();
 
         crate::retry::run(self.retries, Repeatable::Freely, what, |_| {
             let mut response = with_headers!(self.agent.get(&url), &headers)
@@ -469,9 +503,7 @@ impl Transport {
             ("X-YT-Output-Format", "<format=text>yson".to_owned()),
             ("Content-Type", "application/octet-stream".to_owned()),
         ];
-        if let Some(token) = &self.token {
-            headers.push(("Authorization", format!("OAuth {token}")));
-        }
+        headers.extend(self.caller_headers());
 
         let sent = match method {
             // A GET carries no body in `ureq`'s type system, which is also true
@@ -502,6 +534,28 @@ impl Transport {
         }
 
         Ok(response)
+    }
+
+    /// The headers that say who is asking rather than what is being asked.
+    ///
+    /// One place for both, because they belong to every request and not to any
+    /// command: `/hosts` is not a command and still wants them. Building its
+    /// request separately is how it once came to carry no token at all — see
+    /// [`Transport::fetch`].
+    ///
+    /// The trace context is sent on every attempt of a retried command, with
+    /// the same span id each time. That is deliberate: the retries are the
+    /// same logical call, and the cluster's spans for them belong under the
+    /// one span the caller knows about.
+    fn caller_headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = Vec::new();
+        if let Some(token) = &self.token {
+            headers.push(("Authorization", format!("OAuth {token}")));
+        }
+        if let Some(trace) = &self.trace {
+            headers.push((TRACEPARENT, trace.clone()));
+        }
+        headers
     }
 
     /// Applies the streaming timeout override to one request.

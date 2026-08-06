@@ -87,6 +87,19 @@
 //! dropping the handle aborts it, so a `?` on any line leaves the cluster as it
 //! was.
 //!
+//! # Seeing what it did
+//!
+//! The cluster traces itself, so joining its trace costs a header and no
+//! dependency: [`Client::with_trace_context`] puts every request into the
+//! trace a [`TraceContext`] names, and the proxy's own span for that request
+//! is placed inside it rather than starting an orphan.
+//!
+//! This process's own side is the `tracing` feature, off by default: with it,
+//! each attempt runs in a span carrying the command, the attempt number and
+//! the elapsed time, and the message a retry prints on stderr becomes a `WARN`
+//! event instead. It is off because this crate is linked into worker binaries
+//! cross-compiled to musl — the same reason `tls` is.
+//!
 //! # What this does not do
 //!
 //! Heavy commands are documented to require asking `/hosts` for a dedicated
@@ -105,6 +118,7 @@ mod http;
 mod jobs;
 /// Cypress locks.
 pub mod lock;
+mod observe;
 /// The operation handle, and what its commands take and answer.
 pub mod operation;
 /// Table paths that carry attributes.
@@ -115,6 +129,8 @@ pub mod schema;
 mod spec;
 /// Streaming table I/O.
 pub mod stream;
+/// The trace a request belongs to.
+pub mod trace;
 mod transaction;
 mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
@@ -138,6 +154,7 @@ pub use crate::spec::{
     RemoteCopySpec, SortSpec, VanillaSpec, VanillaTask,
 };
 pub use crate::stream::{ResponseReader, TableReader};
+pub use crate::trace::TraceContext;
 pub use crate::transaction::Transaction;
 pub use ytsaurus_format::DataFormat;
 #[cfg(feature = "derive")]
@@ -351,6 +368,45 @@ impl Client {
     #[must_use]
     pub fn transaction_id(&self) -> Option<&str> {
         self.transport.transaction()
+    }
+
+    /// Puts every request this client sends into `context`'s trace.
+    ///
+    /// The cluster traces itself: the proxy opens a span for each request, and
+    /// a request that names a trace has its span put inside that one instead of
+    /// starting an orphan. So this is the cheap half of making a launch
+    /// visible — nothing is emitted from this process, and the work the cluster
+    /// does on its behalf turns up under the caller's own trace.
+    ///
+    /// ```
+    /// use ytsaurus_client::{Client, TraceContext};
+    ///
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// // A service passing on the trace it was called in.
+    /// let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    /// let client = Client::new("http://localhost:8000")
+    ///     .with_trace_context(&TraceContext::parse(incoming)?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`TraceContext::new`] starts a trace for a program that was not called
+    /// by anything, and [`TraceContext::yt_trace_id`] spells its id the way the
+    /// cluster's own logs and UI do.
+    ///
+    /// A [`Transaction`] started from this client inherits the context, pings
+    /// included — the transaction is part of the same piece of work, and a
+    /// commit that hung is one of the things a trace is for.
+    #[must_use]
+    pub fn with_trace_context(mut self, context: &TraceContext) -> Self {
+        self.transport.set_trace(Some(context.header()));
+        self
+    }
+
+    /// The `traceparent` header this client sends, if it was given one.
+    #[must_use]
+    pub fn traceparent(&self) -> Option<&str> {
+        self.transport.trace()
     }
 
     /// Starts a transaction, and keeps it alive while the handle lives.

@@ -23,6 +23,13 @@ tls = ["ureq/rustls"]
 # have. Off by default: it is a compiler plugin, and a crate that only launches
 # operations should not pay to build one.
 derive = ["dep:ytsaurus-helpers"]
+# Spans and events through the `tracing` facade: one span per attempt, and the
+# retry message as a `WARN` event instead of a line on stderr. Off by default
+# for the same reason `tls` is — this crate is linked into worker binaries, and
+# a worker should carry only what it runs on. Sending a `traceparent` to the
+# cluster, which is the other half of being observable, needs none of this and
+# is always compiled in: see `TraceContext`.
+tracing = ["dep:tracing"]
 
 [dependencies]
 ytsaurus-yson.workspace = true
@@ -37,6 +44,14 @@ serde_json = "1.0"
 # that cross-compile to musl with nothing but the Rust toolchain.
 md5 = "0.8"
 ytsaurus-helpers = { workspace = true, optional = true }
+# The facade only, and without `attributes`: `#[instrument]` is a proc macro,
+# and the spans here are opened by hand at three call sites. What is left is
+# `tracing` with its `pin-project-lite`, and `tracing-core` with its
+# `once_cell` — three crates more to compile on a default build, which already
+# has `once_cell` by way of `rustls`, and four without TLS.
+tracing = { version = "0.1", default-features = false, features = [
+    "std",
+], optional = true }
 
 [dev-dependencies]
 serde_bytes.workspace = true

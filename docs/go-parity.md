@@ -104,11 +104,21 @@ bodies, which is the "RPC proxy (custom binary protocol), protobuf row format"
 non-goal twice over.
 
 **Tracing** — `tracing`. The backlog ranked it P3 #15 with the note "only worth
-doing if a user asks". **One has**, and it is now the first item of the pinned
-parity issue: a production deployment cannot be run blind. The two halves are
-still worth separating — emitting a `traceparent` header is a small,
-dependency-free change to the transport, while an OpenTelemetry exporter is a
-dependency tree.
+doing if a user asks". **One did**, it became the first item of the pinned
+parity issue — a production deployment cannot be run blind — and it is built.
+The two halves stayed separate, which was the point of separating them:
+`TraceContext` and `Client::with_trace_context` emit the same `traceparent` the
+Go example's `ytotel.TraceFn` produces, with no dependency at all, while the
+`tracing` feature that spans this client's own attempts is off by default and
+kept out of musl worker builds.
+
+Still no example, and deliberately: what a cluster example would have to check
+is a span in the cluster's trace store, which this client cannot read and the
+local Docker cluster does not run a collector for. The check that exists is a
+wire test — `tests/request_shape.rs` reads the bytes off a socket and pins the
+header, including on the `/hosts` lookup, which builds its own request. An
+exporter for this process's spans remains the user's to choose; that is what a
+facade is for.
 
 **Cluster maintenance** — `admin`. Not named in the non-goals, so this is an
 open decision rather than a closed one. It is out of the client's stated charter

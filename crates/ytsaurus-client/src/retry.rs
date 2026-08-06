@@ -91,7 +91,8 @@ pub struct RetryPolicy {
     attempts: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
-    /// Whether a retry announces itself on stderr. See [`RetryPolicy::quiet`].
+    /// Whether a retry announces itself at all — on stderr, or as a `WARN`
+    /// event where the `tracing` feature is on. See [`RetryPolicy::quiet`].
     report: bool,
 }
 
@@ -137,6 +138,12 @@ impl RetryPolicy {
     /// worker that talks to the cluster while a proxy is flaky would fill it
     /// with retry chatter.
     ///
+    /// With the `tracing` feature on the announcement is a `WARN` event rather
+    /// than a line on stderr, and this mutes that too. Same reason: a
+    /// subscriber installed inside a job is, more often than not, writing to
+    /// the very buffer this exists to protect. [`RetryPolicy::loud`] puts the
+    /// messages back whichever form they take.
+    ///
     /// A [`Client`](crate::Client) built inside a job is quiet already; this is
     /// for choosing it anywhere else:
     ///
@@ -152,10 +159,11 @@ impl RetryPolicy {
         self
     }
 
-    /// The same policy, announcing each retry on stderr.
+    /// The same policy, announcing each retry.
     ///
     /// The default outside a job, and what puts the messages back inside one —
-    /// a job whose stderr nobody else is using may well want them.
+    /// a job whose stderr nobody else is using may well want them, and so does
+    /// one whose subscriber ships them somewhere other than stderr.
     #[must_use]
     pub fn loud(mut self) -> Self {
         self.report = true;
@@ -347,7 +355,8 @@ fn inside_job(job_id: Option<std::ffi::OsString>) -> bool {
 /// cannot fix.
 ///
 /// `action` is told whether this is a retry, which is what a mutating command
-/// puts in its `retry` parameter. Progress goes to stderr unless the policy is
+/// puts in its `retry` parameter. Each attempt is timed and named — see
+/// `observe::attempt` — and progress is reported unless the policy is
 /// [`RetryPolicy::quiet`]: a run that pauses for fifteen seconds should say why
 /// rather than look hung.
 pub(crate) fn run<T>(
@@ -363,7 +372,7 @@ pub(crate) fn run<T>(
 
     let mut attempt = 1;
     loop {
-        match action(attempt > 1) {
+        match crate::observe::attempt(command, attempt, || action(attempt > 1)) {
             Ok(value) => return Ok(value),
             Err(error) => {
                 if attempt >= allowed || !is_retriable(&error) {
@@ -372,12 +381,7 @@ pub(crate) fn run<T>(
 
                 let wait = policy.backoff(attempt);
                 if policy.report {
-                    eprintln!(
-                        "ytsaurus-client: {command} failed ({error}); \
-                         retrying in {:.1}s ({attempt}/{})",
-                        wait.as_secs_f64(),
-                        allowed - 1
-                    );
+                    crate::observe::retrying(command, &error, wait, attempt, allowed - 1);
                 }
                 std::thread::sleep(wait);
                 attempt += 1;

@@ -84,6 +84,75 @@
   it, lists it back, reads one of its jobs by id, finishes it early, and then
   merges two sorted tables and erases a row range from the result.
 
+### The client can be watched: a trace the cluster joins, and spans if you want them
+
+Two halves of one problem, kept apart because they cost different things. A
+launch that took four minutes, a command that was retried three times, a
+transaction that was never committed — none of it left anything behind to look
+at, and that is the first thing a production deployment needs.
+
+- **Added** `TraceContext` and `Client::with_trace_context`, which put every
+  request into a trace **without adding a dependency**. The cluster is already
+  instrumented: its proxy opens a span for each request it serves, and a
+  request carrying a `traceparent` has that span placed inside the caller's
+  trace instead of starting an orphan. So the whole of this half is a header,
+  and the operational value is most of the issue's.
+
+  The header is the [W3C one](https://www.w3.org/TR/trace-context/), which is
+  what all three official clients send — `FormatTraceParentHeader` in the C++
+  wrapper, `injectTracing` in the Go SDK, `generate_traceparent` in the Python
+  one — and what `TryParseTraceParent` reads on the proxy side. That parser is
+  slightly wider than the standard, and both of its spellings are accepted
+  here: the version may be missing entirely, which is the form the Go SDK
+  sends.
+
+  `TraceContext::parse` continues a trace that already exists, which is the
+  case that matters — a service passes on the context it was called in, and the
+  cluster's work turns up under the same trace as the request that caused it.
+  `TraceContext::new` starts one for a program nobody called. A malformed
+  header is **refused rather than sent**: the proxy drops one it cannot parse
+  without saying so, and the trace would then be quietly missing the half that
+  mattered.
+
+  `TraceContext::yt_trace_id` spells the id the way the cluster does —
+  `8e9bcc43-5c2be9b4-56f18c4e-117ea314` rather than 32 undivided hex digits —
+  because that is the spelling in the proxy log, in the `X-YT-Trace-Id`
+  response header and in the UI. They are the same four 32-bit groups in the
+  same order; only the dashes and the leading zeros differ.
+
+  `/hosts` carries the header too. It is not a command and builds its own
+  request, which is exactly how it once came to carry neither the token nor the
+  timeout, and a heavy-proxy lookup slow enough to matter is one worth seeing.
+
+- **Added** a `tracing` feature, **off by default**, which is the half that
+  does cost a dependency. With it on, every attempt runs inside a span carrying
+  the command, the attempt number and how long it took, and the retry message
+  becomes a `WARN` event rather than a line on stderr — the same facts as
+  fields, going wherever the subscriber sends them.
+
+  Off by default for the reason `tls` is: this crate is linked into worker
+  binaries that cross-compile to musl with nothing but the Rust toolchain, and
+  a worker should carry only what it runs on. `examples/` already depends on
+  the client with `default-features = false`, so the worker build never sees
+  it. What it costs when it is on is three crates more to compile —
+  `tracing`, its `pin-project-lite`, and `tracing-core` — plus `once_cell`,
+  which a default build already has by way of `rustls` and a build without
+  TLS does not. The facade is taken without its `attributes` feature:
+  `#[instrument]` is a proc macro, and the three spans here are opened by
+  hand.
+
+  Nothing is emitted without a subscriber, which is what makes it a facade —
+  so a build that turns this on and installs none has traded the retry line on
+  stderr for silence. That is the trade the issue asked for ("routed through
+  it"), and it is why the feature is opt-in rather than the default.
+
+- **Kept**: the retry reporting still mutes itself inside a job. `RetryPolicy`
+  decides whether a retry is announced at all, and that decision now covers
+  both spellings of the announcement — a job's stderr is the cluster's bounded
+  diagnostic buffer, and a subscriber installed in a job is more often than not
+  writing to that same buffer. `RetryPolicy::loud` puts the messages back
+  either way.
+
 ### The cluster end-to-end test no longer needs Python
 
 - **Added** the `e2e` example, which runs all three checks

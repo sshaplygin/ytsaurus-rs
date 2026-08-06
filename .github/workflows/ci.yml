@@ -46,8 +46,14 @@ jobs:
       - name: cargo clippy (client without TLS)
         run: cargo clippy -p ytsaurus-client --no-default-features --all-targets -- -D warnings
 
-      # `derive` is off by default, so the workspace build never compiles the
-      # re-export or the macro against the client's own types.
+      # `derive` and `tracing` are both off by default, so the workspace build
+      # compiles neither the macro against the client's own types nor the spans
+      # and the `tracing`-shaped retry reporting. Clippy as well as the tests:
+      # the two spellings of `observe` are separate code, and only one of them
+      # is linted above.
+      - name: cargo clippy (client with every feature)
+        run: cargo clippy -p ytsaurus-client --all-features --all-targets -- -D warnings
+
       - name: cargo test (client with every feature)
         run: cargo test -p ytsaurus-client --all-features
 
@@ -76,6 +82,23 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+
+      # `tls` and `tracing` are both off in a worker build, and both would
+      # break or bloat it: `rustls` reaches `ring`, which wants a C
+      # cross-compiler, and a worker should carry only what it runs on. Neither
+      # is off by accident — `examples/` takes the client with
+      # `default-features = false` — so this asserts the invariant rather than
+      # trusting it. `-i` exits non-zero when the crate is not in the graph,
+      # which is the passing case.
+      - name: Assert the worker graph has no tracing and no TLS
+        run: |
+          set -euo pipefail
+          for crate in tracing rustls ring; do
+            if cargo tree -p ytsaurus-examples \
+                 --target x86_64-unknown-linux-musl -i "$crate" 2>/dev/null; then
+              echo "ERROR: $crate reached the worker build"; exit 1
+            fi
+          done
 
       - name: Build worker binaries
         run: |
