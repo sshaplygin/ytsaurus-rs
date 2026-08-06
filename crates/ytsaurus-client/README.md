@@ -52,14 +52,20 @@ cargo run -p ytsaurus-client --example launch
 | Typed | `write_table_rows`, `read_table_rows`, `get_as` |
 | Streaming | `read_table_streaming`, `write_table_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
-| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_operation`, `operation_state`, `wait_for_operation`, `abort_operation`, `operation_result_error` |
-| Jobs | `list_jobs`, `get_job_stderr`, `custom_statistics`, `statistic_sum`, `job_statistics`, `job_statistic_sum` |
+| Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_merge`, `start_erase`, `start_remote_copy`, `start_operation`, `operation_state`, `wait_for_operation`, `operation_result_error` |
+| Lifecycle | `abort_operation`, `suspend_operation`, `resume_operation`, `complete_operation`, `update_operation_parameters`, `operation_suspended`, `operation_status`, `attach_operation` → `Operation` |
+| Finding one | `list_operations`, `get_operation`, `get_operation_by_alias`, `list_operation_events` |
+| Jobs | `list_jobs`, `get_job`, `get_job_stderr`, `get_job_input`, `custom_statistics`, `statistic_sum`, `job_statistics`, `job_statistic_sum` |
 | Transactions | `start_transaction`, `with_transaction`, `Transaction::{commit, abort, ping}` |
 | Anything else | `raw_command`, `raw_command_with`, `raw_command_streaming`, `raw_command_upload` |
 
 Specs are built with [`MapSpec`] / [`ReduceSpec`] / [`SortSpec`] /
-[`MapReduceSpec`] / [`VanillaSpec`], which model what launching a
-`ytsaurus-job` worker needs and expose `with_raw` for everything else.
+[`MapReduceSpec`] / [`VanillaSpec`] / [`MergeSpec`] / [`EraseSpec`] /
+[`RemoteCopySpec`], which model what launching a `ytsaurus-job` worker needs and
+expose `with_raw` for everything else. `OperationType` names all nine types the
+cluster registers; the ninth, `join_reduce`, has no builder because the current
+documentation describes the same work as a reduce with `join_by` and
+`enable_key_guarantee=%false`.
 
 `DataFormat` is the common public format choice: use `MapSpec::with_formats`,
 the map-reduce phase equivalents, and `write_table_with_format` /
@@ -357,6 +363,50 @@ operation`, so a defensive second abort is an error rather than a no-op. It is
 sent once and never retried for the same reason: the master's mutation cache does
 not cover a scheduler command, so a retry after a lost answer would report a
 successful abort as a failed one.
+
+## Pausing one, repricing it, and picking it up again
+
+```rust
+let op = client.attach_operation(id);   // an id from anywhere: a file, a log, another process
+
+op.suspend(false)?;                     // stop scheduling; let running jobs finish
+op.resume()?;
+op.update_parameters(&OperationParameters::new().with_pool("interactive").with_weight(2.0))?;
+op.complete()?;                         // finish early and keep the output
+```
+
+`attach_operation` is the reattach door — C++'s `AttachOperation`, Go's
+`Track(id)`. Nothing is sent by it: an id and a client is all an `Operation` is,
+which is why the id is the thing worth persisting. **Dropping the handle does
+nothing**, unlike a `Transaction`: an operation is meant to outlive the process
+that started it.
+
+Everything on the handle is also on `Client`, taking the id — the handle is for
+passing an operation around, not for reaching anything the flat API cannot.
+
+Five things about this the cluster does not document and this crate measured:
+
+- **Suspension is not a state.** A suspended operation still reports `running`.
+  `operation_suspended` is the question that gets a straight answer, and
+  `operation_status` asks it together with the state in one request — which is
+  what `wait_for_operation` polls with, so a wait on a paused operation says
+  `running, suspended` rather than nothing at all.
+- **Suspend is idempotent; resume is not.** A second suspend is accepted, so it
+  is the one mutating scheduler command here that is retried. A resume of
+  something that is not suspended is refused with code 201.
+- **Complete is not idempotent**, exactly as abort is not — and it ends the
+  operation as `completed`, so its output is published and a waiting launcher is
+  told the work succeeded.
+- **An update that changes nothing is refused here**, because the cluster
+  accepts one with 200 and does nothing.
+- **A sorted merge does not need `merge_by`.** Sent without one it is accepted,
+  and the key comes from the sort columns the inputs already carry.
+
+An alias set in the spec can now be looked up:
+`get_operation_by_alias("*nightly-load", &["state"])`, which sends the
+`include_runtime` the cluster insists on. `list_operations` takes an
+`OperationFilter`. [`examples/lifecycle.rs`](examples/lifecycle.rs) runs all of
+it against a cluster.
 
 ## Tables bigger than memory
 

@@ -109,9 +109,10 @@ The codec, the job runtime, the client and the example workers are implemented
 and verified against a cluster. The ranked backlog has been worked top to bottom:
 job diagnostics, one binary that is both launcher and job, vanilla operations,
 reduce and sort, retries, the worker cache, custom statistics, schemas derived
-from a struct, transactions, the rest of Cypress with locks, `alter_table`, and
-streaming table I/O. Every item ends with an example that checks itself on a
-cluster — [`tests/e2e/README.md`](tests/e2e/README.md) is the list of what has
+from a struct, transactions, the rest of Cypress with locks, `alter_table`,
+streaming table I/O, and the whole operation lifecycle — pause, resume, reprice,
+finish early, look one up by alias, and reattach to one after a restart. Every
+item ends with an example that checks itself on a cluster — [`tests/e2e/README.md`](tests/e2e/README.md) is the list of what has
 actually been run, with its output.
 
 **Measured against the official clients.** There is no official Rust SDK, but

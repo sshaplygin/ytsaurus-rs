@@ -107,6 +107,7 @@ cargo run -p ytsaurus-client --example schema       # a derived schema the clust
 cargo run -p ytsaurus-client --example cluster_info # connect, and read a node into a type
 cargo run -p ytsaurus-client --example table_usage  # Rust values in, Rust values out
 cargo run -p ytsaurus-client --example abort        # stopping an operation, and what it costs
+cargo run -p ytsaurus-client --example lifecycle    # pause, reprice, finish early, reattach; merge and erase
 cargo run --release -p ytsaurus-client --example append  # adding rows, against rewriting them
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock

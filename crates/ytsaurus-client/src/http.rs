@@ -59,6 +59,7 @@ const TRANSACTION_ID: &str = "transaction_id";
 const NO_TRANSACTION: &[&str] = &[
     "get_operation",
     "list_operations",
+    "list_operation_events",
     "abort_operation",
     "complete_operation",
     "suspend_operation",

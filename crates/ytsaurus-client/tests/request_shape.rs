@@ -11,8 +11,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 use ytsaurus_client::{
-    Client, ClientError, DataFormat, Method, RetryPolicy, SkiffFormat, SkiffSchema, SkiffSchemaRef,
-    SkiffWireType, TablePath, yson_build,
+    Client, ClientError, DataFormat, Method, OperationFilter, OperationParameters, RetryPolicy,
+    SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType, TablePath, yson_build,
 };
 
 /// Serves exactly one request and returns its headers as text.
@@ -417,5 +417,195 @@ fn a_multi_table_skiff_write_is_refused_before_anything_is_sent() {
     assert!(
         error.to_string().contains("exactly one table schema"),
         "{error}"
+    );
+}
+
+// ------------------------------------------------- the operation lifecycle
+
+#[test]
+fn a_suspend_says_what_to_do_with_the_running_jobs() {
+    // Sent either way round, never left out. The two are different requests:
+    // one lets the jobs that have started finish, the other throws their work
+    // away — and a caller who asked for the second and got the first would
+    // find out much later, from a cluster bill.
+    for abort_running_jobs in [false, true] {
+        let head = capture(|proxy| {
+            let client = Client::new(proxy).with_retries(RetryPolicy::none());
+            client
+                .suspend_operation("1-2-3-4", abort_running_jobs)
+                .expect("suspends");
+        });
+
+        let params = parameters(&head);
+        assert!(head.starts_with("POST /api/v4/suspend_operation"), "{head}");
+        assert!(params.contains(r#"operation_id="1-2-3-4""#), "{params}");
+        assert!(
+            params.contains(&format!("abort_running_jobs=%{abort_running_jobs}")),
+            "{params}"
+        );
+    }
+}
+
+#[test]
+fn the_scheduler_commands_carry_no_mutation_id() {
+    // The master's mutation cache does not cover a scheduler command, which is
+    // the fact `abort_operation` was built on and these three inherit: a
+    // resend under the same ID is answered `No such operation` rather than
+    // with the first response. Suspend is retried, but on its own idempotency
+    // — a second suspend of a suspended operation is simply accepted — and not
+    // by asking the cluster to deduplicate it.
+    let heads = [
+        (
+            "suspend_operation",
+            capture(|proxy| {
+                let client = Client::new(proxy).with_retries(RetryPolicy::none());
+                client
+                    .suspend_operation("1-2-3-4", false)
+                    .expect("suspends");
+            }),
+        ),
+        (
+            "resume_operation",
+            capture(|proxy| {
+                let client = Client::new(proxy).with_retries(RetryPolicy::none());
+                client.resume_operation("1-2-3-4").expect("resumes");
+            }),
+        ),
+        (
+            "complete_operation",
+            capture(|proxy| {
+                let client = Client::new(proxy).with_retries(RetryPolicy::none());
+                client.complete_operation("1-2-3-4").expect("completes");
+            }),
+        ),
+    ];
+
+    for (command, head) in heads {
+        let params = parameters(&head);
+        assert!(
+            head.starts_with(&format!("POST /api/v4/{command}")),
+            "a mutating command is a POST: {head}"
+        );
+        assert!(!params.contains("mutation_id"), "{command}: {params}");
+        assert!(!params.contains("retry="), "{command}: {params}");
+    }
+}
+
+#[test]
+fn updated_parameters_travel_in_the_header_and_not_in_the_body() {
+    // The command reference calls this command's input "structured", which
+    // reads like a request body. The cluster's own registry says `null`, and
+    // the registry is what the proxy implements: the parameters go in
+    // `X-YT-Parameters` like every other command's.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        client
+            .update_operation_parameters(
+                "1-2-3-4",
+                &OperationParameters::new()
+                    .with_pool("fast")
+                    .with_weight(2.5),
+            )
+            .expect("updates");
+    });
+
+    let params = parameters(&head);
+    assert!(
+        head.starts_with("POST /api/v4/update_operation_parameters"),
+        "{head}"
+    );
+    assert!(params.contains(r#"operation_id="1-2-3-4""#), "{params}");
+    assert!(
+        params.contains("parameters={pool=fast;weight=2.5}"),
+        "the parameters are one nested dict, and the weight is a double: {params}"
+    );
+    assert!(
+        !head.to_lowercase().contains("content-length: ")
+            || head.to_lowercase().contains("content-length: 0"),
+        "the command takes no body:\n{head}"
+    );
+}
+
+#[test]
+fn an_update_that_changes_nothing_is_refused_before_it_is_sent() {
+    // Nothing listens on this port, so a Config error proves the check ran
+    // first. The cluster answers an empty update with 200 and does nothing,
+    // which is the shape of mistake that survives every test but the one that
+    // reads the pool afterwards.
+    let client = Client::new("http://127.0.0.1:1").with_retries(RetryPolicy::none());
+    let error = client
+        .update_operation_parameters("1-2-3-4", &OperationParameters::new())
+        .expect_err("an empty update is not a request worth sending");
+
+    assert!(matches!(error, ClientError::Config(_)), "{error:?}");
+}
+
+#[test]
+fn an_alias_lookup_asks_for_runtime_information() {
+    // Without it the cluster refuses outright: "Operation alias cannot be
+    // resolved without using runtime information". A lookup that forgot this
+    // would fail every time, and only against a real cluster.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.get_operation_by_alias("*nightly", &["state"]);
+    });
+
+    let params = parameters(&head);
+    assert!(head.starts_with("GET /api/v4/get_operation"), "{head}");
+    assert!(params.contains(r#"operation_alias="*nightly""#), "{params}");
+    assert!(params.contains("include_runtime=%true"), "{params}");
+    assert!(params.contains("attributes=[state]"), "{params}");
+    assert!(
+        !params.contains("operation_id"),
+        "an alias lookup names no id: {params}"
+    );
+}
+
+#[test]
+fn the_whole_operation_document_is_asked_for_by_naming_no_attributes() {
+    // `attributes=[]` is a request for *no* attributes, which the cluster
+    // answers with `{}`. Leaving the parameter out is what asks for
+    // everything, so an empty slice must not be sent as an empty list.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.get_operation("1-2-3-4", &[]);
+    });
+
+    let params = parameters(&head);
+    assert_eq!(params, r#"{operation_id="1-2-3-4"}"#);
+}
+
+#[test]
+fn a_filtered_listing_sends_its_filter_and_nothing_else() {
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.list_operations(
+            &OperationFilter::new()
+                .with_user("robot-loader")
+                .with_state("running")
+                .with_limit(20),
+        );
+    });
+
+    assert!(head.starts_with("GET /api/v4/list_operations"), "{head}");
+    assert_eq!(
+        parameters(&head),
+        "{limit=20;state=running;user=robot-loader}"
+    );
+}
+
+#[test]
+fn a_job_is_asked_for_by_operation_and_job() {
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        // The stub answers `{value=%true}`, which names no job; the request is
+        // what this is about.
+        let _ = client.get_job("1-2-3-4", "5-6-7-8");
+    });
+
+    assert!(head.starts_with("GET /api/v4/get_job "), "{head}");
+    assert_eq!(
+        parameters(&head),
+        r#"{job_id="5-6-7-8";operation_id="1-2-3-4"}"#
     );
 }
