@@ -57,8 +57,20 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
 | Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
 | Retries | three policies by request class | interceptor chain | one policy × `Repeatable` |
-| Client logging | global `ILogger` | `Config.Logger`, structured | **no logging dependency at all** |
-| Distributed tracing | `EnableClientTracing` | `TraceFn` + Jaeger and OTel adapters | **none** |
+| Client logging | global `ILogger` | `Config.Logger`, structured | optional `tracing` feature, off by default |
+| Distributed tracing | `EnableClientTracing` | `TraceFn` + Jaeger and OTel adapters | `TraceContext` → `traceparent`, no dependency |
+
+The tracing row is closer than it looks: all three send the same W3C
+`traceparent` header, and the cluster is what records the span. What Go's
+`ytjaeger` and `ytotel` adapters add is reading the context out of an ambient
+`context.Context`; here it is passed to the client, because Rust has no ambient
+one to read. An application already exporting OpenTelemetry spans formats its
+current one into a `traceparent` and hands that over, which is the same picture
+by a shorter road.
+
+Logging is a smaller row than it was and still the softer of the two: this
+client has one span per attempt and one event per retry, where the official
+clients log request bodies, proxy choices and connection lifecycles.
 
 Two things this client has that neither other does: retry logging that mutes
 itself inside a job (`YT_JOB_ID`), and being usable from inside a job at all —
@@ -177,11 +189,12 @@ either library would have picked. Three things here are better than in both:
 Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
-the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues) — logging
-and tracing first, then `read_file`, batch requests, read-side column and range
-selection, and transaction `Detach`. *(The operation object and its lifecycle
-were second on that list and are now built; the table above is what they came
-to.)*
+the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
+two on that list are **now built**: logging and tracing — a `traceparent` the
+cluster joins, and an optional `tracing` feature — and the operation object and
+its lifecycle, which is what the table above came to. What is left is
+`read_file`, batch requests, read-side column and range selection, and
+transaction `Detach`.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,

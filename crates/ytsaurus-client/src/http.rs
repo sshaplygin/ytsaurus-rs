@@ -41,6 +41,13 @@ use crate::yson_build::{boolean, insert, string};
 const HEADER_FORMAT: &str = "X-YT-Header-Format";
 const PARAMETERS: &str = "X-YT-Parameters";
 const ERROR: &str = "X-YT-Error";
+/// The W3C trace context, in the spelling the proxy parses. See
+/// [`TraceContext`](crate::TraceContext).
+const TRACEPARENT: &str = "traceparent";
+/// The vendor state the standard pairs with `traceparent`. The proxy has no
+/// opinion about it; a caller's own backend may well have one, and a
+/// participant that forwards the one header is required to forward the other.
+const TRACESTATE: &str = "tracestate";
 
 /// The parameter that puts a command inside a transaction.
 const TRANSACTION_ID: &str = "transaction_id";
@@ -78,11 +85,13 @@ const NO_TRANSACTION: &[&str] = &[
 /// `ureq` gives requests with and without a body distinct builder types, so a
 /// plain function cannot decorate both. A macro can.
 macro_rules! with_headers {
-    ($request:expr, $headers:expr) => {{
+    ($request:expr $(, $headers:expr)* $(,)?) => {{
         let mut request = $request;
-        for (name, value) in $headers {
-            request = request.header(*name, value.as_str());
-        }
+        $(
+            for (name, value) in $headers {
+                request = request.header(*name, value.as_str());
+            }
+        )*
         request
     }};
 }
@@ -107,6 +116,16 @@ pub(crate) struct Transport {
     timeout: Duration,
     /// Stamped onto every command, when the client is bound to a transaction.
     transaction: Option<String>,
+    /// The `traceparent` header, when the client was given a trace to belong
+    /// to.
+    trace: Option<String>,
+    /// The companion `tracestate`, carried unmodified when the context that
+    /// was joined had one. See [`TraceContext::tracestate`].
+    tracestate: Option<String>,
+    /// The headers that say who is asking, rendered once — see
+    /// [`Transport::render_caller_headers`]. None of them changes between
+    /// requests, so none of them is worth building again for each one.
+    caller: Vec<(&'static str, String)>,
 }
 
 impl std::fmt::Debug for Transport {
@@ -137,14 +156,19 @@ impl Transport {
             RetryPolicy::default().quiet()
         };
 
-        Self {
+        let mut transport = Self {
             agent: build_agent(timeout),
             base,
             token,
             retries,
             timeout,
             transaction: None,
-        }
+            trace: None,
+            tracestate: None,
+            caller: Vec::new(),
+        };
+        transport.render_caller_headers();
+        transport
     }
 
     pub(crate) fn set_retries(&mut self, policy: RetryPolicy) {
@@ -162,6 +186,20 @@ impl Transport {
 
     pub(crate) fn transaction(&self) -> Option<&str> {
         self.transaction.as_deref()
+    }
+
+    pub(crate) fn set_trace(&mut self, context: &crate::TraceContext) {
+        self.trace = Some(context.header());
+        self.tracestate = context.tracestate().map(str::to_owned);
+        self.render_caller_headers();
+    }
+
+    pub(crate) fn trace(&self) -> Option<&str> {
+        self.trace.as_deref()
+    }
+
+    pub(crate) fn tracestate(&self) -> Option<&str> {
+        self.tracestate.as_deref()
     }
 
     /// Executes a command, repeating it when the failure looks transient.
@@ -310,20 +348,27 @@ impl Transport {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
-        let response = self.dispatch(method, command, parameters, SendBody::none(), true)?;
-        let status = response.status().as_u16();
+        // Through `retry::run` like every other command, with `Repeatable::Never`
+        // doing the sending-once: it caps the loop at one attempt and never
+        // reaches the retry announcement, so this needs no second seam of its
+        // own to be timed and named. The span closes when the headers arrive —
+        // the reader handed back is read after that, at the caller's pace.
+        crate::retry::run(self.retries, Repeatable::Never, command, |_| {
+            let response = self.dispatch(method, command, parameters, SendBody::none(), true)?;
+            let status = response.status().as_u16();
 
-        if !(200..300).contains(&status) {
-            let mut response = response;
-            let body = response.body_mut().read_to_string().unwrap_or_default();
-            return Err(ClientError::Http {
-                command: command.to_owned(),
-                status,
-                body: truncate(&body, 400),
-            });
-        }
+            if !(200..300).contains(&status) {
+                let mut response = response;
+                let body = response.body_mut().read_to_string().unwrap_or_default();
+                return Err(ClientError::Http {
+                    command: command.to_owned(),
+                    status,
+                    body: truncate(&body, 400),
+                });
+            }
 
-        Ok(response.into_body())
+            Ok(response.into_body())
+        })
     }
 
     /// Sends a command whose request body is read as it goes, and returns the
@@ -346,41 +391,48 @@ impl Transport {
         let stamped = self.in_transaction(command, parameters);
         let parameters = stamped.as_ref().unwrap_or(parameters);
 
-        let mut response = self.dispatch(
-            method,
-            command,
-            parameters,
-            SendBody::from_reader(rows),
-            true,
-        )?;
-        let status = response.status().as_u16();
+        // `Repeatable::Never` is the sending-once, as in `open`: one attempt,
+        // no announcement, and the span comes from the seam every other command
+        // already goes through. Unlike `open` it covers the whole transfer —
+        // the body is read here, as it goes.
+        crate::retry::run(self.retries, Repeatable::Never, command, |_| {
+            let mut response = self.dispatch(
+                method,
+                command,
+                parameters,
+                SendBody::from_reader(&mut *rows),
+                true,
+            )?;
+            let status = response.status().as_u16();
 
-        // Read whichever way it went. A body left unread keeps the connection
-        // out of the pool — `ureq` can only reuse one it knows is finished — so
-        // an upload that ignored its answer would open a fresh connection for
-        // every table write, and leave the old one in TIME_WAIT. The benchmark
-        // is what noticed: 11 623 of them after a few seconds of writing.
-        //
-        // Read as bytes rather than as a string: an upload's answer is a small
-        // structured document today, but a raw command sends whatever it was
-        // given, and lossily decoding a binary answer would be a silent
-        // corruption rather than a refusal.
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(512 * 1024 * 1024)
-            .read_to_vec()
-            .unwrap_or_default();
+            // Read whichever way it went. A body left unread keeps the
+            // connection out of the pool — `ureq` can only reuse one it knows
+            // is finished — so an upload that ignored its answer would open a
+            // fresh connection for every table write, and leave the old one in
+            // TIME_WAIT. The benchmark is what noticed: 11 623 of them after a
+            // few seconds of writing.
+            //
+            // Read as bytes rather than as a string: an upload's answer is a
+            // small structured document today, but a raw command sends whatever
+            // it was given, and lossily decoding a binary answer would be a
+            // silent corruption rather than a refusal.
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(512 * 1024 * 1024)
+                .read_to_vec()
+                .unwrap_or_default();
 
-        if !(200..300).contains(&status) {
-            return Err(ClientError::Http {
-                command: command.to_owned(),
-                status,
-                body: truncate(&String::from_utf8_lossy(&body), 400),
-            });
-        }
+            if !(200..300).contains(&status) {
+                return Err(ClientError::Http {
+                    command: command.to_owned(),
+                    status,
+                    body: truncate(&String::from_utf8_lossy(&body), 400),
+                });
+            }
 
-        Ok(body)
+            Ok(body)
+        })
     }
 
     /// Fetches a path that is not an API v4 command.
@@ -396,13 +448,9 @@ impl Transport {
         }
 
         let url = format!("{}{path}", self.base);
-        let mut headers: Vec<(&str, String)> = Vec::new();
-        if let Some(token) = &self.token {
-            headers.push(("Authorization", format!("OAuth {token}")));
-        }
 
         crate::retry::run(self.retries, Repeatable::Freely, what, |_| {
-            let mut response = with_headers!(self.agent.get(&url), &headers)
+            let mut response = with_headers!(self.agent.get(&url), &self.caller)
                 .call()
                 .map_err(|e| ClientError::Transport {
                     command: what.to_owned(),
@@ -463,28 +511,38 @@ impl Transport {
             reason: format!("could not encode parameters: {e}"),
         })?;
 
-        let mut headers: Vec<(&str, String)> = vec![
+        // What is being asked. Who is asking is `self.caller`, applied beside
+        // this rather than concatenated onto it: those headers are already
+        // rendered, and copying them into a fresh `Vec` per request is the
+        // allocation this avoids.
+        let headers: [(&str, String); 4] = [
             (HEADER_FORMAT, "<format=text>yson".to_owned()),
             (PARAMETERS, encoded),
             ("X-YT-Output-Format", "<format=text>yson".to_owned()),
             ("Content-Type", "application/octet-stream".to_owned()),
         ];
-        if let Some(token) = &self.token {
-            headers.push(("Authorization", format!("OAuth {token}")));
-        }
 
         let sent = match method {
             // A GET carries no body in `ureq`'s type system, which is also true
             // of every command this client sends as one.
-            Method::Get => {
-                with_headers!(self.scoped(self.agent.get(&url), streaming), &headers).call()
-            }
-            Method::Post => {
-                with_headers!(self.scoped(self.agent.post(&url), streaming), &headers).send(body)
-            }
-            Method::Put => {
-                with_headers!(self.scoped(self.agent.put(&url), streaming), &headers).send(body)
-            }
+            Method::Get => with_headers!(
+                self.scoped(self.agent.get(&url), streaming),
+                &headers,
+                &self.caller
+            )
+            .call(),
+            Method::Post => with_headers!(
+                self.scoped(self.agent.post(&url), streaming),
+                &headers,
+                &self.caller
+            )
+            .send(body),
+            Method::Put => with_headers!(
+                self.scoped(self.agent.put(&url), streaming),
+                &headers,
+                &self.caller
+            )
+            .send(body),
         };
 
         let response = sent.map_err(|e| ClientError::Transport {
@@ -502,6 +560,39 @@ impl Transport {
         }
 
         Ok(response)
+    }
+
+    /// The headers that say who is asking rather than what is being asked.
+    ///
+    /// One place for both, because they belong to every request and not to any
+    /// command: `/hosts` is not a command and still wants them. Building its
+    /// request separately is how it once came to carry no token at all — see
+    /// [`Transport::fetch`].
+    ///
+    /// The trace context is sent on every attempt of a retried command, with
+    /// the same span id each time. That is deliberate: the retries are the
+    /// same logical call, and the cluster's spans for them belong under the
+    /// one span the caller knows about.
+    ///
+    /// Rendered when the transport is built or its trace is set, and not once
+    /// per request: every value here is fixed for the transport's lifetime, so
+    /// re-`format!`ing the token and re-cloning the trace for each attempt of
+    /// each command bought nothing. The row-by-row write path and the
+    /// two-second `wait_for_operation` poll are the ones that noticed.
+    fn render_caller_headers(&mut self) {
+        let mut headers = Vec::new();
+        if let Some(token) = &self.token {
+            headers.push(("Authorization", format!("OAuth {token}")));
+        }
+        if let Some(trace) = &self.trace {
+            headers.push((TRACEPARENT, trace.clone()));
+        }
+        // Passed on beside `traceparent` and never without it: the standard
+        // pairs the two, and a `tracestate` sent alone names no trace.
+        if let (Some(_), Some(state)) = (&self.trace, &self.tracestate) {
+            headers.push((TRACESTATE, state.clone()));
+        }
+        self.caller = headers;
     }
 
     /// Applies the streaming timeout override to one request.

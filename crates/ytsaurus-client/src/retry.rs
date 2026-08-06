@@ -16,7 +16,6 @@
 //! transport failures, request timeouts, an unavailable or overloaded proxy,
 //! and a banned one.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::error::{ClientError, Result};
@@ -91,7 +90,8 @@ pub struct RetryPolicy {
     attempts: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
-    /// Whether a retry announces itself on stderr. See [`RetryPolicy::quiet`].
+    /// Whether a retry announces itself at all — on stderr, or as a `WARN`
+    /// event where the `tracing` feature is on. See [`RetryPolicy::quiet`].
     report: bool,
 }
 
@@ -137,6 +137,12 @@ impl RetryPolicy {
     /// worker that talks to the cluster while a proxy is flaky would fill it
     /// with retry chatter.
     ///
+    /// With the `tracing` feature on the announcement is a `WARN` event rather
+    /// than a line on stderr, and this mutes that too. Same reason: a
+    /// subscriber installed inside a job is, more often than not, writing to
+    /// the very buffer this exists to protect. [`RetryPolicy::loud`] puts the
+    /// messages back whichever form they take.
+    ///
     /// A [`Client`](crate::Client) built inside a job is quiet already; this is
     /// for choosing it anywhere else:
     ///
@@ -152,10 +158,11 @@ impl RetryPolicy {
         self
     }
 
-    /// The same policy, announcing each retry on stderr.
+    /// The same policy, announcing each retry.
     ///
     /// The default outside a job, and what puts the messages back inside one —
-    /// a job whose stderr nobody else is using may well want them.
+    /// a job whose stderr nobody else is using may well want them, and so does
+    /// one whose subscriber ships them somewhere other than stderr.
     #[must_use]
     pub fn loud(mut self) -> Self {
         self.report = true;
@@ -247,35 +254,17 @@ impl std::fmt::Display for MutationId {
     }
 }
 
-/// Counts calls, so two IDs made in the same nanosecond still differ.
-static MUTATIONS: AtomicU64 = AtomicU64::new(0);
-
 /// Builds a GUID: four 32-bit numbers in hex, separated by `-`, as the command
 /// reference describes them and as the cluster's own IDs are printed —
 /// `b4ef546-e730447d-103e8-20cfe65`, with no leading zeros.
 ///
-/// The entropy comes from `RandomState`, which the standard library seeds from
-/// the OS once per process, mixed with a counter and the clock. A mutation ID
-/// needs to be *unique*, not unpredictable, and that is a poor reason to add a
-/// random-number crate to a dependency list this short.
+/// The bits come from [`crate::unique::word`], which is also where a
+/// [`TraceContext`](crate::TraceContext) draws its ids: the argument for why
+/// they do not repeat is the same one, and it is made once.
 fn generate() -> String {
-    use std::hash::{BuildHasher, Hasher, RandomState};
-
-    let counter = MUTATIONS.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-
     let mut parts = [0_u32; 4];
     for (i, pair) in parts.chunks_mut(2).enumerate() {
-        // A fresh `RandomState` per half: its keys differ between instances,
-        // so the two halves are not two views of one 64-bit value.
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(counter);
-        hasher.write_u64(nanos);
-        hasher.write_usize(i);
-        let value = hasher.finish();
-
+        let value = crate::unique::word(i as u64);
         pair[0] = (value >> 32) as u32;
         pair[1] = value as u32;
     }
@@ -347,7 +336,8 @@ fn inside_job(job_id: Option<std::ffi::OsString>) -> bool {
 /// cannot fix.
 ///
 /// `action` is told whether this is a retry, which is what a mutating command
-/// puts in its `retry` parameter. Progress goes to stderr unless the policy is
+/// puts in its `retry` parameter. Each attempt is timed and named — see
+/// `observe::attempt` — and progress is reported unless the policy is
 /// [`RetryPolicy::quiet`]: a run that pauses for fifteen seconds should say why
 /// rather than look hung.
 pub(crate) fn run<T>(
@@ -363,7 +353,7 @@ pub(crate) fn run<T>(
 
     let mut attempt = 1;
     loop {
-        match action(attempt > 1) {
+        match crate::observe::attempt(command, attempt, || action(attempt > 1)) {
             Ok(value) => return Ok(value),
             Err(error) => {
                 if attempt >= allowed || !is_retriable(&error) {
@@ -372,12 +362,14 @@ pub(crate) fn run<T>(
 
                 let wait = policy.backoff(attempt);
                 if policy.report {
-                    eprintln!(
-                        "ytsaurus-client: {command} failed ({error}); \
-                         retrying in {:.1}s ({attempt}/{})",
-                        wait.as_secs_f64(),
-                        allowed - 1
-                    );
+                    // `allowed`, not `allowed - 1`: the announcement counts
+                    // attempts, because the span beside it does. Reporting the
+                    // retry *number* against a retry total meant the same
+                    // field name carried two different counters — an event
+                    // saying `attempt=4, of=4` sat next to a span saying
+                    // `attempt=5`, and anything keying on `attempt == of` to
+                    // mean "the last try" fired one attempt early.
+                    crate::observe::retrying(command, &error, wait, attempt, allowed);
                 }
                 std::thread::sleep(wait);
                 attempt += 1;

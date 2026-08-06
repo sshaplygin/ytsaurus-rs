@@ -12,7 +12,7 @@ use std::net::TcpListener;
 
 use ytsaurus_client::{
     Client, ClientError, DataFormat, Method, OperationFilter, OperationParameters, RetryPolicy,
-    SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType, TablePath, yson_build,
+    SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType, TablePath, TraceContext, yson_build,
 };
 
 /// Serves exactly one request and returns its headers as text.
@@ -94,6 +94,21 @@ fn content_length(head: &str) -> Option<usize> {
         .find(|line| line.to_lowercase().starts_with("content-length:"))
         .and_then(|line| line.split(':').nth(1))
         .and_then(|value| value.trim().parse().ok())
+}
+
+/// One header of a captured request, exactly as it was sent.
+///
+/// The name is matched case-insensitively, because HTTP says a header name is;
+/// the value comes back untouched, because some of them are case-sensitive and
+/// lowercasing the whole request head — which the tests here otherwise do —
+/// would hide that.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines()
+        .find(|line| {
+            line.to_lowercase()
+                .starts_with(&format!("{}:", name.to_lowercase()))
+        })
+        .map(|line| line[line.find(':').unwrap_or(0) + 1..].trim().to_owned())
 }
 
 /// The `X-YT-Parameters` header of a captured request.
@@ -341,6 +356,177 @@ fn an_unauthenticated_client_sends_no_authorization_at_all() {
     assert!(
         !head.to_lowercase().contains("authorization:"),
         "an unauthenticated client sent an authorization header:\n{head}"
+    );
+}
+
+#[test]
+fn a_trace_context_travels_as_a_traceparent_header() {
+    // The cluster traces itself, and a request that names a trace has its
+    // proxy-side span put inside that one. The header is the W3C spelling,
+    // which is what `TryParseTraceParent` in the proxy reads and what all three
+    // official clients send; a header we spelled our own way would be dropped
+    // in silence and the launch would simply not appear in the trace.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+
+        // What will be sent, before it is sent — the read-back a caller logs
+        // so the trace can be found again.
+        assert_eq!(
+            client.traceparent(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+
+        let _ = client.exists("//tmp");
+    });
+
+    // The header *name* is matched case-insensitively because HTTP says it is,
+    // and the *value* case-sensitively because the standard says the hex is
+    // lowercase. Lowercasing the whole line, as the tests around this one do,
+    // would accept an uppercased id the standard does not allow.
+    let value = header_value(&head, "traceparent");
+    assert_eq!(
+        value.as_deref(),
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        "the trace context is not on the request as sent:\n{head}"
+    );
+}
+
+#[test]
+fn a_tracestate_travels_beside_the_traceparent() {
+    // The standard pairs the two, and a participant that forwards one is
+    // required to forward the other unmodified. The proxy ignores `tracestate`;
+    // the caller's own backend is what keys off it, so dropping it here would
+    // cost the sampling decision or the correlation key of everything
+    // downstream of this hop and nothing would say so.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent")
+        .with_tracestate("vendora=t61rcWkgMzE,vendorb=x9");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+
+        assert_eq!(client.tracestate(), Some("vendora=t61rcWkgMzE,vendorb=x9"));
+
+        let _ = client.exists("//tmp");
+    });
+
+    assert_eq!(
+        header_value(&head, "tracestate").as_deref(),
+        Some("vendora=t61rcWkgMzE,vendorb=x9"),
+        "the tracestate was dropped on the way to the cluster:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "traceparent").as_deref(),
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        "a tracestate must not displace the traceparent it belongs to:\n{head}"
+    );
+}
+
+#[test]
+fn a_traced_client_sends_no_tracestate_it_was_not_given() {
+    // A `tracestate` naming no vendor is not a smaller version of one; it is a
+    // header the caller's backend has to decide what to do with.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+        let _ = client.exists("//tmp");
+    });
+
+    assert!(
+        !head.to_lowercase().contains("tracestate"),
+        "a tracestate appeared from nowhere:\n{head}"
+    );
+}
+
+#[test]
+fn a_transaction_inherits_the_clients_trace() {
+    // The doc on `with_trace_context` promises this, and it holds only because
+    // `Transaction::start` clones the client rather than rebuilding one from
+    // its parts — which is a plausible refactor, since it immediately overrides
+    // the retries and the timeout on the ping client. A commit or a ping that
+    // hung is named in that doc as the thing the trace is for, so the claim is
+    // load-bearing and nothing else here would notice it breaking.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent");
+
+    let head = capture(|proxy| {
+        let client = Client::new(proxy)
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+        // The reply is an `exists` answer rather than a transaction id, so the
+        // start fails to decode and no ping thread outlives this. The request
+        // is what is under test.
+        let _ = client.start_transaction();
+    });
+
+    assert!(
+        head.starts_with("POST /api/v4/start_transaction"),
+        "the captured request is not the transaction start:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "traceparent").as_deref(),
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        "a transaction started from a traced client left the trace:\n{head}"
+    );
+}
+
+#[test]
+fn a_client_without_a_trace_context_sends_no_traceparent() {
+    // Sampling costs the cluster something, so a client that was not asked to
+    // join a trace must not start one on its own.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.exists("//tmp");
+    });
+
+    assert!(
+        !head.to_lowercase().contains("traceparent"),
+        "an untraced client sent a trace context:\n{head}"
+    );
+}
+
+#[test]
+fn the_hosts_lookup_carries_the_trace_like_a_command_does() {
+    // `/hosts` is not a command and builds its own request, which is how it
+    // once came to carry neither the token nor the timeout. The trace context
+    // is one more thing it would miss, and a heavy-proxy lookup slow enough to
+    // matter is exactly the one worth seeing in the trace.
+    let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .expect("a W3C traceparent");
+
+    let head = capture(|proxy| {
+        let client = Client::with_token(proxy, "secret-token")
+            .with_retries(RetryPolicy::none())
+            .with_trace_context(&context);
+        // The reply is an `exists` answer rather than a host list, so this
+        // fails to decode; the request is what is under test.
+        let _ = client.heavy_proxy();
+    });
+
+    assert!(
+        head.starts_with("GET /hosts HTTP/1.1"),
+        "the lookup is not the documented one:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "traceparent").as_deref(),
+        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        "the hosts lookup dropped the trace context:\n{head}"
+    );
+    assert_eq!(
+        header_value(&head, "authorization").as_deref(),
+        Some("OAuth secret-token"),
+        "the hosts lookup dropped the token:\n{head}"
     );
 }
 

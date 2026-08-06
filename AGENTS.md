@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 479 tests
+cargo test --workspace            # 508 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -95,6 +95,21 @@ there is what keeps that script working with nothing but the Rust toolchain,
 even for a worker that contains the whole client. The dependency is spelled out
 in `examples/Cargo.toml` rather than inherited, because cargo does not let an
 inherited dependency disable default features.
+
+Its **`tracing` feature is off by default** and must stay that way, for the
+second half of the same reason: a worker binary should carry only what it runs
+on, and `default-features = false` in `examples/Cargo.toml` is what keeps it
+out of the musl build. CI asserts that rather than trusting it — the musl job
+lists the worker's dependency graph with `cargo tree -p ytsaurus-examples
+--target x86_64-unknown-linux-musl --prefix none` and fails if `tracing`,
+`rustls` or `ring` is in it. Listed and searched rather than probed with
+`-i <crate>`: `-i` exits non-zero both when the crate is absent (the pass) and
+when cargo could not run at all, and it resolves `-i` before `-p`, so even a
+misspelled package prints the same "did not match any packages". Reading that
+exit code turned every cargo failure into a silent pass. **Do not go back to
+it** — a guard that cannot fail asserts nothing.
+The observability that costs no dependency — the `traceparent` header — is
+always compiled in.
 
 ## Protocol reference
 
@@ -420,6 +435,45 @@ per command. Cluster facts:
 - A reader never sees a partial append — `@row_count` holds its old value until
   the upload transaction commits.
 
+### Tracing
+
+Read out of the cluster's source — the HTTP reference does not mention the
+header at all — and then **watched on a local cluster**, which answers every
+question at once: the proxy puts the trace id it adopted in the `X-YT-Trace-Id`
+of the response, so one `curl` per case says what it did with the header.
+
+- **The proxy joins a caller's trace through a `traceparent` header**, the W3C
+  one: `00-<32 hex trace>-<16 hex span>-<2 hex flags>`. Its parser is
+  `TryParseTraceParent` in `yt/yt/core/http/helpers.cpp`. The flags are a byte:
+  **bit 0 sampled, bit 1 debug**.
+- All three official clients send it: C++ `FormatTraceParentHeader` (hard-coded
+  `00-…-01`), Go `injectTracing`, Python `generate_traceparent` — the last on
+  **every** request, with an id it generated itself.
+- **The version may be left off.** `4bf92f35…-00f067aa0ba902b7-01`, three groups
+  rather than four, is adopted exactly like the four-group form; the parser
+  says so in a comment and the cluster agrees. That is what the Go SDK sends.
+  **Uppercase hex is accepted** too. This client is liberal in and strict out:
+  it parses both and always sends lowercase, four groups.
+- **A malformed header is ignored in silence** — answered 200, with a trace id
+  the proxy made up. Hence `TraceContext::parse` refusing one instead: a trace
+  missing the half that mattered looks exactly like a trace nobody asked for.
+- **The header's trace id and the cluster's GUID spelling are the same four
+  32-bit groups in the same order**, differing only in the dashes and in the
+  leading zeros the cluster drops. Sent and echoed, on a local cluster:
+
+  | sent in `traceparent` | echoed in `X-YT-Trace-Id` |
+  | --- | --- |
+  | `4bf92f3577b34da6a3ce929d0e0e4736` | `4bf92f35-77b34da6-a3ce929d-e0e4736` |
+  | `00000001000000020000000300000004` | `1-2-3-4` |
+  | `00000000000000010000000000000002` | `0-1-0-2` |
+
+  A group that is all zeros keeps **one** digit, never none.
+  `TraceContext::yt_trace_id` reproduces this, and those are its test cases.
+- `X-YT-Correlation-Id` (request) and `X-YT-Request-Id` / `X-YT-Proxy`
+  (response) are the documented, non-trace way to find a request in the proxy
+  log. Not sent or read yet — and reading either would mean handing response
+  headers back, which no method does today.
+
 ### Connections
 
 - **A response body must be read or the connection is not pooled.** `ureq` only
@@ -714,13 +768,28 @@ now built — `abort_operation`, `<append=%true>`, and the escape hatch
 (`Client::raw_command`); only the web UI links remain, and those are a
 deliberate no.
 
-**What is left of the backlog is not code.** P3 #15 (tracing spans) is written
-down as "only worth doing if a user asks" — **and one has**: tracing, together
-with logging, is now the first item of the pinned parity issue, ahead of
+**What is left of the backlog is not code.** P3 #15 (tracing spans) was written
+down as "only worth doing if a user asks" — **one did, and it is built**.
+Logging and tracing were ranked first of the pinned parity issue (#8), ahead of
 everything else, because a production deployment needs to see what the client is
-doing. That supersedes the P3 ranking. TLS is the one part
-of P3 #14 a local cluster cannot exercise. Everything else needs a human — see
-below.
+doing; **that supersedes the P3 #15 ranking**, which should not be read as the
+current order of anything.
+
+What shipped is two halves with different prices. `TraceContext` and
+`Client::with_trace_context` send a W3C `traceparent`, which costs no
+dependency and is always compiled in — the cluster is the instrumented party,
+and this only tells it which trace to join. The `tracing` feature adds a span
+per attempt and is **off by default and absent from musl worker builds**, for
+the reason `tls` is — but it *adds*: with it on and no subscriber installed,
+the stderr line is still printed, because Cargo unifies features across the
+graph and a launcher does not get to decide alone whether this is on. The retry
+reporting goes through whichever is compiled and still mutes itself inside a
+job; that muting is load-bearing and covers both.
+See *Tracing* under *Protocol reference* for what was read out of the cluster's
+source.
+
+TLS is the one part of P3 #14 a local cluster cannot exercise. Everything else
+needs a human — see below.
 
 ### Parked — needs a human and a real cluster
 
