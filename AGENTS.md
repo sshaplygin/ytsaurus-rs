@@ -490,6 +490,17 @@ These cost time once. They are recorded so they do not cost it again.
   key is `value`, not `exists`.** Reading the wrong key failed every call for two
   releases, because nothing in the crate called `exists` until transactions did.
   Every command whose result is read needs a call site, or the shape is a guess.
+- **Never assert on the rendered text of a *generated* value.** The text YSON
+  writer omits the quotes when a string looks like an identifier — first byte a
+  letter or `_`, the rest alphanumeric or `_-.` (`ser::is_safe_unquoted`). A
+  mutation ID is a hex GUID with no leading zeros, so `ebd6e011-…` goes on the
+  wire bare and `3f2a1b-…` goes quoted, decided by its first hex digit:
+  **measured at 39.8 % unquoted over 100 000 IDs**. A wire-level test that
+  matched `mutation_id="…"` therefore passed the first run and failed two in
+  five afterwards. Decode the `X-YT-Parameters` header and compare values, as
+  `tests::sent_parameters` does; matching a *fixed* literal like
+  `transaction_id="3-5d231-…"` is safe because its spelling cannot change.
+  Both forms are valid YSON and the cluster takes either.
 
 ## Architecture
 

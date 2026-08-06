@@ -3094,14 +3094,65 @@ mod tests {
             )
             .expect("sends");
 
-        let headers = String::from_utf8_lossy(&request.join().unwrap()).into_owned();
-        assert!(
-            headers.contains(&format!(r#"mutation_id="{}""#, id.as_str())),
-            "{headers}"
+        let request = request.join().unwrap();
+        let sent = sent_parameters(&request);
+
+        assert_eq!(
+            parameter(&sent, "mutation_id").and_then(YsonValue::as_str),
+            Some(id.as_str()),
+            "{}",
+            String::from_utf8_lossy(&request)
         );
         // And it admits to being a replay, which is what the cluster refuses a
         // duplicate for not doing.
-        assert!(headers.contains("retry=%true"), "{headers}");
+        assert_eq!(
+            parameter(&sent, "retry").map(|v| &v.node),
+            Some(&YsonNode::Boolean(true)),
+            "{}",
+            String::from_utf8_lossy(&request)
+        );
+    }
+
+    /// The `X-YT-Parameters` document of a captured request, decoded.
+    ///
+    /// Reading the value rather than its spelling, because the spelling of a
+    /// *generated* value is not stable. The text YSON writer leaves a string
+    /// unquoted when it looks like an identifier — first byte a letter or `_`,
+    /// the rest alphanumeric or `_-.`, see `ser::is_safe_unquoted` — and a
+    /// mutation ID is a hex GUID printed with no leading zeros. So
+    /// `ebd6e011-…` goes on the wire bare and `3f2a1b-…` goes on it quoted,
+    /// decided by the first hex digit: **measured at 39.8 % unquoted over
+    /// 100 000 IDs**, which is what an assertion on either spelling would have
+    /// cost in flakes. Both spell the same string and the cluster takes both —
+    /// the `idempotent` example deduplicated a replay whose ID went unquoted.
+    fn sent_parameters(request: &[u8]) -> YsonValue {
+        let head = String::from_utf8_lossy(request);
+        let line = head
+            .lines()
+            .find(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("x-yt-parameters"))
+            })
+            .unwrap_or_else(|| panic!("no X-YT-Parameters header in:\n{head}"));
+
+        let value = line
+            .split_once(':')
+            .expect("the header has a value")
+            .1
+            .trim();
+        from_slice(value.as_bytes(), YsonFormat::Text)
+            .unwrap_or_else(|e| panic!("parameters are not text YSON ({e}): {value}"))
+    }
+
+    /// One entry of a decoded parameter document.
+    ///
+    /// `YsonValue` indexes with a panicking `Index`, and a panic here would
+    /// throw away the request the assertion wants to print.
+    fn parameter<'a>(params: &'a YsonValue, key: &str) -> Option<&'a YsonValue> {
+        match &params.node {
+            YsonNode::Map(m) => m.get(key.as_bytes()),
+            _ => None,
+        }
     }
 
     #[test]
