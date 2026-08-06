@@ -194,6 +194,20 @@ const STDERR_EXCERPT: usize = 4096;
 /// too.
 const DEFAULT_FILE_CACHE: &str = "//tmp/yt_wrapper/file_storage/new_cache";
 
+/// Where a worker goes when the file cache will not have it.
+///
+/// `//tmp` because it is the scratch directory an installation gives its users
+/// — the cache itself lives under it — so a caller refused the cache can still
+/// be expected to have this. There is nowhere further to fall: a cluster that
+/// refuses this too is reported rather than worked around.
+const UNCACHED_UPLOAD_DIR: &str = "//tmp";
+
+/// `Access denied` — the cluster's code for a request no matching ACE allows.
+///
+/// What an installation-managed file cache answers a write with, and the whole
+/// of what [`Client::upload_worker_cached`] treats as "no cache for you".
+const ACCESS_DENIED: i64 = 901;
+
 /// The `{value=…}` API v4 wraps a structured answer in.
 ///
 /// Deserialised rather than walked, so [`Client::get_as`] reads the response
@@ -217,6 +231,16 @@ pub struct CachedFile {
     pub name: String,
     /// Whether this call had to upload it. `false` is a cache hit.
     pub uploaded: bool,
+}
+
+/// What an upload through the file cache came to.
+enum Cached {
+    /// It is in the cache, at this path.
+    At(String),
+    /// The cache refused this caller, in the cluster's own words. Carried back
+    /// rather than returned as an error: see [`Client::upload_worker_cached`],
+    /// which uploads outside the cache instead and says so.
+    Refused(ClientError),
 }
 
 /// A connection to one YTsaurus cluster.
@@ -1095,6 +1119,27 @@ impl Client {
     /// the Python wrapper uses, so an installation that already expires old
     /// entries there expires these too.
     ///
+    /// # A cache you may not write to
+    ///
+    /// On an installation where that shared path is maintained by its
+    /// operators, an ordinary user may read it and nothing more — and the
+    /// cluster answers a write with `Access denied`. That is a **degraded
+    /// cache, not a failed upload**: the worker goes up outside the cache
+    /// instead, to a path of its own under `//tmp`, and the launch proceeds.
+    ///
+    /// It is warned about rather than passed over, on stderr — as a `WARN`
+    /// event where the `tracing` feature is on — because the state is
+    /// permanent until someone acts on it and invisible otherwise: every launch
+    /// re-sends the whole binary, and every launch leaves a node behind that no
+    /// cache expiry will collect. The warning names
+    /// [`Client::with_file_cache`], which is the one line that puts a cache
+    /// back.
+    ///
+    /// Only the cluster's refusal of *the cache* is treated this way — creating
+    /// the cache directory, creating the staging node inside it, and the
+    /// handover to `put_file_to_cache`. Any other failure, including an
+    /// `Access denied` on anything else, is returned.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the file cannot be read or the upload fails.
@@ -1119,11 +1164,53 @@ impl Client {
             });
         }
 
+        let path = match self.upload_into_cache(&bytes, &digest)? {
+            Cached::At(path) => {
+                // Set on the cached path too: whether the attribute survives
+                // the move decides whether the job can exec at all, and it is
+                // cheap to be sure.
+                self.set_attribute(&path, "executable", yson_build::boolean(true))?;
+                path
+            }
+            Cached::Refused(denial) => {
+                observe::cache_refused(&self.file_cache, &denial);
+                self.upload_uncached(&digest, &bytes)?
+            }
+        };
+
+        Ok(CachedFile {
+            path,
+            name,
+            uploaded: true,
+        })
+    }
+
+    /// Everything in [`Client::upload_worker_cached`] that touches the cache.
+    ///
+    /// Three of the calls here can be refused by an installation that keeps the
+    /// cache to itself, and all three mean the same thing — this caller has no
+    /// cache at this path — so all three come back as [`Cached::Refused`] for
+    /// the caller to fall back on: creating the cache directory, creating the
+    /// staging node **inside** it, and the handover, `put_file_to_cache`. The
+    /// two creates ask for the same permission on the same directory, so which
+    /// of them a given cluster refuses first is its own business.
+    ///
+    /// Nothing else is caught, deliberately. Between those calls the client is
+    /// writing to a node it has just created: a refusal there is about that
+    /// node rather than about the cache, and the same bytes sent to another
+    /// path would earn the same answer, so falling back would upload twice and
+    /// still fail. And a create refused for some *other* reason — a path that
+    /// resolves to something else, a lock held elsewhere — is not a permission
+    /// problem at all. Both are returned as they always were.
+    fn upload_into_cache(&self, bytes: &[u8], digest: &str) -> Result<Cached> {
         // Created here rather than in the lookup: a cache the installation
         // maintains is one a user may only be able to read, and a lookup that
         // mutated it would fail on exactly the clusters where the cache is
-        // worth the most.
-        self.create("map_node", &self.file_cache)?;
+        // worth the most. Being refused *here* costs a slower upload, which is
+        // what makes that trade worth making.
+        if let Err(denial) = self.create("map_node", &self.file_cache) {
+            return refused_or_reported(denial);
+        }
 
         // Staged inside the cache node, so a cluster that expires the cache
         // expires an interrupted upload with it.
@@ -1133,12 +1220,14 @@ impl Client {
         // and two CI jobs launching together would write to one node and then
         // remove it from under each other.
         let staging = format!("{}/staged_{digest}_{}", self.file_cache, MutationId::new());
-        self.create("file", &staging)?;
+        if let Err(denial) = self.create("file", &staging) {
+            return refused_or_reported(denial);
+        }
 
         let cached = self
-            .write_file_computing_md5(&staging, &bytes)
+            .write_file_computing_md5(&staging, bytes)
             .and_then(|()| self.set_attribute(&staging, "executable", yson_build::boolean(true)))
-            .and_then(|()| self.put_file_to_cache(&staging, &digest));
+            .and_then(|()| self.put_file_to_cache(&staging, digest));
 
         // Removed whichever way that went. On success the cache may have kept
         // the node itself rather than a copy, so this is `force`-removing
@@ -1147,27 +1236,50 @@ impl Client {
         // megabytes behind for good: cache expiry walks the entries the cache
         // itself created, not the staging nodes beside them.
         let removed = self.remove_tree(&staging);
-        // The upload's own failure is the one worth reporting; a cleanup that
-        // also failed only matters when there was nothing else wrong.
-        let path = cached?;
-        removed?;
 
-        // Set on the cached path too: whether the attribute survives the move
-        // decides whether the job can exec at all, and it is cheap to be sure.
-        self.set_attribute(&path, "executable", yson_build::boolean(true))?;
+        match cached {
+            Ok(path) => {
+                // The upload's own failure is the one worth reporting; a
+                // cleanup that also failed only matters when there was nothing
+                // else wrong.
+                removed?;
+                Ok(Cached::At(path))
+            }
+            // Refused at the handover, with the bytes already on the cluster —
+            // they are about to be sent again, which is the price of a launch
+            // that runs at all. A removal that failed too is dropped here
+            // rather than reported: a cache that refuses the handover may well
+            // refuse the cleanup, and failing the launch over a staging node is
+            // exactly what this is not doing.
+            Err(denial) if denied(&denial, "put_file_to_cache") => Ok(Cached::Refused(denial)),
+            Err(failed) => Err(failed),
+        }
+    }
 
-        Ok(CachedFile {
-            path,
-            name,
-            uploaded: true,
-        })
+    /// Uploads the worker outside the cache, for a cluster whose cache this
+    /// caller may not write to.
+    ///
+    /// A path of its own every time, nonce and all, for the reason the staging
+    /// node has one: a name derived from the hash alone is the same node for
+    /// every process uploading the same binary, and two launchers starting
+    /// together would take an exclusive lock on it in turn. The cost is a node
+    /// per launch that no cache expiry will collect, which is the second reason
+    /// the warning names [`Client::with_file_cache`].
+    fn upload_uncached(&self, digest: &str, bytes: &[u8]) -> Result<String> {
+        let remote = format!(
+            "{UNCACHED_UPLOAD_DIR}/ytsaurus_rs_worker_{digest}_{}",
+            MutationId::new()
+        );
+        self.upload_executable(&remote, bytes)?;
+        Ok(remote)
     }
 
     /// Looks up a file in the cluster's file cache by its MD5.
     ///
     /// `None` means nothing is cached under that hash — including when the
     /// cache directory does not exist yet, which is what
-    /// [`Client::upload_worker_cached`] creates on its way past.
+    /// [`Client::upload_worker_cached`] creates on its way past, on a cluster
+    /// that lets it.
     ///
     /// A lookup and nothing more: it sends no mutation, so it works against a
     /// cache the caller may only read.
@@ -3038,6 +3150,38 @@ impl Client {
         let envelope = self.strip_envelope(body, key)?;
         self.field_of(&envelope, key)
     }
+}
+
+/// A `create` inside the cache that was refused, or a `create` that failed.
+///
+/// Only ever called with the failure of one of the two creates
+/// [`Client::upload_into_cache`] makes, both of which write into the cache
+/// directory — which is what makes "denied" mean "no cache here" rather than
+/// "denied something".
+fn refused_or_reported(error: ClientError) -> Result<Cached> {
+    if denied(&error, "create") {
+        return Ok(Cached::Refused(error));
+    }
+    Err(error)
+}
+
+/// Whether `error` is the cluster refusing `command` on ACL grounds.
+///
+/// Both halves matter, and dropping either is how this would come to swallow
+/// something it should report. The code alone catches every `Access denied` a
+/// launch can earn, including ones no fallback addresses; the command alone
+/// catches a create that failed because the path is a table, or because
+/// somebody else holds a lock — failures a second attempt elsewhere would not
+/// fix and a caller needs to hear about.
+fn denied(error: &ClientError, command: &str) -> bool {
+    matches!(
+        error,
+        ClientError::Cluster {
+            command: failed,
+            code,
+            ..
+        } if *code == ACCESS_DENIED && failed == command
+    )
 }
 
 /// Refuses a command name that would address something other than a command.

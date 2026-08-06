@@ -1,13 +1,14 @@
 //! What the client says about itself while it works.
 //!
-//! Two ways of saying it, and which one is compiled in is the `tracing`
-//! feature:
+//! Two things are worth saying — a command is being sent again, and the file
+//! cache will not have this caller's worker — and two ways of saying either,
+//! with the `tracing` feature deciding which is compiled in:
 //!
-//! - **off**, the default: a retry announces itself on stderr and nothing else
+//! - **off**, the default: both announce themselves on stderr and nothing else
 //!   is said. No dependency, and a launcher that pauses for fifteen seconds
 //!   still explains the pause.
 //! - **on**: every attempt runs inside a span carrying the command, the attempt
-//!   number and how long it took, and the retry message becomes a `WARN` event
+//!   number and how long it took, and both messages become `WARN` events
 //!   carrying the same facts as fields. The subscriber decides where any of it
 //!   goes — and if there is no subscriber, the stderr line is printed after
 //!   all. The feature adds a way of saying this; it does not take the old one
@@ -22,8 +23,9 @@
 //! The feature is off by default because this crate is linked into worker
 //! binaries that cross-compile to musl with nothing but the Rust toolchain —
 //! the same reason `tls` is off there. Nothing here is optional at the call
-//! site: [`attempt`] and [`retrying`] exist in both builds, and in the default
-//! one they compile to the call they wrap and an `eprintln!`.
+//! site: [`attempt`], [`retrying`] and [`cache_refused`] exist in both builds,
+//! and in the default one they compile to the call they wrap and an
+//! `eprintln!`.
 //!
 //! What the *cluster* records is a separate question with a separate answer,
 //! and it needs no dependency at all: see [`TraceContext`](crate::TraceContext).
@@ -135,19 +137,74 @@ fn stderr_fallback(
     attempt: u32,
     of: u32,
 ) -> Option<String> {
-    // `NoSubscriber` is what `tracing` falls back to when none was set, so
-    // asking whether the current dispatcher is that one — globally or for this
-    // thread — is asking whether the event just emitted went anywhere.
-    let listening = !tracing::dispatcher::get_default(
-        tracing::Dispatch::is::<tracing::subscriber::NoSubscriber>,
-    );
+    unheard().then(|| retry_message(command, error, wait, attempt, of))
+}
 
-    (!listening).then(|| retry_message(command, error, wait, attempt, of))
+/// Whether the event just emitted went nowhere.
+///
+/// `NoSubscriber` is what `tracing` falls back to when none was set, so asking
+/// whether the current dispatcher is that one — globally or for this thread —
+/// is asking whether anybody was listening.
+#[cfg(feature = "tracing")]
+fn unheard() -> bool {
+    tracing::dispatcher::get_default(tracing::Dispatch::is::<tracing::subscriber::NoSubscriber>)
 }
 
 #[cfg(not(feature = "tracing"))]
 pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attempt: u32, of: u32) {
     eprintln!("{}", retry_message(command, error, wait, attempt, of));
+}
+
+/// Announces that the file cache will not have this caller's worker, and that
+/// it is going up uncached.
+///
+/// Said rather than passed over because the state is invisible otherwise and
+/// permanent until someone acts: every launch re-sends the whole binary, and
+/// the fix is one line — [`Client::with_file_cache`] pointed somewhere this
+/// caller may write. A launch that is merely slower than it should be is
+/// exactly the kind of thing nobody investigates without being told.
+///
+/// Not routed through [`RetryPolicy::quiet`], unlike [`retrying`]: this is said
+/// once per upload rather than once per attempt, and it is said by a launcher —
+/// a job does not upload workers.
+///
+/// [`Client::with_file_cache`]: crate::Client::with_file_cache
+/// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
+#[cfg(feature = "tracing")]
+pub(crate) fn cache_refused(cache: &str, error: &ClientError) {
+    tracing::warn!(
+        cache = %cache,
+        error = %error,
+        "the file cache cannot be written to; uploading the worker uncached"
+    );
+
+    if unheard() {
+        eprintln!("{}", cache_message(cache, error));
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+pub(crate) fn cache_refused(cache: &str, error: &ClientError) {
+    eprintln!("{}", cache_message(cache, error));
+}
+
+/// The fallback announcement as a line of text.
+///
+/// Split out for the reason [`retry_message`] is: this is the whole of what a
+/// default build says, and a message no test can reach is a message that can be
+/// emptied without anything noticing.
+///
+/// It names three things, and each earns its place: the path that was refused,
+/// so the reader knows which cache; the cluster's own words, so an ACL failure
+/// is not mistaken for a network one; and the setter, because a caller who has
+/// just been told the default path does not work still has nothing to do about
+/// it otherwise.
+fn cache_message(cache: &str, error: &ClientError) -> String {
+    format!(
+        "ytsaurus-client: the file cache at {cache} cannot be written to \
+         ({error}); uploading the worker uncached, which re-sends it on every \
+         launch. Client::with_file_cache points it at a path you can write to."
+    )
 }
 
 /// The retry announcement as a line of text.
@@ -207,6 +264,36 @@ mod message_tests {
         // Counted the same way the span's `attempt` field is, and in that
         // order: swapping the two reads as a retry budget four times too big.
         assert!(line.contains("attempt 2 of 5"), "{line}");
+    }
+
+    #[test]
+    fn the_cache_warning_names_the_path_the_refusal_and_the_way_out() {
+        let denied = ClientError::Cluster {
+            command: "create".to_owned(),
+            code: 901,
+            message: "Access denied for user \"robot\": \"write | modify_children\" \
+                      permission for node //tmp/yt_wrapper/file_storage/new_cache \
+                      is not allowed by any matching ACE"
+                .to_owned(),
+            raw: r#"{"code":901}"#.to_owned(),
+        };
+
+        let line = cache_message("//tmp/yt_wrapper/file_storage/new_cache", &denied);
+
+        assert!(
+            line.contains("//tmp/yt_wrapper/file_storage/new_cache"),
+            "{line}"
+        );
+        // The cluster's own words: without them an ACL refusal is
+        // indistinguishable from a proxy that was down for a moment, and only
+        // one of those is worth acting on.
+        assert!(line.contains("Access denied"), "{line}");
+        // The whole reason this is a warning rather than silence. A caller told
+        // only that the cache is gone has nothing to do about it; this is the
+        // one line that puts it back.
+        assert!(line.contains("Client::with_file_cache"), "{line}");
+        // And what it costs until then, which is what makes it worth reading.
+        assert!(line.contains("every launch"), "{line}");
     }
 
     #[test]
@@ -502,6 +589,38 @@ mod tests {
             heard, None,
             "a subscriber is installed and the message would be printed twice"
         );
+    }
+
+    #[test]
+    fn an_unusable_file_cache_is_a_warning_here_too() {
+        // The fallback is silent apart from this, and a deployment uploading
+        // uncached for ever is otherwise indistinguishable from a slow one. At
+        // `WARN`, beside the retry event, because both are "this worked, but
+        // not the way you meant".
+        let denied = ClientError::Cluster {
+            command: "create".to_owned(),
+            code: 901,
+            message: "Access denied for user \"robot\"".to_owned(),
+            raw: r#"{"code":901}"#.to_owned(),
+        };
+
+        let lines = recorded(|| cache_refused("//tmp/yt_wrapper/file_storage/new_cache", &denied));
+
+        let warning = lines
+            .iter()
+            .find(|line| line.starts_with("event WARN"))
+            .unwrap_or_else(|| panic!("nothing was said about the cache: {lines:?}"));
+        assert!(
+            warning.contains("uploading the worker uncached"),
+            "{warning}"
+        );
+        // Which cache, and why — as fields, so a collector can group by the
+        // path rather than by matching on a sentence.
+        assert!(
+            warning.contains("cache=//tmp/yt_wrapper/file_storage/new_cache"),
+            "{warning}"
+        );
+        assert!(warning.contains("Access denied"), "{warning}");
     }
 
     #[test]

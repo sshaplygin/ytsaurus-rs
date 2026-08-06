@@ -511,6 +511,14 @@ otherwise. The cache defaults to the path the Python wrapper uses, so it is
 shared with everything else on the installation;
 `Client::with_file_cache` moves it.
 
+**A cache you may not write to costs speed, not the launch.** On an installation
+that maintains that shared path itself, an ordinary user may read it and no
+more, and the cluster answers the upload into it with `Access denied`. The
+worker then goes up outside the cache, under `//tmp`, and a warning on stderr —
+a `WARN` event with the `tracing` feature on — says so and names
+`with_file_cache`, because every launch re-sends the whole binary until the
+cache is pointed somewhere writable. Any other failure is still a failure.
+
 ## Retries
 
 A shared cluster produces failures that pass on their own. Light commands are

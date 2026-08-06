@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 508 tests
+cargo test --workspace            # 515 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -583,6 +583,16 @@ These cost time once. They are recorded so they do not cost it again.
   cache is worth the most. `upload_worker_cached` creates the directory on the
   miss branch instead. Verified by removing the whole tree and re-running
   `cached_upload`.
+- **The create on that miss branch is the half a managed cache refuses**, with
+  **code 901**, `Access denied … "write | modify_children" … not allowed by any
+  matching ACE` — found on a real multi-node installation (#32) and invisible on
+  a local one, where the caller is root. `upload_worker_cached` treats a 901 on
+  the cache's own writes — creating the directory, creating the staging node in
+  it, `put_file_to_cache` — as an unusable cache, uploads under `//tmp` instead
+  and warns, naming `Client::with_file_cache`. A 901 anywhere else, and any
+  other error, still fails the upload. Neither branch has been run against a
+  cluster that denies anything; `crates/ytsaurus-client/tests/file_cache.rs`
+  scripts the refusals a socket in-process can.
 - **A cached file keeps its name from the hash, not from the upload.** Reference
   it in `file_paths` as `<file_name="my_job">//tmp/.../ab/cdef…` or the job's
   command finds nothing to run.
