@@ -38,6 +38,33 @@ asserts the output table reads back identical to the input, repeats with two
 input and two output tables to exercise table switching, and finishes with a
 `wordcount` map-reduce checked against a hand-computed result.
 
+**The same three checks run without Python**, as
+[`examples/e2e.rs`](../../crates/ytsaurus-client/examples/e2e.rs):
+
+```sh
+export YT_PROXY=http://localhost:8000
+scripts/build-worker.sh cat wordcount
+cargo run -p ytsaurus-client --example e2e
+```
+
+Every command the script sends has a method on `Client` — `remove --recursive
+--force` is `remove_tree`, `create --recursive` is `create`, `write-table
+--format '<format=binary>yson'` is `write_table` because binary YSON is the
+default — and the two `--spec` fragments that carry the meaning,
+`enable_input_table_index` and `enable_key_switch` under **`reduce_job_io`**,
+are modelled on the spec builders. The one thing the CLI does that the client
+does not is **create the destination tables**: `yt map --dst` makes them, and an
+operation that made its own outputs would turn a mistyped destination into a
+stray table rather than an error, so the example creates them itself.
+
+**Both are kept, and that is deliberate.** The Rust example proves the client
+can drive the cluster unaided; the shell script proves the *worker's* output is
+right according to a **different implementation** — the official Python client
+reading the same tables. A check that only ever agrees with itself is worth less
+than one that has to agree with somebody else, so `run_e2e.sh` stays as the
+independent reading, and `examples/e2e.rs` is what runs on a machine with no
+Python.
+
 ### Dynamic Skiff map
 
 The Skiff path is exercised offline by
@@ -68,6 +95,7 @@ Python on `PATH`:
 ```sh
 export YT_PROXY=http://localhost:8000
 scripts/build-worker.sh cat boom selfrun wordcount
+cargo run -p ytsaurus-client --example e2e          # all of run_e2e.sh, no Python
 cargo run -p ytsaurus-client --example launch       # the happy path
 cargo run -p ytsaurus-client --example diagnose     # the failure path
 cargo run -p ytsaurus-client --example sort_reduce  # sort, then reduce over it
@@ -500,6 +528,40 @@ Three things the cluster settled that could not be settled by reading:
   The staged node is invisible to a second client until the commit, which is
   the claim that would be silently false if the raw door bypassed
   `Transport::in_transaction`.
+
+### The same three checks, without Python
+
+`cargo run -p ytsaurus-client --example e2e`, on `ghcr.io/ytsaurus/local:stable`
+on 2026-08-06. Compare the byte counts and the word count with `run_e2e.sh`'s
+above — they are the same numbers, reached without the `yt` CLI:
+
+```text
+== Preflight
+   ok workers built, fixtures read (309676 and 175 bytes)
+== Preparing Cypress
+   ok //tmp/ytsaurus_rs_e2e, with both workers uploaded
+== Running cat as a map operation
+   ok operation cee8ff6b-1203ddb1-103e8-b1bf75b9 finished
+== Comparing input and output byte-for-byte
+   ok identical (309688 bytes)
+== Two input tables, two output tables, with table switching
+   ok table 0 identical (309688 bytes)
+   ok table 1 identical (180 bytes)
+== Wordcount map-reduce
+   ok wordcount matches the reference (9 words)
+```
+
+309 676 bytes went up and 309 688 came back, which is the cluster's re-encoding
+showing through in the preflight line — and the reason the comparison is
+read-back against read-back rather than against the file.
+
+**Where the bytes come from matters.** The first two checks upload
+`fixtures/table_rows_*.bin` as bytes, exactly as the shell script pipes them
+into `yt write-table`. Those were built by `generate_fixtures.py` straight from
+the binary YSON specification and deliberately *not* by this project's encoder;
+regenerating them in the example would have quietly thrown that away. The
+wordcount input is written with `write_table_rows` — through this project's
+encoder — because that check asserts a set of counts, not a byte sequence.
 
 ## Refreshing the golden fixtures
 

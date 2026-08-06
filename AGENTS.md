@@ -570,8 +570,13 @@ Three layers:
    redirection. Its golden fixtures are **captured from a live cluster**
    (`tests/e2e/capture_fixtures.sh`), so it is not our reading of the spec checked
    against itself.
-3. **Cluster e2e** — `tests/e2e/run_e2e.sh` against a local YTsaurus in Docker.
-   Not in CI (needs a multi-GB image). See
+3. **Cluster e2e** — against a local YTsaurus in Docker, two readings of the
+   same three checks. `cargo run -p ytsaurus-client --example e2e` drives them
+   through this crate and needs no Python; `tests/e2e/run_e2e.sh` drives them
+   through the official Python client and so checks the worker's output against
+   a **different implementation** rather than against ourselves. Keep both — the
+   second is the only place anything here is read by code we did not write.
+   Neither is in CI (needs a multi-GB image). See
    [`tests/e2e/README.md`](tests/e2e/README.md).
 
 Fuzzing: `cargo +nightly fuzz run fuzz_target_{1,2}` from `crates/ytsaurus-yson/`.
