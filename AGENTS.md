@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 519 tests
+cargo test --workspace            # 538 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -477,27 +477,84 @@ of the response, so one `curl` per case says what it did with the header.
 ### Where a heavy command goes
 
 Observed on a real multi-node installation rather than a local Docker one — see
-[#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30), which is where the
-strings below are quoted from.
+[#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30) — and then read back
+out of the documentation and the cluster's own source, because the observation
+and the documentation disagreed and the source is what settles it.
 
-- **A control proxy refuses a heavy request, and the refusal is an HTTP 200.**
-  The body carries a structured YTsaurus error — `cluster error 1: Control
-  proxy may not serve heavy requests with input data`. There is no status code
-  to grep for, and the crate's documentation promised a 503 for two releases.
+- **A control proxy will not serve a heavy request, and what it does instead
+  depends on whether the request carries input data.** The rule is
+  `TContext::TryRedirectHeavyRequests` in
+  [`yt/yt/server/http_proxy/context.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/server/http_proxy/context.cpp):
+
+  | Request | Answer |
+  | --- | --- |
+  | heavy **with** input data — `write_table`, `write_file` | **503** + `Retry-After: 60`, carrying `Control proxy may not serve heavy requests with input data` |
+  | heavy **without** — `read_table`, `read_file`, `get_job_input`, `get_job_stderr` | **307** to a data proxy |
+  | heavy read, no data proxy available | **503**, `There are no data proxies available` |
+  | any of them with `X-YT-Suppress-Redirect` | served by the control proxy after all |
+
+  The `inDataType` column of the driver registry is exactly that test, so the
+  split is mechanical rather than a judgement.
+
+  **This crate recorded the refusal as an HTTP 200 and that was wrong.** The
+  status was never observed: `ClientError::Cluster` renders as `{command}:
+  cluster error {code}: {message}` and does not print the status at all, so a
+  503 carrying an `X-YT-Error` header looks exactly like a 200 carrying one.
+  Only the error string is first-hand here.
+
+  The documentation gives both halves of the rule and neither whole. The
+  [`/hosts` section](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)
+  says "When you try to execute a heavy command, light proxies return code
+  503"; the return-code table on the same page lists "307 — Redirecting heavy
+  queries from light to heavy proxies".
+- **The role that refuses is spelled `control`, exactly.**
+  `TCoordinator::CanHandleHeavyRequests` is `Role != "control"`, so a proxy
+  with any other role — including `default` — serves heavy commands.
 - **A deployment behind a balancer is the case that breaks**, not the case that
   works: the balancer fronts the *control* proxies, so every upload arrives at
   one. Pointing `YT_PROXY` at an address from `/hosts` makes the same examples
   pass unchanged, which is what proved the cause.
-- **`/hosts` answers a JSON list of bare host names**, best first, and defaults
-  to the `data` role — the one that serves heavy commands. No scheme and not
-  always a port, so the scheme comes from the address the caller configured.
-- The client asks once per client and keeps the answer (`Transport::base_for`);
-  an empty or absent list means "the configured address serves everything",
+- **`/hosts` answers a JSON list of bare host names, best first.** The
+  [HTTP proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)
+  shows the wire form — `["n0008-sas.cluster-name", …]` — and the
+  [reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)
+  the ordering: "ordered by load … the very first proxy in the resulting list
+  is the least loaded". No scheme and usually no port, so both come from the
+  address the caller configured. (`TCoordinator::ListProxies` shuffles the
+  better half of the list before returning it, so "first" means "one of the
+  good ones", not "the best".)
+- **"Defaults to the `data` role" is not in the documentation** — it was
+  asserted here without one for a release. It is `default_role_filter`, a
+  coordinator **config parameter**, defaulted in `TCoordinatorConfig::Register`
+  to `NApi::DefaultHttpProxyRole`, which
+  [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h)
+  spells `"data"`. A compiled-in default an operator can change, then, not a
+  protocol guarantee — which is why this client validates what it is handed
+  rather than trusting the role. `?role=`, `/hosts/all` (which alone shows
+  banned and dead proxies) and the plain-text form selected by an exact
+  `Accept: text/plain` are all source-only too.
+- **The documentation asks for the list to be re-queried, and this client does
+  not.** From the [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload):
+  "A good strategy is to re-query the `/hosts` list every minute or every few
+  queries and change the current proxy to which queries are made." This client
+  asks once and keeps the answer for the client's lifetime
+  (`Transport::base_for`), re-asking only when the proxy it chose stops
+  answering. That is a deliberate deviation, recorded in
+  [docs/sdk-comparison.md](docs/sdk-comparison.md); it trades load-balancing
+  quality for one round trip per client.
+- An empty or absent list means "the configured address serves everything",
   which is what a single-node cluster is. **A cluster on loopback is not asked
   at all**: what it publishes for itself is an address behind the port mapping
   or tunnel that `localhost` stands for, and following it would break every
   upload that works today. That last point is reasoning, not a measurement —
   no local cluster's `/hosts` answer has been captured here.
+- **A name from `/hosts` is checked before it is used.** The documentation says
+  nothing at all about which hosts a token may be sent to — the `/hosts` flow
+  and the `Authorization: OAuth` header are documented on the same page and
+  never connected — so the answer is this client's to choose, and it chooses
+  the conservative one: same domain as the configured address, scheme and port
+  from the configured address, no `://`, `/`, `@` or whitespace.
+  `Client::with_heavy_proxies_anywhere` opts out of the domain rule alone.
 
 ### Connections
 

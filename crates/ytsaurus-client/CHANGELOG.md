@@ -27,11 +27,55 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
   streaming seams — `Transport::open` and `Transport::upload` — are heavy by
   construction, so a raw streaming command is routed too.
 
+  **Breaking** `Repeatable` gained a variant *and* `#[non_exhaustive]`. Code
+  that matches it exhaustively needs a `_` arm — and will not need another one
+  the next time the registry earns a name here.
+
+- **A discovered host is constrained to the configured address's own domain.**
+  A heavy command carries the caller's OAuth token, and the `/hosts` body is
+  what decides where it goes: on a plain-`http://` base, forging that body is
+  exactly as easy as forging a `Location` header, which this client refuses to
+  follow. So the name is checked rather than pasted — same domain as the
+  configured address (or the configured host itself), scheme and port from the
+  configured address, and no `://`, `/`, `@` or whitespace. Measured on the
+  first cut of this feature: `http://n0132` from an `https://` client stripped
+  TLS and put the token on the wire in cleartext, `real.example.net@evil.example.net`
+  connected to `evil.example.net`, and a configured `:8443` was dropped.
+  A refused name is passed over and the rest of the list tried; a `/hosts`
+  answer refused entirely leaves the upload going where it went before there
+  was a lookup.
+
+  **Added** `Client::with_heavy_proxies_anywhere`, the opt-in for an
+  installation whose `/hosts` genuinely names another domain. It relaxes the
+  domain rule and nothing else.
+
+- **The lookup has its own budget**: one attempt bounded by 800 ms, not the
+  client's five attempts of up to two minutes with fifteen seconds of backoff
+  between them — all of which used to run while holding the lock every other
+  heavy command wants. Measured: a `/hosts` answering 503 cost a heavy command
+  **15.03 s**, and one that accepted the question and never answered cost it
+  **615 s**. Both are now under a second (3 ms and 804 ms). A lookup that failed
+  for a reason that might pass leaves the configured address in use for ten
+  seconds and is then asked again, which is the same retry spread out where it
+  queues nobody: **eight threads against a hanging `/hosts` took 240 s and
+  performed 40 lookups, and now take 809 ms and perform one.** Eight threads
+  against a healthy one still ask exactly once, which they already did.
+
+- **A heavy proxy that cannot be reached gives the configured address back.**
+  Before, the answer was thrown away, the same question asked, the same dead
+  host resolved, and every upload for the rest of the client's life failed the
+  same way — the shipped test asserted exactly that. The measured trigger is
+  ordinary: a single-node container reached from the host is not on loopback
+  (`172.17.0.2`), so discovery runs and `/hosts` answers with a
+  container-internal name. Now the first upload fails, the second succeeds
+  against the configured address, and the cluster is asked again ten seconds
+  later.
+
 - **A cluster that names no heavy proxy keeps serving them itself.** That is
   what leaves a single-node installation working exactly as it did, and an
   absent `/hosts` (404) is remembered as such so it is not asked again before
-  every upload. A lookup that failed for a reason that might pass is not
-  remembered, by the same judgement the retry policy uses.
+  every upload. So is a body that is not a list of host names, and so is an
+  answer whose every name was refused.
 
 - **A cluster on loopback is not asked at all**, which is the other half of
   leaving local alone: `localhost` is this machine's own cluster or a tunnel to
@@ -40,22 +84,56 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
   and the round trip could not have helped in the first place.
   **Added** `Client::with_proxy_discovery` to override that in both directions
   — on for a port-forward into a real installation, off to pin everything to
-  the address given.
+  the address given. With it off, a heavy failure now takes no lock and reads
+  no state, rather than mutating an answer the client will never look at.
 
-- **Corrected** two things this crate's own documentation said about the gap,
-  both wrong in a way that cost time. It is **not a 503**: the response is HTTP
-  200 carrying a structured YTsaurus error, `cluster error 1: Control proxy may
-  not serve heavy requests with input data`, so there is no status to grep for.
+- **A routed failure names the host it went to.** `write_table: transport
+  error: io: Connection refused` is a true report about an address that appears
+  nowhere in the caller's own code — the client chose it, out of a list the
+  cluster gave it, and then said nothing about the choice. It now reads
+  `write_table at n0132-sas.example.net:9013: …`.
+
+- **"Would waiting help?" and "would asking again help?" are two questions**,
+  and `retry::is_retriable` was being asked both. The second is now
+  `worth_asking_again`, used by the two places that decide whether to keep or
+  discard what `/hosts` said. They agree on every failure this release can
+  produce; the point of splitting them is the ones the next release can — a
+  refused redirect is worth asking again and a rejected certificate is not, and
+  neither answer is the retry policy's.
+
+- **Corrected** what this crate said about the refusal, twice over. The claim
+  that it is "not a 503, it is an HTTP 200" was never observed: `ClientError`
+  renders a cluster error without its status, so a 503 carrying an `X-YT-Error`
+  header looks exactly like a 200 carrying one. The cluster's own rule
+  (`TContext::TryRedirectHeavyRequests`) splits on whether the request carries
+  input data — a heavy **write** gets 503 with `Retry-After: 60` and the string
+  `Control proxy may not serve heavy requests with input data`, a heavy **read**
+  gets a **307** to a data proxy — and the documentation gives one half in its
+  `/hosts` section and the other in its return-code table. Only the error string
+  is first-hand here. "`/hosts` defaults to the `data` role" was asserted with
+  no citation and now has one: it is `default_role_filter`, a coordinator config
+  parameter whose compiled-in default is `data`, so an operator can change it.
   And a deployment **behind a balancer is the case that breaks**, not the case
   that works — the balancer fronts the control proxies. `heavy_proxy` remains,
   no longer as the escape hatch that makes an upload work but as the way to see
   the address or hand it to something that is not this client.
 
+- **Not done, and written down instead:** the documentation asks for `/hosts` to
+  be re-queried "every minute or every few queries", and both official clients
+  do. This one asks once per client and keeps the answer, re-asking only when
+  the proxy it chose stops answering. That is a load-balancing regression the
+  cluster absorbs, not a correctness one, and it is now disclosed in
+  `docs/sdk-comparison.md` rather than left to be discovered.
+
 - **Tested offline**, because none of it can be verified here: two listeners in
   `tests/request_shape.rs`, one answering `/hosts` with the other's address, and
   assertions about which one each command reached. A cluster answers a heavy
   command the same way whichever proxy was asked, so nothing about the answers
-  could have caught this.
+  could have caught this. Every one of the three unpinned heavy call sites —
+  `write_file`, `write_skiff_table`, `read_skiff_table` — is now in that test's
+  exact request list; `write_file` is the one that mattered, because
+  `upload_worker`, `upload_current_exe` and `upload_worker_cached` all funnel
+  through it.
 
 ### An operation is no longer a string and four commands
 

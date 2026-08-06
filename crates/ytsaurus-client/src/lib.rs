@@ -109,8 +109,8 @@
 //! the first time it sends a heavy command, keeps the answer for the rest of
 //! its life, and sends every later heavy command there. Light commands stay on
 //! the address it was configured with. A heavy command that fails for a reason
-//! another proxy might not have throws the answer away, so the next one asks
-//! again.
+//! another proxy might not have goes back to the configured address, and the
+//! cluster is asked again in a few seconds.
 //!
 //! **A cluster that names no heavy proxy is answered by using the configured
 //! address**, which is what leaves a single-node installation working exactly
@@ -120,13 +120,26 @@
 //! from either. [`Client::with_proxy_discovery`] overrides that in both
 //! directions, and [`Client::heavy_proxy`] answers the question directly.
 //!
+//! **A discovered host is used only if it shares the configured address's own
+//! domain**, and the scheme and port come from that address rather than from
+//! the answer. A heavy command carries the caller's OAuth token, and the
+//! `/hosts` body is what decides where it goes — on a plain-`http://` base,
+//! forging that body is exactly as easy as forging a `Location` header, which
+//! this client refuses to follow. [`Client::with_heavy_proxies_anywhere`] is
+//! the opt-in for an installation whose `/hosts` genuinely names another
+//! domain.
+//!
 //! Getting this wrong does not look like a routing problem, which is why it is
-//! worth spelling out what it does look like. A control proxy refuses a heavy
-//! request with **HTTP 200** carrying a structured YTsaurus error — `cluster
-//! error 1: Control proxy may not serve heavy requests with input data` — and
-//! not with a 503, so there is no status code to grep for. And a deployment
-//! **behind a balancer is the case that breaks**, not the case that works: the
-//! balancer fronts the control proxies, so every upload arrives at one.
+//! worth spelling out what it does look like. The refusal arrives as a
+//! structured YTsaurus error — `cluster error 1: Control proxy may not serve
+//! heavy requests with input data` — and this crate's own error rendering does
+//! not print the status beside it, which is how the status came to be recorded
+//! here as 200. The cluster's own rule, from
+//! `TContext::TryRedirectHeavyRequests`, turns on whether the request carries
+//! input data: a heavy **write** gets **503** with `Retry-After: 60`, and a
+//! heavy **read** gets a **307** to a data proxy. And a deployment **behind a
+//! balancer is the case that breaks**, not the case that works: the balancer
+//! fronts the control proxies, so every upload arrives at one.
 
 #![warn(missing_docs)]
 
@@ -379,6 +392,46 @@ impl Client {
         self
     }
 
+    /// Lets `/hosts` name a heavy proxy outside the configured address's own
+    /// domain.
+    ///
+    /// **Off by default, and the default is the safe one.** A heavy command
+    /// carries the caller's OAuth token, and the `/hosts` body decides where it
+    /// goes. So a discovered name is used only if it is the configured host
+    /// itself or sits under that host's parent domain —
+    /// `https://cluster.example.net` will follow `n0132-sas.example.net` and
+    /// will not follow `n0132-sas.somewhere-else.net`. A name that is refused is
+    /// passed over; a `/hosts` answer that is refused entirely leaves the upload
+    /// going to the configured address, which is where it went before this
+    /// client routed anything.
+    ///
+    /// Turn it on for an installation whose `/hosts` genuinely names another
+    /// domain — a cluster fronted by a vanity address, or one whose data proxies
+    /// live under a separate zone. Nothing else in the client changes; the
+    /// scheme still comes from the configured address, a name carrying `://`,
+    /// `/`, `@` or whitespace is still refused, and the configured port still
+    /// carries through.
+    ///
+    /// The symptom of needing it is an upload that reaches the *configured*
+    /// address and is refused there — `Control proxy may not serve heavy
+    /// requests with input data` — while [`Client::heavy_proxy`] shows a
+    /// perfectly good address the client declined to use.
+    ///
+    /// ```
+    /// use ytsaurus_client::Client;
+    ///
+    /// let client = Client::new("https://cluster.example.net")
+    ///     .with_heavy_proxies_anywhere(true);
+    /// ```
+    ///
+    /// This does not disturb what a client it was cloned from has already
+    /// resolved.
+    #[must_use]
+    pub fn with_heavy_proxies_anywhere(mut self, enabled: bool) -> Self {
+        self.transport.set_heavy_proxies_anywhere(enabled);
+        self
+    }
+
     /// Turns the failed-job report in [`Client::wait_for_operation`] on or off.
     ///
     /// On by default: when an operation fails, the client asks the cluster
@@ -518,7 +571,15 @@ impl Client {
     ///
     /// It asks every time and shares nothing with what the client resolved for
     /// itself, so calling it neither costs nor changes anything the next
-    /// command does.
+    /// command does. It also reports the name **as the cluster gave it**,
+    /// before the checks automatic routing puts it through — which is what
+    /// makes it the way to see why a host was declined. A name here that the
+    /// uploads are not using is the symptom
+    /// [`Client::with_heavy_proxies_anywhere`] exists for.
+    ///
+    /// It shares the lookup's budget, though: one attempt bounded well under a
+    /// second, rather than the client's retry policy and request timeout. The
+    /// budget belongs to the question, not to whoever asked it.
     ///
     /// # Errors
     ///
@@ -2871,11 +2932,25 @@ impl Client {
     ///
     /// # What it does not
     ///
-    /// **It is sent once.** A command this crate does not model cannot be
-    /// assumed non-mutating, and a retry that applied an unknown mutation twice
-    /// would be a far worse failure than one lost to a flaky proxy — so the
-    /// retry policy is ignored here, whatever it says.
-    /// [`Client::raw_command_with`] is where a caller who knows better says so.
+    /// **It is sent once, and to the configured address.** A command this crate
+    /// does not model cannot be assumed non-mutating, and a retry that applied
+    /// an unknown mutation twice would be a far worse failure than one lost to
+    /// a flaky proxy — so the default is [`Repeatable::Never`] and the retry
+    /// policy is ignored here, whatever it says.
+    ///
+    /// `Never` is the safe answer for *repeating*, and it is the wrong answer
+    /// for *routing*: it sends the command to the address the client was
+    /// configured with, which on an installation that separates proxy roles is
+    /// a control proxy that will not serve a heavy one. A raw `write_file` sent
+    /// this way is refused with `Control proxy may not serve heavy requests
+    /// with input data`, and a raw `read_file` is answered with a 307 to a data
+    /// proxy. [`Client::raw_command_with`] is where a caller who knows the
+    /// command is heavy says [`Repeatable::Heavy`] and gets both halves of that
+    /// answer at once.
+    ///
+    /// The streaming doors need no such care:
+    /// [`Client::raw_command_streaming`] and [`Client::raw_command_upload`] are
+    /// heavy by construction, because streaming *is* the heavy shape.
     ///
     /// Nor does it know the verb: see [`Method`] for the cluster's own rule for
     /// picking one.

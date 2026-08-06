@@ -542,9 +542,9 @@ Table and file data — `write_table`, `read_table`, `write_file`,
 `upload_worker`, and the streaming form of each — is what YTsaurus calls a
 *heavy* command, and a large installation serves those on a separate set of
 proxies. **The client routes them itself**: the first heavy command asks
-`/hosts`, the answer is kept for the client's lifetime, and one that fails for a
-reason another proxy might not have throws it away so the next asks again. Light
-commands stay on the address you gave.
+`/hosts`, the answer is kept for the client's lifetime, and a proxy that stops
+answering is given back for the configured address while the cluster is asked
+again. Light commands stay on the address you gave.
 
 A cluster that names no heavy proxy is answered by using that address, so a
 single-node installation is unaffected — and one reached at `localhost` is not
@@ -553,11 +553,36 @@ from the other end of a port mapping or a tunnel.
 `Client::with_proxy_discovery` overrides both, and [`Client::heavy_proxy`] still
 answers the question directly.
 
-Without this, the failure is not obvious: a control proxy refuses a heavy
-request with **HTTP 200** carrying `cluster error 1: Control proxy may not serve
-heavy requests with input data`, and a deployment behind a balancer is the case
-that breaks rather than the case that works — the balancer fronts the control
-proxies.
+**The lookup has its own budget** — one attempt, 800 ms — rather than the
+client's five attempts and two-minute timeout. It sits in front of your first
+upload, and not getting an answer costs nothing worse than the routing this
+crate had none of a release ago.
+
+**A discovered host has to share your address's domain.** A heavy command
+carries your OAuth token, and the `/hosts` body is what decides where it goes;
+on a plain-`http://` base, forging that body is exactly as easy as forging a
+`Location` header, which this client refuses to follow. So
+`https://cluster.example.net` will follow `n0132-sas.example.net` and will not
+follow `n0132-sas.somewhere-else.net`; the scheme and the port come from your
+address, not from the answer; and a name carrying `://`, `/`, `@` or whitespace
+is not a name. `Client::with_heavy_proxies_anywhere(true)` is the opt-in for an
+installation whose `/hosts` genuinely names another domain — the symptom is an
+upload refused at your own address while `heavy_proxy()` shows a perfectly good
+one the client declined to use.
+
+Without any of this, the failure is not obvious. The refusal arrives as
+`cluster error 1: Control proxy may not serve heavy requests with input data` —
+this crate's errors do not print the HTTP status beside the cluster's own, so
+the status is not what to look for. The cluster splits on whether the request
+carries input data: a heavy **write** is refused with 503, a heavy **read** is
+answered with a 307 to a data proxy. And a deployment behind a balancer is the
+case that breaks rather than the case that works — the balancer fronts the
+control proxies.
+
+One deliberate difference from the C++ and Go clients: they re-query `/hosts`
+periodically, as [the documentation
+recommends](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload), and
+this one does not. See [docs/sdk-comparison.md](../../docs/sdk-comparison.md).
 
 ## Limits worth knowing
 

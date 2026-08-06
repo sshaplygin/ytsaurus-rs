@@ -34,7 +34,12 @@ use crate::error::{ClientError, Result};
 /// the command — it does not cover the scheduler, which is why
 /// [`Client::abort_operation`](crate::Client::abort_operation) is `Never`
 /// despite being both light and mutating.
+///
+/// The enum is `#[non_exhaustive]`: the cluster's registry has more shapes than
+/// this crate has needed so far, and a caller that matches on it exhaustively
+/// would break the next time one of them earns a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Repeatable {
     /// Safe to repeat unchanged, with no mutation ID to deduplicate by.
     ///
@@ -72,12 +77,18 @@ pub enum Repeatable {
     /// and only if a heavy command needs it. Nothing about the call site
     /// changes: this is the same `isHeavy` bit of the cluster's command
     /// registry that says the command cannot be repeated, and both answers
-    /// follow from writing it down once.
+    /// follow from writing it down once. The discovered host is constrained to
+    /// the configured address's own domain — see
+    /// [`Client::with_heavy_proxies_anywhere`](crate::Client::with_heavy_proxies_anywhere).
     ///
     /// `write_table`, `read_table`, `write_file`, `get_job_input` and
-    /// `get_job_stderr` are the modelled ones; a raw command that streams in
-    /// either direction is sent this way whatever the caller says, because
-    /// streaming *is* the heavy shape.
+    /// `get_job_stderr` are the modelled ones — every one of them declared
+    /// `isHeavy = true` in `REGISTER_ALL`/`REGISTER` in the cluster's
+    /// [driver registry](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp),
+    /// whose argument order is `(command, name, inDataType, outDataType,
+    /// isVolatile, isHeavy)`. A raw command that streams in either direction is
+    /// sent this way whatever the caller says, because streaming *is* the heavy
+    /// shape.
     Heavy,
 }
 
@@ -294,7 +305,12 @@ fn generate() -> String {
     )
 }
 
-/// Whether repeating the request could plausibly succeed.
+/// Whether **waiting** and sending the same request again could plausibly
+/// succeed.
+///
+/// This is the question the retry loop asks, and only that one. "Would asking
+/// somewhere else help?" is a different question with a different answer —
+/// see [`worth_asking_again`].
 pub(crate) fn is_retriable(error: &ClientError) -> bool {
     match error {
         // The request never got an answer: a refused connection, a reset, a
@@ -330,6 +346,49 @@ fn contains_retriable_code(value: &serde_json::Value) -> bool {
         .get("inner_errors")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|inner| inner.iter().any(contains_retriable_code))
+}
+
+/// Whether putting the **question** to the cluster again could plausibly get a
+/// different answer.
+///
+/// Not the same question as [`is_retriable`], and the difference is the whole
+/// reason this exists. `is_retriable` asks *would waiting help?* — it decides
+/// whether to send the same request to the same place after a pause. This one
+/// asks *would asking again ever help?*, and its callers are the two places
+/// that decide whether the client keeps or discards what `/hosts` told it:
+/// `Transport::base_for` and `Transport::after_heavy`. Neither is going to
+/// re-send anything; both are choosing between "remember this answer" and "ask
+/// once more later".
+///
+/// They differ for exactly the failures where the *addressee* is what was
+/// wrong rather than the moment. Every reason to wait is also a reason to ask
+/// again — a proxy that was restarting is one the coordinator may well name
+/// differently in a minute — so this starts from `is_retriable` and adds to it.
+///
+/// **Two arms belong here that this branch cannot yet write**, because the
+/// variants they name are introduced by sibling pull requests. Each is one
+/// line, and this function is shaped so that it is:
+///
+/// - **`ClientError::Redirected` → `true`** (#36, redirect credentials). A
+///   balancer that answered with a `Location` this client refuses to follow is
+///   not a permanent verdict on heavy routing: its routing may be different for
+///   the next request, and the thing that must not happen is *following* the
+///   redirect, not *asking* again. Left as `is_retriable`'s `false`, one such
+///   answer would disable heavy routing for the client's whole life.
+/// - **a rejected certificate → `false`** (#39, TLS CA bundle). A host this
+///   process does not trust will not become trusted by being asked twice, and
+///   the fix is a CA bundle rather than another question. That arm needs no
+///   line here: #39 narrows `is_retriable` to answer `false` for one, and
+///   `false` is the right answer on this side too.
+///
+/// Until #39 lands, a rejected certificate arrives as `ClientError::Transport`
+/// and is therefore judged retriable — correct for the variants that exist on
+/// this branch, and wrong the moment the other two do.
+pub(crate) fn worth_asking_again(error: &ClientError) -> bool {
+    is_retriable(error)
+    // The one-line addition, once #36 is in the tree:
+    //
+    //     || matches!(error, ClientError::Redirected { .. })
 }
 
 /// Whether a fresh client should announce its retries.
@@ -457,6 +516,50 @@ mod tests {
         assert!(is_retriable(&http(429)));
         assert!(!is_retriable(&http(404)));
         assert!(!is_retriable(&http(401)));
+    }
+
+    #[test]
+    fn asking_again_is_a_different_question_from_waiting() {
+        // Two predicates, two questions. Everything worth waiting for is worth
+        // asking about again — a proxy that was restarting is one the
+        // coordinator may name differently in a minute — so this direction of
+        // the implication is the one that must hold on every branch.
+        for worth_waiting in [
+            ClientError::Transport {
+                command: "write_table".to_owned(),
+                source: Box::new(ureq::Error::HostNotFound),
+            },
+            ClientError::Http {
+                command: "hosts".to_owned(),
+                status: 503,
+                body: String::new(),
+            },
+            cluster_error(2100, r#"{"code":2100}"#),
+        ] {
+            assert!(is_retriable(&worth_waiting), "{worth_waiting}");
+            assert!(worth_asking_again(&worth_waiting), "{worth_waiting}");
+        }
+
+        // And a settled answer is settled for both. A cluster with no `/hosts`
+        // endpoint answers 404 every time, so the lookup is remembered as
+        // "this cluster serves its own heavy commands" rather than repeated
+        // before every upload.
+        for settled in [
+            ClientError::Http {
+                command: "hosts".to_owned(),
+                status: 404,
+                body: String::new(),
+            },
+            ClientError::Decode {
+                command: "hosts".to_owned(),
+                reason: "not a list of host names".to_owned(),
+            },
+            ClientError::Config("no proxy".to_owned()),
+            cluster_error(500, r#"{"code":500}"#),
+        ] {
+            assert!(!is_retriable(&settled), "{settled}");
+            assert!(!worth_asking_again(&settled), "{settled}");
+        }
     }
 
     #[test]

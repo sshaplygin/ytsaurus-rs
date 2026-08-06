@@ -52,7 +52,7 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Token lookup | `Token`, `TokenPath`, `~/.yt/token` | `YT_TOKEN`; a file only with `ReadTokenFromFile` | `YT_TOKEN`, `YT_TOKEN_PATH`, `~/.yt/token` |
 | Other credentials | TVM, service tickets, impersonation | 5 implementations, swappable per call | OAuth only |
 | TLS | `UseTLS` | `UseTLS` + caller CA bundle | `tls` feature, system roots |
-| Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — one host, kept for the client's life and dropped when a heavy command cannot reach it; no ban list |
+| Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — one host, **never refreshed**, dropped for 10 s when it cannot be reached; constrained to the configured domain |
 | Compression | configurable, off by default | zstd both ways | gzip **inbound only** |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
 | Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
@@ -67,6 +67,29 @@ The tracing row is closer than it looks: all three send the same W3C
 one to read. An application already exporting OpenTelemetry spans formats its
 current one into a `traceparent` and hands that over, which is the same picture
 by a shorter road.
+
+The heavy-proxy row is the one to read twice, because "automatic" hides two
+deliberate differences.
+
+**This client never refreshes the host.** The
+[proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload) asks
+for the opposite — "A good strategy is to re-query the `/hosts` list every
+minute or every few queries and change the current proxy to which queries are
+made" — and C++'s `THostManager` and Go's client both do. Here the answer is
+resolved once per client and kept for its lifetime; it is given up only when
+the chosen proxy stops answering, and even then only for ten seconds before the
+question is asked again. A long-lived launcher therefore pins one data proxy for
+its whole run, which is a load-balancing regression the cluster absorbs rather
+than a correctness one. The trade is one round trip per client instead of one
+per minute, and there is no ban list, so a proxy that fails is re-chosen as
+readily as any other.
+
+**And a discovered host is constrained**, which neither other client does. The
+`/hosts` body decides where a request carrying the caller's OAuth token goes,
+so a name is used only if it shares the configured address's domain, and the
+scheme and port come from the configured address rather than from the answer.
+`Client::with_heavy_proxies_anywhere(true)` restores the other clients'
+behaviour for an installation that needs it.
 
 Logging is a smaller row than it was and still the softer of the two: this
 client has one span per attempt and one event per retry, where the official

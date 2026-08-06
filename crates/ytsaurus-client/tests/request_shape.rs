@@ -817,10 +817,28 @@ struct Proxy {
     seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+/// What a stand-in proxy does with `GET /hosts`.
+#[derive(Clone)]
+enum Hosts {
+    /// Answers 200 with this JSON body.
+    List(String),
+    /// Answers 404 — a cluster with no such endpoint.
+    Absent,
+    /// Answers a status that says "not now": the shape of a proxy restarting.
+    Status(u16),
+    /// Accepts the question and never answers it.
+    Hang,
+}
+
 impl Proxy {
     /// A proxy that answers `/hosts` with `hosts`, or with 404 when given
     /// `None` — the shape of a cluster that has no such endpoint.
     fn new(hosts: Option<String>) -> Self {
+        Self::answering(hosts.map_or(Hosts::Absent, Hosts::List), 200)
+    }
+
+    /// A proxy that answers `/hosts` one way and commands with `commands`.
+    fn answering(hosts: Hosts, commands: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let address = listener.local_addr().expect("has an address");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -834,7 +852,7 @@ impl Proxy {
                 // One thread per connection: `ureq` pools them, and a client
                 // that opened a second while the first sat idle would deadlock
                 // against a server that answered them in turn.
-                std::thread::spawn(move || serve(stream, hosts, seen));
+                std::thread::spawn(move || serve(stream, hosts, commands, seen));
             }
         });
 
@@ -873,10 +891,14 @@ impl Proxy {
 /// Answers requests on one connection until the client hangs up.
 fn serve(
     mut stream: std::net::TcpStream,
-    hosts: Option<String>,
+    hosts: Hosts,
+    commands: u16,
     seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clones"));
+    // Held open and never answered, for `Hosts::Hang`: dropping the socket
+    // would be a connection reset, which is a different thing to measure.
+    let mut hung = Vec::new();
 
     loop {
         let mut head = String::new();
@@ -907,23 +929,31 @@ fn serve(
         let asked_where_to_go = head.starts_with("GET /hosts ");
         seen.lock().expect("nothing panicked holding it").push(head);
 
-        let reply = match (asked_where_to_go, &hosts) {
-            (true, None) => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
-            (true, Some(list)) => reply(list.as_bytes()),
-            (false, _) => reply(br#"{"value"=%true}"#),
+        let answer = if asked_where_to_go {
+            match &hosts {
+                Hosts::List(list) => reply(200, list.as_bytes()),
+                Hosts::Absent => reply(404, b""),
+                Hosts::Status(status) => reply(*status, b""),
+                Hosts::Hang => {
+                    hung.push(stream.try_clone().expect("clones"));
+                    continue;
+                }
+            }
+        } else {
+            reply(commands, br#"{"value"=%true}"#)
         };
 
-        if stream.write_all(&reply).is_err() {
+        if stream.write_all(&answer).is_err() {
             return;
         }
         stream.flush().ok();
     }
 }
 
-/// A 200 carrying `body`, on a connection that stays open.
-fn reply(body: &[u8]) -> Vec<u8> {
+/// A response carrying `body`, on a connection that stays open.
+fn reply(status: u16, body: &[u8]) -> Vec<u8> {
     let mut reply = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-yt-yson-text\r\n\r\n",
+        "HTTP/1.1 {status} .\r\nContent-Length: {}\r\nContent-Type: application/x-yt-yson-text\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -987,15 +1017,32 @@ fn a_heavy_command_goes_to_the_proxy_the_cluster_names() {
     );
 }
 
+/// One table of one named column — enough to make a Skiff call well formed.
+fn one_column() -> SkiffFormat {
+    SkiffFormat::new(vec![SkiffSchemaRef::Inline(SkiffSchema::tuple([
+        SkiffSchema::named("n", SkiffWireType::Int64),
+    ]))])
+    .expect("one named tuple is a valid format")
+}
+
 #[test]
 fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
-    // Buffered, streamed in, streamed out, and a job's stderr: four routes
-    // through the transport — `call`, `upload`, `open` — that each had their
-    // own way of choosing an address. And one lookup between them, because the
-    // answer is kept for the client's lifetime.
+    // Buffered, streamed in, streamed out, files, Skiff in both directions and
+    // a job's stderr: every route through the transport — `call`, `upload`,
+    // `open` — that each had their own way of choosing an address. And one
+    // lookup between all of them, because the answer is kept for the client's
+    // lifetime.
+    //
+    // The list is exact in both directions on purpose. Each of these call
+    // sites is one word — `Repeatable::Heavy` — away from going to the control
+    // proxy in silence, and `write_file` is the one that matters most:
+    // `upload_worker`, `upload_current_exe` and `upload_worker_cached` all
+    // funnel through it, so a single wrong word there sends every worker
+    // upload back to a proxy that will not take it.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&control);
+    let skiff = one_column();
 
     client.write_table("//tmp/t", b"").expect("buffered write");
     client
@@ -1004,18 +1051,30 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
             [std::collections::BTreeMap::from([("n", 1_i64)])],
         )
         .expect("streamed write");
+    client.write_file("//tmp/f", b"x").expect("file write");
+    client
+        .write_skiff_table("//tmp/t", b"", &skiff)
+        .expect("skiff write");
     // The stub answers `{value=%true}`, which is not a table: these fail on
     // the answer, having asked the question this is about.
     let _ = client.read_table("//tmp/t");
     let _ = client.read_table_streaming("//tmp/t");
+    let _ = client.read_skiff_table("//tmp/t", &skiff);
     let _ = client.get_job_stderr("1-2-3-4", "5-6-7-8");
 
-    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1"],
+        "a heavy command was served by the control proxy"
+    );
     assert_eq!(
         heavy.requests(),
         [
             "PUT /api/v4/write_table HTTP/1.1",
             "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_file HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "GET /api/v4/read_table HTTP/1.1",
             "GET /api/v4/read_table HTTP/1.1",
             "GET /api/v4/read_table HTTP/1.1",
             "GET /api/v4/get_job_stderr HTTP/1.1",
@@ -1096,23 +1155,334 @@ fn a_cluster_with_no_hosts_endpoint_is_not_asked_before_every_upload() {
 }
 
 #[test]
-fn a_heavy_proxy_that_cannot_be_reached_is_asked_about_again() {
-    // A proxy that is down, drained or banned stays broken for every upload
-    // that follows, so the answer is thrown away rather than kept for the
-    // client's lifetime. The failed command itself is *not* re-sent: heavy
-    // commands are not retried, and a streamed body is gone by then.
-    let control = Proxy::new(Some(format!(r#"["{}"]"#, nowhere())));
+fn a_heavy_proxy_that_cannot_be_reached_gives_the_configured_address_back() {
+    // The measured trigger, from a single-node container reached from the
+    // host: `172.17.0.2` is not local, so discovery runs, and `/hosts` answers
+    // with a container-internal name nothing outside can dial.
+    //
+    // The first upload finds that out — it is not re-sent, because heavy
+    // commands are not retried and a streamed body is gone by then. What must
+    // not happen is what happened before: the answer thrown away, the same
+    // question asked, the same dead host resolved, and every upload for the
+    // rest of the client's life failing the same way. The client falls back to
+    // the address the caller gave, which is serving perfectly well.
+    let dead = nowhere();
+    let control = Proxy::new(Some(format!(r#"["{dead}"]"#)));
     let client = discovering(&control);
 
     let first = client.write_table("//tmp/t", b"");
     let second = client.write_table("//tmp/t", b"");
 
-    assert!(first.is_err() && second.is_err(), "nothing was listening");
+    assert!(first.is_err(), "nothing was listening on {dead}");
+    assert!(
+        second.is_ok(),
+        "the second upload was sent to the dead host too: {second:?}"
+    );
     assert_eq!(
         control.requests(),
-        ["GET /hosts HTTP/1.1", "GET /hosts HTTP/1.1"],
-        "the client kept an address it could not reach"
+        ["GET /hosts HTTP/1.1", "PUT /api/v4/write_table HTTP/1.1"],
+        "the client kept resolving an address it could not reach"
     );
+}
+
+#[test]
+fn a_failure_at_a_discovered_proxy_says_which_one() {
+    // `write_table: transport error: io: Connection refused` is a true report
+    // about an address that appears nowhere in the caller's own code — the
+    // client picked it out of a list the cluster gave it, and then said
+    // nothing about the choice.
+    let dead = nowhere();
+    let control = Proxy::new(Some(format!(r#"["{dead}"]"#)));
+
+    let error = discovering(&control)
+        .write_table("//tmp/t", b"")
+        .expect_err("nothing was listening");
+
+    assert!(
+        error
+            .to_string()
+            .starts_with(&format!("write_table at {dead}:")),
+        "the failure did not name the proxy it went to: {error}"
+    );
+}
+
+#[test]
+fn a_failure_at_the_configured_address_is_not_dressed_up_as_a_routed_one() {
+    // The other half of naming the host, and the guard that keeps the two
+    // decisions apart. The caller typed the configured address, so naming it
+    // back at them says nothing — and a failure there is not evidence about a
+    // lookup that was never in charge of it.
+    //
+    // Both uploads fail with the same 503 from the same kind of stub; the only
+    // difference is that the client chose where the first one went. That is
+    // what the message has to reflect, and what "state is `At(x)` and `x` is
+    // where this command went" is for.
+    let heavy = Proxy::answering(Hosts::Absent, 503);
+    let control = Proxy::answering(Hosts::List(format!(r#"["{}"]"#, heavy.host())), 503);
+    let client = discovering(&control);
+
+    let chosen = client.write_table("//tmp/t", b"").expect_err("503");
+    let given = client.write_table("//tmp/t", b"").expect_err("503");
+
+    assert!(
+        chosen
+            .to_string()
+            .starts_with(&format!("write_table at {}:", heavy.host())),
+        "{chosen}"
+    );
+    assert!(
+        given.to_string().starts_with("write_table:"),
+        "a failure at the address the caller gave was reported as a routed one: {given}"
+    );
+}
+
+#[test]
+fn a_settled_lookup_survives_a_failed_upload() {
+    // A 404 `/hosts` is remembered as "this cluster serves its own heavy
+    // commands", and an upload that then fails at *that* address says nothing
+    // about the lookup — the caller chose the address, and there is no other
+    // answer to go back for. Forgetting here would restart a settled question
+    // on every 503, which is the opposite of what the fallback is for.
+    let control = Proxy::answering(Hosts::Absent, 503);
+    let client = discovering(&control);
+
+    assert!(client.write_table("//tmp/t", b"").is_err());
+    assert!(client.write_table("//tmp/t", b"").is_err());
+
+    assert_eq!(
+        control.requests(),
+        [
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ],
+        "a settled lookup was restarted by a failure that had nothing to do with it"
+    );
+}
+
+#[test]
+fn a_mistake_at_the_heavy_proxy_does_not_send_the_client_back_to_ask() {
+    // A table that does not exist will not exist over there either. Only a
+    // failure another proxy could plausibly not have — a refused connection, a
+    // 503, a banned proxy — is worth giving up a resolved address for; asking
+    // again on every mistake would cost a lookup per typo.
+    let heavy = Proxy::answering(Hosts::Absent, 404);
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client = discovering(&control);
+
+    assert!(client.write_table("//tmp/t", b"").is_err());
+    assert!(client.write_table("//tmp/t", b"").is_err());
+
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(
+        heavy.requests(),
+        [
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ],
+        "the client threw away a working address because a command was wrong"
+    );
+}
+
+#[test]
+fn a_discovery_off_client_never_touches_the_routing_state() {
+    // Nothing to forget and nothing to ask, so a heavy failure costs no lock
+    // and no lookup. The point is that `with_proxy_discovery(false)` is a
+    // whole-feature off switch and not merely a "do not ask first".
+    let control = Proxy::answering(Hosts::List(r#"["heavy.example.net"]"#.to_owned()), 503);
+
+    let client = Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(false);
+
+    assert!(client.write_table("//tmp/t", b"").is_err());
+    assert!(client.write_table("//tmp/t", b"").is_err());
+
+    assert_eq!(
+        control.requests(),
+        [
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn a_blank_name_in_the_answer_is_passed_over_rather_than_believed() {
+    // `/hosts` is ordered best-first, so the first entry is the one to use —
+    // unless it is not a host name at all. A blank one used to be filtered out
+    // by hand; it is now one of the several shapes `heavy_base` refuses, and
+    // the list is walked until something usable turns up.
+    let heavy = Proxy::new(None);
+    let control = Proxy::new(Some(format!(r#"["", "   ", "{}"]"#, heavy.host())));
+    let client = discovering(&control);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(heavy.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+}
+
+#[test]
+fn an_answer_that_is_not_a_list_of_host_names_settles_the_question() {
+    // A body this client cannot read will not become readable by being asked
+    // for again, so it is remembered exactly as an empty list is: the
+    // configured address serves the uploads, and no lookup goes in front of
+    // them.
+    for nonsense in [
+        "not json at all",
+        r#"{"hosts": ["n0132-sas.example.net"]}"#,
+        "[1, 2, 3]",
+        "null",
+    ] {
+        let control = Proxy::answering(Hosts::List(nonsense.to_owned()), 200);
+        let client = discovering(&control);
+
+        client.write_table("//tmp/t", b"").expect("writes");
+        client.write_table("//tmp/t", b"").expect("writes");
+
+        assert_eq!(
+            control.requests(),
+            [
+                "GET /hosts HTTP/1.1",
+                "PUT /api/v4/write_table HTTP/1.1",
+                "PUT /api/v4/write_table HTTP/1.1",
+            ],
+            "{nonsense:?} was asked about twice, or routed somewhere"
+        );
+    }
+}
+
+#[test]
+fn a_host_outside_the_configured_domain_is_refused() {
+    // The `/hosts` body decides where every heavy command goes, and a heavy
+    // command carries the caller's OAuth token. On a plain-http base, forging
+    // this body is exactly as easy as forging a `Location` header — which this
+    // client refuses to follow. So a name from another domain is passed over,
+    // and the upload goes to the address the caller actually chose.
+    //
+    // The client here is configured with `127.0.0.1`, which is a literal
+    // address and therefore admits only itself: `localhost` names the same
+    // machine and is still not the same host.
+    let elsewhere = Proxy::new(None);
+    let named = format!("localhost:{}", elsewhere.address.port());
+    let control = Proxy::new(Some(format!(r#"["{named}"]"#)));
+
+    discovering(&control)
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1", "PUT /api/v4/write_table HTTP/1.1"],
+    );
+    assert!(
+        elsewhere.requests().is_empty(),
+        "the token went to a host the caller never named: {:?}",
+        elsewhere.requests()
+    );
+}
+
+#[test]
+fn an_installation_that_really_does_answer_elsewhere_can_opt_in() {
+    // The escape hatch, so that an installation whose `/hosts` genuinely names
+    // another domain — a vanity address, data proxies in a separate zone — is
+    // not stranded by the default. Same two listeners as above, one builder
+    // call apart.
+    let heavy = Proxy::new(None);
+    let named = format!("localhost:{}", heavy.address.port());
+    let control = Proxy::new(Some(format!(r#"["{named}"]"#)));
+
+    Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(true)
+        .with_heavy_proxies_anywhere(true)
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(heavy.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+}
+
+#[test]
+fn the_lookup_has_its_own_budget_and_a_heavy_command_does_not_wait_out_the_clients() {
+    // The lookup used to run under the client's full policy — five attempts,
+    // one to eight seconds of backoff between them, two minutes each — while
+    // holding the lock every other heavy command wants. A `/hosts` answering
+    // 503 therefore cost a heavy command **15 s**, and one that hung cost it
+    // **615 s**. Both measured; the second is why this test exists at all.
+    //
+    // The bound is loose because this is a clock, and the thing being ruled
+    // out is two orders of magnitude away from it.
+    for (what, hosts) in [
+        ("503", Hosts::Status(503)),
+        ("no answer at all", Hosts::Hang),
+    ] {
+        let control = Proxy::answering(hosts, 200);
+        // The client's own policy, not `none()`: the point is that the lookup
+        // does not inherit it.
+        let client = Client::new(&control.url()).with_proxy_discovery(true);
+
+        let started = std::time::Instant::now();
+        client.write_table("//tmp/t", b"").expect("writes");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a heavy command waited {elapsed:?} on a /hosts that answered {what}"
+        );
+    }
+}
+
+#[test]
+fn waiting_threads_do_not_queue_up_behind_a_failing_lookup() {
+    // Eight threads, one broken `/hosts`. Each used to wait out the lookup in
+    // front of it and then perform its own, because a failure that might pass
+    // left the state unasked: 8 x 5 attempts = 40 lookups and 240 s, measured.
+    //
+    // A lookup that fails now leaves an answer too — "the configured address,
+    // for the next few seconds" — so the seven behind the first find a
+    // decision rather than an invitation to repeat it.
+    let control = Proxy::answering(Hosts::Hang, 200);
+    let client = Client::new(&control.url()).with_proxy_discovery(true);
+
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| client.write_table("//tmp/t", b"").expect("writes"));
+        }
+    });
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "eight threads took {elapsed:?}, which is a queue rather than one lookup"
+    );
+    let asked = control
+        .requests()
+        .iter()
+        .filter(|line| line.starts_with("GET /hosts"))
+        .count();
+    assert!(asked <= 2, "{asked} lookups for one question");
+}
+
+#[test]
+fn eight_threads_against_a_healthy_cluster_still_ask_exactly_once() {
+    // The success path, which was already perfect and must stay that way: the
+    // lock is held across the lookup precisely so that the seven threads
+    // behind the first read its answer instead of asking again.
+    let heavy = Proxy::new(None);
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client = discovering(&control);
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| client.write_table("//tmp/t", b"").expect("writes"));
+        }
+    });
+
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(heavy.requests().len(), 8);
 }
 
 #[test]
