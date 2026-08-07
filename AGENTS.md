@@ -361,12 +361,20 @@ per command. Cluster facts:
   `Client::new` is infallible with nothing above it to time a file read out.
 - **A rejected certificate is not retried — for two of the reasons, not all of
   them.** It arrives as `ureq::Error::Io` of kind `InvalidData` wrapping a
-  `rustls::Error`, rendered `invalid peer certificate: <Debug of
-  CertificateError>`, and was retried five times as an ordinary transport
-  failure, which put ~15 s of backoff in front of a verdict that cannot change.
-  Only `UnknownIssuer` and `NotValidForName` are that verdict: both are decided
-  by *this client's* roots and *this client's* URL, which the next attempt does
-  not change. Everything else stays retriable, and deliberately so —
+  `rustls::Error`, rendered `invalid peer certificate: <CertificateError>`, and
+  was retried five times as an ordinary transport failure, which put ~15 s of
+  backoff in front of a verdict that cannot change. Only `UnknownIssuer` and
+  the name mismatch are that verdict: both are decided by *this client's* roots
+  and *this client's* URL, which the next attempt does not change.
+
+  **Match the rendering, not the variant name.** `rustls` renders that error
+  with `Display`, and `Display for CertificateError` writes prose for the
+  context-carrying variants while falling back to `Debug` for the rest. So
+  `UnknownIssuer` arrives under its own name, but a hostname mismatch arrives
+  as `certificate not valid for name "…"; certificate is only valid for …` —
+  and the webpki verifier builds *only* `NotValidForNameContext`, never the
+  bare variant, so matching `NotValidForName` alone settles nothing in the
+  default build. Both spellings are listed for that reason. Everything else stays retriable, and deliberately so —
   `rustls-platform-verifier` maps a failed revocation lookup or an unreadable
   trust store to `Other(…)` under the same prefix, and classifying those would
   make enabling `platform-verifier` a way of turning a transient OS condition

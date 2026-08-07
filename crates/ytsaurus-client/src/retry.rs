@@ -104,8 +104,15 @@ const CERTIFICATE_VERDICT: &str = "invalid peer certificate: ";
 ///   root store is the same one a second later; only `YT_CA_BUNDLE` or the
 ///   `platform-verifier` feature changes it.
 /// - `NotValidForName` — the certificate does not cover the host that was
-///   asked for. The host is the same one a second later too. (It also matches
-///   `NotValidForNameContext { .. }`, which carries the names it compared.)
+///   asked for. The host is the same one a second later too.
+/// - `certificate not valid for name ` — the **same** verdict, spelled the way
+///   it actually arrives. `rustls` renders `InvalidCertificate` with `Display`
+///   rather than `Debug` (`Error::fmt`), and `Display for CertificateError`
+///   gives the context-carrying variants prose instead of their variant name.
+///   The webpki verifier only ever builds `NotValidForNameContext` for a
+///   hostname mismatch — the bare `NotValidForName` above is unreachable in the
+///   default build — so matching the variant name alone would settle nothing
+///   and quietly cost five attempts for a certificate naming another host.
 ///
 /// Everything else stays retriable, and the reason is the same in each case:
 /// the answer might genuinely differ next time.
@@ -121,7 +128,11 @@ const CERTIFICATE_VERDICT: &str = "invalid peer certificate: ";
 /// - `invalid certificate revocation list` is a CRL that could not be fetched
 ///   or parsed — the same transient class as `Other`.
 /// - `peer sent no certificates` is a proxy that answered wrong once.
-const SETTLED_REJECTIONS: &[&str] = &["UnknownIssuer", "NotValidForName"];
+const SETTLED_REJECTIONS: &[&str] = &[
+    "UnknownIssuer",
+    "NotValidForName",
+    "certificate not valid for name ",
+];
 
 /// How often, and how patiently, a failed request is repeated.
 ///
@@ -556,9 +567,16 @@ mod tests {
 
         for rejection in [
             "invalid peer certificate: NotValidForName",
-            // The context-carrying form of the same verdict.
-            "invalid peer certificate: NotValidForNameContext { expected: DnsName(\"a\"), \
-             presented: [\"DnsName(\\\"b\\\")\"] }",
+            // The form this verdict actually arrives in, and the one that
+            // matters: `rustls` renders `InvalidCertificate` with `Display`,
+            // and `Display for CertificateError` writes prose for the
+            // context-carrying variants rather than their variant name. The
+            // webpki verifier builds *only* `NotValidForNameContext` for a
+            // hostname mismatch, so this string — not the one above — is what
+            // a cluster whose certificate names another host produces.
+            "invalid peer certificate: certificate not valid for name \
+             \"cluster.example.net\"; certificate is only valid for \
+             DnsName(\"other.example.net\")",
         ] {
             assert!(
                 !is_retriable(&transport_error(std::io::ErrorKind::InvalidData, rejection)),
