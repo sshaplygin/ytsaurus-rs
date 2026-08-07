@@ -770,13 +770,32 @@ fn configured_bundle() -> Option<&'static Path> {
 /// cannot have changed meaning in between. Anything *other* than the
 /// configured bundle is parsed on the spot — only a test ever asks for one,
 /// and a memo keyed on nothing would hand it the first test's answer.
+///
+/// **Only success is remembered.** Memoising the failure too would pin a
+/// passing condition for the life of the process: a first `Client::new` that
+/// lands while config management is rewriting the file in place, or before the
+/// mount carrying it is ready, would leave every later client in that process
+/// refusing to send anything — with no way back short of a restart. That is
+/// the same "make a bad afternoon permanent" mistake this module argues
+/// against in [`crate::retry`]'s certificate classification, and it would be
+/// odd to commit it here. A failed read is simply tried again next time; the
+/// cost is bounded by the size cap, and a bundle that is genuinely broken pays
+/// it only on the construction path it was already failing.
 #[cfg(feature = "tls")]
 fn root_certs(named: Option<&Path>) -> Result<Option<ureq::tls::TlsConfig>, String> {
-    static CONFIGURED: std::sync::OnceLock<Result<Option<ureq::tls::TlsConfig>, String>> =
+    static CONFIGURED: std::sync::OnceLock<Option<ureq::tls::TlsConfig>> =
         std::sync::OnceLock::new();
 
     if named == configured_bundle() {
-        return CONFIGURED.get_or_init(|| roots_for(named)).clone();
+        if let Some(roots) = CONFIGURED.get() {
+            return Ok(roots.clone());
+        }
+
+        let roots = roots_for(named)?;
+        // A race here is harmless: two threads that both parsed the same file
+        // agree about it, and the loser drops its copy.
+        let _ = CONFIGURED.set(roots.clone());
+        return Ok(roots);
     }
 
     roots_for(named)
