@@ -350,17 +350,35 @@ per command. Cluster facts:
     where it pointed. One that stays on the same origin is followed, token and
     all: nothing new learns it, and refusing would break every command against
     a balancer that canonicalises its own host.
-  - a redirect on a request with a **body** is refused whatever it carries.
-    A redirect rewrites a `POST`/`PUT` into a `GET` and drops the body, so a
-    `write_table` came back `Ok(())` having written no rows. That costs data
-    rather than a credential, so it does not wait for a token to be present.
-  - a chain longer than `MAX_REDIRECTS` is a loop, not a route.
+  - **the method and the body survive the hop** — the request is sent again,
+    not rewritten into a `GET`. That is what 307/308 require by definition, and
+    what an API v4 command needs whatever the digit: a command's verb is fixed
+    by the command (mutating → POST, input stream → PUT), and no `Location`
+    changes it. So a bodiless `POST create` follows a balancer's `301`, and a
+    buffered `write_table` sends its rows to where it was pointed.
+  - what *is* refused is a redirect on a body this client **cannot send
+    again**: `Transport::upload`'s reader — `write_table_rows`,
+    `raw_command_upload` — has already begun to drain into the first request
+    and cannot be rewound. Refused with or without a token, because it costs
+    data rather than a credential: a `write_table` that arrived with no rows
+    came back `Ok(())` having written none.
+  - a chain longer than `MAX_REDIRECTS` is a loop, not a route — and the whole
+    chain shares **one** deadline, the command's own. Handing each hop a fresh
+    `timeout_global` made the real limit `(MAX_REDIRECTS + 1)×` the one the
+    caller asked for: 22 minutes at the default two, on an `exists`.
 
   `Location` is resolved against the address the request went to (RFC 3986
   §4.2), so a relative one still names a host in the error and in the origin
-  comparison. Reproduced offline in
+  comparison — and §5.3, so a reference with no path of its own (`?path=…`,
+  `#frag`) keeps the request's path rather than falling back to its directory.
+  Reproduced offline in
   `crates/ytsaurus-client/tests/redirect_credentials.rs`; a local cluster runs
   one proxy and redirects nothing.
+
+  The `HEAVY` list in `http.rs` decides only whether a refusal ends with "go to
+  a heavy proxy". It is the cluster's `isHeavy` bit, so it covers commands only
+  `raw_command` can send; **it must be reconciled with `Repeatable::Heavy` when
+  #38 merges**, and the source carries that marker.
 
 ### The operation lifecycle
 

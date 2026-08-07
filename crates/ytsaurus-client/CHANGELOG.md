@@ -40,14 +40,43 @@
   deliberately cross-host, which is exactly the case that setting does not
   cover.
 
-- **Changed** a redirected request that carries a **body** now fails, with or
-  without a token. This closes a silent data loss that predates the fix above:
-  a redirect rewrites a `POST` or `PUT` into a `GET` and drops the body, the
-  cluster answers that empty request on its own terms, and `write_table`
-  returned `Ok(())` having written no rows at all. A write that quietly wrote
-  nothing is worse than one that failed. Callers that relied on a redirected
-  write appearing to succeed — there is no correct such caller — now see
+- **Changed** a followed redirect now sends the **same request** again: same
+  method, same body. That is what `307` and `308` require by definition, and
+  what an API v4 command needs whatever the digit — a command's verb is fixed
+  by the command, so a `create` rewritten into a `GET` is not a `create`. A
+  bodiless `POST` therefore follows a balancer's canonical-host `301` like any
+  other command, and a buffered `write_table` sends its rows to the address it
+  was pointed at.
+
+  What still fails is a redirect on a body this client **cannot send a second
+  time**: `write_table_rows` and `raw_command_upload` read their body as they
+  send it, so by the time the `3xx` arrives some of it has gone and a reader
+  cannot be rewound. Those close a silent data loss that predates all of this —
+  a redirect that dropped the body left `write_table` returning `Ok(())` having
+  written no rows — and they report it as
   `ClientError::Redirected { refusal: RedirectRefusal::Body, .. }`.
+
+- **Fixed** the request timeout being multiplied by the length of a redirect
+  chain. `Client::with_timeout` documents an end-to-end limit for a buffered
+  command, and taking the following away from `ureq` — whose `Timeout::Global`
+  had covered the whole chain — gave every hop a fresh copy of it instead. The
+  real limit became `(hops + 1) ×` the one asked for: a client with a 400 ms
+  timeout, meeting a proxy that redirects to itself with 300 ms of thought per
+  hop, returned from `exists` after **3.36 s and eleven requests**. At the
+  default two minutes that is twenty-two of them, on one `exists` — and the
+  same on `Client::heavy_proxy`, which follows its own redirects.
+
+  An attempt now takes its deadline once and gives each hop what is left of it,
+  so the chain spends one budget. A retry is a fresh attempt and still gets a
+  fresh budget, as it always did.
+
+- **Fixed** `Location: ?path=//other` resolving against the request's
+  *directory* rather than its path — `/api/v4/?path=//other` where
+  [RFC 3986 §5.3][rfc3986-5.3] asks for `/api/v4/exists?path=//other`. A
+  reference with no path of its own keeps the base's, and a bare `#fragment`
+  keeps the base's query as well. Costs a `404` rather than a credential, since
+  the origin is the same either way — but a `404` for a request the proxy meant
+  to have answered.
 
 - **Added** `RedirectRefusal`, the reason a redirect was refused:
   `Credentials`, `Body` or `TooMany`. It is a field on
@@ -59,6 +88,13 @@
   `redirect_auth_headers` expresses that. A chain longer than ten hops is a
   loop rather than a route, and is refused as one.
 
+- **Fixed** `get_job_stderr` missing from the list of heavy commands, so a
+  launcher whose stderr fetch met a redirect was refused with no advice
+  attached — at the moment it was already diagnosing a failure. The list is the
+  cluster's `isHeavy` bit rather than an inventory of what this crate models,
+  which is why `read_file` and `read_blob_table` stay on it: `raw_command`
+  sends those, and the documentation on `raw_command_streaming` reads a file.
+
 - **Breaking** `ClientError` is now `#[non_exhaustive]`. A `match` over it must
   carry a `_` arm. The ways a cluster can refuse are the cluster's to add and
   not this crate's to freeze — every release so far has added one — so the
@@ -68,6 +104,7 @@
 
 [return-codes]: https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes
 [rfc3986]: https://www.rfc-editor.org/rfc/rfc3986#section-4.2
+[rfc3986-5.3]: https://www.rfc-editor.org/rfc/rfc3986#section-5.3
 
 ### An operation is no longer a string and four commands
 

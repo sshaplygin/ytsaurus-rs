@@ -297,11 +297,17 @@ impl Client {
 
     /// Overrides the request timeout, which defaults to two minutes.
     ///
-    /// For a buffered command the limit is end to end. A streaming transfer —
-    /// [`Client::read_table_streaming`], [`Client::write_table_rows`] and
-    /// their kin — is not cut off mid-table: there the timeout bounds each
-    /// wait *around* the data (connecting, sending the request, the response
-    /// headers), and the data itself moves for as long as it takes.
+    /// For a buffered command the limit is end to end, **redirects included**:
+    /// an attempt takes its deadline once and the hops it makes share what is
+    /// left of it, so a proxy that redirects cannot multiply the limit by the
+    /// length of the chain. A retry is a fresh attempt and gets a fresh budget,
+    /// which is what [`Client::with_retries`] bounds.
+    ///
+    /// A streaming transfer — [`Client::read_table_streaming`],
+    /// [`Client::write_table_rows`] and their kin — is not cut off mid-table:
+    /// there the timeout bounds each wait *around* the data (connecting,
+    /// sending the request, the response headers), and the data itself moves
+    /// for as long as it takes.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.transport.set_timeout(timeout);

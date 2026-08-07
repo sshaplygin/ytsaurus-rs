@@ -7,10 +7,16 @@
 //!
 //! That is the report these begin with, and not all of what they hold. This
 //! client follows redirects itself now, so the rest of the policy is here too:
-//! a redirect that stays on the same origin **is** followed, token and all; one
-//! on a request carrying a body is refused whether there is a token or not,
-//! because a redirect drops the body and a write that wrote nothing comes back
-//! looking like a write that worked.
+//! a redirect that stays on the same origin **is** followed, token and all, and
+//! so is the method and the body — a `POST create` met by a balancer's `301`
+//! arrives as a `POST create`. What is refused is a redirect on a body this
+//! client cannot send a second time, which is a body that is a *stream*: by the
+//! time the `3xx` arrives some of it has gone, and a write that arrived with no
+//! rows comes back looking like a write that worked.
+//!
+//! And the whole chain is bounded twice over — by ten hops, and by the
+//! command's own timeout, which the hops share rather than each being handed a
+//! copy of.
 //!
 //! None of this can be reproduced against the local cluster this repository
 //! tests with: it runs one proxy and redirects nothing. So it is reproduced
@@ -19,9 +25,11 @@
 //! in for the host it points at, which answers exactly the error the issue
 //! reports and **must never be reached**.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ytsaurus_client::{Client, ClientError, RedirectRefusal, RetryPolicy};
 
@@ -32,11 +40,19 @@ fn stub(reply: String) -> (String, Arc<Mutex<Vec<String>>>) {
 }
 
 /// As [`stub`], answering `replies` in order and repeating the last one.
+fn stub_answering(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    stub_answering_after(Duration::ZERO, replies)
+}
+
+/// As [`stub_answering`], taking `delay` to think about each request.
 ///
 /// Detached rather than joined: half of what these prove is that nobody
 /// connected at all, and there is nothing to wait for in that case. The thread
 /// ends with the test process.
-fn stub_answering(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+fn stub_answering_after(
+    delay: Duration,
+    replies: Vec<String>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
     let address = listener.local_addr().expect("has an address");
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -46,13 +62,14 @@ fn stub_answering(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
         let mut answered = 0_usize;
         while let Ok((mut stream, _)) = listener.accept() {
             let mut reader = BufReader::new(stream.try_clone().expect("clones"));
-            let head = read_head(&mut reader);
+            let request = read_request(&mut reader);
             let reply = &replies[answered.min(replies.len() - 1)];
             answered += 1;
             // Recorded before the reply goes out, so a client that has been
             // answered has already been counted: the assertions run after the
             // call returns, and would otherwise race it.
-            recorded.lock().expect("not poisoned").push(head);
+            recorded.lock().expect("not poisoned").push(request);
+            std::thread::sleep(delay);
             stream.write_all(reply.as_bytes()).ok();
             stream.flush().ok();
         }
@@ -61,12 +78,12 @@ fn stub_answering(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
     (format!("http://{address}"), seen)
 }
 
-/// Reads one request head, and stops there.
+/// Reads one request: the head, and the body when the head declares a length.
 ///
-/// The one request with a body is small enough to sit in the socket buffer
-/// while the reply goes out, and it is a request that must never be answered
-/// on its merits anyway.
-fn read_head(reader: &mut BufReader<TcpStream>) -> String {
+/// The body matters because a redirect is followed by sending the same request
+/// again — so whether the rows arrived at the second host is a question with an
+/// answer, rather than something taken on trust.
+fn read_request(reader: &mut BufReader<TcpStream>) -> String {
     let mut head = String::new();
     loop {
         let mut line = String::new();
@@ -77,7 +94,19 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> String {
             Err(_) => break,
         }
     }
-    head
+
+    let length = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let mut body = vec![0; length];
+    if reader.read_exact(&mut body).is_err() {
+        body.clear();
+    }
+    format!("{head}\r\n{}", String::from_utf8_lossy(&body))
 }
 
 /// The answer a control proxy gives a heavy read: go to that other host.
@@ -306,8 +335,17 @@ fn a_redirect_that_stays_on_the_host_is_followed_with_the_token() {
 fn a_redirect_that_never_arrives_anywhere_is_a_loop_and_not_a_route() {
     // The cost of following redirects here rather than leaving them to `ureq`
     // is that the bound is ours to keep. A balancer pointing at itself would
-    // otherwise be an unbounded loop inside one attempt, under a timeout that
-    // each hop resets.
+    // otherwise go round until the command's deadline ran out — two minutes by
+    // default, spent on a route that was never going to arrive.
+    //
+    // The assertions below are what keep it, and they are the only thing that
+    // does. Measured with `MAX_REDIRECTS` raised out of the way: **nothing
+    // hangs**. The stub gives out after about eight seconds of connections it
+    // cannot keep up with, and the run fails with a transport error — `Peer
+    // disconnected` — rather than with the refusal that should have arrived
+    // after ten hops. So read a failure here as "the bound is gone", not as
+    // "the stub is flaky", and do not expect a missing bound to announce
+    // itself by making the suite sit still.
     let (proxy, seen) = stub(redirect_with(
         301,
         "Moved Permanently",
@@ -333,14 +371,17 @@ fn a_redirect_that_never_arrives_anywhere_is_a_loop_and_not_a_route() {
 }
 
 #[test]
-fn a_write_is_not_redirected_into_a_successful_nothing() {
-    // No token, so nothing to leak — and the expensive failure anyway. A
-    // redirect rewrites a PUT into a GET and drops the body; the cluster
-    // answers the empty request, and `write_table` returns `Ok(())` having
-    // written no rows at all. A write that quietly wrote nothing is worse than
-    // one that failed.
+fn a_buffered_write_is_sent_again_rather_than_emptied() {
+    // The expensive failure this rule exists for: a redirect that rewrote the
+    // PUT into a GET and dropped the body, so `write_table` returned `Ok(())`
+    // having written no rows at all.
+    //
+    // Following the redirect *ourselves* answers it outright — the same method
+    // and the same rows go to the address the proxy named, which is what a
+    // `307` means and what a heavy redirect to a data proxy is for. So the
+    // assertion is not that the write was refused; it is that the rows arrived.
     let (elsewhere, elsewhere_seen) = stub(empty_answer());
-    let (proxy, _) = stub(redirect_with(
+    let (proxy, proxy_seen) = stub(redirect_with(
         302,
         "Found",
         &format!("{elsewhere}/api/v4/write_table"),
@@ -348,26 +389,111 @@ fn a_write_is_not_redirected_into_a_successful_nothing() {
     ));
 
     let client = Client::new(&proxy).with_retries(RetryPolicy::none());
-    let error = client
+    client
         .write_table("//tmp/t", b"{a=1};")
-        .expect_err("a redirect that would drop the rows is refused");
+        .expect("the rows are sent to where the redirect pointed");
+
+    let first = heads(&proxy_seen);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(
+        first[0].starts_with("PUT /api/v4/write_table"),
+        "{}",
+        first[0]
+    );
+
+    let followed = heads(&elsewhere_seen);
+    assert_eq!(followed.len(), 1, "the redirect was not followed");
+    assert!(
+        followed[0].starts_with("PUT /api/v4/write_table"),
+        "the method did not survive the hop: {}",
+        followed[0]
+    );
+    assert!(
+        followed[0].ends_with("{a=1};"),
+        "the rows were dropped on the way: {}",
+        followed[0]
+    );
+}
+
+#[test]
+fn a_streamed_write_is_refused_because_it_cannot_be_sent_twice() {
+    // The half of the old rule that survives, and the only half that was ever
+    // true. `write_table_rows` encodes as it sends: by the time the `3xx`
+    // arrives some of the body has gone, and a reader cannot be rewound. There
+    // is no request left to send to the second host, so nothing is sent.
+    let (elsewhere, elsewhere_seen) = stub(empty_answer());
+    let (proxy, _) = stub(redirect_with(
+        307,
+        "Temporary Redirect",
+        &format!("{elsewhere}/api/v4/write_table"),
+        "",
+    ));
+
+    let client = Client::new(&proxy).with_retries(RetryPolicy::none());
+    let error = client
+        .write_table_rows("//tmp/t", [BTreeMap::from([("a", 1_i64)])])
+        .expect_err("a body that cannot be replayed is refused");
 
     assert!(
         matches!(
             &error,
             ClientError::Redirected {
                 refusal: RedirectRefusal::Body,
-                status: 302,
+                status: 307,
                 ..
             }
         ),
         "{error:?}"
     );
+    // And the reason it gives is the reason it has: nothing about a `GET`, and
+    // nothing about a body that does not exist.
+    let message = error.to_string();
+    assert!(message.contains("read as it is sent"), "{message}");
     assert!(
         heads(&elsewhere_seen).is_empty(),
         "the rows were dropped on the way: {:?}",
         heads(&elsewhere_seen)
     );
+}
+
+#[test]
+fn a_bodiless_post_follows_a_canonicalising_balancer() {
+    // The promise the same-origin rule makes — "a balancer canonicalising its
+    // own host does not break every command" — was kept for `GET` only: the
+    // refusal tested the *method*, so every POST in the crate met a `301` with
+    // `RedirectRefusal::Body`, about a body that was not there. The head says
+    // `content-length: 0`.
+    //
+    // `307` because it is the code that settles the argument outright: it
+    // preserves the method and the body by definition, so there was never a
+    // body to be rewritten away.
+    let (proxy, seen) = stub_answering(vec![
+        redirect_with(307, "Temporary Redirect", "/api/v4/create", ""),
+        empty_answer(),
+    ]);
+
+    let client = Client::with_token(&proxy, "secret-token").with_retries(RetryPolicy::none());
+    client
+        .create("map_node", "//tmp/thing")
+        .expect("a bodiless POST has nothing to lose to a redirect");
+
+    let asked = heads(&seen);
+    assert_eq!(asked.len(), 2, "the redirect was not followed: {asked:?}");
+    for head in &asked {
+        assert!(
+            head.starts_with("POST /api/v4/create"),
+            "the command's verb did not survive the hop: {head}"
+        );
+        // The head that says there is no body to lose, on both hops. It is
+        // also what the refusal used to be reported about.
+        assert!(head.to_lowercase().contains("content-length: 0"), "{head}");
+        // Same origin, so the token goes: there is no host here it was not
+        // already addressed to.
+        assert!(
+            head.to_lowercase().contains("authorization: oauth"),
+            "{head}"
+        );
+    }
 }
 
 #[test]
@@ -444,6 +570,82 @@ fn the_hosts_lookup_refuses_a_redirect_too() {
         "{error:?}"
     );
     assert!(heads(&elsewhere_seen).is_empty(), "the token was forwarded");
+}
+
+/// A proxy that redirects to itself, slowly.
+///
+/// Every hop costs `HOP`, and the client is given a budget it cannot spend
+/// twice. The point of both timeout tests below: the deadline belongs to the
+/// command, not to the request, so a chain of hops shares one.
+const HOP: Duration = Duration::from_millis(300);
+/// Less than two hops, so a second one cannot finish inside it.
+const BUDGET: Duration = Duration::from_millis(400);
+/// Comfortably more than the budget and comfortably less than what eleven hops
+/// would cost — 3.3 s of them, plus whatever the machine is busy with.
+const PATIENCE: Duration = Duration::from_millis(1_500);
+
+#[test]
+fn a_redirect_chain_spends_the_commands_timeout_and_not_one_each() {
+    // `with_timeout` promises a limit that is end to end for a buffered
+    // command. Following redirects inside the transport is where that can be
+    // quietly lost: give each hop the full timeout and the real limit becomes
+    // eleven times the one the caller asked for — 22 minutes at the default
+    // two, on an `exists`.
+    let (proxy, seen) = stub_answering_after(
+        HOP,
+        vec![redirect_with(
+            301,
+            "Moved Permanently",
+            "/api/v4/exists?path=//tmp",
+            "",
+        )],
+    );
+
+    let client = Client::with_token(&proxy, "secret-token")
+        .with_retries(RetryPolicy::none())
+        .with_timeout(BUDGET);
+
+    let started = Instant::now();
+    let error = client.exists("//tmp").expect_err("the budget runs out");
+    let took = started.elapsed();
+
+    assert!(
+        took < PATIENCE,
+        "the command outlived its own timeout: {took:?} against a {BUDGET:?} budget, \
+         {} requests",
+        heads(&seen).len()
+    );
+    // And it says so as a timeout, which is what it is — not as a redirect
+    // refusal, which is what it would become if the chain were allowed to run
+    // to its bound.
+    let message = error.to_string();
+    assert!(
+        message.contains("timeout"),
+        "the deadline was reported as something else: {message}"
+    );
+}
+
+#[test]
+fn the_hosts_lookup_shares_one_budget_across_its_hops_too() {
+    // `/hosts` builds its own request and follows its own redirects, which is
+    // how it has come to miss things the command path had. It is also the
+    // lookup a caller reaches for *because* of a redirect, so a caller already
+    // waiting on one proxy should not wait eleven times over on the next.
+    let (proxy, _) = stub_answering_after(
+        HOP,
+        vec![redirect_with(301, "Moved Permanently", "/hosts", "")],
+    );
+
+    let client = Client::with_token(&proxy, "secret-token")
+        .with_retries(RetryPolicy::none())
+        .with_timeout(BUDGET);
+
+    let started = Instant::now();
+    let error = client.heavy_proxy().expect_err("the budget runs out");
+    let took = started.elapsed();
+
+    assert!(took < PATIENCE, "{took:?} against a {BUDGET:?} budget");
+    assert!(error.to_string().contains("timeout"), "{error}");
 }
 
 #[test]

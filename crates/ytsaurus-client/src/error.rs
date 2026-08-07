@@ -176,16 +176,25 @@ pub enum RedirectRefusal {
     )]
     Credentials,
 
-    /// The request carries a body.
+    /// The request body cannot be sent a second time.
     ///
-    /// A redirect rewrites a `POST` or a `PUT` into a `GET` and drops what it
-    /// carried, and the cluster answers that empty `GET` on its own terms. A
-    /// `write_table` that lost its rows on the way is the expensive case: it
-    /// comes back `Ok`, having written nothing.
+    /// A redirect is followed by sending the same request to the address it
+    /// named: same method, same payload. So a body is no reason to refuse one
+    /// — a bodiless `POST`, which is most of API v4, goes wherever it is
+    /// pointed, and a body held in memory goes with it.
+    ///
+    /// A body that is a **stream** cannot. `write_table` from an iterator and
+    /// every `raw_command_upload` read their body as it is sent, so by the
+    /// time the `3xx` arrives some of it has already gone and there is nothing
+    /// to rewind. Sending what is left would be a different request; sending
+    /// nothing is the expensive failure this refuses — a `write_table` that
+    /// arrived carrying no rows is answered much like one that succeeded.
     #[error(
-        "the request carries a body. A redirect rewrites it into a `GET` and \
-         drops the body with it, and a write that arrived carrying no rows is \
-         answered much like one that succeeded — which is worse than failing."
+        "the request body is read as it is sent, so this client cannot send it \
+         to the address the redirect named — a reader that has already begun \
+         to drain cannot be rewound. A write that arrived carrying no rows is \
+         answered much like one that succeeded, which is worse than failing. \
+         Send the body from memory, or address the host you meant to reach."
     )]
     Body,
 

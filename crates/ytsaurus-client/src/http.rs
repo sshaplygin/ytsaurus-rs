@@ -28,10 +28,10 @@
 //! well-formed output would go unnoticed either way: in practice a partial read
 //! reported as success.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use ureq::SendBody;
 use ureq::http::HeaderMap;
-use ureq::{AsSendBody, SendBody};
 use ytsaurus_yson::{YsonFormat, YsonValue, to_string};
 
 use crate::error::{ClientError, RedirectRefusal, Result, truncate};
@@ -57,14 +57,33 @@ const MAX_REDIRECTS: usize = 10;
 /// line for us — *"light commands only transmit command parameters within a
 /// query, but heavy commands write or read the data stream"* — and marks each
 /// of `read_table`, `write_table`, `read_file`, `write_file` and
-/// `read_blob_table` **Heavy**. `get_job_input` is here on the same definition
-/// rather than on a row of its own: its answer *is* the data stream, which is
-/// why this crate reads it through [`Transport::open`].
+/// `read_blob_table` **Heavy**. `get_job_input` and `get_job_stderr` are here
+/// on the same definition rather than on rows of their own: their answer *is*
+/// the data stream, which is why this crate reads the first through
+/// [`Transport::open`] and why `get_job_stderr` hands back bytes rather than
+/// text.
+///
+/// The list is what the **cluster** declares heavy, not what this crate
+/// happens to model: `read_file` and `read_blob_table` have no method here and
+/// are reachable through
+/// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming) —
+/// which is how the documentation on that method reads a file — so leaving
+/// them out would take the advice away from exactly the caller who went to the
+/// trouble of streaming.
 ///
 /// Used for one thing only — whether a refused redirect is told to go to a
 /// heavy proxy. A command sent through
 /// [`Client::raw_command`](crate::Client::raw_command) that is heavy and not
 /// listed here loses the advice, not the refusal.
+///
+/// **Merge marker.** `Repeatable` grows a `Heavy` variant on
+/// `feature/heavy-proxy-routing` (#38), which encodes the cluster's `isHeavy`
+/// bit for routing. The two lists say the same thing about the same commands
+/// and are written down twice, so **whoever merges that branch must check this
+/// list against every `Repeatable::Heavy` call site** and reconcile the two —
+/// a command routed to a heavy proxy but missing here is refused a redirect
+/// with `heavy: false`, and told nothing it can act on. There is no test to
+/// catch it from this side: `Repeatable::Heavy` does not exist on this branch.
 const HEAVY: &[&str] = &[
     "read_table",
     "write_table",
@@ -72,6 +91,7 @@ const HEAVY: &[&str] = &[
     "write_file",
     "read_blob_table",
     "get_job_input",
+    "get_job_stderr",
 ];
 /// The W3C trace context, in the spelling the proxy parses. See
 /// [`TraceContext`](crate::TraceContext).
@@ -136,6 +156,45 @@ pub(crate) enum Payload<'a> {
     Bytes(&'a [u8]),
 }
 
+/// The request body, in a form one request can send more than once.
+///
+/// `ureq`'s [`SendBody`] is one-shot by construction — it may be a reader that
+/// has already been drained — so following a redirect needs the body kept as
+/// something that can produce a fresh `SendBody` per hop. That is the whole
+/// difference between the two loaded variants, and the whole of what
+/// [`RedirectRefusal::Body`] now means.
+enum Outgoing<'a> {
+    /// No body at all — neither `Content-Length` nor `Transfer-Encoding`.
+    ///
+    /// [`Transport::open`]'s request, which is a `GET` for everything this
+    /// crate models and reaches `ureq`'s body-carrying builder only through
+    /// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming).
+    /// Distinct from `Bytes(&[])`, which is a body of length zero: what goes
+    /// on the wire differs, and this is the one that always sent nothing.
+    Empty,
+    /// Bytes held in memory, and so sent again to wherever a redirect points.
+    ///
+    /// An empty slice belongs here rather than in [`Outgoing::Empty`]: most of
+    /// API v4 carries its parameters in `X-YT-Parameters` and its payload
+    /// nowhere, and such a command has always gone out as `Content-Length: 0`.
+    /// A body of length zero is still a body a `GET` could not have carried —
+    /// and still nothing a redirect can lose.
+    Bytes(&'a [u8]),
+    /// A body read as it is sent — [`Client::write_table_rows`](crate::Client::write_table_rows)
+    /// and every [`Client::raw_command_upload`](crate::Client::raw_command_upload).
+    ///
+    /// A reader cannot be rewound, and by the time a `3xx` arrives some of it
+    /// has already gone out, so a redirect on one of these is refused.
+    Stream(&'a mut dyn std::io::Read),
+}
+
+impl Outgoing<'_> {
+    /// Whether a redirect on this request could send the same request again.
+    fn replayable(&self) -> bool {
+        !matches!(self, Outgoing::Stream(_))
+    }
+}
+
 /// A configured connection to one cluster.
 #[derive(Clone)]
 pub(crate) struct Transport {
@@ -143,8 +202,9 @@ pub(crate) struct Transport {
     base: String,
     token: Option<String>,
     retries: RetryPolicy,
-    /// End-to-end limit for buffered commands; per-phase limit for streaming
-    /// ones — see [`Transport::dispatch`].
+    /// End-to-end limit for buffered commands — one budget per attempt, shared
+    /// out between the redirect hops that attempt makes. Per-phase limit for
+    /// streaming ones. See [`Transport::dispatch`].
     timeout: Duration,
     /// Stamped onto every command, when the client is bound to a transaction.
     transaction: Option<String>,
@@ -333,11 +393,15 @@ impl Transport {
         parameters: &YsonValue,
         payload: &Payload<'_>,
     ) -> Result<Vec<u8>> {
-        let mut bytes: &[u8] = match payload {
-            Payload::None => &[],
-            Payload::Bytes(bytes) => bytes,
+        // Held as bytes rather than as a `SendBody`, so a redirect can send the
+        // same request again — see [`Outgoing`]. `None` is an empty slice and
+        // not `Outgoing::Empty`, which is what it has always been on the wire:
+        // `Content-Length: 0`.
+        let body = match payload {
+            Payload::None => Outgoing::Bytes(&[]),
+            Payload::Bytes(bytes) => Outgoing::Bytes(bytes),
         };
-        let mut response = self.dispatch(method, command, parameters, bytes.as_body(), false)?;
+        let mut response = self.dispatch(method, command, parameters, body, false)?;
 
         let status = response.status().as_u16();
         let body = response
@@ -390,7 +454,7 @@ impl Transport {
         // own to be timed and named. The span closes when the headers arrive —
         // the reader handed back is read after that, at the caller's pace.
         crate::retry::run(self.retries, Repeatable::Never, command, |_| {
-            let response = self.dispatch(method, command, parameters, SendBody::none(), true)?;
+            let response = self.dispatch(method, command, parameters, Outgoing::Empty, true)?;
             let status = response.status().as_u16();
 
             if !(200..300).contains(&status) {
@@ -436,7 +500,7 @@ impl Transport {
                 method,
                 command,
                 parameters,
-                SendBody::from_reader(&mut *rows),
+                Outgoing::Stream(&mut *rows),
                 true,
             )?;
             let status = response.status().as_u16();
@@ -488,21 +552,27 @@ impl Transport {
         crate::retry::run(self.retries, Repeatable::Freely, what, |_| {
             let mut url = first.clone();
             let mut hops = 0;
+            // One budget for the lookup, shared out between its hops — as in
+            // `dispatch`, and for the same reason.
+            let deadline = self.deadline(false);
 
             // `/hosts` is where a redirect would be most tempting to follow —
             // it is a lookup, not a command — and it carries the token like
             // everything else does. It goes through the same rules as a
             // command, and for the same reasons. The loop ends because
-            // `redirect` refuses past [`MAX_REDIRECTS`].
+            // `redirect` refuses past [`MAX_REDIRECTS`], or sooner because the
+            // deadline runs out.
             let mut response = loop {
-                let response = with_headers!(self.agent.get(&url), &self.caller)
-                    .call()
-                    .map_err(|e| ClientError::Transport {
-                        command: what.to_owned(),
-                        source: Box::new(e),
-                    })?;
+                let left = remaining(deadline, what)?;
+                let response =
+                    with_headers!(self.scoped(self.agent.get(&url), false, left), &self.caller)
+                        .call()
+                        .map_err(|e| ClientError::Transport {
+                            command: what.to_owned(),
+                            source: Box::new(e),
+                        })?;
 
-                match self.redirect(what, &response, &url, Method::Get, hops)? {
+                match self.redirect(what, &response, &url, true, hops)? {
                     Some(next) => {
                         if let Some(error) = tls_unavailable(&next) {
                             return Err(error);
@@ -549,12 +619,21 @@ impl Transport {
     /// connect, sending the request, the response headers — each stay bounded
     /// by the same timeout, so a dead proxy still fails promptly; only the
     /// body itself is open-ended.
+    ///
+    /// **A buffered command's timeout is end to end across the redirects too.**
+    /// The deadline is taken once, here, and every hop is given what is left of
+    /// it rather than a fresh copy — which is what `ureq` did while it was the
+    /// one following them, `Timeout::Global` covering the whole chain. Handing
+    /// each hop the full timeout instead would make the real limit
+    /// `(MAX_REDIRECTS + 1)` times the one the caller asked for: eleven times
+    /// two minutes for a balancer that points at itself, on a call that
+    /// promised two.
     fn dispatch(
         &self,
         method: Method,
         command: &str,
         parameters: &YsonValue,
-        body: SendBody<'_>,
+        mut body: Outgoing<'_>,
         streaming: bool,
     ) -> Result<ureq::http::Response<ureq::Body>> {
         if let Some(error) = tls_unavailable(&self.base) {
@@ -579,37 +658,56 @@ impl Transport {
             ("Content-Type", "application/octet-stream".to_owned()),
         ];
 
-        // Held in an `Option` because the loop below can send more than once
-        // and a body can be sent only the once — a `SendBody` may be a reader
-        // that has already been drained. Nothing but a GET is ever followed
-        // (see [`Transport::redirect`]), so nothing that has a body reaches a
-        // second attempt.
-        let mut body = Some(body);
-        // The loop ends because `redirect` refuses past [`MAX_REDIRECTS`].
+        // Taken once for the attempt, not once per hop. See the note above.
+        let deadline = self.deadline(streaming);
+        // The loop ends because `redirect` refuses past [`MAX_REDIRECTS`], and
+        // sooner than that because the deadline runs out.
         let mut hops = 0;
 
         loop {
+            let left = remaining(deadline, command)?;
+
+            // The method survives the hop, whatever the digit: `307` and `308`
+            // require it, and an API v4 command's verb belongs to the command
+            // — the reference derives it from whether the command mutates and
+            // whether it has an input stream, neither of which a `Location`
+            // changes. So does the body, when there is one that can be sent
+            // again; `redirect` refuses the hop when there is not.
             let sent = match method {
                 // A GET carries no body in `ureq`'s type system, which is also
                 // true of every command this client sends as one.
                 Method::Get => with_headers!(
-                    self.scoped(self.agent.get(&url), streaming),
+                    self.scoped(self.agent.get(&url), streaming, left),
                     &headers,
                     &self.caller
                 )
                 .call(),
-                Method::Post => with_headers!(
-                    self.scoped(self.agent.post(&url), streaming),
-                    &headers,
-                    &self.caller
-                )
-                .send(body.take().expect("a request with a body is sent once")),
-                Method::Put => with_headers!(
-                    self.scoped(self.agent.put(&url), streaming),
-                    &headers,
-                    &self.caller
-                )
-                .send(body.take().expect("a request with a body is sent once")),
+                // `post` and `put` build the same request type, so the body is
+                // chosen once for both. A fresh `SendBody` per hop rather than
+                // one taken out of an `Option`: that is what lets the same
+                // request go out twice, and `SendBody` cannot be reused.
+                Method::Post | Method::Put => {
+                    let request = with_headers!(
+                        self.scoped(
+                            match method {
+                                Method::Put => self.agent.put(&url),
+                                _ => self.agent.post(&url),
+                            },
+                            streaming,
+                            left
+                        ),
+                        &headers,
+                        &self.caller
+                    );
+
+                    match &mut body {
+                        Outgoing::Empty => request.send(SendBody::none()),
+                        Outgoing::Bytes(bytes) => request.send(*bytes),
+                        Outgoing::Stream(reader) => {
+                            request.send(SendBody::from_reader(&mut **reader))
+                        }
+                    }
+                }
             };
 
             let response = sent.map_err(|e| ClientError::Transport {
@@ -620,7 +718,7 @@ impl Transport {
             // Before the cluster's own error, because a redirect is not the
             // cluster reporting a failure — it is this client deciding where a
             // request goes, which is a fact no `X-YT-Error` could carry.
-            if let Some(next) = self.redirect(command, &response, &url, method, hops)? {
+            if let Some(next) = self.redirect(command, &response, &url, body.replayable(), hops)? {
                 // The same guard the first address got: a same-origin redirect
                 // cannot change the scheme, but nothing here assumes that.
                 if let Some(error) = tls_unavailable(&next) {
@@ -684,12 +782,19 @@ impl Transport {
     /// followed: nothing new learns the token by it, and a balancer
     /// canonicalising its own host would otherwise break every command.
     ///
-    /// **A redirect on a request with a body is refused whatever it carries.**
-    /// A redirect rewrites a `POST` or `PUT` into a `GET` and drops the body;
-    /// the cluster answers that empty request on its own terms, and a
-    /// `write_table` that arrived with no rows comes back looking like a write
-    /// that worked. That one costs data rather than a credential, so it does
-    /// not wait for a token to be present.
+    /// **A redirect on a body this client cannot send again is refused.** Not
+    /// on a body: on an *unrepeatable* one. Following a redirect here means
+    /// sending the same request to the address it named — same method, same
+    /// payload — which is what `307` and `308` require and what an API v4
+    /// command needs whatever the digit, since a command's verb is a property
+    /// of the command. A payload held as bytes goes out again and nothing is
+    /// lost. A payload that is a *reader* — [`Transport::upload`], so
+    /// `write_table` from an iterator and every `raw_command_upload` — has
+    /// already begun to drain into the first request by the time the `3xx`
+    /// arrives, and cannot be rewound. That one is refused, with or without a
+    /// token: dropping the rows and reporting the answer to an empty request
+    /// is how a write that wrote nothing comes back looking like one that
+    /// worked.
     ///
     /// **A chain that does not end is refused.** [`MAX_REDIRECTS`] hops, then
     /// it is a loop rather than a route.
@@ -709,7 +814,7 @@ impl Transport {
         command: &str,
         response: &ureq::http::Response<ureq::Body>,
         request_url: &str,
-        method: Method,
+        replayable: bool,
         hops: usize,
     ) -> Result<Option<String>> {
         let status = response.status();
@@ -743,7 +848,7 @@ impl Transport {
         if self.token.is_some() && !same_origin(request_url, &target) {
             return refused(RedirectRefusal::Credentials);
         }
-        if !matches!(method, Method::Get) {
+        if !replayable {
             return refused(RedirectRefusal::Body);
         }
         if hops >= MAX_REDIRECTS {
@@ -786,18 +891,40 @@ impl Transport {
         self.caller = headers;
     }
 
-    /// Applies the streaming timeout override to one request.
+    /// When one attempt of a command must be finished by.
     ///
-    /// The end-to-end deadline comes off; every phase before the data — DNS,
-    /// connect, sending the request, waiting for the response headers — keeps
-    /// the same bound individually. See [`Transport::dispatch`].
+    /// `None` for a streaming transfer, which is bounded per phase instead —
+    /// and for a timeout so large that no `Instant` can express its deadline,
+    /// where the agent's own `timeout_global` is left to do the bounding.
+    fn deadline(&self, streaming: bool) -> Option<Instant> {
+        if streaming {
+            return None;
+        }
+        Instant::now().checked_add(self.timeout)
+    }
+
+    /// Bounds one request: what is left of the command's deadline, or the
+    /// per-phase limits a streaming transfer gets instead.
+    ///
+    /// For a streaming request the end-to-end deadline comes off and every
+    /// phase before the data — DNS, connect, sending the request, waiting for
+    /// the response headers — keeps the same bound individually. For a
+    /// buffered one `left` is the remainder of the deadline taken in
+    /// [`Transport::dispatch`], so a redirect chain spends one budget between
+    /// its hops rather than one apiece.
     fn scoped<Any>(
         &self,
         request: ureq::RequestBuilder<Any>,
         streaming: bool,
+        left: Option<Duration>,
     ) -> ureq::RequestBuilder<Any> {
         if !streaming {
-            return request;
+            return match left {
+                Some(left) => request.config().timeout_global(Some(left)).build(),
+                // No deadline to share out — the agent's own global timeout
+                // still applies.
+                None => request,
+            };
         }
         request
             .config()
@@ -807,6 +934,26 @@ impl Transport {
             .timeout_send_request(Some(self.timeout))
             .timeout_recv_response(Some(self.timeout))
             .build()
+    }
+}
+
+/// What is left of `deadline` for the next request.
+///
+/// `Ok(None)` when there is no deadline to share out, and `Err` when the
+/// command has already spent it — reported the way `ureq` reports the same
+/// exhaustion from inside a request, so that a caller sees one answer whether
+/// the budget ran out mid-request or between two hops of a redirect chain.
+fn remaining(deadline: Option<Instant>, command: &str) -> Result<Option<Duration>> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+
+    match deadline.checked_duration_since(Instant::now()) {
+        Some(left) if !left.is_zero() => Ok(Some(left)),
+        _ => Err(ClientError::Transport {
+            command: command.to_owned(),
+            source: Box::new(ureq::Error::Timeout(ureq::Timeout::Global)),
+        }),
     }
 }
 
@@ -906,8 +1053,17 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// The four forms of [RFC 3986 §4.2](https://www.rfc-editor.org/rfc/rfc3986#section-4.2),
 /// in the order they are tried: an absolute URI keeps its own scheme and
 /// authority; a network-path reference (`//host/path`) keeps the scheme; an
-/// absolute-path reference (`/path`) keeps scheme and authority; anything else
-/// is relative to the directory of the request's path.
+/// absolute-path reference (`/path`) keeps scheme and authority; a relative
+/// reference keeps everything down to the directory the request's path is in.
+///
+/// The last of those has two forms with **no path of their own**, and
+/// [§5.3](https://www.rfc-editor.org/rfc/rfc3986#section-5.3) is explicit that
+/// they keep the base's: `Location: ?path=//other` against
+/// `/api/v4/exists?path=//tmp` is `/api/v4/exists?path=//other`, not
+/// `/api/v4/?path=//other`, and `Location: #frag` keeps the query as well.
+/// Getting that wrong costs a `404` rather than a credential — the origin is
+/// the same either way — but it is a `404` for a request the proxy meant to
+/// answer.
 ///
 /// `None` for a `Location` this cannot place — an empty one, or a request
 /// address with no `scheme://`. The caller treats that as "not a redirect this
@@ -923,7 +1079,7 @@ fn resolve(request: &str, location: &str) -> Option<String> {
 
     let (scheme, rest) = request.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(end);
+    let (authority, target) = rest.split_at(end);
     if authority.is_empty() {
         return None;
     }
@@ -935,9 +1091,23 @@ fn resolve(request: &str, location: &str) -> Option<String> {
         return Some(format!("{scheme}://{authority}{location}"));
     }
 
-    // Relative to the directory the request's path is in, with the query
-    // string dropped: it belonged to the old path.
-    let path = path.split(['?', '#']).next().unwrap_or("");
+    // The base's path and query, without the fragment: a fragment is never
+    // part of what a reference is resolved against.
+    let base = target.split('#').next().unwrap_or("");
+    let path = base.split('?').next().unwrap_or("");
+
+    // A reference with no path of its own keeps the base's — and a bare
+    // fragment keeps the base's query too, where a query of its own replaces
+    // it.
+    if location.starts_with('#') {
+        return Some(format!("{scheme}://{authority}{base}{location}"));
+    }
+    if location.starts_with('?') {
+        return Some(format!("{scheme}://{authority}{path}{location}"));
+    }
+
+    // A relative path is merged with the directory the base's path is in, and
+    // takes the query with it: that one belonged to the old path.
     let directory = path.rsplit_once('/').map_or("", |(head, _)| head);
     Some(format!("{scheme}://{authority}{directory}/{location}"))
 }
@@ -1145,6 +1315,32 @@ mod tests {
             resolve(request, "read_table").as_deref(),
             Some("http://proxy.example.net:8000/api/v4/read_table")
         );
+        // A reference with no path of its own keeps the request's — RFC 3986
+        // §5.3. Dropping it back to the directory turns a rewritten command
+        // into a `404` on `/api/v4/`.
+        assert_eq!(
+            resolve(request, "?path=//other").as_deref(),
+            Some("http://proxy.example.net:8000/api/v4/exists?path=//other")
+        );
+        // A bare fragment keeps the query too.
+        assert_eq!(
+            resolve(request, "#frag").as_deref(),
+            Some("http://proxy.example.net:8000/api/v4/exists?path=//tmp#frag")
+        );
+        // The base's own fragment is never part of what is resolved against.
+        assert_eq!(
+            resolve("http://h/api/v4/exists?path=//tmp#old", "?path=//other").as_deref(),
+            Some("http://h/api/v4/exists?path=//other")
+        );
+        // Nothing to be relative to but the root.
+        assert_eq!(
+            resolve("http://h", "?path=//tmp").as_deref(),
+            Some("http://h?path=//tmp")
+        );
+        assert_eq!(
+            resolve("http://h", "read_table").as_deref(),
+            Some("http://h/read_table")
+        );
         // Whitespace is header padding, not part of the address.
         assert_eq!(
             resolve(request, "  /hosts  ").as_deref(),
@@ -1198,11 +1394,51 @@ mod tests {
     fn the_heavy_commands_are_the_ones_that_carry_a_stream() {
         // The advice a refused redirect ends with is "go to a heavy proxy",
         // which only a heavy command can act on.
-        for command in ["read_table", "write_table", "write_file", "get_job_input"] {
+        //
+        // Every command this crate itself sends heavily is here. `get_job_stderr`
+        // was the one that was not, and it is the one a launcher reaches for
+        // while it is already diagnosing a failure — the worst moment to be
+        // handed a refusal with no advice in it. See the merge marker on
+        // [`HEAVY`]: #38 writes the same fact down a second time.
+        for command in [
+            "read_table",
+            "write_table",
+            "write_file",
+            "get_job_input",
+            "get_job_stderr",
+        ] {
             assert!(HEAVY.contains(&command), "{command}");
         }
-        for command in ["create", "exists", "start_operation", "hosts"] {
+        // And the ones reachable only through the raw door, which is the point
+        // of listing what the cluster calls heavy rather than what this crate
+        // models: the documentation on `raw_command_streaming` reads a file.
+        for command in ["read_file", "read_blob_table"] {
+            assert!(HEAVY.contains(&command), "{command}");
+        }
+        for command in ["create", "exists", "start_operation", "get_job", "hosts"] {
             assert!(!HEAVY.contains(&command), "{command}");
         }
+    }
+
+    #[test]
+    fn a_deadline_is_shared_out_and_then_refused() {
+        let command = "exists";
+        // No deadline: nothing to share out, and nothing to refuse.
+        assert!(remaining(None, command).expect("no deadline").is_none());
+
+        let ahead = Instant::now() + Duration::from_secs(30);
+        let left = remaining(Some(ahead), command)
+            .expect("still time")
+            .expect("a bound");
+        assert!(left <= Duration::from_secs(30) && left > Duration::from_secs(29));
+
+        // Spent. Reported as the timeout it is, and as a `Transport` error, so
+        // the retry policy treats it exactly as it treats one that happened
+        // inside a request.
+        let error = remaining(Some(Instant::now() - Duration::from_millis(1)), command)
+            .expect_err("the budget is gone");
+        assert!(matches!(error, ClientError::Transport { .. }), "{error:?}");
+        assert!(error.to_string().contains("timeout"), "{error}");
+        assert!(crate::retry::is_retriable(&error), "{error:?}");
     }
 }
