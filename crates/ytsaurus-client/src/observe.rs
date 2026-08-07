@@ -173,9 +173,18 @@ pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attem
 /// test in this process can read back, in the half of the file the test module
 /// below is not compiled for. It could be emptied to `{}` with every test in
 /// the workspace green, and it is the whole of what a default build says about
-/// a cache it has given up on. Written once, the only thing left to empty is
-/// this, and emptying it takes the `WARN` event with it — which the tests do
-/// hold.
+/// a cache it has given up on.
+///
+/// Written once, the *decision* is held in both configurations by
+/// [`cache_fallback`], and with `tracing` on, emptying this body also takes the
+/// `WARN` event the tests assert. **What is still not held is the `eprintln!`
+/// itself in the default build.** Replacing it with `let _ = cache_fallback(…)`
+/// leaves the suite green and clippy quiet, and no test here can catch that:
+/// stderr is a descriptor this process cannot read back, so observing it means
+/// a subprocess rather than a unit test. What was won is that the line's
+/// *content* and the choice to emit it are pinned; what is left unguarded is
+/// one call, which is a smaller hole than the one it replaced but is not no
+/// hole. Do not read the tests below as covering it.
 ///
 /// [`Client::with_file_cache`]: crate::Client::with_file_cache
 /// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
