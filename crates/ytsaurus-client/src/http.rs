@@ -895,6 +895,7 @@ fn bundle(path: &Path) -> Result<ureq::tls::TlsConfig, String> {
 
     let mut certs: Vec<Certificate<'static>> = Vec::new();
     let mut unparsable = 0usize;
+    let mut damaged: Option<String> = None;
 
     for item in parse_pem(&pem) {
         match item {
@@ -903,8 +904,27 @@ fn bundle(path: &Path) -> Result<ureq::tls::TlsConfig, String> {
             // A private key, or a section this `ureq` does not recognise. Not a
             // root, and not a mistake either: a deployment that keeps its key
             // and its CA in one file is ordinary.
-            _ => {}
+            Ok(_) => {}
+            // A section that did not survive the envelope: corrupt base64, or a
+            // file that stops mid-block. Counted rather than skipped, because
+            // skipping it is the silent truncation this whole function exists
+            // to end — the roots would simply be fewer than the file says, and
+            // the first request would fail `UnknownIssuer` naming neither.
+            // Ordinary bundles do not reach here: leading comments and labels
+            // between blocks parse cleanly, so this is damage, not decoration.
+            Err(why) => {
+                damaged.get_or_insert_with(|| why.to_string());
+            }
         }
+    }
+
+    if let Some(why) = damaged {
+        return Err(format!(
+            "{CA_BUNDLE} names {shown}, which holds a section that could not be read: {why}. A \
+             truncated download or a mangled copy-paste is the usual cause; the roots that did \
+             parse are deliberately not used, because a bundle that is quietly shorter than the \
+             file names is worse than one that is refused"
+        ));
     }
 
     if unparsable > 0 {
@@ -1357,6 +1377,40 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
 
         assert!(refusal.contains("2 of 3"), "{refusal}");
         assert!(refusal.contains(&file.shown()), "{refusal}");
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn a_block_that_did_not_survive_the_envelope_refuses_the_file_too() {
+        // The other half of the same truncation: a section that never decodes
+        // at all. `parse_pem` yields `Err` for it and the roots that did parse
+        // are still perfectly good — which is exactly the trap, because a store
+        // that is quietly shorter than the file fails later, as `UnknownIssuer`
+        // against a cluster that is not at fault.
+        //
+        // Ordinary bundles do not land here: a leading comment or a label
+        // between blocks parses without complaint. Only damage does.
+        for (what, body) in [
+            (
+                "corrupt base64",
+                format!(
+                    "{CA_PEM}-----BEGIN CERTIFICATE-----\n!!!! not base64 !!!!\n\
+                     -----END CERTIFICATE-----\n{CA_PEM}"
+                ),
+            ),
+            (
+                "a file that stops mid-block",
+                format!("{CA_PEM}-----BEGIN CERTIFICATE-----\nMIIB"),
+            ),
+        ] {
+            let file = TempPem::new(&body);
+            let refusal = bundle(file.path()).err().unwrap_or_else(|| {
+                panic!("{what} should refuse the file rather than shorten the store")
+            });
+
+            assert!(refusal.contains(&file.shown()), "{what}: {refusal}");
+            assert!(refusal.contains("could not be read"), "{what}: {refusal}");
+        }
     }
 
     #[test]
