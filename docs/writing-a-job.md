@@ -248,6 +248,16 @@ The name has to be passed along: a cached node is named after its hash, and
 `./my_job` would find nothing to run without it. `worker.uploaded` says whether
 this call was a miss.
 
+`worker.cached` says something else, and the two are not the same question. On
+an installation that keeps `//tmp/yt_wrapper/file_storage` to itself an ordinary
+user may only read it, and the cluster answers the upload into it with `Access
+denied`; the client warns, uploads the worker under `//tmp` instead and the
+launch goes on. `cached` is false there and true both for a hit and for an
+upload the cache accepted — so it, not `uploaded`, is what to check before
+removing the node afterwards: on an ordinary cluster that node is the shared
+cache entry, and deleting it evicts the binary for everybody.
+`Client::with_file_cache` points the cache somewhere writable.
+
 ### What the cluster puts in a job's environment
 
 Captured from a job on a local cluster, not from documentation:
