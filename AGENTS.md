@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 538 tests
+cargo test --workspace            # 551 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -537,11 +537,20 @@ and the documentation disagreed and the source is what settles it.
   not.** From the [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload):
   "A good strategy is to re-query the `/hosts` list every minute or every few
   queries and change the current proxy to which queries are made." This client
-  asks once and keeps the answer for the client's lifetime
-  (`Transport::base_for`), re-asking only when the proxy it chose stops
-  answering. That is a deliberate deviation, recorded in
+  asks once and keeps the whole answer for the client's lifetime
+  (`Transport::base_for`), re-asking only when every name in it has failed.
+  That is a deliberate deviation, recorded in
   [docs/sdk-comparison.md](docs/sdk-comparison.md); it trades load-balancing
   quality for one round trip per client.
+- **A failed heavy command moves to the next name in the answer, not back to
+  the configured address.** The distinction is the whole feature: with separate
+  roles the configured address is a control proxy, so falling back there
+  answers one transient 503 with a window of guaranteed refusals — issue #30
+  reproduced on demand. Only an answer whose every name has failed falls back,
+  and then for `HOSTS_RETRY_AFTER` before the cluster is asked again. A proxy
+  that refuses heavy work *because of its role* counts as failed too:
+  `retry::worth_asking_again` says so where `is_retriable` cannot, which is why
+  the two predicates are separate.
 - An empty or absent list means "the configured address serves everything",
   which is what a single-node cluster is. **A cluster on loopback is not asked
   at all**: what it publishes for itself is an address behind the port mapping
@@ -551,10 +560,22 @@ and the documentation disagreed and the source is what settles it.
 - **A name from `/hosts` is checked before it is used.** The documentation says
   nothing at all about which hosts a token may be sent to — the `/hosts` flow
   and the `Authorization: OAuth` header are documented on the same page and
-  never connected — so the answer is this client's to choose, and it chooses
-  the conservative one: same domain as the configured address, scheme and port
-  from the configured address, no `://`, `/`, `@` or whitespace.
-  `Client::with_heavy_proxies_anywhere` opts out of the domain rule alone.
+  never connected — so the answer is this client's to choose: same domain as the
+  configured address, scheme and port from the configured address, no `://`,
+  `/`, `@` or whitespace, and a bracketed name only for an IPv6 literal (`ureq`
+  3.3 hands `[not.an.ip]` straight to the resolver, so accepting it buys a
+  permanently unresolvable address).
+  **The domain rule is a typo guard, not a token boundary** — say so when
+  writing about it. Steering the `/hosts` body means owning the proxy (which
+  has the token) or the wire (which reads it off every light command), and a
+  suffix rule with no public-suffix list treats every tenant of a hosting
+  platform as a neighbour. `Client::with_heavy_proxies_in` is the version that
+  is a boundary; `Client::with_heavy_proxies_anywhere` removes the rule.
+- **A configured name with no dot is matched as a label.** `YT_PROXY=hume` is
+  the ordinary spelling and has no parent domain, so the domain rule
+  degenerated to "the name itself" and refused
+  `["n0008-sas.hume.yt.yandex.net"]` in full and for good. It now has to appear
+  as a label of the discovered name and not as its leftmost one.
 
 ### Connections
 

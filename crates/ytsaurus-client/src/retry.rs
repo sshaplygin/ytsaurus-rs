@@ -199,6 +199,17 @@ impl RetryPolicy {
         self
     }
 
+    /// Whether this policy says anything out loud at all.
+    ///
+    /// Read by the transport as well as by [`run`]: the one thing the client
+    /// announces that is not a retry — a `/hosts` answer it declined, see
+    /// [`crate::observe::declined`] — has to be muted by the same switch, for
+    /// the same reason. A job's stderr is the cluster's bounded diagnostic
+    /// buffer whatever the client is talking about.
+    pub(crate) fn reports(self) -> bool {
+        self.report
+    }
+
     /// How long to wait after the `attempt`-th failure, counting from one.
     fn backoff(self, attempt: u32) -> Duration {
         let doubled = self
@@ -385,10 +396,28 @@ fn contains_retriable_code(value: &serde_json::Value) -> bool {
 /// and is therefore judged retriable — correct for the variants that exist on
 /// this branch, and wrong the moment the other two do.
 pub(crate) fn worth_asking_again(error: &ClientError) -> bool {
-    is_retriable(error)
+    is_retriable(error) || refused_for_being_the_wrong_proxy(error)
     // The one-line addition, once #36 is in the tree:
     //
     //     || matches!(error, ClientError::Redirected { .. })
+}
+
+/// Whether the proxy refused this because of the **role it has**.
+///
+/// The purest case of "waiting would not help and asking somewhere else would",
+/// and the reason the two predicates are separate. `Control proxy may not serve
+/// heavy requests with input data` arrives as an ordinary cluster error with
+/// code 1, which [`is_retriable`] correctly judges hopeless: sending it there
+/// again will be refused again, forever. Asking the *coordinator* again, on the
+/// other hand, is the entire fix — and a client that has been routed onto a
+/// control proxy (an operator can change `default_role_filter`, and `/hosts`
+/// then lists proxies that refuse this) would otherwise keep that address for
+/// its whole life and fail every heavy command with it.
+fn refused_for_being_the_wrong_proxy(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Cluster { message, .. } if message.contains(crate::http::CONTROL_REFUSAL)
+    )
 }
 
 /// Whether a fresh client should announce its retries.
@@ -539,6 +568,21 @@ mod tests {
             assert!(is_retriable(&worth_waiting), "{worth_waiting}");
             assert!(worth_asking_again(&worth_waiting), "{worth_waiting}");
         }
+
+        // And the case that makes the split earn its keep: a proxy refusing a
+        // heavy command because of the role it has. Waiting cannot help — it
+        // will refuse the next one identically, forever — and asking the
+        // coordinator for another proxy is the entire fix. `/hosts` lists
+        // whatever `default_role_filter` says, which an operator can change, so
+        // a control proxy really can turn up in the answer.
+        let wrong_proxy = ClientError::Cluster {
+            command: "write_table".to_owned(),
+            code: 1,
+            message: "Control proxy may not serve heavy requests with input data".to_owned(),
+            raw: r#"{"code":1}"#.to_owned(),
+        };
+        assert!(!is_retriable(&wrong_proxy), "{wrong_proxy}");
+        assert!(worth_asking_again(&wrong_proxy), "{wrong_proxy}");
 
         // And a settled answer is settled for both. A cluster with no `/hosts`
         // endpoint answers 404 every time, so the lookup is remembered as

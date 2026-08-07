@@ -828,7 +828,35 @@ enum Hosts {
     Status(u16),
     /// Accepts the question and never answers it.
     Hang,
+    /// Answers this body, eventually — a cluster slower than the budget.
+    Slow(std::time::Duration, String),
 }
+
+/// What a stand-in proxy does with a **heavy** command.
+///
+/// The default stub serves everything, which is a single-node installation and
+/// most of this file. It is also, for the tests that are about routing, a stub
+/// that cannot fail the way the real thing does: a control proxy refuses a
+/// heavy request outright, so a client that stopped routing looks exactly like
+/// one that never did unless the stub refuses too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Serves every command, whatever its weight.
+    Any,
+    /// Refuses a heavy command the way a real control proxy does.
+    Control,
+}
+
+/// The commands a control proxy will not serve, from the cluster's own registry
+/// — the `isHeavy` column of `REGISTER_ALL` in `driver.cpp`.
+const HEAVY_COMMANDS: &[&str] = &[
+    "write_table",
+    "write_file",
+    "read_table",
+    "read_file",
+    "get_job_input",
+    "get_job_stderr",
+];
 
 impl Proxy {
     /// A proxy that answers `/hosts` with `hosts`, or with 404 when given
@@ -839,6 +867,16 @@ impl Proxy {
 
     /// A proxy that answers `/hosts` one way and commands with `commands`.
     fn answering(hosts: Hosts, commands: u16) -> Self {
+        Self::in_role(hosts, commands, Role::Any)
+    }
+
+    /// A **control** proxy: it names heavy proxies and serves none of their
+    /// work itself.
+    fn control(hosts: String) -> Self {
+        Self::in_role(Hosts::List(hosts), 200, Role::Control)
+    }
+
+    fn in_role(hosts: Hosts, commands: u16, role: Role) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let address = listener.local_addr().expect("has an address");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -852,7 +890,7 @@ impl Proxy {
                 // One thread per connection: `ureq` pools them, and a client
                 // that opened a second while the first sat idle would deadlock
                 // against a server that answered them in turn.
-                std::thread::spawn(move || serve(stream, hosts, commands, seen));
+                std::thread::spawn(move || serve(stream, hosts, commands, role, seen));
             }
         });
 
@@ -893,6 +931,7 @@ fn serve(
     mut stream: std::net::TcpStream,
     hosts: Hosts,
     commands: u16,
+    role: Role,
     seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clones"));
@@ -927,6 +966,9 @@ fn serve(
         }
 
         let asked_where_to_go = head.starts_with("GET /hosts ");
+        let heavy = HEAVY_COMMANDS
+            .iter()
+            .any(|command| head.contains(&format!("/api/v4/{command} ")));
         seen.lock().expect("nothing panicked holding it").push(head);
 
         let answer = if asked_where_to_go {
@@ -938,7 +980,13 @@ fn serve(
                     hung.push(stream.try_clone().expect("clones"));
                     continue;
                 }
+                Hosts::Slow(delay, list) => {
+                    std::thread::sleep(*delay);
+                    reply(200, list.as_bytes())
+                }
             }
+        } else if role == Role::Control && heavy {
+            refusal()
         } else {
             reply(commands, br#"{"value"=%true}"#)
         };
@@ -959,6 +1007,18 @@ fn reply(status: u16, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     reply.extend_from_slice(body);
     reply
+}
+
+/// What a control proxy answers a heavy request with input data.
+///
+/// The cluster's own shape, from `TContext::TryRedirectHeavyRequests`: **503**
+/// with `Retry-After`, carrying the reason in an `X-YT-Error` document — which
+/// is where this client reads it, so the status is not what the caller sees.
+fn refusal() -> Vec<u8> {
+    let error =
+        r#"{"code":1,"message":"Control proxy may not serve heavy requests with input data"}"#;
+    format!("HTTP/1.1 503 .\r\nContent-Length: 0\r\nRetry-After: 60\r\nX-YT-Error: {error}\r\n\r\n")
+        .into_bytes()
 }
 
 /// An address nothing is listening on, for a proxy that has gone away.
@@ -1243,8 +1303,14 @@ fn a_settled_lookup_survives_a_failed_upload() {
     // about the lookup — the caller chose the address, and there is no other
     // answer to go back for. Forgetting here would restart a settled question
     // on every 503, which is the opposite of what the fallback is for.
+    //
+    // **With the retry window set to nothing**, which is what makes this test
+    // its name. At ten seconds a forgotten answer and a settled one look
+    // identical for the whole life of the test: the state could be written as
+    // `FellBack` here, or the guard that keeps this code out of a settled
+    // lookup could be deleted outright, and this assertion would still pass.
     let control = Proxy::answering(Hosts::Absent, 503);
-    let client = discovering(&control);
+    let client = discovering(&control).with_hosts_retry_after(std::time::Duration::ZERO);
 
     assert!(client.write_table("//tmp/t", b"").is_err());
     assert!(client.write_table("//tmp/t", b"").is_err());
@@ -1257,6 +1323,254 @@ fn a_settled_lookup_survives_a_failed_upload() {
             "PUT /api/v4/write_table HTTP/1.1",
         ],
         "a settled lookup was restarted by a failure that had nothing to do with it"
+    );
+}
+
+#[test]
+fn a_lookup_that_did_not_settle_is_asked_again_and_a_settled_one_is_not() {
+    // The distinction the whole `HeavyProxy` enum turns on, and the one nothing
+    // could see: with the window fixed at ten seconds, no test in this suite
+    // outlived one, so `Configured` and `FellBack` were observationally
+    // identical — either could be written where the other was, and every test
+    // stayed green. Set the window to nothing and the two say different things
+    // about the very next upload.
+    //
+    // 404 is deterministic, so asking again would cost a round trip per upload
+    // and buy nothing. 503 says only "not now".
+    let settled = Proxy::answering(Hosts::Absent, 200);
+    let client = discovering(&settled).with_hosts_retry_after(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        settled.requests(),
+        [
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ],
+        "a settled answer was asked about again"
+    );
+
+    // An answer this client declines in full is settled too: the names will be
+    // the same names next time, and the domain rule the same rule.
+    let refused = Proxy::new(Some(r#"["n0132-sas.somewhere-else.net"]"#.to_owned()));
+    let client = discovering(&refused).with_hosts_retry_after(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        refused.requests(),
+        [
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ],
+        "an answer that was declined in full was asked for again"
+    );
+
+    let unsettled = Proxy::answering(Hosts::Status(503), 200);
+    let client = discovering(&unsettled).with_hosts_retry_after(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        unsettled.requests(),
+        [
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+            "GET /hosts HTTP/1.1",
+            "PUT /api/v4/write_table HTTP/1.1",
+        ],
+        "a lookup that failed for a reason that might pass was never repeated"
+    );
+}
+
+#[test]
+fn the_control_proxy_in_these_tests_refuses_a_heavy_command_as_a_real_one_does() {
+    // Everything below depends on this. A stub that cheerfully serves every
+    // upload cannot tell a client that routed from one that did not, so a
+    // regression that sends heavy commands back to the control proxy — the
+    // whole of #30 — is invisible against it.
+    let control = Proxy::control("[]".to_owned());
+
+    let error = Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .write_table("//tmp/t", b"")
+        .expect_err("a control proxy refuses a heavy request with input data");
+
+    assert!(
+        error
+            .to_string()
+            .contains("Control proxy may not serve heavy requests with input data"),
+        "{error}"
+    );
+    // And the refusal says what the cluster cannot: that this client sent it
+    // here on purpose, and which switch changes that.
+    assert!(
+        error.to_string().contains("with_proxy_discovery"),
+        "the refusal says nothing about the routing that would have avoided it: {error}"
+    );
+}
+
+#[test]
+fn a_proxy_that_stumbles_is_dropped_for_the_next_one_not_for_the_control_proxy() {
+    // The failure that arrived through the fix for the previous one. A data
+    // proxy answering a single transient 503 — a drain, a restart — used to
+    // send the client back to the *configured* address for ten seconds, and on
+    // the deployment this feature was written for that address is a balancer in
+    // front of the control proxies. So every heavy command in that window was
+    // answered `Control proxy may not serve heavy requests with input data`:
+    // #30 itself, reproducible on demand, once per hiccup.
+    //
+    // `/hosts` had already named the alternatives. Now they are used.
+    let second = Proxy::new(None);
+    let first = Proxy::answering(Hosts::Absent, 503);
+    let control = Proxy::control(format!(r#"["{}", "{}"]"#, first.host(), second.host()));
+    let client = discovering(&control);
+
+    assert!(
+        client.write_table("//tmp/t", b"").is_err(),
+        "the first proxy answered 503"
+    );
+    client
+        .write_table("//tmp/t", b"")
+        .expect("the second proxy the cluster named is fine");
+
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1"],
+        "an upload went back to the control proxy, which is what refuses one"
+    );
+    assert_eq!(first.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+    assert_eq!(
+        second.requests(),
+        ["PUT /api/v4/write_table HTTP/1.1"],
+        "the rest of the answer was thrown away with the host that failed"
+    );
+}
+
+#[test]
+fn a_proxy_that_refuses_heavy_work_is_given_up_like_one_that_cannot_be_reached() {
+    // `/hosts` lists what `default_role_filter` says, and that is a coordinator
+    // config parameter an operator can change — not a protocol guarantee that
+    // the names are data proxies. A control proxy among them refuses with an
+    // ordinary cluster error, code 1, which is hopeless to *retry* and the
+    // clearest case there is for asking somewhere else: the two questions
+    // `worth_asking_again` exists to keep apart.
+    let good = Proxy::new(None);
+    let wrong_role = Proxy::control("[]".to_owned());
+    let control = Proxy::control(format!(r#"["{}", "{}"]"#, wrong_role.host(), good.host()));
+    let client = discovering(&control);
+
+    assert!(client.write_table("//tmp/t", b"").is_err());
+    client
+        .write_table("//tmp/t", b"")
+        .expect("the second is fine");
+
+    assert_eq!(good.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+}
+
+#[test]
+fn a_refusal_at_the_configured_address_says_what_would_have_routed_it() {
+    // The silent half of #30: the client asked, was given a perfectly good
+    // name, declined it under the domain rule, and said nothing. What the
+    // operator sees is the cluster error the feature was built to prevent, with
+    // nothing in it about `/hosts`, about a name, or about the one builder call
+    // that would have used it.
+    //
+    // The client here is configured with `127.0.0.1`, a literal address, which
+    // admits only itself — so `localhost` names the same machine and is still
+    // refused.
+    let elsewhere = Proxy::new(None);
+    let named = format!("localhost:{}", elsewhere.address.port());
+    let control = Proxy::control(format!(r#"["{named}"]"#));
+
+    let error = discovering(&control)
+        .write_table("//tmp/t", b"")
+        .expect_err("a control proxy refuses a heavy request with input data");
+
+    assert!(
+        error.to_string().contains("with_heavy_proxies_anywhere"),
+        "the refusal does not say that a name was declined: {error}"
+    );
+    assert!(
+        elsewhere.requests().is_empty(),
+        "the token went to a host the caller never named: {:?}",
+        elsewhere.requests()
+    );
+}
+
+#[test]
+fn a_list_of_proxies_written_out_by_hand_is_what_is_used() {
+    // The third mode, and the only one that is a boundary rather than a
+    // heuristic: `anywhere` is all-or-nothing, and the domain rule is a guard
+    // against a typo — on a shared platform, a parent domain is shared with
+    // every other tenant of it.
+    let allowed = Proxy::new(None);
+    let refused = Proxy::new(None);
+    let control = Proxy::control(format!(
+        r#"["localhost:{}", "localhost:{}"]"#,
+        refused.address.port(),
+        allowed.address.port()
+    ));
+
+    Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(true)
+        .with_heavy_proxies_in([format!("localhost:{}", allowed.address.port())])
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
+    assert_eq!(allowed.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+    assert!(
+        refused.requests().is_empty(),
+        "a name outside the list was used: {:?}",
+        refused.requests()
+    );
+}
+
+#[test]
+fn the_lookup_budget_can_be_raised_and_not_only_lowered() {
+    // It used to be the smaller of 800 ms and the client's own timeout, so
+    // `with_timeout` could only ever lower it: a cluster answering `/hosts` in
+    // 900 ms was unroutable by any configuration at all. And 800 ms is not
+    // always generous — the first heavy command is often a client's first
+    // request, with DNS, TCP and a TLS handshake inside the same budget.
+    let heavy = Proxy::new(None);
+    let slow = Hosts::Slow(
+        std::time::Duration::from_millis(1200),
+        format!(r#"["{}"]"#, heavy.host()),
+    );
+    let control = Proxy::answering(slow, 200);
+
+    Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(true)
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert!(
+        heavy.requests().is_empty(),
+        "the default budget waited out a cluster it is meant to give up on"
+    );
+
+    Client::new(&control.url())
+        .with_retries(RetryPolicy::none())
+        .with_proxy_discovery(true)
+        .with_hosts_timeout(std::time::Duration::from_secs(3))
+        .write_table("//tmp/t", b"")
+        .expect("writes");
+
+    assert_eq!(
+        heavy.requests(),
+        ["PUT /api/v4/write_table HTTP/1.1"],
+        "the budget could not be raised, so this cluster is unroutable"
     );
 }
 

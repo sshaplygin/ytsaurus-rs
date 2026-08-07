@@ -62,6 +62,7 @@
 //! time has not earned the wait.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,18 @@ const TRACESTATE: &str = "tracestate";
 
 /// The parameter that puts a command inside a transaction.
 const TRANSACTION_ID: &str = "transaction_id";
+
+/// The cluster's own words when a proxy refuses a command because of the role
+/// it has.
+///
+/// `Control proxy may not serve heavy requests with input data`, from
+/// `TContext::TryRedirectHeavyRequests`. It is the only failure here that names
+/// the *addressee* rather than the request, which is why two places read it: a
+/// proxy that says it is worth asking the cluster for another one
+/// ([`crate::retry::worth_asking_again`]), and a caller who got it at the
+/// address they configured is owed the sentence that says why nothing routed it
+/// away ([`refusal_hint`]).
+pub(crate) const CONTROL_REFUSAL: &str = "may not serve heavy requests";
 
 /// Commands that have no transaction to be in.
 ///
@@ -155,19 +168,28 @@ pub(crate) enum Payload<'a> {
 /// `/hosts` is down from paying for the answer over and over.
 const HOSTS_TIMEOUT: Duration = Duration::from_millis(800);
 
-/// How long the configured address serves heavy commands after a lookup that
-/// did not settle, before the cluster is asked again.
+/// How long the configured address serves heavy commands after a **lookup**
+/// that did not settle, before the cluster is asked again.
 ///
-/// Two failures share this. A lookup that failed for a reason that might pass,
-/// and a discovered proxy a heavy command could not reach: both mean "use the
-/// address the caller gave, and ask again in a moment" rather than "ask again
-/// now", which is what turned eight threads into eight lookups and one dead
-/// host into every upload failing.
+/// A lookup that failed for a reason that might pass means "use the address the
+/// caller gave, and ask again in a moment" rather than "ask again now", which
+/// is what turned eight threads into eight lookups.
+///
+/// **A failed heavy *command* is not this.** Its answer is the next name in the
+/// list `/hosts` already gave — see [`Transport::after_heavy`] — and only an
+/// answer whose every name has now failed comes back here. Falling back on the
+/// first failure is what made a single transient 503 route the next ten seconds
+/// of uploads to a control proxy that refuses every one of them, which is the
+/// symptom this whole feature exists to prevent.
 ///
 /// Short, because it is also how quickly routing comes back once the cluster
 /// does. Long enough that a client uploading in a loop against a broken
 /// `/hosts` pays [`HOSTS_TIMEOUT`] a handful of times a minute rather than
-/// once per upload.
+/// once per upload. Settable — [`Transport::set_hosts_retry_after`] — because
+/// a constant nothing can move is a constant no test can tell from any other:
+/// with this fixed at ten seconds, nothing in the suite outlived one window, so
+/// [`HeavyProxy::Configured`] and [`HeavyProxy::FellBack`] were observationally
+/// identical and either could be swapped for the other with every test green.
 const HOSTS_RETRY_AFTER: Duration = Duration::from_secs(10);
 
 /// Where the cluster wants heavy commands sent.
@@ -180,24 +202,124 @@ const HOSTS_RETRY_AFTER: Duration = Duration::from_secs(10);
 enum HeavyProxy {
     /// The cluster has not been asked yet.
     Unasked,
-    /// The address `/hosts` named, already a base URL.
-    At(String),
+    /// The address `/hosts` named, already a base URL — and the rest of that
+    /// same answer, in the order it arrived.
+    ///
+    /// The tail is the ban list, small and short-lived: a heavy command that
+    /// fails somewhere another proxy might not have drops the host it used and
+    /// takes the next one, rather than giving up on routing altogether. Both
+    /// official clients keep one (Go bans a failing proxy for five minutes);
+    /// this crate had none, and its absence is why one 503 from a draining data
+    /// proxy sent the following ten seconds of uploads to a control proxy.
+    At {
+        /// Where heavy commands are going now.
+        base: String,
+        /// What to use instead when this one fails, best first.
+        rest: VecDeque<String>,
+    },
     /// The cluster was asked and named none this client may use, so the
     /// configured address serves heavy commands too. A single-node cluster, any
     /// installation that does not separate the roles, and a `/hosts` whose
     /// answer was refused — see [`heavy_base`].
+    ///
+    /// **A settled answer, not a pause**: it is never asked about again. That
+    /// is the whole difference from [`HeavyProxy::FellBack`], and the reason
+    /// the two are separate variants.
     Configured,
-    /// The question did not settle, or the answer did not work.
+    /// The question did not settle, or the whole answer has now failed.
     ///
     /// The configured address serves heavy commands until `until`, and then the
     /// cluster is asked once more. This is what a *waiting* thread finds rather
     /// than an invitation to perform the same failing lookup itself, and what a
-    /// heavy command finds after the proxy it was routed to refused the
-    /// connection.
+    /// heavy command finds once every proxy in the answer has been tried.
     FellBack {
         /// When to ask again. See [`HOSTS_RETRY_AFTER`].
         until: Instant,
     },
+}
+
+/// Which of the names `/hosts` gives back this client is willing to use.
+///
+/// Three answers, because the two the crate shipped with were "everything the
+/// domain rule allows" and "everything at all" — and the only cure for a domain
+/// rule that misses by one label was to give up the control entirely. See
+/// [`heavy_base`] for what the rule is and, more to the point, what it is worth.
+#[derive(Clone, Debug)]
+enum HeavyHosts {
+    /// The configured address's own domain, the default. See [`same_domain`].
+    SameDomain,
+    /// Wherever `/hosts` says, checked for being a host name and nothing else.
+    Anywhere,
+    /// Exactly these names, compared without case — and a port only where both
+    /// sides name one, since `/hosts` usually names none and the port then
+    /// comes from the configured address.
+    ///
+    /// An empty list admits nothing, which is a way of saying "route nowhere"
+    /// — [`Transport::set_proxy_discovery`] is the way of saying it plainly.
+    Only(Vec<String>),
+}
+
+impl HeavyHosts {
+    /// Whether a discovered host is one this client may send a token to.
+    ///
+    /// `configured` is the base URL the caller gave; `discovered` is one entry
+    /// of the `/hosts` answer, trimmed and already known to be an authority.
+    fn admits(&self, configured: &str, discovered: &str) -> bool {
+        match self {
+            Self::SameDomain => same_domain(host_of(configured), host_of(discovered)),
+            Self::Anywhere => true,
+            Self::Only(names) => names.iter().any(|name| same_name(name, discovered)),
+        }
+    }
+}
+
+/// Whether a name a caller wrote out means the same proxy as a discovered one.
+///
+/// The host without case, and the port **only where both name one**: `/hosts`
+/// answers with bare host names unless the coordinator's `ShowPorts` says
+/// otherwise, so a list that had to spell the port out would be a list that
+/// usually matched nothing.
+fn same_name(listed: &str, discovered: &str) -> bool {
+    let listed = listed.trim();
+
+    if !host_of(listed).eq_ignore_ascii_case(host_of(discovered)) {
+        return false;
+    }
+    match (port_of(listed), port_of(discovered)) {
+        (Some(listed), Some(discovered)) => listed == discovered,
+        _ => true,
+    }
+}
+
+/// Why a name from `/hosts` was passed over.
+///
+/// Kept apart from the refusal itself so that the client can say which of the
+/// two happened: a name it could not read is a broken cluster or a forged
+/// answer, and a name it could read and declined is a configuration this
+/// operator can change in one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Declined {
+    /// Not a host name: blank, or carrying a scheme, a path, userinfo,
+    /// whitespace, a bad port, or brackets around something that is not an
+    /// IPv6 literal.
+    Malformed,
+    /// A perfectly good name somewhere this client was not pointed.
+    Elsewhere,
+}
+
+impl Declined {
+    /// The half-sentence an operator needs, which depends on what was allowed.
+    fn because(self, allowed: &HeavyHosts, configured: &str) -> String {
+        match (self, allowed) {
+            (Self::Malformed, _) => "is not a host name".to_owned(),
+            (Self::Elsewhere, HeavyHosts::Only(_)) => {
+                "is not one of the names with_heavy_proxies_in was given".to_owned()
+            }
+            (Self::Elsewhere, _) => {
+                format!("is not under the domain of {}", host_of(configured))
+            }
+        }
+    }
 }
 
 /// A configured connection to one cluster.
@@ -212,9 +334,16 @@ pub(crate) struct Transport {
     /// Whether to ask at all. Off for a cluster on loopback — see
     /// [`is_local`] — and settable either way by the caller.
     discovery: bool,
-    /// Whether a discovered host may leave the configured address's own
-    /// domain. Off by default — see [`heavy_base`].
-    anywhere: bool,
+    /// Which discovered hosts may be used. The configured address's own domain
+    /// by default — see [`heavy_base`].
+    hosts: HeavyHosts,
+    /// The whole budget for one `/hosts` lookup. [`HOSTS_TIMEOUT`] by default,
+    /// and its own field rather than a minimum with `timeout` so that a cluster
+    /// answering in 900 ms can be routed to at all.
+    hosts_timeout: Duration,
+    /// How long a fallback lasts before the cluster is asked again. See
+    /// [`HOSTS_RETRY_AFTER`].
+    hosts_retry_after: Duration,
     token: Option<String>,
     retries: RetryPolicy,
     /// End-to-end limit for buffered commands; per-phase limit for streaming
@@ -265,7 +394,9 @@ impl Transport {
         let mut transport = Self {
             agent: build_agent(timeout),
             discovery: !is_local(&base),
-            anywhere: false,
+            hosts: HeavyHosts::SameDomain,
+            hosts_timeout: HOSTS_TIMEOUT,
+            hosts_retry_after: HOSTS_RETRY_AFTER,
             base,
             heavy: Arc::new(Mutex::new(HeavyProxy::Unasked)),
             token,
@@ -292,8 +423,28 @@ impl Transport {
 
     /// Lets a discovered host be one outside the configured address's domain.
     pub(crate) fn set_heavy_proxies_anywhere(&mut self, enabled: bool) {
-        self.anywhere = enabled;
+        self.hosts = if enabled {
+            HeavyHosts::Anywhere
+        } else {
+            HeavyHosts::SameDomain
+        };
         self.forget_heavy();
+    }
+
+    /// Narrows discovered hosts to a list the caller wrote out.
+    pub(crate) fn set_heavy_proxies_in(&mut self, names: Vec<String>) {
+        self.hosts = HeavyHosts::Only(names);
+        self.forget_heavy();
+    }
+
+    /// Overrides the budget for one `/hosts` lookup.
+    pub(crate) fn set_hosts_timeout(&mut self, timeout: Duration) {
+        self.hosts_timeout = timeout;
+    }
+
+    /// Overrides how long a fallback lasts before the cluster is asked again.
+    pub(crate) fn set_hosts_retry_after(&mut self, after: Duration) {
+        self.hosts_retry_after = after;
     }
 
     /// Drops what discovery resolved, because the rules it resolved under have
@@ -435,12 +586,20 @@ impl Transport {
     /// those. See the module documentation for what the refusal looks like.
     ///
     /// The lookup happens **at most once per client** while it keeps working,
-    /// and only when the first heavy command needs it. A cluster that names
-    /// nobody this client may use — a single-node installation, any that does
-    /// not split the roles, and one whose answer [`heavy_base`] refused — is
-    /// remembered as answered, and every heavy command then goes where it
-    /// always went. That fallback is not a nicety: it is the whole of what keeps
-    /// a local cluster behaving as it did.
+    /// and only when the first heavy command needs it. The **whole** answer is
+    /// kept, not just the name in use: the rest is what a heavy command falls
+    /// through to when the one it used fails, which is what stops a single
+    /// stumble from sending the next few seconds of uploads back to a control
+    /// proxy. See [`Transport::after_heavy`].
+    ///
+    /// A cluster that names nobody this client may use — a single-node
+    /// installation, any that does not split the roles, and one whose answer
+    /// [`heavy_base`] refused — is remembered as answered, and every heavy
+    /// command then goes where it always went. That fallback is not a nicety: it
+    /// is the whole of what keeps a local cluster behaving as it did. A refused
+    /// answer is also *said*, once — see [`crate::observe::declined`] — because
+    /// it is the one branch here that looks exactly like the bug this feature
+    /// fixes.
     ///
     /// The mutex is held **across the lookup**, deliberately: a second thread
     /// that wanted a heavy proxy at the same moment waits for this answer
@@ -458,7 +617,7 @@ impl Transport {
 
         let mut resolved = lock(&self.heavy);
         match &*resolved {
-            HeavyProxy::At(base) => return Cow::Owned(base.clone()),
+            HeavyProxy::At { base, .. } => return Cow::Owned(base.clone()),
             HeavyProxy::Configured => return Cow::Borrowed(&self.base),
             HeavyProxy::FellBack { until } if Instant::now() < *until => {
                 return Cow::Borrowed(&self.base);
@@ -467,23 +626,43 @@ impl Transport {
         }
 
         match self.heavy_hosts() {
-            // The first host this client is willing to use, not simply the
-            // first host. `/hosts` is ordered best-first, and a name that is
-            // blank, malformed or somewhere else entirely is passed over rather
-            // than being allowed to stand for the whole answer.
-            Ok(hosts) => match hosts
-                .iter()
-                .find_map(|host| heavy_base(&self.base, host, self.anywhere))
-            {
-                Some(base) => {
-                    *resolved = HeavyProxy::At(base.clone());
-                    Cow::Owned(base)
+            // Every host this client is willing to use, in the order the
+            // cluster gave them: `/hosts` is ordered best-first, the first is
+            // where the commands go, and the rest are what a failure falls
+            // through to. A name that is blank, malformed or somewhere else
+            // entirely is passed over rather than being allowed to stand for
+            // the whole answer — and, since a whole answer passed over is the
+            // one failure that leaves routing silently off, the reasons are
+            // said out loud once.
+            Ok(hosts) => {
+                let mut usable = VecDeque::new();
+                let mut refused = Vec::new();
+                for host in &hosts {
+                    match heavy_base(&self.base, host, &self.hosts) {
+                        Ok(base) => usable.push_back(base),
+                        Err(why) => refused
+                            .push(format!("{host:?} {}", why.because(&self.hosts, &self.base))),
+                    }
                 }
-                None => {
-                    *resolved = HeavyProxy::Configured;
-                    Cow::Borrowed(&self.base)
+
+                match usable.pop_front() {
+                    Some(base) => {
+                        *resolved = HeavyProxy::At {
+                            base: base.clone(),
+                            rest: usable,
+                        };
+                        Cow::Owned(base)
+                    }
+                    None => {
+                        *resolved = HeavyProxy::Configured;
+                        drop(resolved);
+                        if !refused.is_empty() && self.retries.reports() {
+                            crate::observe::declined(&self.base, &refused);
+                        }
+                        Cow::Borrowed(&self.base)
+                    }
                 }
-            },
+            }
             // A failed lookup is never fatal: the command goes where it would
             // have gone before there was a lookup at all. Whether to ask again
             // is `worth_asking_again`, which is a different question from
@@ -494,7 +673,7 @@ impl Transport {
             Err(error) => {
                 *resolved = if crate::retry::worth_asking_again(&error) {
                     HeavyProxy::FellBack {
-                        until: Instant::now() + HOSTS_RETRY_AFTER,
+                        until: Instant::now() + self.hosts_retry_after,
                     }
                 } else {
                     HeavyProxy::Configured
@@ -547,31 +726,72 @@ impl Transport {
     /// and cannot see. It now reads `write_table at n0132-sas.example.net:9013:
     /// …`.
     ///
-    /// **A proxy that could not be reached stops being used.** The command
-    /// itself is *not* sent again — heavy commands are not retried, and by this
-    /// point a streaming body has been consumed anyway. This is about the next
-    /// one: the client falls back to the configured address and asks the
-    /// cluster again after [`HOSTS_RETRY_AFTER`], rather than resolving the same
-    /// dead host over and over, which is what made every upload after the first
-    /// failure fail too. Only for a failure a different proxy could plausibly
-    /// fix; a table that does not exist will not exist over there either.
+    /// **A proxy that could not be reached stops being used, and the next name
+    /// in the answer takes over.** The command itself is *not* sent again —
+    /// heavy commands are not retried, and by this point a streaming body has
+    /// been consumed anyway. This is about the next one.
+    ///
+    /// It used to go back to the configured address for
+    /// [`HOSTS_RETRY_AFTER`], and that is exactly the wrong address to go back
+    /// to. On the deployment this feature was written for the configured
+    /// address is a balancer in front of the *control* proxies, so one
+    /// transient 503 from a draining data proxy — or one refused connection
+    /// during a restart — turned into ten seconds of `Control proxy may not
+    /// serve heavy requests with input data`, which is [#30] itself,
+    /// reproducible on demand. `/hosts` had already named the alternatives;
+    /// nothing was using them. Now the failed host is dropped and the next one
+    /// is taken, and only an answer whose every name has failed falls back —
+    /// where falling back is at least a state that ends.
+    ///
+    /// Only for a failure another proxy could plausibly not have. A table that
+    /// does not exist will not exist over there either, so a resolve error
+    /// keeps the address it was asked at; a proxy that refuses heavy work
+    /// *because of the role it has* is the clearest possible case for asking
+    /// somewhere else, and [`crate::retry::worth_asking_again`] says so.
+    ///
+    /// [#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
     fn after_heavy<T>(&self, repeatable: Repeatable, base: &str, result: Result<T>) -> Result<T> {
-        if repeatable != Repeatable::Heavy || !self.discovery {
+        if repeatable != Repeatable::Heavy {
             return result;
         }
         let Err(error) = result else {
             return result;
         };
+        if !self.discovery {
+            return Err(refusal_hint(
+                error,
+                "this client does not route heavy commands: \
+                 Client::with_proxy_discovery(true) turns the /hosts lookup on",
+            ));
+        }
 
         let mut resolved = lock(&self.heavy);
-        if !matches!(&*resolved, HeavyProxy::At(at) if at == base) {
-            return Err(error);
+        if !matches!(&*resolved, HeavyProxy::At { base: at, .. } if at == base) {
+            // The command went to the configured address, which is the caller's
+            // own choice and needs no explaining — unless what came back is a
+            // proxy saying it will not serve this at all, which is the failure
+            // routing exists to prevent and which says nothing about routing
+            // being what was missing.
+            let why = declined_routing(&resolved);
+            return Err(refusal_hint(error, why));
         }
 
         if crate::retry::worth_asking_again(&error) {
-            *resolved = HeavyProxy::FellBack {
-                until: Instant::now() + HOSTS_RETRY_AFTER,
-            };
+            // Falling back is the default and stepping to the next name is the
+            // exception, written that way round so that an exhausted answer
+            // cannot leave a stale address in place: `replace` is also what
+            // lets the tail be moved out of the state it belonged to.
+            let previous = std::mem::replace(
+                &mut *resolved,
+                HeavyProxy::FellBack {
+                    until: Instant::now() + self.hosts_retry_after,
+                },
+            );
+            if let HeavyProxy::At { mut rest, .. } = previous
+                && let Some(next) = rest.pop_front()
+            {
+                *resolved = HeavyProxy::At { base: next, rest };
+            }
         }
         drop(resolved);
 
@@ -944,10 +1164,18 @@ impl Transport {
     /// The other direction from [`Transport::scoped`], and for the mirrored
     /// reason: a table transfer is allowed to take as long as it takes, and the
     /// question in front of it is not. See [`HOSTS_TIMEOUT`].
+    ///
+    /// **Its own field, not a minimum with the client's timeout.** Taking the
+    /// smaller of the two let `Client::with_timeout` lower this budget and
+    /// never raise it, so a cluster that answers `/hosts` in 900 ms could not
+    /// be routed to by any configuration at all — and the first heavy command
+    /// is quite often a client's first request, with DNS, TCP and TLS inside
+    /// the same 800 ms. `Client::with_hosts_timeout` moves it in both
+    /// directions.
     fn within_budget<Any>(&self, request: ureq::RequestBuilder<Any>) -> ureq::RequestBuilder<Any> {
         request
             .config()
-            .timeout_global(Some(HOSTS_TIMEOUT.min(self.timeout)))
+            .timeout_global(Some(self.hosts_timeout))
             .build()
     }
 }
@@ -985,33 +1213,55 @@ fn lock(heavy: &Mutex<HeavyProxy>) -> MutexGuard<'_, HeavyProxy> {
 ///   the name usually has none — the coordinator only appends `:port` when its
 ///   `ShowPorts` config says to — and a client reached at `:8443` has no reason
 ///   to believe the heavy proxies answer on 80.
-/// - **an unbracketed name with more than one colon is refused.** A bare IPv6
-///   literal is not a valid URL authority; bracketed, it is.
-/// - **the name must sit under the configured address's own domain**, unless
-///   `anywhere` says otherwise. See below.
+/// - **the name has to be one host and at most one port.** A bare IPv6 literal
+///   is not a valid URL authority; bracketed, it is — and brackets around
+///   anything that is *not* an IPv6 literal are worse than a refusal, because
+///   `ureq` 3.3 hands them to the resolver unchanged. Probed:
+///   `https://[n0132.example.com]evil.attacker.com` parses with the host
+///   `[n0132.example.com]`, which no DNS will ever answer, so the entry cost
+///   nothing but a permanently failing address.
+/// - **the name must sit where `allowed` says**, which is the configured
+///   address's own domain by default. See below.
 ///
-/// # Why the domain is checked
+/// # What the domain rule is worth, and what it is not
 ///
-/// The `/hosts` body decides where every heavy command goes, and the request
-/// that goes there carries the caller's OAuth token. On a plain-`http://` base,
-/// forging that body is exactly as easy as forging a `Location` header — and
-/// this client refuses to let a `Location` choose where the token goes. Letting
-/// a JSON array choose it instead would be the same decision answered two ways.
+/// It was written down here as "the token cannot go somewhere you did not
+/// name", and that is more than it does. To steer the token with a `/hosts`
+/// body you must control that body: over `https://` that means owning the
+/// proxy, which already has the token, and over `http://` it means being a
+/// man-in-the-middle, who reads the token out of every light command without
+/// touching this code path at all. The one threat model where the rule bites is
+/// a proxy **registering itself** in the cluster's coordinator under a name the
+/// operators did not intend.
 ///
-/// The rule is deliberately mechanical, because no public-suffix list is worth
-/// a dependency here: the name must **be** the configured host, or sit under
-/// the configured host's parent domain — its own name minus the leftmost label,
+/// And there it is a coarse instrument, because it is a suffix rule and cannot
+/// be anything else without a public-suffix list — a dependency deliberately
+/// not taken. `yt-prod.westeurope.cloudapp.azure.com` admits every Azure VM in
+/// the region; `yt-1234.us-east-1.elb.amazonaws.com` admits every ELB in it.
+/// So read this as **a guard against a typo in a configuration and against an
+/// obviously foreign domain**, not as a boundary that holds a credential.
+/// `HeavyHosts::Only` — `Client::with_heavy_proxies_in` — is the boundary,
+/// because it is a list somebody wrote on purpose.
+///
+/// The rule itself: the name must **be** the configured host, or sit under the
+/// configured host's parent domain — its own name minus the leftmost label,
 /// never shortened below two labels. `cluster.example.net` therefore admits
 /// `n0132-sas.example.net` and `n0132-sas.cluster.example.net`, and refuses
-/// `cluster.example.net.evil.com`. An address that is a literal IP admits only
-/// itself: an IP has no domain to share.
+/// `cluster.example.net.evil.com`. A **bare cluster name** — `YT_PROXY=hume`,
+/// which is the commonest spelling there is — has no parent domain, and is
+/// matched as a label instead; see [`same_domain`]. An address that is a
+/// literal IP admits only itself: an IP has no domain to share.
 ///
 /// A refused name is passed over, and a cluster whose whole answer is refused
 /// is treated as one that named nobody — the upload goes to the configured
-/// address, which is where it went before there was a lookup at all.
-/// `Client::with_heavy_proxies_anywhere` is the opt-in for an installation
-/// whose `/hosts` genuinely names another domain.
-fn heavy_base(configured: &str, host: &str, anywhere: bool) -> Option<String> {
+/// address, which is where it went before there was a lookup at all, and
+/// [`crate::observe::declined`] says so once rather than leaving it to be
+/// deduced from a cluster error much later.
+fn heavy_base(
+    configured: &str,
+    host: &str,
+    allowed: &HeavyHosts,
+) -> std::result::Result<String, Declined> {
     let host = host.trim();
 
     if host.is_empty()
@@ -1020,18 +1270,13 @@ fn heavy_base(configured: &str, host: &str, anywhere: bool) -> Option<String> {
         || host.contains('@')
         || host.contains(['?', '#'])
         || host.chars().any(char::is_whitespace)
+        || !is_authority(host)
     {
-        return None;
+        return Err(Declined::Malformed);
     }
 
-    // A bare IPv6 literal has to be bracketed to be an authority. Unbracketed,
-    // a second colon means this is not one host and one port.
-    if !host.starts_with('[') && host.matches(':').count() > 1 {
-        return None;
-    }
-
-    if !anywhere && !same_domain(host_of(configured), host_of(host)) {
-        return None;
+    if !allowed.admits(configured, host) {
+        return Err(Declined::Elsewhere);
     }
 
     let scheme = if configured.starts_with("https://") {
@@ -1040,10 +1285,43 @@ fn heavy_base(configured: &str, host: &str, anywhere: bool) -> Option<String> {
         "http://"
     };
 
-    match (has_port(host), port_of(configured)) {
-        (false, Some(port)) => Some(format!("{scheme}{host}:{port}")),
-        _ => Some(format!("{scheme}{host}")),
+    Ok(match (has_port(host), port_of(configured)) {
+        (false, Some(port)) => format!("{scheme}{host}:{port}"),
+        _ => format!("{scheme}{host}"),
+    })
+}
+
+/// Whether a name from `/hosts` is one host and at most one port.
+///
+/// Bracketed, it has to hold an **IPv6 literal**: the brackets are what make a
+/// literal an authority, and they are not decoration a name may wear. `ureq`
+/// 3.3 does not strip them from anything else, so `[n0132.example.com]evil` was
+/// accepted here and then failed to resolve for as long as the client lived —
+/// every heavy command failing on DNS, the address kept, and the failures
+/// repeating without end.
+///
+/// Unbracketed, a colon introduces a port and a port is digits. That also
+/// refuses the bare IPv6 literal, which is the same rule seen from the other
+/// side: `2a02:6b8::2` is not a host and a port.
+fn is_authority(host: &str) -> bool {
+    match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((literal, tail)) => {
+                literal.parse::<std::net::Ipv6Addr>().is_ok()
+                    && (tail.is_empty() || tail.strip_prefix(':').is_some_and(is_port))
+            }
+            None => false,
+        },
+        None => match host.split_once(':') {
+            Some((name, port)) => !name.is_empty() && is_port(port),
+            None => true,
+        },
     }
+}
+
+/// Whether what follows a colon is a port and nothing else.
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether `discovered` sits under the same domain as `configured`.
@@ -1052,8 +1330,27 @@ fn heavy_base(configured: &str, host: &str, anywhere: bool) -> Option<String> {
 /// never shortened below two labels — so a client pointed at
 /// `cluster.example.net` accepts anything under `example.net`, and one pointed
 /// at the two-label `example.net` accepts only `example.net` and what is under
-/// it. See [`heavy_base`] for why this is a suffix rule and not a public-suffix
-/// lookup.
+/// it. See [`heavy_base`] for what this rule is worth, which is less than it
+/// was once written down as.
+///
+/// # A bare cluster name has no parent domain
+///
+/// `YT_PROXY=hume` is not an edge case, it is the ordinary spelling: a cluster
+/// name with no dots in it, which `Transport::new` supports on purpose by
+/// putting `https://` in front. Such a name has nothing to take a leftmost
+/// label off, so the parent-domain rule degenerates to "the name itself" —
+/// and then a `/hosts` answering `["n0008-sas.hume.yt.yandex.net"]`, which is
+/// the real shape of a real installation, is refused **entirely and
+/// permanently**: the state settles as `Configured`, the lookup is never
+/// repeated, and every upload goes back to being refused by a control proxy
+/// with nothing anywhere to say why. The same break waits in Kubernetes for
+/// anyone who addresses the service by its short name.
+///
+/// So a configured name with no dot is matched as a **label** of the discovered
+/// name, and not as its leftmost one: `hume` admits
+/// `n0008-sas.hume.yt.yandex.net` and `n0008-sas.hume`, and refuses
+/// `hume.evil.com` — where the cluster's name has been put in the position a
+/// *host* name occupies rather than the position a domain does.
 ///
 /// A literal IP address has no domain, so it admits only itself.
 fn same_domain(configured: &str, discovered: &str) -> bool {
@@ -1070,8 +1367,17 @@ fn same_domain(configured: &str, discovered: &str) -> bool {
     }
 
     let domain = match configured.split_once('.') {
+        // Its parent domain, never shortened below two labels.
         Some((_, parent)) if parent.contains('.') => parent,
-        _ => configured.as_str(),
+        Some(_) => configured.as_str(),
+        // A bare cluster name: a label of the discovered name, and not the
+        // leftmost one, which is where the proxy's own name goes.
+        None => {
+            return discovered
+                .split('.')
+                .skip(1)
+                .any(|label| label == configured);
+        }
     };
 
     discovered == domain || discovered.ends_with(&format!(".{domain}"))
@@ -1108,6 +1414,55 @@ fn authority_of(base: &str) -> &str {
         .next()
         .unwrap_or_default();
     authority.rsplit_once('@').map_or(authority, |(_, h)| h)
+}
+
+/// Why a heavy command was served at the configured address after all.
+///
+/// One short clause per state, for [`refusal_hint`] to hang on the cluster's
+/// own refusal. Each names the builder that changes the answer, because the
+/// refusal itself names nothing: an operator reading `Control proxy may not
+/// serve heavy requests with input data` has no way to learn from it that this
+/// client asked `/hosts`, got a perfectly good name and declined it.
+fn declined_routing(state: &HeavyProxy) -> &'static str {
+    match state {
+        HeavyProxy::Configured => {
+            "/hosts named no heavy proxy this client would use — \
+             Client::with_heavy_proxies_anywhere(true) or \
+             Client::with_heavy_proxies_in([…]) allows a name it refused"
+        }
+        HeavyProxy::FellBack { .. } => {
+            "the heavy proxies /hosts named have all just failed, \
+             so this went to the configured address for a moment"
+        }
+        HeavyProxy::Unasked | HeavyProxy::At { .. } => "this client did not route this command",
+    }
+}
+
+/// Adds the sentence a control proxy's refusal does not carry.
+///
+/// Only for that one refusal, which is the only failure here that is about
+/// *which proxy was asked* — see [`CONTROL_REFUSAL`]. Everything else is about
+/// the request, and a hint about routing beside it would be noise.
+///
+/// Appended to the message rather than wrapped in a new variant: the caller
+/// wants the cluster's own words *and* the one fact the cluster cannot know,
+/// and a second error type would make the first harder to match on for the sake
+/// of the second.
+fn refusal_hint(error: ClientError, why: &str) -> ClientError {
+    match error {
+        ClientError::Cluster {
+            command,
+            code,
+            message,
+            raw,
+        } if message.contains(CONTROL_REFUSAL) => ClientError::Cluster {
+            command,
+            code,
+            message: format!("{message} ({why})"),
+            raw,
+        },
+        other => other,
+    }
 }
 
 /// Names the proxy a routed command actually went to.
@@ -1347,7 +1702,12 @@ mod tests {
 
     /// `heavy_base` under the default rules — a name may not leave the domain.
     fn routed(configured: &str, host: &str) -> Option<String> {
-        heavy_base(configured, host, false)
+        heavy_base(configured, host, &HeavyHosts::SameDomain).ok()
+    }
+
+    /// `heavy_base` with the domain rule relaxed.
+    fn routed_anywhere(configured: &str, host: &str) -> Option<String> {
+        heavy_base(configured, host, &HeavyHosts::Anywhere).ok()
     }
 
     #[test]
@@ -1468,9 +1828,6 @@ mod tests {
         assert!(same_domain("cluster.example.net", "example.net"));
         // Case is not part of a host name.
         assert!(same_domain("Cluster.Example.NET", "n0132-sas.example.net"));
-        // The doc's own example shape: a one-label cluster name, with the
-        // proxies under it.
-        assert!(same_domain("cluster-name", "n0008-sas.cluster-name"));
 
         // Never below two labels, or a client pointed at `example.net` would
         // follow anything at all under `.net`.
@@ -1489,29 +1846,67 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_cluster_name_is_matched_as_a_label_and_not_as_a_domain() {
+        // `YT_PROXY=hume` — a cluster name with no dots — is the ordinary
+        // spelling, and `Transport::new` supports it on purpose. It has no
+        // leftmost label to take off, so the parent-domain rule degenerated to
+        // "the name itself" and refused the real answer of a real installation:
+        // `["n0008-sas.hume.yt.yandex.net"]` was declined in full, the state
+        // settled as "this cluster has no heavy proxies", and it is never asked
+        // again — leaving the operator with the cluster error from #30 and
+        // nothing to connect it to.
+        assert!(same_domain("hume", "n0008-sas.hume.yt.yandex.net"));
+        // The documentation's own example shape, which is the same rule.
+        assert!(same_domain("cluster-name", "n0008-sas.cluster-name"));
+        // And Kubernetes, where a service addressed by its short name answers
+        // with the fully qualified one.
+        assert!(same_domain(
+            "yt-http-proxy",
+            "yt-http-proxy-0.yt-http-proxy.yt.svc.cluster.local"
+        ));
+
+        // Not the leftmost label, which is where the *proxy's* own name goes:
+        // a name that puts the cluster's name there is claiming to be the
+        // cluster, in somebody else's zone.
+        assert!(!same_domain("hume", "hume.evil.com"));
+        // A whole label, not a prefix of one.
+        assert!(!same_domain("hume", "n0008-sas.humeier.yt.yandex.net"));
+        assert!(!same_domain("hume", "evil.com"));
+        // The configured name itself is still the configured name.
+        assert!(same_domain("hume", "hume"));
+
+        // And through `heavy_base`, which is where the base URL
+        // `Transport::new` builds for a bare name meets the rule: `Client::new
+        // ("hume")` is `https://hume`, and the answer above is what a real
+        // installation returns for it.
+        assert_eq!(
+            routed("https://hume", "n0008-sas.hume.yt.yandex.net"),
+            Some("https://n0008-sas.hume.yt.yandex.net".to_owned())
+        );
+    }
+
+    #[test]
     fn an_installation_that_really_does_answer_elsewhere_can_say_so() {
         // The opt-in, for a cluster fronted by a vanity address or one whose
         // data proxies live under a separate zone. It relaxes the domain and
         // nothing else: the scheme still comes from the configured address, and
         // a name carrying furniture is still not a name.
         assert_eq!(
-            heavy_base(
+            routed_anywhere(
                 "https://cluster.example.net",
-                "n0132-sas.somewhere-else.net",
-                true
+                "n0132-sas.somewhere-else.net"
             ),
             Some("https://n0132-sas.somewhere-else.net".to_owned())
         );
         assert_eq!(
-            heavy_base("https://cluster.example.net", "http://n0132", true),
+            routed_anywhere("https://cluster.example.net", "http://n0132"),
             None,
             "the escape hatch is about the domain, not about the scheme"
         );
         assert_eq!(
-            heavy_base(
+            routed_anywhere(
                 "https://cluster.example.net",
-                "real.example.net@evil.example.net",
-                true
+                "real.example.net@evil.example.net"
             ),
             None
         );
@@ -1520,7 +1915,7 @@ mod tests {
         // `https://:8000`.
         for blank in ["", "   ", "\t\n"] {
             assert_eq!(
-                heavy_base("https://cluster.example.net:8000", blank, true),
+                routed_anywhere("https://cluster.example.net:8000", blank),
                 None,
                 "{blank:?} was accepted as a host name"
             );
@@ -1528,27 +1923,132 @@ mod tests {
     }
 
     #[test]
-    fn a_bracketed_address_keeps_its_brackets_and_a_bare_one_is_refused() {
+    fn a_list_written_out_by_hand_is_the_third_answer() {
+        // The domain rule is a typo guard, not a boundary: on a shared platform
+        // a parent domain is shared with every other tenant. A list somebody
+        // wrote on purpose is the version that is a boundary — and the only
+        // cure for a domain rule that misses by one label that is not "take the
+        // rule away entirely".
+        let only = HeavyHosts::Only(vec![
+            "n0132-sas.somewhere-else.net".to_owned(),
+            "n0133-sas.somewhere-else.net:9013".to_owned(),
+        ]);
+
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net:8443",
+                "n0132-sas.somewhere-else.net",
+                &only
+            ),
+            Ok("https://n0132-sas.somewhere-else.net:8443".to_owned()),
+            "a listed name outside the domain is still allowed"
+        );
+        // Case is not part of a host name, and a port is compared only where
+        // both sides name one — `/hosts` usually names none.
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net:8443",
+                "N0133-SAS.somewhere-else.net:9013",
+                &only
+            ),
+            Ok("https://N0133-SAS.somewhere-else.net:9013".to_owned()),
+        );
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net:8443",
+                "n0133-sas.somewhere-else.net",
+                &only
+            ),
+            Ok("https://n0133-sas.somewhere-else.net:8443".to_owned()),
+            "a listed port must not be a requirement on an answer that has none"
+        );
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net:8443",
+                "n0133-sas.somewhere-else.net:9014",
+                &only
+            ),
+            Err(Declined::Elsewhere),
+            "a port both sides name has to be the same port"
+        );
+        // Everything else is refused, including a name the domain rule would
+        // have allowed: this narrows, it does not widen.
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net",
+                "n0134-sas.example.net",
+                &only
+            ),
+            Err(Declined::Elsewhere)
+        );
+        assert_eq!(
+            heavy_base("https://cluster.example.net", "http://n0132", &only),
+            Err(Declined::Malformed),
+            "a list is about which names, not about what a name may look like"
+        );
+        // An empty list admits nothing, which is a way of turning routing off.
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net",
+                "n0132-sas.example.net",
+                &HeavyHosts::Only(Vec::new())
+            ),
+            Err(Declined::Elsewhere)
+        );
+    }
+
+    #[test]
+    fn a_bracketed_address_has_to_hold_an_ipv6_literal() {
         // A bare IPv6 literal is not a valid URL authority — bracketed, it is —
         // and an unbracketed second colon means this is not one host and one
         // port.
         assert_eq!(
-            heavy_base("http://[2a02:6b8::1]:8000", "[2a02:6b8::2]:9013", true),
+            routed_anywhere("http://[2a02:6b8::1]:8000", "[2a02:6b8::2]:9013"),
             Some("http://[2a02:6b8::2]:9013".to_owned())
         );
         assert_eq!(
-            heavy_base("http://[2a02:6b8::1]:8000", "[2a02:6b8::2]", true),
+            routed_anywhere("http://[2a02:6b8::1]:8000", "[2a02:6b8::2]"),
             Some("http://[2a02:6b8::2]:8000".to_owned()),
             "the configured port carries through a bracketed name too"
         );
         assert_eq!(
-            heavy_base("http://cluster.example.net", "2a02:6b8::2", true),
+            routed_anywhere("http://cluster.example.net", "2a02:6b8::2"),
             None
         );
         assert_eq!(
-            heavy_base("http://cluster.example.net", "n0132:9013:9014", true),
+            routed_anywhere("http://cluster.example.net", "n0132:9013:9014"),
             None
         );
+
+        // The shape that made the brackets worth checking rather than merely
+        // counting colons. Probed against `ureq` 3.3: this parses with the host
+        // `[n0132.example.com]` — brackets are only stripped for something that
+        // is an IPv6 literal — so no DNS will ever answer it. The token stays
+        // put, which is the reason the second-colon rule waved it through, and
+        // the cost is worse than a leak of nothing: the address is remembered,
+        // every heavy command fails resolving it, and the failures repeat for
+        // as long as the client lives.
+        for shape in [
+            "[n0132.example.com]evil.attacker.com",
+            "[n0132.example.com]",
+            "[n0132.example.com]:9013",
+            "[2a02:6b8::2]junk",
+            "[2a02:6b8::2]:junk",
+            "[2a02:6b8::2]:",
+            "[2a02:6b8::2",
+            "[]",
+            "[]:9013",
+            // A port is digits, on either shape of name.
+            "n0132.example.net:",
+            "n0132.example.net:90a3",
+            ":9013",
+        ] {
+            assert_eq!(
+                routed_anywhere("http://cluster.example.net", shape),
+                None,
+                "{shape:?} was accepted as a host name"
+            );
+        }
     }
 
     #[test]

@@ -14,9 +14,80 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
 
 - **Added** automatic routing. The first heavy command asks `/hosts`, the
   answer is kept for the client's lifetime and shared by every clone of it, and
-  a heavy command that fails for a reason another proxy might not have throws
-  it away so that the next one asks again. The failed command itself is not
-  re-sent: heavy commands are not retried, and by then a streamed body is gone.
+  a heavy command that fails for a reason another proxy might not have gives up
+  the host it used for the next name in that same answer. The failed command
+  itself is not re-sent: heavy commands are not retried, and by then a streamed
+  body is gone.
+
+- **A failure moves to the next proxy, not back to the configured address.**
+  The first cut of this feature had no ban list — Go's has one, and its absence
+  was disclosed in `docs/sdk-comparison.md` rather than reconsidered — so one
+  transient 503 from a draining data proxy, or one refused connection during a
+  restart, sent the next ten seconds of heavy commands to the address the
+  caller configured. On the deployment this whole feature was written for that
+  address is a balancer in front of the **control** proxies, which refuse every
+  heavy command with input data: the fallback reproduced [#30] on demand, once
+  per hiccup, and heavy commands are not retried, so every command in the
+  window failed. `/hosts` had already named the alternatives. Now the answer is
+  kept whole, best first, the failed host is dropped, and only an answer whose
+  every name has failed falls back to the configured address — for ten seconds,
+  and then the cluster is asked again.
+
+  A proxy that refuses heavy work **because of the role it has** is given up
+  the same way. `/hosts` lists whatever `default_role_filter` says, which is a
+  coordinator config parameter rather than a guarantee, so a control proxy can
+  appear in it; its refusal is a cluster error that no retry could ever fix and
+  that asking the coordinator again fixes immediately — which is exactly the
+  distinction `worth_asking_again` was split out for.
+
+- **Added** `Client::with_heavy_proxies_in`, a list of proxies written out by
+  hand. The domain rule below is a guard against a typo, not a boundary; and
+  `with_heavy_proxies_anywhere` was all-or-nothing, so the only cure for a rule
+  that missed by one label was to remove the rule. Names are compared without
+  case, and with a port only where both sides name one.
+
+- **Added** `Client::with_hosts_timeout` and `Client::with_hosts_retry_after`.
+  The lookup budget was `min(800 ms, the client's own timeout)`, so
+  `with_timeout` could only ever lower it and a cluster answering `/hosts` in
+  900 ms was unroutable by any configuration at all — while the first heavy
+  command, which is often a client's first request, pays DNS, TCP and a TLS
+  handshake out of the same 800 ms. The retry window is settable for a smaller
+  reason that turned out to matter: at a fixed ten seconds no test outlived one,
+  so `HeavyProxy::Configured` and `HeavyProxy::FellBack` were observationally
+  identical and either could be written where the other was with the whole suite
+  green. Both are now pinned by a test that sets the window to nothing.
+
+- **A `/hosts` answer this client declines in full is announced**, once, naming
+  what was refused and why — on stderr, or as a `WARN` event where the `tracing`
+  feature is on, and muted inside a job like every other thing this client says.
+  And when a heavy command is then refused at the configured address, the
+  cluster's `Control proxy may not serve heavy requests with input data` carries
+  the sentence the cluster cannot know: that this client asked, declined the
+  answer, and which builder call changes that. Silence there was the whole
+  failure mode — the operator gets back the error from #30 with nothing to
+  connect it to.
+
+  The refusal that prompted this is not hypothetical. `Client::new("hume")` — a
+  bare cluster name, which `Transport::new` supports on purpose and which is how
+  `YT_PROXY` is usually written — has no parent domain to take a leftmost label
+  off, so the rule degenerated to "the name itself" and refused
+  `["n0008-sas.hume.yt.yandex.net"]` in full, permanently and in silence. A
+  configured name with no dot is now matched as a **label** of the discovered
+  name, and not as its leftmost one: `hume` follows
+  `n0008-sas.hume.yt.yandex.net` and not `hume.evil.com`. The same break was
+  waiting in Kubernetes for anyone addressing the service by its short name.
+
+- **A bracketed name has to hold an IPv6 literal.** The rule was "an unbracketed
+  name with more than one colon is refused", which waved through anything that
+  started with `[`. Probed against `ureq` 3.3:
+  `https://[n0132.example.com]evil.attacker.com` parses with the host
+  `[n0132.example.com]` — the brackets are stripped only for a literal — so the
+  token went nowhere, and the cost was worse than a leak of nothing. The address
+  was remembered, every heavy command failed to resolve it, and (before the ban
+  list above) the failure repeated for as long as the client lived. A port is
+  now digits on either shape of name, too.
+
+[#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
 
 - **The classification is the one the crate already had.** `Repeatable` encodes
   the two bits the cluster's own command registry declares, `isVolatile` and
@@ -31,11 +102,7 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
   that matches it exhaustively needs a `_` arm — and will not need another one
   the next time the registry earns a name here.
 
-- **A discovered host is constrained to the configured address's own domain.**
-  A heavy command carries the caller's OAuth token, and the `/hosts` body is
-  what decides where it goes: on a plain-`http://` base, forging that body is
-  exactly as easy as forging a `Location` header, which this client refuses to
-  follow. So the name is checked rather than pasted — same domain as the
+- **A discovered host is checked rather than pasted**: same domain as the
   configured address (or the configured host itself), scheme and port from the
   configured address, and no `://`, `/`, `@` or whitespace. Measured on the
   first cut of this feature: `http://n0132` from an `https://` client stripped
@@ -44,6 +111,20 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
   A refused name is passed over and the rest of the list tried; a `/hosts`
   answer refused entirely leaves the upload going where it went before there
   was a lookup.
+
+  **What the domain rule is worth** was overstated when it landed, and is worth
+  stating plainly instead. It is a guard against a typo in a configuration and
+  against an obviously foreign name — not what keeps the token where the caller
+  put it. Steering a heavy command with a `/hosts` body means controlling that
+  body: over `https://` that is owning the proxy, which has the token already,
+  and over `http://` it is being a man-in-the-middle, who reads the token out of
+  every light command without coming near this code. The threat it does cover is
+  a proxy registering itself in the coordinator under an unintended name, and
+  even there it is coarse, because a suffix rule with no public-suffix list
+  behind it — a dependency deliberately not taken — reads
+  `yt-1234.us-east-1.elb.amazonaws.com` as sharing a domain with every other
+  load balancer in the region. The scheme, the port and the `@`/`/`/`://`
+  refusals are the parts that hold up on their own.
 
   **Added** `Client::with_heavy_proxies_anywhere`, the opt-in for an
   installation whose `/hosts` genuinely names another domain. It relaxes the
@@ -61,15 +142,15 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
   performed 40 lookups, and now take 809 ms and perform one.** Eight threads
   against a healthy one still ask exactly once, which they already did.
 
-- **A heavy proxy that cannot be reached gives the configured address back.**
-  Before, the answer was thrown away, the same question asked, the same dead
-  host resolved, and every upload for the rest of the client's life failed the
-  same way — the shipped test asserted exactly that. The measured trigger is
-  ordinary: a single-node container reached from the host is not on loopback
-  (`172.17.0.2`), so discovery runs and `/hosts` answers with a
-  container-internal name. Now the first upload fails, the second succeeds
-  against the configured address, and the cluster is asked again ten seconds
-  later.
+- **A heavy proxy that cannot be reached is given up.** Before, the answer was
+  thrown away, the same question asked, the same dead host resolved, and every
+  upload for the rest of the client's life failed the same way — the shipped
+  test asserted exactly that. The measured trigger is ordinary: a single-node
+  container reached from the host is not on loopback (`172.17.0.2`), so
+  discovery runs and `/hosts` answers with a container-internal name. Now the
+  first upload fails, the next name in the answer takes over, and when there is
+  none the second upload succeeds against the configured address with the
+  cluster asked again ten seconds later.
 
 - **A cluster that names no heavy proxy keeps serving them itself.** That is
   what leaves a single-node installation working exactly as it did, and an
@@ -120,10 +201,10 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
 
 - **Not done, and written down instead:** the documentation asks for `/hosts` to
   be re-queried "every minute or every few queries", and both official clients
-  do. This one asks once per client and keeps the answer, re-asking only when
-  the proxy it chose stops answering. That is a load-balancing regression the
-  cluster absorbs, not a correctness one, and it is now disclosed in
-  `docs/sdk-comparison.md` rather than left to be discovered.
+  do. This one asks once per client and then walks the answer it was given,
+  asking again only when the answer runs out. That is a load-balancing
+  regression the cluster absorbs, not a correctness one, and it is now disclosed
+  in `docs/sdk-comparison.md` rather than left to be discovered.
 
 - **Tested offline**, because none of it can be verified here: two listeners in
   `tests/request_shape.rs`, one answering `/hosts` with the other's address, and

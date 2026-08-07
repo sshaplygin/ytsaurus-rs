@@ -108,9 +108,18 @@
 //! serves those on a separate set of proxies. This client asks `/hosts` for one
 //! the first time it sends a heavy command, keeps the answer for the rest of
 //! its life, and sends every later heavy command there. Light commands stay on
-//! the address it was configured with. A heavy command that fails for a reason
-//! another proxy might not have goes back to the configured address, and the
-//! cluster is asked again in a few seconds.
+//! the address it was configured with.
+//!
+//! **A proxy that fails is dropped for the next name in the same answer.** The
+//! whole list `/hosts` gave is kept, best first, and a heavy command that fails
+//! for a reason another proxy might not have moves the client on to the one
+//! behind it. Only when every name in the answer has failed does the client go
+//! back to the configured address — and then only until it asks the cluster
+//! again, a few seconds later
+//! ([`Client::with_hosts_retry_after`]). That order matters: on a deployment
+//! with separate proxy roles the configured address is a *control* proxy, and
+//! going back there on the first hiccup is the failure this feature exists to
+//! prevent.
 //!
 //! **A cluster that names no heavy proxy is answered by using the configured
 //! address**, which is what leaves a single-node installation working exactly
@@ -122,12 +131,21 @@
 //!
 //! **A discovered host is used only if it shares the configured address's own
 //! domain**, and the scheme and port come from that address rather than from
-//! the answer. A heavy command carries the caller's OAuth token, and the
-//! `/hosts` body is what decides where it goes — on a plain-`http://` base,
-//! forging that body is exactly as easy as forging a `Location` header, which
-//! this client refuses to follow. [`Client::with_heavy_proxies_anywhere`] is
-//! the opt-in for an installation whose `/hosts` genuinely names another
-//! domain.
+//! the answer. That rule is a guard against a typo in a configuration and
+//! against an obviously foreign name — not a promise about where a token can
+//! end up. Steering it with a `/hosts` body means controlling that body, which
+//! over `https://` means owning the proxy (which has the token already) and
+//! over `http://` means being a man-in-the-middle (who reads it out of every
+//! light command anyway). Where the rule does bite is a proxy registering
+//! itself in the cluster's coordinator under an unintended name, and even there
+//! it is coarse: sharing a parent domain on a hosting platform means sharing it
+//! with every other tenant of that platform.
+//! [`Client::with_heavy_proxies_in`] is the version that is a boundary — a list
+//! written out on purpose — and [`Client::with_heavy_proxies_anywhere`] is the
+//! opt-out for an installation whose `/hosts` genuinely names another domain.
+//! When a whole answer is declined the client says so once, naming what it
+//! refused and why, rather than leaving it to be deduced from a cluster error
+//! later on.
 //!
 //! Getting this wrong does not look like a routing problem, which is why it is
 //! worth spelling out what it does look like. The refusal arrives as a
@@ -395,15 +413,28 @@ impl Client {
     /// Lets `/hosts` name a heavy proxy outside the configured address's own
     /// domain.
     ///
-    /// **Off by default, and the default is the safe one.** A heavy command
-    /// carries the caller's OAuth token, and the `/hosts` body decides where it
-    /// goes. So a discovered name is used only if it is the configured host
-    /// itself or sits under that host's parent domain —
+    /// **Off by default.** A discovered name is used only if it is the
+    /// configured host itself or sits under that host's parent domain —
     /// `https://cluster.example.net` will follow `n0132-sas.example.net` and
-    /// will not follow `n0132-sas.somewhere-else.net`. A name that is refused is
-    /// passed over; a `/hosts` answer that is refused entirely leaves the upload
-    /// going to the configured address, which is where it went before this
-    /// client routed anything.
+    /// will not follow `n0132-sas.somewhere-else.net`. A configured name with
+    /// no dots in it, which is how `YT_PROXY` is usually written, is matched as
+    /// a label instead: `hume` follows `n0008-sas.hume.yt.yandex.net`. A name
+    /// that is refused is passed over; a `/hosts` answer that is refused
+    /// entirely leaves the upload going to the configured address, which is
+    /// where it went before this client routed anything, and the client says so
+    /// once rather than leaving it to be deduced.
+    ///
+    /// **What that rule is worth**, since it was once written down here as more
+    /// than it is: it guards against a typo in a configuration and against an
+    /// obviously foreign name. It is not what keeps a token where you put it.
+    /// Steering a heavy command with a `/hosts` body means controlling that
+    /// body — over `https://` that is owning the proxy, which has the token
+    /// already, and over `http://` that is being a man-in-the-middle, who reads
+    /// the token out of every light command without coming near this. Where the
+    /// rule does bite is a proxy registering itself in the coordinator under an
+    /// unintended name, and even there a shared parent domain on a hosting
+    /// platform is shared with every tenant of it. Use
+    /// [`Client::with_heavy_proxies_in`] where a real boundary is wanted.
     ///
     /// Turn it on for an installation whose `/hosts` genuinely names another
     /// domain — a cluster fronted by a vanity address, or one whose data proxies
@@ -415,7 +446,9 @@ impl Client {
     /// The symptom of needing it is an upload that reaches the *configured*
     /// address and is refused there — `Control proxy may not serve heavy
     /// requests with input data` — while [`Client::heavy_proxy`] shows a
-    /// perfectly good address the client declined to use.
+    /// perfectly good address the client declined to use. The client says so
+    /// itself, once, when it declines a whole `/hosts` answer, and the refusal
+    /// it then collects carries the same sentence.
     ///
     /// ```
     /// use ytsaurus_client::Client;
@@ -424,11 +457,102 @@ impl Client {
     ///     .with_heavy_proxies_anywhere(true);
     /// ```
     ///
+    /// **This is all or nothing**, which is why
+    /// [`Client::with_heavy_proxies_in`] exists beside it: a domain rule that
+    /// misses by one label should not have to be answered by removing the rule.
+    /// The last of the two called is the one that decides.
+    ///
     /// This does not disturb what a client it was cloned from has already
     /// resolved.
     #[must_use]
     pub fn with_heavy_proxies_anywhere(mut self, enabled: bool) -> Self {
         self.transport.set_heavy_proxies_anywhere(enabled);
+        self
+    }
+
+    /// Restricts heavy commands to a list of proxies written out by hand.
+    ///
+    /// The third answer to "which of the names `/hosts` gives may this client
+    /// send a token to", and the only one that is a boundary rather than a
+    /// heuristic. The domain rule is a guard against a typo and against an
+    /// obviously foreign name — it cannot be more than that without a
+    /// public-suffix list, and on a shared platform a shared parent domain
+    /// means very little: `yt-1234.us-east-1.elb.amazonaws.com` and every other
+    /// load balancer in that region share one. A list somebody wrote on purpose
+    /// does not have that problem.
+    ///
+    /// Names are compared **without their ports and without case**; the port a
+    /// command is sent to still comes from the configured address, or from the
+    /// `/hosts` entry when it carries one. Everything else in the client is
+    /// unchanged: the scheme comes from the configured address, and a name
+    /// carrying `://`, `/`, `@` or whitespace is still not a name.
+    ///
+    /// ```
+    /// use ytsaurus_client::Client;
+    ///
+    /// let client = Client::new("https://cluster.example.net")
+    ///     .with_heavy_proxies_in(["n0132-sas.example.net", "n0133-sas.example.net"]);
+    /// ```
+    ///
+    /// An empty list admits nothing, so every heavy command stays on the
+    /// configured address — [`Client::with_proxy_discovery`] is the plainer way
+    /// to say that. The last of this and
+    /// [`Client::with_heavy_proxies_anywhere`] to be called is the one that
+    /// decides, and neither disturbs what a client this was cloned from has
+    /// already resolved.
+    #[must_use]
+    pub fn with_heavy_proxies_in<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.transport
+            .set_heavy_proxies_in(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Overrides the budget for the `/hosts` lookup, which defaults to 800 ms.
+    ///
+    /// The lookup sits in front of the first heavy command and gets its own
+    /// budget rather than the client's, because not getting an answer costs
+    /// nothing worse than the routing this crate had none of a release ago —
+    /// see [`Client::with_timeout`] for the one that bounds a command.
+    ///
+    /// **Raising it is the point.** The budget used to be the smaller of 800 ms
+    /// and the client's own timeout, so it could only ever be lowered: a
+    /// cluster that answers `/hosts` in 900 ms could not be routed to by any
+    /// configuration at all. And 800 ms is not always generous — the first
+    /// heavy command is often a client's first request, which puts DNS, TCP and
+    /// a TLS handshake inside the same budget.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use ytsaurus_client::Client;
+    ///
+    /// let client = Client::new("https://cluster.example.net")
+    ///     .with_hosts_timeout(Duration::from_secs(3));
+    /// ```
+    #[must_use]
+    pub fn with_hosts_timeout(mut self, timeout: Duration) -> Self {
+        self.transport.set_hosts_timeout(timeout);
+        self
+    }
+
+    /// Overrides how long routing stays off after it falls back, which defaults
+    /// to ten seconds.
+    ///
+    /// Two things end up here: a `/hosts` lookup that failed for a reason that
+    /// might pass, and an answer whose every proxy has since failed. Both mean
+    /// "use the address the caller gave, and ask the cluster again in a
+    /// moment"; this is the moment. A lookup that *settled* — no such endpoint,
+    /// an answer that is not a list of names, a cluster that names no heavy
+    /// proxy — is not affected by this at all, because it is never asked again.
+    ///
+    /// Shorter brings routing back sooner after a cluster recovers, and costs a
+    /// lookup more often while it is broken. Longer is the other trade.
+    #[must_use]
+    pub fn with_hosts_retry_after(mut self, after: Duration) -> Self {
+        self.transport.set_hosts_retry_after(after);
         self
     }
 
@@ -577,9 +701,10 @@ impl Client {
     /// uploads are not using is the symptom
     /// [`Client::with_heavy_proxies_anywhere`] exists for.
     ///
-    /// It shares the lookup's budget, though: one attempt bounded well under a
-    /// second, rather than the client's retry policy and request timeout. The
-    /// budget belongs to the question, not to whoever asked it.
+    /// It shares the lookup's budget, though: one attempt bounded by
+    /// [`Client::with_hosts_timeout`] — 800 ms unless that says otherwise —
+    /// rather than the client's retry policy and request timeout. The budget
+    /// belongs to the question, not to whoever asked it.
     ///
     /// # Errors
     ///
@@ -588,10 +713,11 @@ impl Client {
     /// cluster answered and named no heavy proxy — which a failure must not be
     /// allowed to look like, since the caller's next move is to stop looking.
     pub fn heavy_proxy(&self) -> Result<Option<String>> {
-        // Through the transport, so this carries the token and honours the
-        // timeout, the retry policy and the TLS guard like every other request
-        // — and so that the automatic routing and this read the same answer
-        // with the same parser.
+        // Through the transport, so this carries the token and the TLS guard
+        // like every other request, and so that the automatic routing and this
+        // read the same answer with the same parser. Not the timeout and not
+        // the retry policy: `Transport::fetch` gives this question its own
+        // budget, which is the whole point of it having one.
         Ok(self.transport.heavy_hosts()?.into_iter().next())
     }
 
