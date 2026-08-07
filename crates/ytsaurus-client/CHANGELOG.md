@@ -45,15 +45,25 @@
   what an API v4 command needs whatever the digit — a command's verb is fixed
   by the command, so a `create` rewritten into a `GET` is not a `create`. A
   bodiless `POST` therefore follows a balancer's canonical-host `301` like any
-  other command, and a buffered `write_table` sends its rows to the address it
-  was pointed at.
+  other command, and a same-origin `write_table` sends its rows on rather than
+  losing them.
 
-  What still fails is a redirect on a body this client **cannot send a second
-  time**: `write_table_rows` and `raw_command_upload` read their body as they
-  send it, so by the time the `3xx` arrives some of it has gone and a reader
-  cannot be rewound. Those close a silent data loss that predates all of this —
-  a redirect that dropped the body left `write_table` returning `Ok(())` having
-  written no rows — and they report it as
+  Two things still do not travel, and the rule for both is the **origin**:
+
+  - **credentials** — unchanged, and described above;
+  - **data**, with or without a token
+    (`RedirectRefusal::Payload`, new). The same objection as the token, about
+    the other thing a caller picks a host for: a tokenless `write_table` does
+    not get to send a table's rows to whichever host a `Location` header
+    names. A body of length zero is not data — `Content-Length: 0` gives
+    nothing away — so most of API v4 is unaffected.
+
+  Separately, a body this client **cannot send a second time** is refused
+  wherever it points: `write_table_rows` and `raw_command_upload` read their
+  body as they send it, so by the time the `3xx` arrives some of it has gone
+  and a reader cannot be rewound. That closes a silent data loss that predates
+  all of this — a redirect that dropped the body left `write_table` returning
+  `Ok(())` having written no rows — and reports it as
   `ClientError::Redirected { refusal: RedirectRefusal::Body, .. }`.
 
 - **Fixed** the request timeout being multiplied by the length of a redirect
@@ -79,8 +89,9 @@
   to have answered.
 
 - **Added** `RedirectRefusal`, the reason a redirect was refused:
-  `Credentials`, `Body` or `TooMany`. It is a field on
+  `Credentials`, `Body`, `Payload` or `TooMany`. It is a field on
   `ClientError::Redirected`, and it renders the clause the message carries.
+  Non-exhaustive, which is what let `Payload` join it.
 
   `ureq` now follows **no** redirect for any transport (`max_redirects(0)`) and
   this client follows them itself, because the answer turns on the credentials,

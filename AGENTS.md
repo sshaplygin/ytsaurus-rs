@@ -343,25 +343,33 @@ per command. Cluster facts:
   the redirect is deliberately cross-host, which is precisely what that setting
   does not cover.
 - **`ureq` therefore follows nothing — `max_redirects(0)` for every transport —
-  and the client follows redirects itself**, because the answer turns on three
-  things no combination of `ureq` settings expresses:
+  and the client follows redirects itself**, because the answer turns on
+  several things at once that no combination of `ureq` settings expresses.
+  **Same origin: everything goes.** **Crossing one: the token and the data stay
+  behind.** In detail:
   - a redirect that **changes origin** (scheme, host or port) is refused when
     the request carries credentials, with `ClientError::Redirected`, naming
     where it pointed. One that stays on the same origin is followed, token and
     all: nothing new learns it, and refusing would break every command against
     a balancer that canonicalises its own host.
+  - a redirect that changes origin is **also** refused when the request carries
+    **data**, token or no token (`RedirectRefusal::Payload`). The same
+    objection as the token, about the other thing a caller picks a host for: a
+    tokenless `write_table` must not send a table's rows to whichever host a
+    `Location` header names. A body of **length zero** is not data —
+    `Content-Length: 0` gives nothing away — so a bodiless `POST` still goes.
   - **the method and the body survive the hop** — the request is sent again,
     not rewritten into a `GET`. That is what 307/308 require by definition, and
     what an API v4 command needs whatever the digit: a command's verb is fixed
     by the command (mutating → POST, input stream → PUT), and no `Location`
     changes it. So a bodiless `POST create` follows a balancer's `301`, and a
-    buffered `write_table` sends its rows to where it was pointed.
-  - what *is* refused is a redirect on a body this client **cannot send
-    again**: `Transport::upload`'s reader — `write_table_rows`,
-    `raw_command_upload` — has already begun to drain into the first request
-    and cannot be rewound. Refused with or without a token, because it costs
-    data rather than a credential: a `write_table` that arrived with no rows
-    came back `Ok(())` having written none.
+    same-origin `write_table` sends its rows on rather than losing them.
+  - a body this client **cannot send again** is refused wherever it points:
+    `Transport::upload`'s reader — `write_table_rows`, `raw_command_upload` —
+    has already begun to drain into the first request and cannot be rewound.
+    Refused with or without a token, because it costs data rather than a
+    credential: a `write_table` that arrived with no rows came back `Ok(())`
+    having written none.
   - a chain longer than `MAX_REDIRECTS` is a loop, not a route — and the whole
     chain shares **one** deadline, the command's own. Handing each hop a fresh
     `timeout_global` made the real limit `(MAX_REDIRECTS + 1)×` the one the
@@ -373,7 +381,12 @@ per command. Cluster facts:
   `#frag`) keeps the request's path rather than falling back to its directory.
   Reproduced offline in
   `crates/ytsaurus-client/tests/redirect_credentials.rs`; a local cluster runs
-  one proxy and redirects nothing.
+  one proxy and redirects nothing. **A stub there must read the whole request
+  before it answers** — head *and* body, `Content-Length` or chunked, as
+  `request_shape.rs` already did. Replying to a body still being written closes
+  the connection under `ureq`, which then reports a broken pipe instead of the
+  answer; a small body survives that on macOS and not on a Linux runner, which
+  is a test that passes locally and fails in CI.
 
   The `HEAVY` list in `http.rs` decides only whether a refusal ends with "go to
   a heavy proxy". It is the cluster's `isHeavy` bit, so it covers commands only

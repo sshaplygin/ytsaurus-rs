@@ -198,6 +198,29 @@ pub enum RedirectRefusal {
     )]
     Body,
 
+    /// The request carries data, and the redirect leaves the origin it was
+    /// addressed to.
+    ///
+    /// [`RedirectRefusal::Credentials`] asked again about the other thing a
+    /// caller chooses a host for. A token is not the only thing worth
+    /// withholding from a host nobody named: a table's rows are the caller's
+    /// own data, and a `Location` header is the far end of the connection
+    /// asking for them to be sent somewhere else. So this one does not wait
+    /// for a token to be present.
+    ///
+    /// A redirect that stays on the origin is followed, body and all — the
+    /// bytes were already going there. And a body of length zero is not data:
+    /// `Content-Length: 0` gives nothing away, so most of API v4 is unaffected.
+    #[error(
+        "the request carries data and the redirect leaves the host it was \
+         addressed to. Sending it on would hand the body to a host the caller \
+         never named, on the say-so of a header that arrived mid-flight. A \
+         redirect that stays on the same host is followed, body and all; to \
+         reach another one on purpose, ask the cluster for it and address it \
+         yourself."
+    )]
+    Payload,
+
     /// The redirects did not end.
     ///
     /// This client follows a bounded number of same-origin hops; a balancer

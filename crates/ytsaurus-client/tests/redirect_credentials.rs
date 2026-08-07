@@ -6,13 +6,19 @@
 //! is missing credentials` about a token that is perfectly valid.
 //!
 //! That is the report these begin with, and not all of what they hold. This
-//! client follows redirects itself now, so the rest of the policy is here too:
-//! a redirect that stays on the same origin **is** followed, token and all, and
-//! so is the method and the body — a `POST create` met by a balancer's `301`
-//! arrives as a `POST create`. What is refused is a redirect on a body this
-//! client cannot send a second time, which is a body that is a *stream*: by the
-//! time the `3xx` arrives some of it has gone, and a write that arrived with no
-//! rows comes back looking like a write that worked.
+//! client follows redirects itself now, so the rest of the policy is here too.
+//! A redirect that stays on the **same origin** is followed — token, method and
+//! body — so a `POST create` met by a balancer's `301` arrives as a `POST
+//! create`, and a `write_table` sends its rows on rather than losing them.
+//!
+//! Crossing an origin is where things are withheld, and there are two of them:
+//! the **token**, and the request's **data**. Neither waits on the other — a
+//! tokenless `write_table` does not get to send a table to whichever host a
+//! `Location` names — and a body of length zero is not data, so a bodiless
+//! command still goes. Separately, a body this client cannot send a second time
+//! (a *stream*) is refused wherever it points: by the time the `3xx` arrives
+//! some of it has gone, and a write that arrived with no rows comes back
+//! looking like a write that worked.
 //!
 //! And the whole chain is bounded twice over — by ten hops, and by the
 //! command's own timeout, which the hops share rather than each being handed a
@@ -61,6 +67,9 @@ fn stub_answering_after(
     std::thread::spawn(move || {
         let mut answered = 0_usize;
         while let Ok((mut stream, _)) = listener.accept() {
+            // So a client that goes away mid-request fails this stub rather
+            // than hanging the suite behind a read that will never finish.
+            stream.set_read_timeout(Some(STUB_PATIENCE)).ok();
             let mut reader = BufReader::new(stream.try_clone().expect("clones"));
             let request = read_request(&mut reader);
             let reply = &replies[answered.min(replies.len() - 1)];
@@ -78,11 +87,23 @@ fn stub_answering_after(
     (format!("http://{address}"), seen)
 }
 
-/// Reads one request: the head, and the body when the head declares a length.
+/// How long the stub waits on a request that has stopped arriving.
+const STUB_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Reads one request **whole** — head and body — and only then returns.
 ///
-/// The body matters because a redirect is followed by sending the same request
-/// again — so whether the rows arrived at the second host is a question with an
-/// answer, rather than something taken on trust.
+/// Whole, and that is the load-bearing word. Answering a request whose body is
+/// still being written closes the connection under the client, and what it sees
+/// then is `EPIPE` rather than the reply: the answer never gets read, and the
+/// decision the test is about is never reached. A body with a `Content-Length`
+/// is small enough here to sit in the socket buffer and survive that; a
+/// **chunked** one is written by `ureq` as the reader produces it, and a Linux
+/// runner loses the race that macOS won. `write_table_rows` sends exactly that,
+/// so the fix is to stop racing rather than to hope for a buffer — the stub
+/// reads to the end of the body in both framings before it says anything.
+///
+/// Reading it also makes it evidence: whether the rows arrived at the second
+/// host is then a question with an answer rather than something taken on trust.
 fn read_request(reader: &mut BufReader<TcpStream>) -> String {
     let mut head = String::new();
     loop {
@@ -95,18 +116,70 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> String {
         }
     }
 
-    let length = head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
+    let header = |name: &str| {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_owned())
+    };
 
-    let mut body = vec![0; length];
-    if reader.read_exact(&mut body).is_err() {
-        body.clear();
-    }
+    let body = if header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
+        read_chunked(reader)
+    } else {
+        let length = header("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        if reader.read_exact(&mut body).is_err() {
+            body.clear();
+        }
+        body
+    };
+
     format!("{head}\r\n{}", String::from_utf8_lossy(&body))
+}
+
+/// Drains a chunked body to its terminating zero-length chunk.
+///
+/// Bails on anything it cannot parse rather than looping: a stub that hung on
+/// a malformed chunk would hang the test, and there is nothing here it could
+/// usefully say about one.
+fn read_chunked(reader: &mut BufReader<TcpStream>) -> Vec<u8> {
+    let mut body = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        // `size[;extension]`, in hex.
+        let size = line.trim().split(';').next().unwrap_or("");
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            break;
+        };
+        if size == 0 {
+            // The trailer section — empty in practice — ends at a blank line.
+            loop {
+                let mut end = String::new();
+                match reader.read_line(&mut end) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if end == "\r\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            break;
+        }
+
+        let mut chunk = vec![0; size];
+        if reader.read_exact(&mut chunk).is_err() {
+            break;
+        }
+        body.extend_from_slice(&chunk);
+        // The CRLF that closes the chunk.
+        if reader.read_exact(&mut [0; 2]).is_err() {
+            break;
+        }
+    }
+    body
 }
 
 /// The answer a control proxy gives a heavy read: go to that other host.
@@ -377,9 +450,43 @@ fn a_buffered_write_is_sent_again_rather_than_emptied() {
     // having written no rows at all.
     //
     // Following the redirect *ourselves* answers it outright — the same method
-    // and the same rows go to the address the proxy named, which is what a
-    // `307` means and what a heavy redirect to a data proxy is for. So the
-    // assertion is not that the write was refused; it is that the rows arrived.
+    // and the same rows go where the proxy pointed. On the **same origin**,
+    // which is the case the rule is for: a balancer canonicalising its own
+    // paths. The rows were already going to that host. Crossing to another one
+    // is the test below, and is refused.
+    let (proxy, seen) = stub_answering(vec![
+        redirect_with(307, "Temporary Redirect", "/api/v4/write_table", ""),
+        empty_answer(),
+    ]);
+
+    let client = Client::new(&proxy).with_retries(RetryPolicy::none());
+    client
+        .write_table("//tmp/t", b"{a=1};")
+        .expect("the rows are sent again rather than dropped");
+
+    let asked = heads(&seen);
+    assert_eq!(asked.len(), 2, "the redirect was not followed: {asked:?}");
+    for head in &asked {
+        assert!(
+            head.starts_with("PUT /api/v4/write_table"),
+            "the method did not survive the hop: {head}"
+        );
+        assert!(
+            head.ends_with("{a=1};"),
+            "the rows were dropped on the way: {head}"
+        );
+    }
+}
+
+#[test]
+fn a_buffered_write_does_not_take_the_rows_to_another_host() {
+    // The other half, and the one following redirects at all put at risk: with
+    // no token there is no credential to refuse over, and the rows are
+    // re-sendable — so nothing but this rule stops a `Location` header from
+    // redirecting a table's contents to whichever host it names. That is not
+    // the silent nothing the rule above prevents; it is the caller's data going
+    // somewhere the caller never chose, which is the same objection the token
+    // gets and deserves the same answer.
     let (elsewhere, elsewhere_seen) = stub(empty_answer());
     let (proxy, proxy_seen) = stub(redirect_with(
         302,
@@ -389,28 +496,61 @@ fn a_buffered_write_is_sent_again_rather_than_emptied() {
     ));
 
     let client = Client::new(&proxy).with_retries(RetryPolicy::none());
-    client
+    let error = client
         .write_table("//tmp/t", b"{a=1};")
-        .expect("the rows are sent to where the redirect pointed");
+        .expect_err("rows do not cross an origin on a header's say-so");
 
-    let first = heads(&proxy_seen);
-    assert_eq!(first.len(), 1, "{first:?}");
     assert!(
-        first[0].starts_with("PUT /api/v4/write_table"),
-        "{}",
-        first[0]
+        matches!(
+            &error,
+            ClientError::Redirected {
+                refusal: RedirectRefusal::Payload,
+                status: 302,
+                ..
+            }
+        ),
+        "{error:?}"
     );
+    // Asked of the second stub rather than of the error: what matters is that
+    // the bytes did not arrive, not that a `Result` said so.
+    assert!(
+        heads(&elsewhere_seen).is_empty(),
+        "the rows went to a host nobody named: {:?}",
+        heads(&elsewhere_seen)
+    );
+    assert_eq!(heads(&proxy_seen).len(), 1);
+}
+
+#[test]
+fn a_bodiless_post_may_still_cross_an_origin() {
+    // The line the data rule draws is around *data*, not around bodies. A
+    // command with no payload — most of API v4 — sends `Content-Length: 0` and
+    // gives nothing away by going, so it keeps the behaviour a tokenless client
+    // has always had. Drawing the line at "has a body" instead would refuse
+    // every POST again, which is the bug this branch spent a commit fixing.
+    let (elsewhere, elsewhere_seen) = stub(empty_answer());
+    let (proxy, _) = stub(redirect_with(
+        307,
+        "Temporary Redirect",
+        &format!("{elsewhere}/api/v4/create"),
+        "",
+    ));
+
+    let client = Client::new(&proxy).with_retries(RetryPolicy::none());
+    client
+        .create("map_node", "//tmp/thing")
+        .expect("an empty body has nothing to give away");
 
     let followed = heads(&elsewhere_seen);
     assert_eq!(followed.len(), 1, "the redirect was not followed");
     assert!(
-        followed[0].starts_with("PUT /api/v4/write_table"),
-        "the method did not survive the hop: {}",
+        followed[0].starts_with("POST /api/v4/create"),
+        "{}",
         followed[0]
     );
     assert!(
-        followed[0].ends_with("{a=1};"),
-        "the rows were dropped on the way: {}",
+        !followed[0].to_lowercase().contains("authorization:"),
+        "there was no token to send: {}",
         followed[0]
     );
 }
@@ -421,6 +561,13 @@ fn a_streamed_write_is_refused_because_it_cannot_be_sent_twice() {
     // true. `write_table_rows` encodes as it sends: by the time the `3xx`
     // arrives some of the body has gone, and a reader cannot be rewound. There
     // is no request left to send to the second host, so nothing is sent.
+    //
+    // Rows enough that the body cannot sit in a socket buffer, which is what
+    // the stub's draining is for: answering a chunked request that is still
+    // being written closes the connection under `ureq`, and it reports the
+    // broken pipe rather than the refusal. A small body wins that race on one
+    // platform and loses it on another — this one loses it everywhere unless
+    // `read_request` really does read to the end of the body before replying.
     let (elsewhere, elsewhere_seen) = stub(empty_answer());
     let (proxy, _) = stub(redirect_with(
         307,
@@ -431,7 +578,10 @@ fn a_streamed_write_is_refused_because_it_cannot_be_sent_twice() {
 
     let client = Client::new(&proxy).with_retries(RetryPolicy::none());
     let error = client
-        .write_table_rows("//tmp/t", [BTreeMap::from([("a", 1_i64)])])
+        .write_table_rows(
+            "//tmp/t",
+            (0..200_000).map(|i| BTreeMap::from([("a", i as i64)])),
+        )
         .expect_err("a body that cannot be replayed is refused");
 
     assert!(

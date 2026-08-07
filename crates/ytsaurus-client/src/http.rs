@@ -160,9 +160,15 @@ pub(crate) enum Payload<'a> {
 ///
 /// `ureq`'s [`SendBody`] is one-shot by construction — it may be a reader that
 /// has already been drained — so following a redirect needs the body kept as
-/// something that can produce a fresh `SendBody` per hop. That is the whole
-/// difference between the two loaded variants, and the whole of what
-/// [`RedirectRefusal::Body`] now means.
+/// something that can produce a fresh `SendBody` per hop.
+///
+/// Two questions are asked of it when a `3xx` arrives, and they are not the
+/// same question. **Can this request be sent again?** — no, if it is a reader
+/// ([`Outgoing::replayable`], [`RedirectRefusal::Body`]). **Would sending it
+/// again hand someone data?** — yes, if there are bytes in it
+/// ([`Outgoing::carries_data`], [`RedirectRefusal::Payload`]). A body of length
+/// zero answers no to the second and yes to the first, which is why an empty
+/// slice is not the same thing as a table full of rows.
 enum Outgoing<'a> {
     /// No body at all — neither `Content-Length` nor `Transfer-Encoding`.
     ///
@@ -178,7 +184,7 @@ enum Outgoing<'a> {
     /// API v4 carries its parameters in `X-YT-Parameters` and its payload
     /// nowhere, and such a command has always gone out as `Content-Length: 0`.
     /// A body of length zero is still a body a `GET` could not have carried —
-    /// and still nothing a redirect can lose.
+    /// and still nothing a redirect can lose or give away.
     Bytes(&'a [u8]),
     /// A body read as it is sent — [`Client::write_table_rows`](crate::Client::write_table_rows)
     /// and every [`Client::raw_command_upload`](crate::Client::raw_command_upload).
@@ -192,6 +198,20 @@ impl Outgoing<'_> {
     /// Whether a redirect on this request could send the same request again.
     fn replayable(&self) -> bool {
         !matches!(self, Outgoing::Stream(_))
+    }
+
+    /// Whether there are bytes here that a redirect would be giving away.
+    ///
+    /// A body of length zero is not data. `Content-Length: 0` is what a `POST
+    /// create` sends and what a `GET` does not send at all; neither has
+    /// anything in it that a caller would mind another host receiving, so
+    /// neither is a reason to refuse a hop the credentials rule allows.
+    fn carries_data(&self) -> bool {
+        match self {
+            Outgoing::Empty => false,
+            Outgoing::Bytes(bytes) => !bytes.is_empty(),
+            Outgoing::Stream(_) => true,
+        }
     }
 }
 
@@ -572,7 +592,7 @@ impl Transport {
                             source: Box::new(e),
                         })?;
 
-                match self.redirect(what, &response, &url, true, hops)? {
+                match self.redirect(what, &response, &url, &Outgoing::Empty, hops)? {
                     Some(next) => {
                         if let Some(error) = tls_unavailable(&next) {
                             return Err(error);
@@ -718,7 +738,7 @@ impl Transport {
             // Before the cluster's own error, because a redirect is not the
             // cluster reporting a failure — it is this client deciding where a
             // request goes, which is a fact no `X-YT-Error` could carry.
-            if let Some(next) = self.redirect(command, &response, &url, body.replayable(), hops)? {
+            if let Some(next) = self.redirect(command, &response, &url, &body, hops)? {
                 // The same guard the first address got: a same-origin redirect
                 // cannot change the scheme, but nothing here assumes that.
                 if let Some(error) = tls_unavailable(&next) {
@@ -771,7 +791,9 @@ impl Transport {
     /// would be dropped exactly as before — and the next reader would conclude
     /// the problem lay somewhere else entirely.
     ///
-    /// So the rules are here instead, and there are three of them.
+    /// So the rules are here instead, and there are four of them. Three say
+    /// what a redirect must not take with it across an origin, and the fourth
+    /// says when a route stops being one.
     ///
     /// **A redirect that leaves the origin is refused when the request carries
     /// credentials.** That leaves the honest choice — re-attach for the host
@@ -783,21 +805,37 @@ impl Transport {
     /// canonicalising its own host would otherwise break every command.
     ///
     /// **A redirect on a body this client cannot send again is refused.** Not
-    /// on a body: on an *unrepeatable* one. Following a redirect here means
-    /// sending the same request to the address it named — same method, same
-    /// payload — which is what `307` and `308` require and what an API v4
-    /// command needs whatever the digit, since a command's verb is a property
-    /// of the command. A payload held as bytes goes out again and nothing is
-    /// lost. A payload that is a *reader* — [`Transport::upload`], so
-    /// `write_table` from an iterator and every `raw_command_upload` — has
+    /// on a body: on an *unrepeatable* one, and wherever it points. Following a
+    /// redirect here means sending the same request to the address it named —
+    /// same method, same payload — which is what `307` and `308` require and
+    /// what an API v4 command needs whatever the digit, since a command's verb
+    /// is a property of the command. A payload held as bytes goes out again and
+    /// nothing is lost. A payload that is a *reader* — [`Transport::upload`],
+    /// so `write_table` from an iterator and every `raw_command_upload` — has
     /// already begun to drain into the first request by the time the `3xx`
     /// arrives, and cannot be rewound. That one is refused, with or without a
     /// token: dropping the rows and reporting the answer to an empty request
     /// is how a write that wrote nothing comes back looking like one that
     /// worked.
     ///
+    /// **A redirect that leaves the origin is refused when the request carries
+    /// data**, whether or not there is a token. This is the credentials rule
+    /// again, about the other thing a caller chooses a host for: a token is not
+    /// the only thing worth not handing to a host nobody named, and a table's
+    /// rows are the caller's own. Sending them on would answer a header that
+    /// arrived mid-flight with the contents of the request. A body of length
+    /// zero is not data — `Content-Length: 0` gives nothing away — so a
+    /// bodiless `POST` still goes wherever the credentials rule lets it.
+    ///
     /// **A chain that does not end is refused.** [`MAX_REDIRECTS`] hops, then
     /// it is a loop rather than a route.
+    ///
+    /// The order is the order of what a caller most needs told. Credentials
+    /// first, because a leaked token is the worst outcome and a refused one is
+    /// the confusing one. Then the unrepeatable body, because that is refused
+    /// at any address and so is the more general fact about the request. Then
+    /// the data crossing an origin, which is the one a same-origin balancer
+    /// never triggers.
     ///
     /// The deliberate way to reach a data proxy is to ask the cluster for one
     /// — `/hosts`, [`Client::heavy_proxy`](crate::Client::heavy_proxy) — and
@@ -814,7 +852,7 @@ impl Transport {
         command: &str,
         response: &ureq::http::Response<ureq::Body>,
         request_url: &str,
-        replayable: bool,
+        body: &Outgoing<'_>,
         hops: usize,
     ) -> Result<Option<String>> {
         let status = response.status();
@@ -842,14 +880,26 @@ impl Transport {
             })
         };
 
+        // Computed once: both origin rules ask the same question, and it is
+        // the expensive one here.
+        let elsewhere = !same_origin(request_url, &target);
+
         // Credentials first: it is the one a caller most needs the reason for,
         // and the one a heavy `write_table` would otherwise be told the wrong
         // thing about.
-        if self.token.is_some() && !same_origin(request_url, &target) {
+        if self.token.is_some() && elsewhere {
             return refused(RedirectRefusal::Credentials);
         }
-        if !replayable {
+        if !body.replayable() {
             return refused(RedirectRefusal::Body);
+        }
+        // A token is not the only thing a caller picks a host for. Without
+        // this, a tokenless `write_table` answered `302` sent its rows to
+        // whichever host the header named — which is not the silent nothing
+        // the rule above prevents, but it is still the request's contents
+        // going somewhere nobody asked for.
+        if elsewhere && body.carries_data() {
+            return refused(RedirectRefusal::Payload);
         }
         if hops >= MAX_REDIRECTS {
             return refused(RedirectRefusal::TooMany);
