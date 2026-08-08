@@ -285,6 +285,46 @@ machine where the CLI already works needs nothing else. A token read from a file
 is trimmed — `echo token > ~/.yt/token` leaves a newline, and sending it fails
 authentication with an error that never mentions a newline.
 
+**A cluster behind a private CA needs its CA named.** A bare host name in
+`YT_PROXY` means `https://`, and TLS here is `rustls` with the Mozilla root
+bundle compiled in — so an installation whose certificate chains to a corporate
+CA is refused with `invalid peer certificate: UnknownIssuer`, however happily
+`curl` talks to it. `YT_CA_BUNDLE` names a PEM file to trust instead:
+
+```sh
+export YT_PROXY=cluster.example.net
+export YT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+```
+
+Every certificate in the file becomes a root; anything else in it — a private
+key, a comment — is not one, and is skipped. A file that yields no certificates
+at all is **refused**, with an error naming it, rather than quietly falling back
+to the Mozilla roots: that fallback would answer a deliberate request with the
+very handshake failure the variable exists to end. So is a file that cannot be
+read, one that is not a regular file, and one larger than 16 MB.
+
+**A `BEGIN CERTIFICATE` block that is not an X.509 certificate refuses the whole
+file**, naming it and saying how many blocks were wrong. PEM is only an
+envelope, and `rustls` discards a block it cannot parse without telling anyone —
+so a PKCS#7 `.p7b` re-armoured under that label used to be accepted, produce an
+empty root store, and fail every request with the same `UnknownIssuer` this
+variable exists to end. `openssl pkcs7 -print_certs` converts one properly.
+
+The other way is the `platform-verifier` feature, which trusts whatever the
+operating system trusts and so needs nothing set — see *Features*. The bundle
+wins when both are there: it is the more specific answer, and the one the caller
+went out of their way to give.
+
+**An unknown issuer, or a certificate that does not cover the host asked for, is
+reported once rather than retried.** Neither is transient: both are decided by
+this client's own roots and its own URL, which are the same on the fifth attempt,
+and retrying only put fifteen seconds of doubling backoff in front of the same
+message. Every other TLS complaint is still retried — an expired certificate,
+because a round-robin fleet mid-rotation may answer with a renewed one next
+time, and a platform verifier's `Other(…)`, because that is how
+`rustls-platform-verifier` reports a revocation lookup or a trust store that was
+briefly unavailable. So is an ordinary reset connection.
+
 **Responses are compressed.** Every request carries `Accept-Encoding: gzip` and
 every answer is decompressed on the way in, including a streamed table read: on
 a local cluster 67.7 MiB of table arrived as 400 KiB. Uploads are not
@@ -338,6 +378,15 @@ at all if you install none.
 off leaves a client that speaks plain HTTP and needs no C toolchain — which is
 how a binary that is both launcher and job gets cross-compiled to musl. Without
 it, an `https://` proxy fails with an error naming the feature.
+
+`platform-verifier` (off) verifies the cluster against the operating system's
+own trust store rather than the Mozilla bundle, so an on-premises installation
+works with nothing set — the machine already trusts its CA, which is why `curl`
+and the `yt` CLI reach it. Off by default because it costs
+`rustls-platform-verifier`, and because the compiled-in bundle is the safer
+default for a client that may be running outside the network it is talking to.
+`YT_CA_BUNDLE` covers the same ground with no dependency at all and is checked
+first.
 
 `tracing` (off) adds the spans above. Off for the same reason: a worker binary
 should carry only what it runs on, and `examples/` — what `build-worker.sh`

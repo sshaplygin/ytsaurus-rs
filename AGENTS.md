@@ -96,13 +96,17 @@ even for a worker that contains the whole client. The dependency is spelled out
 in `examples/Cargo.toml` rather than inherited, because cargo does not let an
 inherited dependency disable default features.
 
-Its **`tracing` feature is off by default** and must stay that way, for the
-second half of the same reason: a worker binary should carry only what it runs
-on, and `default-features = false` in `examples/Cargo.toml` is what keeps it
-out of the musl build. CI asserts that rather than trusting it — the musl job
-lists the worker's dependency graph with `cargo tree -p ytsaurus-examples
---target x86_64-unknown-linux-musl --prefix none` and fails if `tracing`,
-`rustls` or `ring` is in it. Listed and searched rather than probed with
+Its **`tracing` and `platform-verifier` features are off by default** and must
+stay that way, for the second half of the same reason: a worker binary should
+carry only what it runs on, and `default-features = false` in
+`examples/Cargo.toml` is what keeps them out of the musl build.
+`platform-verifier` is gated on `tls` and so cannot reach a worker even if
+something asked for it; `YT_CA_BUNDLE`, which answers the same need with no
+dependency at all, sits behind `tls` for the same reason. CI asserts all of
+this rather than trusting it — the musl job lists the worker's dependency graph
+with `cargo tree -p ytsaurus-examples --target x86_64-unknown-linux-musl
+--prefix none` and fails if `tracing`, `rustls`, `ring` or
+`rustls-platform-verifier` is in it. Listed and searched rather than probed with
 `-i <crate>`: `-i` exits non-zero both when the crate is absent (the pass) and
 when cargo could not run at all, and it resolves `-i` before `-p`, so even a
 misspelled package prints the same "did not match any packages". Reading that
@@ -330,6 +334,53 @@ per command. Cluster facts:
   a crate linked into musl worker binaries, which is a human's call.
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
+- **TLS trusts the Mozilla bundle unless told otherwise**, which is
+  `webpki-roots` compiled in through `ureq`'s `rustls` feature. A bare host name
+  in `YT_PROXY` means `https://`, so an on-premises installation behind a
+  corporate CA was unreachable — `invalid peer certificate: UnknownIssuer`,
+  where `curl` succeeds by reading the OS trust store. `YT_CA_BUNDLE` names a
+  PEM file instead; the `platform-verifier` feature trusts what the OS trusts;
+  the bundle wins where both are set. A **bundle that parses to no certificates
+  is refused**, naming the file — the fallback would be the same silent
+  `UnknownIssuer`. Verified against a real multi-node installation with a
+  three-deep, self-signed chain (#29); a local cluster is plain HTTP and cannot
+  exercise any of it.
+- **PEM is an envelope and proves nothing about what is inside it.**
+  `ureq::tls::parse_pem` splits the sections and base64-decodes them; the
+  `Certificate` it hands back is documented as unvalidated, and `rustls`'
+  `add_parsable_certificates` then **discards what it cannot parse and reports
+  the count to nobody**. So a PKCS#7 `.p7b` re-armoured under a
+  `BEGIN CERTIFICATE` label — how a Windows-born bundle usually arrives — was
+  accepted, produced an empty root store, and failed every request with the
+  same `UnknownIssuer` the variable exists to end. `http::is_x509` checks the
+  DER skeleton (`SEQUENCE { SEQUENCE, SEQUENCE, BIT STRING }`, and the head of
+  the `TBSCertificate` inside it) and **one bad block refuses the whole file**;
+  a `ContentInfo` parts company at its first member, which is an OBJECT
+  IDENTIFIER rather than the `tbsCertificate` sequence. The bundle is also
+  `stat`ed before it is opened, because opening a FIFO blocks for ever and
+  `Client::new` is infallible with nothing above it to time a file read out.
+- **A rejected certificate is not retried — for two of the reasons, not all of
+  them.** It arrives as `ureq::Error::Io` of kind `InvalidData` wrapping a
+  `rustls::Error`, rendered `invalid peer certificate: <CertificateError>`, and
+  was retried five times as an ordinary transport failure, which put ~15 s of
+  backoff in front of a verdict that cannot change. Only `UnknownIssuer` and
+  the name mismatch are that verdict: both are decided by *this client's* roots
+  and *this client's* URL, which the next attempt does not change.
+
+  **Match the rendering, not the variant name.** `rustls` renders that error
+  with `Display`, and `Display for CertificateError` writes prose for the
+  context-carrying variants while falling back to `Debug` for the rest. So
+  `UnknownIssuer` arrives under its own name, but a hostname mismatch arrives
+  as `certificate not valid for name "…"; certificate is only valid for …` —
+  and the webpki verifier builds *only* `NotValidForNameContext`, never the
+  bare variant, so matching `NotValidForName` alone settles nothing in the
+  default build. Both spellings are listed for that reason. Everything else stays retriable, and deliberately so —
+  `rustls-platform-verifier` maps a failed revocation lookup or an unreadable
+  trust store to `Other(…)` under the same prefix, and classifying those would
+  make enabling `platform-verifier` a way of turning a transient OS condition
+  into a permanent failure; `Expired` and `Revoked` are properties of the fleet
+  member that answered, and a round-robin set mid-rotation may answer with a
+  renewed one next time.
 - **A heavy read through a control proxy is answered with a cross-host `307`**
   naming a data proxy. The
   [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)

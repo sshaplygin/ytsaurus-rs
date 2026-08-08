@@ -2,6 +2,79 @@
 
 ## Unreleased
 
+### A cluster behind a private CA is reachable
+
+- **Added** `YT_CA_BUNDLE`, a PEM file of root certificates to verify the
+  cluster against instead of the Mozilla bundle `ureq` compiles in, and the
+  **`platform-verifier`** feature, which trusts whatever the operating system
+  trusts. Both are off by default and the default is unchanged: a client may be
+  running outside the network it is talking to, where the machine's own trust
+  store is the less trustworthy of the two.
+
+  Until now there was no way to name a CA at all, so an on-premises
+  installation whose chain ends at a corporate root was simply unreachable over
+  `https://` — which is the scheme a bare host name in `YT_PROXY` selects.
+  `curl` reaches the same URL, because it reads the OS trust store. There was no
+  workaround in this crate's public API. Both official clients and the `yt` CLI
+  let a deployment point at its own CA; this is that (#29).
+
+  **A bundle that yields no certificates is refused**, with an error naming the
+  file, rather than quietly becoming the Mozilla roots — a fallback would answer
+  a deliberate request with the very `UnknownIssuer` the variable exists to end,
+  and name neither the file nor the reason. So is one that cannot be read. The
+  refusal is discovered while the agent is being built, where there is nothing
+  to fail, so it waits for the first request that would have needed it. A
+  cluster reached over plain HTTP is not refused: there is no handshake for the
+  bundle to have configured.
+
+  **And so is a `BEGIN CERTIFICATE` block that is not an X.509 certificate.**
+  PEM is only an envelope: the reader splits the sections and base64-decodes
+  them, and `rustls` then discards a block it cannot parse *without telling
+  anyone*. So a PKCS#7 `.p7b` re-armoured under that label — how a Windows-born
+  bundle usually arrives — was accepted here, produced an empty root store, and
+  failed every request with exactly the `UnknownIssuer` that naming a CA is
+  supposed to prevent, mentioning neither the file nor the variable. Every block
+  is now checked to be a certificate, and one that is not refuses the whole
+  file, naming it and saying how many blocks were wrong: a root store silently
+  shorter than the one the caller wrote down is the same failure a step later.
+
+  The bundle wins where both are set. It is the more specific answer, and the
+  one the caller went out of their way to give.
+
+  The file is read **once per process** and capped at 16 MB, and it must be a
+  regular file. `Client::new` cannot fail and the client's global timeout covers
+  requests rather than files, so there was nothing above the read to bound it: a
+  variable naming a FIFO hung the constructor for ever, and one naming something
+  enormous was paid for in memory before anyone could be told. Once per process
+  because an agent is rebuilt more often than it looks — `Client::with_timeout`
+  makes a new one, and a transaction's start and drop each build a client.
+
+  **No new direct dependency, and the musl worker graph is unchanged.** `ureq`
+  3.3 already offers both routes; both sit behind the `tls` feature, which
+  `examples/` — what `build-worker.sh` cross-compiles — turns off. The CI guard
+  now searches for `rustls-platform-verifier` alongside `tracing`, `rustls` and
+  `ring`.
+
+- **Fixed** a certificate error being retried five times. An unknown issuer is
+  not a transient failure — the same roots reject the same certificate on the
+  fifth attempt — but it arrived as a transport error, and every transport error
+  was retriable, so a misconfigured CA took about fifteen seconds of doubling
+  backoff to report. It is reported at the first attempt now.
+
+  Deliberately narrow, and narrower than "the certificate was rejected". Only
+  `UnknownIssuer` and `NotValidForName` are settled, because both are decided by
+  *this client's* root store and *this client's* URL, neither of which the next
+  attempt changes. Every other TLS complaint is still retried: an expired or
+  revoked certificate is a property of the fleet member that answered, and a
+  round-robin set mid-rotation may answer with a renewed one; a revocation list
+  that could not be fetched is transient by definition; and
+  `rustls-platform-verifier` — which the new `platform-verifier` feature turns
+  on — reports a failed revocation lookup or a momentarily unreadable trust
+  store as `Other(…)` under the same prefix, so classifying that would have made
+  enabling the feature a way of turning a bad afternoon on this machine into a
+  permanent failure. A reset connection, a refused one and a timeout are all
+  still retried, as is every protocol-level disagreement mid-handshake.
+
 ### A token no longer follows a redirect to a host nobody chose
 
 - **Fixed** a credential-carrying request being redirected and arriving
