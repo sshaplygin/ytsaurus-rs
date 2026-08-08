@@ -12,7 +12,7 @@
 //! two, and [`Proxy`] rather than [`capture`].
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 
 use ytsaurus_client::{
     Client, ClientError, DataFormat, Method, OperationFilter, OperationParameters, RetryPolicy,
@@ -1022,11 +1022,40 @@ fn refusal() -> Vec<u8> {
 }
 
 /// An address nothing is listening on, for a proxy that has gone away.
+///
+/// It has one job — a connection to it must be *refused*, at once — and one
+/// hazard behind that job: the port must be one no other stub in the suite can
+/// end up bound to, or "nowhere" becomes somewhere.
+///
+/// The obvious way is to bind `127.0.0.1:0`, read the port the OS chose, and
+/// drop the listener so nothing is left answering. That refuses connections —
+/// until the OS hands the freed port to another test's `TcpListener::bind`. The
+/// range is cycled through before a port is reused, so within one binary it
+/// almost never comes round; across a suite that binds thousands of sockets it
+/// does, and then a request meant to go nowhere reaches a live listener (or the
+/// stub that took the port receives a stray request). It is the kind of flake
+/// that passes on a re-run and cannot be reproduced on demand.
+///
+/// A **privileged** port sidesteps the hazard entirely: `bind("127.0.0.1:0")`
+/// draws from the ephemeral range only — 32768+ on Linux, 49152+ on macOS — so
+/// nothing in this suite can ever be assigned a port below 1024, and no test
+/// process binds one deliberately. Nothing is listening there, so a connection
+/// is refused immediately on both platforms. The refusal is *verified* rather
+/// than assumed: the first candidate that actually refuses is the one returned,
+/// so a machine that happens to run something on one of these ports is skipped
+/// rather than silently turning "nowhere" into a live host.
 fn nowhere() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
-    let address = listener.local_addr().expect("has an address");
-    drop(listener);
-    address.to_string()
+    for port in 1u16..=16 {
+        let address = format!("127.0.0.1:{port}");
+        let socket = address.parse().expect("a valid loopback address");
+        match TcpStream::connect_timeout(&socket, std::time::Duration::from_millis(200)) {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return address,
+            // A listener answered, or the connect timed out: not nowhere. Try
+            // the next reserved port rather than hand back a live one.
+            _ => continue,
+        }
+    }
+    panic!("no reserved loopback port refused a connection; cannot address nowhere");
 }
 
 /// A client that discovers, though it is talking to a listener on loopback.
