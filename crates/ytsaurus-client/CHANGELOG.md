@@ -75,6 +75,184 @@
   permanent failure. A reset connection, a refused one and a timeout are all
   still retried, as is every protocol-level disagreement mid-handshake.
 
+### A token no longer follows a redirect to a host nobody chose
+
+- **Fixed** a credential-carrying request being redirected and arriving
+  unauthenticated. A control proxy does not refuse a heavy *read*: it answers
+  `307 Temporary Redirect` naming a data proxy on **another host** — the
+  [HTTP proxy reference][return-codes] gives that row as *"Redirecting heavy
+  queries from light to heavy proxies"* — and `ureq` drops the `Authorization`
+  header when it follows one; its default is `RedirectAuthHeaders::Never`. The
+  read then arrived without a token and the cluster answered `cluster error
+  111: Client is missing credentials`, which sent the user to check their
+  token, their token file and their permissions. None of them was at fault.
+
+  A request whose redirect **changes origin** — scheme, host or port — now
+  fails with **`ClientError::Redirected`** when it carries credentials, naming
+  the status and where it pointed. The alternative, re-attaching the
+  credentials and going, would follow an unsolicited instruction that arrived
+  mid-flight, on a request addressed somewhere else. Asking the cluster for a
+  data proxy is the deliberate route to the same place, `Client::heavy_proxy`,
+  and the error says so — but only to a command that could use one. A `create`
+  that met a balancer's `301` is not told to go and find a heavy proxy.
+
+  The error stops short of telling anyone their token is good: a gateway in
+  front of the cluster may answer an expired token with a redirect of its own,
+  so it reports only what this client is certain of — the credentials were not
+  sent to the host that answered.
+
+  A redirect that **stays on the same origin** is followed, token and all.
+  Nothing new learns the credential by it, and a balancer canonicalising its
+  own host would otherwise break every command against that installation. The
+  `Location` is resolved against the address the request went to
+  ([RFC 3986 §4.2][rfc3986]), so `Location: /api/v4/exists` is placed on the
+  host that sent it rather than reported as a path with no host in it.
+
+  `redirect_auth_headers(RedirectAuthHeaders::SameHost)` is **not** the fix and
+  the source says why where someone would reach for it: the redirect is
+  deliberately cross-host, which is exactly the case that setting does not
+  cover.
+
+- **Changed** a followed redirect now sends the **same request** again: same
+  method, same body. That is what `307` and `308` require by definition, and
+  what an API v4 command needs whatever the digit — a command's verb is fixed
+  by the command, so a `create` rewritten into a `GET` is not a `create`. A
+  bodiless `POST` therefore follows a balancer's canonical-host `301` like any
+  other command, and a same-origin `write_table` sends its rows on rather than
+  losing them.
+
+  Two things still do not travel, and the rule for both is the **origin**:
+
+  - **credentials** — unchanged, and described above;
+  - **data**, with or without a token
+    (`RedirectRefusal::Payload`, new). The same objection as the token, about
+    the other thing a caller picks a host for: a tokenless `write_table` does
+    not get to send a table's rows to whichever host a `Location` header
+    names. A body of length zero is not data — `Content-Length: 0` gives
+    nothing away — so most of API v4 is unaffected.
+
+  Separately, a body this client **cannot send a second time** is refused
+  wherever it points: `write_table_rows` and `raw_command_upload` read their
+  body as they send it, so by the time the `3xx` arrives some of it has gone
+  and a reader cannot be rewound. That closes a silent data loss that predates
+  all of this — a redirect that dropped the body left `write_table` returning
+  `Ok(())` having written no rows — and reports it as
+  `ClientError::Redirected { refusal: RedirectRefusal::Body, .. }`.
+
+- **Fixed** the request timeout being multiplied by the length of a redirect
+  chain. `Client::with_timeout` documents an end-to-end limit for a buffered
+  command, and taking the following away from `ureq` — whose `Timeout::Global`
+  had covered the whole chain — gave every hop a fresh copy of it instead. The
+  real limit became `(hops + 1) ×` the one asked for: a client with a 400 ms
+  timeout, meeting a proxy that redirects to itself with 300 ms of thought per
+  hop, returned from `exists` after **3.36 s and eleven requests**. At the
+  default two minutes that is twenty-two of them, on one `exists` — and the
+  same on `Client::heavy_proxy`, which follows its own redirects.
+
+  An attempt now takes its deadline once and gives each hop what is left of it,
+  so the chain spends one budget. A retry is a fresh attempt and still gets a
+  fresh budget, as it always did.
+
+- **Fixed** `Location: ?path=//other` resolving against the request's
+  *directory* rather than its path — `/api/v4/?path=//other` where
+  [RFC 3986 §5.3][rfc3986-5.3] asks for `/api/v4/exists?path=//other`. A
+  reference with no path of its own keeps the base's, and a bare `#fragment`
+  keeps the base's query as well. Costs a `404` rather than a credential, since
+  the origin is the same either way — but a `404` for a request the proxy meant
+  to have answered.
+
+- **Added** `RedirectRefusal`, the reason a redirect was refused:
+  `Credentials`, `Body`, `Payload` or `TooMany`. It is a field on
+  `ClientError::Redirected`, and it renders the clause the message carries.
+  Non-exhaustive, which is what let `Payload` join it.
+
+  `ureq` now follows **no** redirect for any transport (`max_redirects(0)`) and
+  this client follows them itself, because the answer turns on the credentials,
+  the origin and the body at once, and no combination of `max_redirects` and
+  `redirect_auth_headers` expresses that. A chain longer than ten hops is a
+  loop rather than a route, and is refused as one.
+
+- **Fixed** `get_job_stderr` missing from the list of heavy commands, so a
+  launcher whose stderr fetch met a redirect was refused with no advice
+  attached — at the moment it was already diagnosing a failure. The list is the
+  cluster's `isHeavy` bit rather than an inventory of what this crate models,
+  which is why `read_file` and `read_blob_table` stay on it: `raw_command`
+  sends those, and the documentation on `raw_command_streaming` reads a file.
+
+- **Breaking** `ClientError` is now `#[non_exhaustive]`. A `match` over it must
+  carry a `_` arm. The ways a cluster can refuse are the cluster's to add and
+  not this crate's to freeze — every release so far has added one — so the
+  attribute goes on while the release is source-breaking anyway rather than
+  after. Naming a variant, constructing one and destructuring one are
+  unaffected.
+
+[return-codes]: https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes
+[rfc3986]: https://www.rfc-editor.org/rfc/rfc3986#section-4.2
+[rfc3986-5.3]: https://www.rfc-editor.org/rfc/rfc3986#section-5.3
+
+### A cache that refuses you, and the upload that goes anyway
+
+- **Fixed** `Client::upload_worker_cached` dying at the first upload on an
+  installation that maintains `//tmp/yt_wrapper/file_storage` itself. The
+  `create` on the miss branch is answered `cluster error 901: Access denied for
+  user …: "write | modify_children" … is not allowed by any matching ACE`, and
+  four of the shipped examples never got past it — `vanilla`, `statistics`,
+  `cached_upload` and `profile` (#32). A 901 on the cache's **own** writes —
+  creating the cache directory, creating the staging node inside it, and the
+  handover to `put_file_to_cache` — now means "no cache for you": the worker
+  goes up under `//tmp` on a path of its own and the launch carries on.
+
+  Precisely those three. A 901 on the bytes themselves is about the node this
+  client has just created, not about the cache, and the same bytes sent
+  elsewhere would earn the same answer; a create that failed for a resolve
+  error or a lock held elsewhere is not a permission problem at all. Both are
+  returned as they always were, because a fallback that swallowed either would
+  upload twice and then report success.
+
+  The code is looked for anywhere in the error document rather than only at the
+  top, as the retry classifier and the transaction one already do: every
+  transcript seen so far is flat, and an outer code is routinely a category with
+  the reason nested under it.
+
+- **Breaking** `CachedFile` gained a `cached` field. Code that matches the
+  struct by name or reads its fields is unaffected; code that destructures every
+  field needs `..`.
+
+  It is there because `uploaded` was answering two questions with one bit. It is
+  true both for a file the cache accepted and for one that went to `//tmp`
+  because the cache would not, and `path` was the only difference — so a
+  launcher that cleans up after itself was deleting the installation's **shared
+  cache entry** on an ordinary cluster, evicting the binary for everyone else,
+  and one that does not clean up leaks a node per launch on the cluster where
+  the fallback fires, since nothing expires those. `cached` is the field to
+  branch on: true for a hit and for an accepted upload, false only for the
+  fallback.
+
+- **Added** a warning when that happens, on stderr and as a `WARN` event where
+  the `tracing` feature is on. The state is permanent until someone acts and
+  invisible otherwise — every launch re-sends the whole binary and leaves a node
+  behind. The message names the path that was refused, quotes the cluster so an
+  ACL failure is not mistaken for a flaky proxy, and names
+  `Client::with_file_cache`, which already existed and is the one line that puts
+  a cache back.
+
+- **Documented** what the fallback node is: an ordinary `//tmp` node with
+  whatever ACL `//tmp` carries, no expiry, and a name unguessable only as far
+  as a mutation ID is — the entropy behind one says of itself that its callers
+  need an id to be *unique, not unpredictable*, having been built to
+  deduplicate a retry rather than to withhold a name. On shared scratch space a
+  co-tenant can rewrite the worker's bytes between the upload and the job that
+  execs them. It is the ordinary exposure of anything left in `//tmp`, and it
+  is the reason to point `with_file_cache` at a directory of your own rather
+  than to accept the fallback as a settled state.
+
+**Not verified against a cluster.** A local cluster in Docker makes the caller
+`root` and can never answer `Access denied`, which is why this was found on a
+real multi-node installation and not before. `tests/file_cache.rs` scripts a
+cluster on a socket in-process and asserts the sequence of commands, which is
+what is actually under test: which call was refused, and what the client did
+next.
+
 ### An operation is no longer a string and four commands
 
 - **Added** the rest of the operation lifecycle — `suspend_operation`,

@@ -338,7 +338,7 @@ pub(crate) fn is_retriable(error: &ClientError) -> bool {
         ClientError::Transport { source, .. } => !rejected_the_certificate(source),
         ClientError::Http { status, .. } => RETRIABLE_STATUSES.contains(status),
         ClientError::Cluster { code, raw, .. } => {
-            RETRIABLE_CODES.contains(code) || raw_contains_retriable_code(raw)
+            RETRIABLE_CODES.contains(code) || raw_contains_code(raw, RETRIABLE_CODES)
         }
         _ => false,
     }
@@ -394,20 +394,29 @@ fn rejected_the_certificate(error: &ureq::Error) -> bool {
         .any(|settled| reason.starts_with(settled))
 }
 
-/// Looks for a retriable code anywhere in the error document.
+/// Looks for one of `wanted` anywhere in an error document.
 ///
-/// The outer code is often a wrapper — `Request retries failed` — while the
-/// reason that decides retriability sits in `inner_errors`.
-fn raw_contains_retriable_code(raw: &str) -> bool {
+/// The outer code is often a wrapper — `Request retries failed`, `Error
+/// resolving path` — while the code that decides anything sits in
+/// `inner_errors`. Every classifier in this crate that reads a cluster code
+/// has to walk the document for that reason, so the walk is written once and
+/// the list of codes is the caller's: [`is_retriable`] passes the retriable
+/// ones, and `Client::upload_worker_cached` passes `Access denied`.
+///
+/// A document that is not JSON at all answers `false` rather than failing: the
+/// outer code has already been consulted by then, and a classifier that
+/// returned an error would only be asked to guess again.
+pub(crate) fn raw_contains_code(raw: &str, wanted: &[i64]) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
-    contains_retriable_code(&value)
+    contains_code(&value, wanted)
 }
 
-fn contains_retriable_code(value: &serde_json::Value) -> bool {
+/// The walk itself: this error's own code, then every error nested under it.
+fn contains_code(value: &serde_json::Value, wanted: &[i64]) -> bool {
     if let Some(code) = value.get("code").and_then(serde_json::Value::as_i64)
-        && RETRIABLE_CODES.contains(&code)
+        && wanted.contains(&code)
     {
         return true;
     }
@@ -415,7 +424,7 @@ fn contains_retriable_code(value: &serde_json::Value) -> bool {
     value
         .get("inner_errors")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|inner| inner.iter().any(contains_retriable_code))
+        .is_some_and(|inner| inner.iter().any(|error| contains_code(error, wanted)))
 }
 
 /// Whether a fresh client should announce its retries.
