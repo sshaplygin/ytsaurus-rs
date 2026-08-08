@@ -52,7 +52,7 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Token lookup | `Token`, `TokenPath`, `~/.yt/token` | `YT_TOKEN`; a file only with `ReadTokenFromFile` | `YT_TOKEN`, `YT_TOKEN_PATH`, `~/.yt/token` |
 | Other credentials | TVM, service tickets, impersonation | 5 implementations, swappable per call | OAuth only |
 | TLS | `UseTLS` | `UseTLS` + caller CA bundle | `tls` feature, system roots |
-| Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — one answer, **never refreshed**, walked host by host as they fail; constrained to the configured domain, or to a list you write |
+| Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — a pool picked at random, refreshed lazily every minute, a failed host dropped until a refresh restores it; constrained to the configured domain, or to a list you write |
 | Compression | configurable, off by default | zstd both ways | gzip **inbound only** |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
 | Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
@@ -68,28 +68,41 @@ one to read. An application already exporting OpenTelemetry spans formats its
 current one into a `traceparent` and hands that over, which is the same picture
 by a shorter road.
 
-The heavy-proxy row is the one to read twice, because "automatic" hides two
-deliberate differences.
+The heavy-proxy row recorded this table's one deliberate divergence for a
+release — "one answer, never refreshed, walked host by host as it fails" —
+and #40 retired it. The official clients disagree on trimmings (C++ refreshes
+lazily on access and never bans; Go refreshes in the background and bans for
+five minutes) but agree on the core, **never commit to one host**, and that
+property earned its keep here the hard way: a certificate valid for every
+proxy but one pinned the client to the one bad host, and N launchers started
+together were all handed the same "least loaded" first entry and piled onto
+it. Now:
 
-**This client never refreshes the host.** The
-[proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload) asks
-for the opposite — "A good strategy is to re-query the `/hosts` list every
-minute or every few queries and change the current proxy to which queries are
-made" — and C++'s `THostManager` and Go's client both do. Here the answer is
-resolved once per client and kept for its lifetime. A long-lived launcher
-therefore pins one data proxy for its whole run, which is a load-balancing
-regression the cluster absorbs rather than a correctness one. The trade is one
-round trip per client instead of one per minute.
+**Selection is random per command**, from the pool the answer named, as both
+official clients pick — `THostManager` with `RandomNumber`, Go's
+`ProxySet.PickRandom`. The entropy is the crate's existing id source, whose
+contract — *unique, not unpredictable* — is the right bar for load-spreading,
+so no new dependency.
 
-**The ban list is smaller than Go's and is now there.** Go bans a failing proxy
-for five minutes and picks another; this client keeps the answer `/hosts` gave
-and walks it, dropping the host a heavy command failed at and taking the next.
-The bans last as long as the answer does, and when the answer runs out the
-client uses the configured address for ten seconds and then asks again. Having
-none at all was worse than a coarse one: the fallback address on a deployment
-with separate roles is a *control* proxy, so a single transient 503 answered ten
-seconds of uploads with `Control proxy may not serve heavy requests with input
-data` — the very failure the routing was written for.
+**The list is refreshed lazily on access**, the C++ way rather than Go's: the
+heavy command that finds the answer older than
+`Client::with_host_list_refresh_interval` — one minute by default, the
+[proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)'s
+own "re-query every minute" — asks `/hosts` first. No background thread, so a
+client that stops uploading stops asking; a refresh that fails keeps the
+previous answer in use.
+
+**A failing host is dropped, not walked to the next and not pinned.** The ban
+is shorter-lived than Go's five minutes: a dropped host stays out until a
+refresh names it again, at most one interval away. The drop turns on "was
+this failure attributable to the host" — deliberately including a rejected
+certificate, the per-host condition the old walk's predicate gated out — and
+a pool with nobody left falls back to the configured address for ten seconds
+before the cluster is asked again. Falling back any earlier was itself a bug
+once: the fallback address on a deployment with separate roles is a *control*
+proxy, so a single transient 503 answered ten seconds of uploads with
+`Control proxy may not serve heavy requests with input data` — the very
+failure the routing was written for.
 
 **And a discovered host is constrained**, which neither other client does: a
 name is used only if it shares the configured address's domain, and the scheme

@@ -115,21 +115,29 @@
 //! Table and file data — [`Client::write_table`], [`Client::read_table`],
 //! [`Client::write_file`], [`Client::upload_worker`] and the streaming forms of
 //! each — is what YTsaurus calls a *heavy* command, and a large installation
-//! serves those on a separate set of proxies. This client asks `/hosts` for one
-//! the first time it sends a heavy command, keeps the answer for the rest of
-//! its life, and sends every later heavy command there. Light commands stay on
-//! the address it was configured with.
+//! serves those on a separate set of proxies. This client asks `/hosts` the
+//! first time it sends a heavy command, keeps the whole answer as a **pool**,
+//! and sends each heavy command to a member **picked at random** — the way
+//! both official SDKs pick, because `/hosts` orders its answer
+//! least-loaded-first and N clients that all took the first entry would all
+//! pile onto the same "least loaded" host. The answer is **refreshed** when
+//! it outlives [`Client::with_host_list_refresh_interval`] — a minute by
+//! default, the documentation's own advice — lazily, by the heavy command
+//! that finds it stale; there is no background thread, and a client that
+//! stops uploading stops asking. Light commands stay on the address it was
+//! configured with.
 //!
-//! **A proxy that fails is dropped for the next name in the same answer.** The
-//! whole list `/hosts` gave is kept, best first, and a heavy command that fails
-//! for a reason another proxy might not have moves the client on to the one
-//! behind it. Only when every name in the answer has failed does the client go
-//! back to the configured address — and then only until it asks the cluster
-//! again, a few seconds later
-//! ([`Client::with_hosts_retry_after`]). That order matters: on a deployment
-//! with separate proxy roles the configured address is a *control* proxy, and
-//! going back there on the first hiccup is the failure this feature exists to
-//! prevent.
+//! **A proxy that fails is dropped from the pool, not committed to.** A heavy
+//! command that fails for a reason attributable to the host it went to — a
+//! refused connection, a 503, a certificate that does not match that host's
+//! own name — takes that host out of the pool, and the next command picks
+//! from what remains; a later refresh that still names the host puts it back.
+//! Only a pool with nobody left in it sends the client back to the configured
+//! address — and then only until it asks the cluster again, a few seconds
+//! later ([`Client::with_hosts_retry_after`]). That order matters: on a
+//! deployment with separate proxy roles the configured address is a *control*
+//! proxy, and going back there on the first hiccup is the failure this
+//! feature exists to prevent.
 //!
 //! **A cluster that names no heavy proxy is answered by using the configured
 //! address**, which is what leaves a single-node installation working exactly
@@ -608,6 +616,32 @@ impl Client {
     #[must_use]
     pub fn with_hosts_retry_after(mut self, after: Duration) -> Self {
         self.transport.set_hosts_retry_after(after);
+        self
+    }
+
+    /// Overrides how old a `/hosts` answer may grow before a heavy command
+    /// re-asks, which defaults to one minute.
+    ///
+    /// The default is the documentation's own advice — "a good strategy is to
+    /// re-query the `/hosts` list every minute or every few queries" — and
+    /// the refresh is lazy, the way the C++ SDK does it: the heavy command
+    /// that finds the list stale asks first, and a client that stops
+    /// uploading stops asking. There is no background thread. A refresh that
+    /// fails keeps the previous answer in use rather than dropping routing on
+    /// the floor.
+    ///
+    /// The refresh is also what restores a proxy the client dropped: a heavy
+    /// command that fails for a reason attributable to the host it went to —
+    /// a refused connection, a 503, a certificate that does not match that
+    /// host's name — takes that host out of the pool, and the next fresh
+    /// answer that still names it puts it back.
+    ///
+    /// Shorter follows the cluster's load-ordering more closely and costs a
+    /// lookup more often; longer is the other trade. `Duration::MAX`
+    /// effectively restores the old ask-once behaviour.
+    #[must_use]
+    pub fn with_host_list_refresh_interval(mut self, interval: Duration) -> Self {
+        self.transport.set_host_list_refresh_interval(interval);
         self
     }
 

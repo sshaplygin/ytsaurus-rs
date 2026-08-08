@@ -62,7 +62,6 @@
 //! time has not earned the wait.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -326,31 +325,35 @@ const HOSTS_TIMEOUT: Duration = Duration::from_millis(800);
 /// identical and either could be swapped for the other with every test green.
 const HOSTS_RETRY_AFTER: Duration = Duration::from_secs(10);
 
+/// How old a `/hosts` answer may grow before a heavy command re-asks.
+///
+/// The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)
+/// asks for exactly this: "A good strategy is to re-query the `/hosts` list
+/// every minute or every few queries and change the current proxy to which
+/// queries are made." A minute, then — and lazily, on the heavy command that
+/// finds the list stale, the way the C++ client's `THostManager` does it,
+/// rather than from a background thread this crate would otherwise not need.
+///
+/// Settable — [`Transport::set_host_list_refresh_interval`] — for the same
+/// reason [`HOSTS_RETRY_AFTER`] is: a constant nothing can move is a constant
+/// no test can tell from any other, and "refreshed after the interval and not
+/// before" is one of the properties the tests pin.
+const HOST_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Where the cluster wants heavy commands sent.
 ///
-/// Asked once per client and kept for its lifetime — see
-/// [`Transport::base_for`]. Shared by every clone, because
-/// `Client::with_transaction`, `Operation` and the diagnostics client are all
-/// clones of one client, and a lookup each would be a lookup per command.
+/// Resolved on the first heavy command and *maintained* after that — refreshed
+/// when it grows old, a failed host dropped — rather than asked once and kept
+/// for the client's lifetime; see [`Transport::base_for`]. Shared by every
+/// clone, because `Client::with_transaction`, `Operation` and the diagnostics
+/// client are all clones of one client, and a lookup each would be a lookup
+/// per command.
 #[derive(Debug)]
 enum HeavyProxy {
     /// The cluster has not been asked yet.
     Unasked,
-    /// The address `/hosts` named, already a base URL — and the rest of that
-    /// same answer, in the order it arrived.
-    ///
-    /// The tail is the ban list, small and short-lived: a heavy command that
-    /// fails somewhere another proxy might not have drops the host it used and
-    /// takes the next one, rather than giving up on routing altogether. Both
-    /// official clients keep one (Go bans a failing proxy for five minutes);
-    /// this crate had none, and its absence is why one 503 from a draining data
-    /// proxy sent the following ten seconds of uploads to a control proxy.
-    At {
-        /// Where heavy commands are going now.
-        base: String,
-        /// What to use instead when this one fails, best first.
-        rest: VecDeque<String>,
-    },
+    /// The answer `/hosts` gave, kept whole and picked from at random.
+    Pool(HeavyPool),
     /// The cluster was asked and named none this client may use, so the
     /// configured address serves heavy commands too. A single-node cluster, any
     /// installation that does not separate the roles, and a `/hosts` whose
@@ -370,6 +373,61 @@ enum HeavyProxy {
         /// When to ask again. See [`HOSTS_RETRY_AFTER`].
         until: Instant,
     },
+}
+
+/// The heavy proxies this client is currently willing to use.
+///
+/// What the official clients keep and this crate did not: the C++ client's
+/// `THostManager` holds the whole `/hosts` answer and picks a random member
+/// per request, refreshing the list lazily when it has outlived its interval;
+/// the Go client's `ProxySet` does the same with a ban list beside it. This
+/// crate pinned the first name for the client's lifetime instead, and that
+/// divergence produced two real failures (#40): a per-host condition — a
+/// certificate valid for every proxy but one — pinned every upload to the one
+/// bad host, and N launchers started together were all handed the same
+/// "least loaded" first entry and piled onto it for their whole lives.
+///
+/// So: never commit to one host. A pool, picked from at random per command; a
+/// host a command failed at is dropped and the next command picks from what
+/// remains; a refresh — the next heavy command after
+/// [`HOST_LIST_REFRESH_INTERVAL`] — rebuilds the pool from a fresh answer,
+/// which is also what restores a dropped host the cluster still vouches for.
+#[derive(Debug)]
+struct HeavyPool {
+    /// Usable base URLs from the last `/hosts` answer, minus any dropped
+    /// since. Never empty: a pool with nothing left to pick from becomes
+    /// [`HeavyProxy::FellBack`] instead, which is a state that ends.
+    hosts: Vec<String>,
+    /// When the answer these came from stops being fresh enough to use
+    /// without asking again. `None` for an interval so large no `Instant`
+    /// can express its deadline — `with_host_list_refresh_interval(Duration::MAX)`
+    /// is the documented way to ask for the old ask-once behaviour, and it
+    /// must not be a panic in `Instant` arithmetic instead.
+    refresh_due: Option<Instant>,
+}
+
+impl HeavyPool {
+    /// One of the pool's hosts, picked at random.
+    ///
+    /// Random per command, as both official clients pick — the property is
+    /// load-spreading, not unpredictability, so the id source this crate
+    /// already has is entropy enough (its contract is *unique, not
+    /// unpredictable*, and that is the bar here too). The modulo bias against
+    /// a 64-bit word is beneath measuring for any real fleet.
+    fn pick(&self) -> &str {
+        let drawn = crate::unique::word(0) as usize;
+        &self.hosts[drawn % self.hosts.len()]
+    }
+
+    /// Takes a failed host out of the pool until a refresh restores it.
+    ///
+    /// By value, not by position: two commands in flight may both have gone to
+    /// the host that just failed, and the second drop must not evict an
+    /// innocent neighbour — or anything at all, once the first has already
+    /// done it.
+    fn drop_host(&mut self, base: &str) {
+        self.hosts.retain(|host| host != base);
+    }
 }
 
 /// Which of the names `/hosts` gives back this client is willing to use.
@@ -478,6 +536,9 @@ pub(crate) struct Transport {
     /// How long a fallback lasts before the cluster is asked again. See
     /// [`HOSTS_RETRY_AFTER`].
     hosts_retry_after: Duration,
+    /// How old a `/hosts` answer may grow before a heavy command re-asks. See
+    /// [`HOST_LIST_REFRESH_INTERVAL`].
+    host_list_refresh: Duration,
     token: Option<String>,
     retries: RetryPolicy,
     /// End-to-end limit for buffered commands — one budget per attempt, shared
@@ -542,6 +603,7 @@ impl Transport {
             hosts: HeavyHosts::SameDomain,
             hosts_timeout: HOSTS_TIMEOUT,
             hosts_retry_after: HOSTS_RETRY_AFTER,
+            host_list_refresh: HOST_LIST_REFRESH_INTERVAL,
             base,
             heavy: Arc::new(Mutex::new(HeavyProxy::Unasked)),
             token,
@@ -591,6 +653,11 @@ impl Transport {
     /// Overrides how long a fallback lasts before the cluster is asked again.
     pub(crate) fn set_hosts_retry_after(&mut self, after: Duration) {
         self.hosts_retry_after = after;
+    }
+
+    /// Overrides how old a `/hosts` answer may grow before it is refreshed.
+    pub(crate) fn set_host_list_refresh_interval(&mut self, interval: Duration) {
+        self.host_list_refresh = interval;
     }
 
     /// Drops what discovery resolved, because the rules it resolved under have
@@ -739,12 +806,23 @@ impl Transport {
     /// proxy, and the balancer a caller is usually pointed at fronts exactly
     /// those. See the module documentation for what the refusal looks like.
     ///
-    /// The lookup happens **at most once per client** while it keeps working,
-    /// and only when the first heavy command needs it. The **whole** answer is
-    /// kept, not just the name in use: the rest is what a heavy command falls
-    /// through to when the one it used fails, which is what stops a single
-    /// stumble from sending the next few seconds of uploads back to a control
-    /// proxy. See [`Transport::after_heavy`].
+    /// The lookup happens when the first heavy command needs it, and then
+    /// again only when the answer has outlived
+    /// [`HOST_LIST_REFRESH_INTERVAL`] — lazily, on the heavy command that
+    /// finds it stale, never from a background thread. The **whole** answer is
+    /// kept as a pool and every heavy command picks a member **at random**:
+    /// `/hosts` orders its answer least-loaded-first, so N clients started
+    /// together that all took `[0]` would all pile onto the same "least
+    /// loaded" host — the imbalance the ordering exists to prevent. A host a
+    /// command failed at is dropped from the pool until a refresh restores it;
+    /// see [`Transport::after_heavy`]. Both official clients do exactly this
+    /// (`THostManager` in C++, `ProxySet` in Go), and the property they agree
+    /// on is the one this preserves: **never commit to one host.**
+    ///
+    /// A refresh that fails keeps the pool it was refreshing: the previous
+    /// answer stays in use, and the question is put off — briefly for a
+    /// failure that might pass, a whole interval for one that will not —
+    /// rather than repeated in front of every upload.
     ///
     /// A cluster that names nobody this client may use — a single-node
     /// installation, any that does not split the roles, and one whose answer
@@ -770,8 +848,48 @@ impl Transport {
         }
 
         let mut resolved = lock(&self.heavy);
-        match &*resolved {
-            HeavyProxy::At { base, .. } => return Cow::Owned(base.clone()),
+        match &mut *resolved {
+            HeavyProxy::Pool(pool) => {
+                // A stale pool is refreshed before it is picked from — the
+                // documentation's own strategy, and lazily like the C++
+                // client, so the client that stopped uploading also stopped
+                // asking. A refresh that does not produce a usable list
+                // changes nothing but when the question is put again: the
+                // hosts in hand are from an answer the cluster did give, and
+                // dropping them for a fallback would route uploads to a
+                // control proxy because a *lookup* hiccupped.
+                if pool.refresh_due.is_some_and(|due| Instant::now() >= due) {
+                    match self.usable_hosts() {
+                        Ok(hosts) if !hosts.is_empty() => {
+                            *pool = HeavyPool {
+                                hosts,
+                                refresh_due: Instant::now().checked_add(self.host_list_refresh),
+                            };
+                        }
+                        // An answer with nobody usable in it, kept off the
+                        // pool: a fleet mid-rotation can briefly answer with
+                        // nothing, and adopting that would end routing for
+                        // good where waiting out the interval costs nothing.
+                        Ok(_) => {
+                            pool.refresh_due = Instant::now().checked_add(self.host_list_refresh);
+                        }
+                        Err(error) => {
+                            // Put off briefly when the failure might pass, and
+                            // a whole interval when it will not — a 404 will be
+                            // a 404 in ten seconds too, and the pool in hand
+                            // still routes.
+                            pool.refresh_due = Instant::now().checked_add(
+                                if crate::retry::worth_asking_again(&error) {
+                                    self.hosts_retry_after
+                                } else {
+                                    self.host_list_refresh
+                                },
+                            );
+                        }
+                    }
+                }
+                return Cow::Owned(pool.pick().to_owned());
+            }
             HeavyProxy::Configured => return Cow::Borrowed(&self.base),
             HeavyProxy::FellBack { until } if Instant::now() < *until => {
                 return Cow::Borrowed(&self.base);
@@ -780,42 +898,31 @@ impl Transport {
         }
 
         match self.heavy_hosts() {
-            // Every host this client is willing to use, in the order the
-            // cluster gave them: `/hosts` is ordered best-first, the first is
-            // where the commands go, and the rest are what a failure falls
-            // through to. A name that is blank, malformed or somewhere else
-            // entirely is passed over rather than being allowed to stand for
-            // the whole answer — and, since a whole answer passed over is the
-            // one failure that leaves routing silently off, the reasons are
-            // said out loud once.
+            // Every host this client is willing to use becomes the pool a
+            // heavy command picks from. A name that is blank, malformed or
+            // somewhere else entirely is passed over rather than being
+            // allowed to stand for the whole answer — and, since a whole
+            // answer passed over is the one failure that leaves routing
+            // silently off, the reasons are said out loud once.
             Ok(hosts) => {
-                let mut usable = VecDeque::new();
-                let mut refused = Vec::new();
-                for host in &hosts {
-                    match heavy_base(&self.base, host, &self.hosts) {
-                        Ok(base) => usable.push_back(base),
-                        Err(why) => refused
-                            .push(format!("{host:?} {}", why.because(&self.hosts, &self.base))),
+                let (usable, refused) = self.admitted(&hosts);
+
+                if usable.is_empty() {
+                    *resolved = HeavyProxy::Configured;
+                    drop(resolved);
+                    if !refused.is_empty() && self.retries.reports() {
+                        crate::observe::declined(&self.base, &refused);
                     }
+                    return Cow::Borrowed(&self.base);
                 }
 
-                match usable.pop_front() {
-                    Some(base) => {
-                        *resolved = HeavyProxy::At {
-                            base: base.clone(),
-                            rest: usable,
-                        };
-                        Cow::Owned(base)
-                    }
-                    None => {
-                        *resolved = HeavyProxy::Configured;
-                        drop(resolved);
-                        if !refused.is_empty() && self.retries.reports() {
-                            crate::observe::declined(&self.base, &refused);
-                        }
-                        Cow::Borrowed(&self.base)
-                    }
-                }
+                let pool = HeavyPool {
+                    hosts: usable,
+                    refresh_due: Instant::now().checked_add(self.host_list_refresh),
+                };
+                let picked = pool.pick().to_owned();
+                *resolved = HeavyProxy::Pool(pool);
+                Cow::Owned(picked)
             }
             // A failed lookup is never fatal: the command goes where it would
             // have gone before there was a lookup at all. Whether to ask again
@@ -835,6 +942,31 @@ impl Transport {
                 Cow::Borrowed(&self.base)
             }
         }
+    }
+
+    /// One `/hosts` answer, split into the base URLs this client will use and
+    /// the reasons for the names it will not.
+    fn admitted(&self, hosts: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut usable = Vec::new();
+        let mut refused = Vec::new();
+        for host in hosts {
+            match heavy_base(&self.base, host, &self.hosts) {
+                Ok(base) => usable.push(base),
+                Err(why) => {
+                    refused.push(format!("{host:?} {}", why.because(&self.hosts, &self.base)));
+                }
+            }
+        }
+        (usable, refused)
+    }
+
+    /// A fresh `/hosts` answer reduced to the base URLs this client will use.
+    ///
+    /// The refresh path: the refusals are not repeated out loud here, because
+    /// a refresh that declines what the first resolve declined would say the
+    /// same sentence once a minute for the client's whole life.
+    fn usable_hosts(&self) -> Result<Vec<String>> {
+        Ok(self.admitted(&self.heavy_hosts()?).0)
     }
 
     /// The heavy proxies the cluster names, best first.
@@ -880,10 +1012,10 @@ impl Transport {
     /// and cannot see. It now reads `write_table at n0132-sas.example.net:9013:
     /// …`.
     ///
-    /// **A proxy that could not be reached stops being used, and the next name
-    /// in the answer takes over.** The command itself is *not* sent again —
-    /// heavy commands are not retried, and by this point a streaming body has
-    /// been consumed anyway. This is about the next one.
+    /// **A proxy a command failed at is dropped from the pool, and the next
+    /// command picks from what remains.** The command itself is *not* sent
+    /// again — heavy commands are not retried, and by this point a streaming
+    /// body has been consumed anyway. This is about the next one.
     ///
     /// It used to go back to the configured address for
     /// [`HOSTS_RETRY_AFTER`], and that is exactly the wrong address to go back
@@ -892,16 +1024,23 @@ impl Transport {
     /// transient 503 from a draining data proxy — or one refused connection
     /// during a restart — turned into ten seconds of `Control proxy may not
     /// serve heavy requests with input data`, which is [#30] itself,
-    /// reproducible on demand. `/hosts` had already named the alternatives;
-    /// nothing was using them. Now the failed host is dropped and the next one
-    /// is taken, and only an answer whose every name has failed falls back —
-    /// where falling back is at least a state that ends.
+    /// reproducible on demand. `/hosts` had already named the alternatives.
+    /// Now the failed host is dropped and the survivors carry the load, and
+    /// only a pool with nobody left in it falls back — where falling back is
+    /// at least a state that ends.
     ///
-    /// Only for a failure another proxy could plausibly not have. A table that
-    /// does not exist will not exist over there either, so a resolve error
-    /// keeps the address it was asked at; a proxy that refuses heavy work
-    /// *because of the role it has* is the clearest possible case for asking
-    /// somewhere else, and [`crate::retry::worth_asking_again`] says so.
+    /// Only for a failure **attributable to the host** it went to. A table
+    /// that does not exist will not exist over there either, so a resolve
+    /// error keeps the pool exactly as it was. But the predicate is
+    /// [`crate::retry::attributable_to_the_host`], deliberately *not*
+    /// [`crate::retry::worth_asking_again`]: the two agree except about a
+    /// rejected certificate, and that disagreement was a real failure (#40).
+    /// A certificate valid for every proxy but one — `NotValidForName` is a
+    /// verdict about *this* host's name — answered "not worth asking the
+    /// coordinator again", so the bad host was neither stepped past nor
+    /// re-resolved, and every heavy command failed against it until the
+    /// window elapsed and the same ordered-first host came back. Dropping a
+    /// host must not require the lookup's own predicate to agree.
     ///
     /// [#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
     fn after_heavy<T>(&self, repeatable: Repeatable, base: &str, result: Result<T>) -> Result<T> {
@@ -919,35 +1058,28 @@ impl Transport {
             ));
         }
 
-        let mut resolved = lock(&self.heavy);
-        if !matches!(&*resolved, HeavyProxy::At { base: at, .. } if at == base) {
+        if base == self.base {
             // The command went to the configured address, which is the caller's
             // own choice and needs no explaining — unless what came back is a
             // proxy saying it will not serve this at all, which is the failure
             // routing exists to prevent and which says nothing about routing
             // being what was missing.
+            let resolved = lock(&self.heavy);
             let why = declined_routing(&resolved);
             return Err(refusal_hint(error, why));
         }
 
-        if crate::retry::worth_asking_again(&error) {
-            // Falling back is the default and stepping to the next name is the
-            // exception, written that way round so that an exhausted answer
-            // cannot leave a stale address in place: `replace` is also what
-            // lets the tail be moved out of the state it belonged to.
-            let previous = std::mem::replace(
-                &mut *resolved,
-                HeavyProxy::FellBack {
-                    until: Instant::now() + self.hosts_retry_after,
-                },
-            );
-            if let HeavyProxy::At { mut rest, .. } = previous
-                && let Some(next) = rest.pop_front()
-            {
-                *resolved = HeavyProxy::At { base: next, rest };
+        if crate::retry::attributable_to_the_host(&error) {
+            let mut resolved = lock(&self.heavy);
+            if let HeavyProxy::Pool(pool) = &mut *resolved {
+                pool.drop_host(base);
+                if pool.hosts.is_empty() {
+                    *resolved = HeavyProxy::FellBack {
+                        until: Instant::now() + self.hosts_retry_after,
+                    };
+                }
             }
         }
-        drop(resolved);
 
         Err(routed_to(error, base))
     }
@@ -1859,7 +1991,7 @@ fn declined_routing(state: &HeavyProxy) -> &'static str {
             "the heavy proxies /hosts named have all just failed, \
              so this went to the configured address for a moment"
         }
-        HeavyProxy::Unasked | HeavyProxy::At { .. } => "this client did not route this command",
+        HeavyProxy::Unasked | HeavyProxy::Pool(_) => "this client did not route this command",
     }
 }
 
@@ -3636,6 +3768,109 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
                 "{light:?} went looking for a heavy proxy"
             );
         }
+    }
+
+    /// A pool of exactly these hosts, seeded as if `/hosts` had answered.
+    fn pooled(transport: &Transport, hosts: &[&str]) {
+        *lock(&transport.heavy) = HeavyProxy::Pool(HeavyPool {
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            refresh_due: Instant::now().checked_add(Duration::from_secs(3600)),
+        });
+    }
+
+    /// The hosts a seeded pool still holds, or `None` once it stopped being
+    /// a pool at all.
+    fn pool_of(transport: &Transport) -> Option<Vec<String>> {
+        match &*lock(&transport.heavy) {
+            HeavyProxy::Pool(pool) => Some(pool.hosts.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_rejected_certificate_drops_the_host_and_a_wrong_command_does_not() {
+        // The regression #40 is about, in the one place it can be pinned
+        // without a TLS listener presenting a bad certificate. A cert rejected
+        // `NotValidForName` is a per-host verdict — the cluster's other
+        // proxies present names that match — but it is deliberately not
+        // retriable and not `worth_asking_again`, so a drop gated on either
+        // predicate (as the first routing release gated it) leaves the client
+        // pinned to the one bad host: not stepped past, not re-resolved,
+        // failing every heavy command until the window elapses and the same
+        // ordered-first host comes back. Dropping must not need the lookup's
+        // predicate to agree.
+        let mut transport =
+            Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
+        transport.set_proxy_discovery(true);
+        pooled(
+            &transport,
+            &[
+                "https://n0132-sas.example.net",
+                "https://n0133-sas.example.net",
+            ],
+        );
+
+        let rejected: Result<()> = Err(ClientError::Transport {
+            command: "write_table".to_owned(),
+            source: Box::new(ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid peer certificate: certificate not valid for name \
+                 \"n0132-sas.example.net\"; certificate is only valid for [\"cluster.example.net\"]",
+            ))),
+        });
+        let reported =
+            transport.after_heavy(Repeatable::Heavy, "https://n0132-sas.example.net", rejected);
+
+        assert!(reported.is_err());
+        assert_eq!(
+            pool_of(&transport).as_deref(),
+            Some(&["https://n0133-sas.example.net".to_owned()][..]),
+            "the host whose certificate was rejected stayed in the pool"
+        );
+
+        // The other half of the predicate: a failure about the *request* —
+        // a table that does not exist — will be exactly as wrong next door,
+        // so it costs the pool nothing.
+        let wrong_command: Result<()> = Err(ClientError::Http {
+            command: "write_table".to_owned(),
+            status: 404,
+            body: String::new(),
+        });
+        let reported = transport.after_heavy(
+            Repeatable::Heavy,
+            "https://n0133-sas.example.net",
+            wrong_command,
+        );
+
+        assert!(reported.is_err());
+        assert_eq!(
+            pool_of(&transport).as_deref(),
+            Some(&["https://n0133-sas.example.net".to_owned()][..]),
+            "a mistaken command evicted a perfectly good host"
+        );
+    }
+
+    #[test]
+    fn a_pool_with_nobody_left_falls_back_and_the_fallback_ends() {
+        // The last host dropped is not a pool of zero to divide by — it is
+        // the fallback state, which the next heavy command after the window
+        // answers by asking the cluster again.
+        let mut transport =
+            Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
+        transport.set_proxy_discovery(true);
+        pooled(&transport, &["https://n0132-sas.example.net"]);
+
+        let refused: Result<()> = Err(ClientError::Http {
+            command: "write_table".to_owned(),
+            status: 503,
+            body: String::new(),
+        });
+        let _ = transport.after_heavy(Repeatable::Heavy, "https://n0132-sas.example.net", refused);
+
+        assert!(
+            matches!(&*lock(&transport.heavy), HeavyProxy::FellBack { .. }),
+            "an emptied pool did not fall back"
+        );
     }
 
     #[test]

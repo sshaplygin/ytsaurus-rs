@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Heavy proxies: a pool, picked at random, refreshed — never one host for life
+
+- **Changed** how heavy commands choose their proxy, to parity with the C++
+  and Go SDKs (#40). The `/hosts` answer used to be resolved once and its
+  first name pinned for the client's whole life, stepping to the next name
+  only on a failure the *lookup's* predicate recognised. Both official
+  clients deliberately never commit to one host, and the divergence produced
+  two real failures: a certificate rejected `NotValidForName` — a per-host
+  condition; the fleet's other proxies were fine — pinned every upload to the
+  one bad proxy, and N launchers started together were all handed the same
+  "least loaded" first entry and piled onto it for their whole lives. Now the
+  whole answer is a pool, each heavy command picks a member at random (the
+  crate's existing id source is the entropy — *unique, not unpredictable* is
+  the right bar for load-spreading, so no new dependency), and the list is
+  refreshed lazily by the first heavy command that finds it older than the
+  refresh interval, per the documentation's own "re-query every minute". A
+  failed refresh keeps the previous answer in use. No background thread; a
+  client that stops uploading stops asking.
+
+  A non-breaking behaviour change: `with_proxy_discovery(false)` still pins
+  everything to the configured address, `heavy_proxy()` still answers with
+  the cluster's first pick, and a cluster that names no heavy proxy is still
+  served by the configured address, asked once.
+
+- **Fixed** the pinning half of that divergence on its own terms: a heavy
+  command's failure now drops the host it went to on any failure
+  *attributable to the host* — a refused connection, a 503, a wrong-role
+  refusal, and now a rejected certificate — rather than only on the failures
+  `worth_asking_again` recognises, which is the predicate for the `/hosts`
+  lookup and answers `false` for a certificate verdict. The dropped host
+  stays out until a refresh names it again; a pool with nobody left falls
+  back to the configured address for `with_hosts_retry_after` and the
+  cluster is then asked afresh, exactly as before.
+
+- **Added** `Client::with_host_list_refresh_interval(Duration)`, defaulting
+  to one minute. `Duration::MAX` effectively restores the old ask-once
+  behaviour.
+
 ### A cache that refuses you, and the upload that goes anyway
 
 - **Fixed** `Client::upload_worker_cached` dying at the first upload on an
