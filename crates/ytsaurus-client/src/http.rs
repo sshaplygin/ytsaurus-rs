@@ -184,7 +184,18 @@ pub(crate) const CONTROL_REFUSAL: &str = "may not serve heavy requests";
 /// `start_operation` is deliberately *not* here: an operation genuinely can run
 /// inside a transaction, which is how its output tables stay invisible until
 /// the launcher commits.
+///
+/// `execute_batch` is here for a different reason than its neighbours: it is
+/// served by the proxy's own driver, but its options are `TExecuteBatchOptions
+/// : TMutatingOptions` — no transactional half — so an outer `transaction_id`
+/// means nothing. **Measured on a local cluster**: a batch stamped with one
+/// created its node *outside* the transaction, visible at once and untouched
+/// by the abort. `Client::execute_batch` stamps the transaction into each
+/// part's parameters instead, which the same measurement shows the cluster
+/// honours; the entry here keeps the blanket stamp from dressing the envelope
+/// up in a parameter the cluster is known to drop.
 const NO_TRANSACTION: &[&str] = &[
+    "execute_batch",
     "get_operation",
     "list_operations",
     "list_operation_events",
@@ -200,6 +211,16 @@ const NO_TRANSACTION: &[&str] = &[
     "abort_job",
     "poll_job_shell",
 ];
+
+/// Whether `command` is one the blanket transaction stamp skips.
+///
+/// Read by `Client::execute_batch` as well as by
+/// [`Transport::in_transaction`], because a batch *part* is a command too: a
+/// `get_operation` that takes no `transaction_id` outside a batch takes none
+/// inside one, and two copies of the list would drift.
+pub(crate) fn takes_no_transaction(command: &str) -> bool {
+    NO_TRANSACTION.contains(&command)
+}
 
 /// Applies a header list to either builder flavour.
 ///
@@ -839,7 +860,7 @@ impl Transport {
     fn in_transaction(&self, command: &str, parameters: &YsonValue) -> Option<YsonValue> {
         let id = self.transaction.as_ref()?;
 
-        if NO_TRANSACTION.contains(&command) {
+        if takes_no_transaction(command) {
             return None;
         }
 

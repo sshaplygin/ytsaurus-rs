@@ -53,6 +53,95 @@
   it keeps working, though a failed host is still dropped and an emptied
   pool still falls back and re-asks.
 
+### A dozen commands, one round trip, and the answers one by one
+
+- **Added** `BatchRequest` and `Client::execute_batch` — the cluster's
+  `execute_batch`, which both official clients have had all along
+  (C++ `CreateBatchRequest`, Go `NewBatchRequest`). A launcher that creates a
+  dozen tables no longer makes a dozen round trips (#11).
+
+  **The answer is a `Vec` of per-part `Result`s**, because that is what a
+  batch is: its parts fail individually, and collapsing them into one `Result`
+  would lose the only thing batching costs any clarity on. Each `Ok` carries
+  the part's own envelope, keyed by what that command returns — `{node_id=…}`
+  for a create, `{value=…}` for an exists — and each `Err` is an ordinary
+  `ClientError::Cluster` named after the part's command, flattened
+  outer-plus-innermost like every other. Verified on a local cluster with a
+  four-part batch answering `[error 501, ok, ok, error 500]`, in exactly the
+  order the parts went in.
+
+  **The building shape is a builder**, not a slice of prepared commands:
+  typed methods (`create`, `create_table`, `exists`, `get`, `list`, `remove`,
+  `remove_tree`, `set_attribute`) that send exactly what their `Client`
+  namesakes send, plus a `raw` escape hatch. A builder is what lets the retry
+  class be decided instead of guessed — see below — and what keeps a part
+  from being a shape the cluster refuses: only light commands with `null` or
+  `structured` input and output can be parts at all.
+
+- **Added** the two options both official clients expose:
+  `with_concurrency`, the command's own server-side cap (“to avoid exhausting
+  your request rate limit”, default 50 in the cluster's registration), and
+  `with_max_part_size`, the C++ client's `BatchPartMaxSize` — a bigger batch
+  is split into consecutive requests, `concurrency × 5` per request unless
+  told otherwise, results stitched back in part order. A request that fails
+  wholesale fails the call wholesale with the earlier requests already
+  applied, which is what the C++ client's `ExecuteBatch` does too; the C++
+  client also re-queues a *retriable part* client-side, and this one
+  deliberately does not — per-part errors are handed back for the caller to
+  judge, and `docs/sdk-comparison.md` discloses the difference.
+
+- **A mutating batch is retried under one mutation id, and that is safe
+  because the cluster spreads it over the parts.** The driver hands part *k*
+  the batch's id plus *k* (`GenerateNextBatchMutationId`) and stamps the
+  batch's `retry` flag into every volatile part, so a replayed batch replays
+  every part under its original id and the master's cache answers each with
+  its first response. Measured, not assumed: a two-create batch replayed
+  under its id with `retry=%true` answered the **same two node ids** both
+  times, where the same batch under a fresh id got two `501 already exists`.
+  A batch of nothing but reads mutates nothing and carries no id; a batch
+  holding a **`raw` part is sent once**, whatever the policy says, because a
+  command this crate cannot classify may mutate somewhere no mutation cache
+  covers — the scheduler commands are the measured example.
+
+- **A client bound to a transaction puts the parts in it, not the
+  envelope.** `execute_batch` has no transactional options, and a local
+  cluster proved what that means: an outer `transaction_id` was dropped in
+  silence and the part's create landed *outside* the transaction, surviving
+  its abort — the silent escape a transaction exists to prevent. Each part is
+  stamped instead, with the transport's own exceptions: a part that names its
+  own transaction keeps it, and a command with no transaction to be in is
+  left alone.
+
+- **The batch's parameters travel in the POST body**, where every other
+  command's ride in `X-YT-Parameters`: a batch's parameters *are* the batched
+  commands, and a header has a size nobody promises. The C++ client makes the
+  same choice for this same command, and the proxy merges body parameters
+  with the header's (`TContext::CaptureParameters`) — measured: `requests` in
+  the body and `mutation_id` in the header land as one parameter set.
+
+- **Parts run in parallel, and the documentation means it.** A batch that
+  created a node and asked `exists` about it in the same breath was answered
+  `%false` — both parts succeeded, and the read simply ran first. A part and
+  its consequence belong in two batches. Also measured: a part naming an
+  unknown command fails the **whole batch** (`Unknown command "frobnicate"`,
+  no per-part results), because the driver resolves the command before
+  per-part error handling begins.
+
+- The parser refuses what it does not recognise — a `results` count that
+  does not match the parts, an item that is neither `{output=…}` nor
+  `{error=…}` nor the empty map a `null`-output command answers with —
+  rather than reading it as somebody's success. This crate's envelope rules
+  were learned from `exists` answering under `value`; the paranoia is paid
+  for.
+
+  Verified end to end on a local cluster by
+  `cargo run -p ytsaurus-client --example batch`: twelve creates in one
+  round trip and every node there afterwards, the one-fails-rest-succeed
+  batch, a split batch with a failure kept at its own index, and a batch
+  inside a transaction invisible until the commit. The wire shape — verb,
+  body, mutation id repeated across a retry and absent from a read-only
+  batch — is pinned by `tests/batch.rs` against an in-process stub.
+
 ### A cache that refuses you, and the upload that goes anyway
 
 - **Fixed** `Client::upload_worker_cached` dying at the first upload on an

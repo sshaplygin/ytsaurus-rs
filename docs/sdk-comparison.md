@@ -55,7 +55,7 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — a pool picked at random, refreshed lazily every minute, a failed host dropped until a refresh restores it; constrained to the configured domain, or to a list you write |
 | Compression | configurable, off by default | zstd both ways | gzip **inbound only** |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
-| Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
+| Batching several commands | `CreateBatchRequest` → futures | `NewBatchRequest` → `BatchResponse[T]` | `BatchRequest` → `Vec<Result<…>>`, per-part; **no per-part retry**, where C++ re-queues a retriable part |
 | Retries | three policies by request class | interceptor chain | one policy × `Repeatable` |
 | Client logging | global `ILogger` | `Config.Logger`, structured | optional `tracing` feature, off by default |
 | Distributed tracing | `EnableClientTracing` | `TraceFn` + Jaeger and OTel adapters | `TraceContext` → `traceparent`, no dependency |
@@ -244,9 +244,10 @@ What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
 two on that list are **now built**: logging and tracing — a `traceparent` the
 cluster joins, and an optional `tracing` feature — and the operation object and
-its lifecycle, which is what the table above came to. What is left is
-`read_file`, batch requests, read-side column and range selection, and
-transaction `Detach`.
+its lifecycle, which is what the table above came to. So are batch requests:
+`BatchRequest` and `Client::execute_batch`, per-part `Result`s with the C++
+client's `Concurrency` and `BatchPartMaxSize` options. What is left is
+`read_file`, read-side column and range selection, and transaction `Detach`.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,
