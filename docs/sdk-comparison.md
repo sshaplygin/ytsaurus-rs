@@ -198,16 +198,26 @@ from the fact that all four are "mutating and light".
 | --- | --- | --- | --- |
 | Timeout / ping period | 120 s / 5 s | 15 s / 3 s | 30 s / timeout ÷ 3 |
 | Handle doubles as a client | `ITransaction : IClientBase` | `Tx` embeds the interfaces | `Deref<Target = Client>` |
-| Attach to one started elsewhere | yes, fully | yes | **binds commands only** — cannot ping, commit or abort |
-| `Detach` — stop pinging, leave it alive | **yes** | partial | **no — dropping always aborts** |
+| Attach to one started elsewhere | yes, fully | yes | yes — `attach_transaction`, pinging included |
+| `Detach` — stop pinging, leave it alive | **yes** | partial | yes — and dropping an *attached* handle detaches too |
 | Learn it was lost without a command | no | **`Tx.Finished()` channel** | manual `ping()` |
 | Prerequisite transaction ids | yes | yes | no |
 | Wait for a waitable lock | `GetAcquiredFuture()` | **no helper** | **yes, with a mandatory deadline** |
 | Unlock | yes | yes | no |
 | Child-key / attribute locks | yes | yes | no — whole-node only |
 
-`Detach` is the sharpest of these: there is no way to hand a live transaction to
-another process from Rust.
+`Detach` used to be the sharpest of these — there was no way to hand a live
+transaction to another process from Rust. There is now: `Transaction::detach`
+stops the keep-alive and leaves the transaction running, `attach_transaction`
+turns the id back into a pinging handle elsewhere (reading the interval from
+`#<id>/@timeout`, as the attacher must), and `ping_transaction` /
+`commit_transaction` / `abort_transaction` finish one from nothing but the id.
+What `Drop` does follows the C++ destructor's line: a handle this process
+*started* still aborts on drop — that is what makes `?` safe inside a
+transaction — where an *attached* one detaches. Go's
+`AttachTx(id, {AutoPingable: false})` maps onto `with_transaction` plus the
+by-id commands; the Rust `attach_transaction` always pings, because a
+non-pinging handle would duplicate exactly that pair.
 
 ## Dynamic tables, administration, the rest
 
@@ -244,9 +254,9 @@ What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
 two on that list are **now built**: logging and tracing — a `traceparent` the
 cluster joins, and an optional `tracing` feature — and the operation object and
-its lifecycle, which is what the table above came to. What is left is
-`read_file`, batch requests, read-side column and range selection, and
-transaction `Detach`.
+its lifecycle, which is what the table above came to; so is transaction
+`Detach`, with attach and the by-id commands beside it. What is left is
+`read_file`, batch requests, and read-side column and range selection.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,

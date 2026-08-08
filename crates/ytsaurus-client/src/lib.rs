@@ -97,6 +97,12 @@
 //! dropping the handle aborts it, so a `?` on any line leaves the cluster as it
 //! was.
 //!
+//! A transaction can also outlive its handle: [`Transaction::detach`] stops
+//! the keep-alive and leaves it running, [`Client::attach_transaction`] turns
+//! the id back into a handle elsewhere, and [`Client::ping_transaction`],
+//! [`Client::commit_transaction`] and [`Client::abort_transaction`] finish one
+//! from a process that holds nothing but the id.
+//!
 //! # Seeing what it did
 //!
 //! The cluster traces itself, so joining its trace costs a header and no
@@ -679,12 +685,16 @@ impl Client {
     ///
     /// Every command it then sends happens inside that transaction. This is the
     /// low-level door: [`Client::start_transaction`] is the one that starts a
-    /// transaction, keeps it alive and aborts it if the work does not finish.
-    /// Use this to rejoin a transaction whose ID came from somewhere else — a
-    /// parent process, or a previous run.
+    /// transaction, keeps it alive and aborts it if the work does not finish,
+    /// and [`Client::attach_transaction`] is the one that turns an id from
+    /// elsewhere into such a handle — pinging, able to commit and abort.
     ///
-    /// Nothing pings the transaction on this path, so it expires on the
-    /// cluster's schedule unless its owner is pinging it.
+    /// This binding does neither: nothing pings the transaction on this path,
+    /// so it expires on the cluster's schedule unless its owner — or
+    /// [`Client::ping_transaction`] — is pinging it, and finishing it takes
+    /// [`Client::commit_transaction`] or [`Client::abort_transaction`] with
+    /// the id. What it buys over `attach_transaction` is costlessness: no
+    /// round trip, no thread.
     #[must_use]
     pub fn with_transaction(mut self, id: impl Into<String>) -> Self {
         self.transport.set_transaction(Some(id.into()));
@@ -787,6 +797,114 @@ impl Client {
     /// Returns [`ClientError`] if the transaction cannot be started.
     pub fn start_transaction_with(&self, timeout: Duration) -> Result<Transaction> {
         Transaction::start(self, timeout)
+    }
+
+    /// Attaches to a transaction something else started, and keeps it alive.
+    ///
+    /// The receiving half of [`Transaction::detach`]: one process starts a
+    /// transaction and detaches, hands the id over, and this turns the id back
+    /// into a real [`Transaction`] — a bound client, a pinging thread, and
+    /// `commit`/`abort`/`ping` that work. Two things differ from a handle the
+    /// same process started, and both follow from not being the owner:
+    ///
+    /// - **Dropping it detaches rather than aborts** — the pings stop and
+    ///   nothing is sent. The C++ client's destructor draws the same line, and
+    ///   for the same reason: an attacher's `?` must not destroy work the
+    ///   process that started the transaction is still counting on. An
+    ///   explicit [`Transaction::abort`] still aborts; only the drop differs.
+    /// - **The ping interval is read, not chosen.** Pinging needs the
+    ///   transaction's timeout and the id alone does not carry it, so this
+    ///   asks the cluster for `#<id>/@timeout` — one round trip, which is also
+    ///   what makes attaching to a transaction that is gone fail *here*,
+    ///   rather than on the first command sent through the handle.
+    ///
+    /// The handle always pings. One that did not would be
+    /// [`Client::with_transaction`] — the plain binding, which already exists —
+    /// plus [`Client::ping_transaction`], [`Client::commit_transaction`] and
+    /// [`Client::abort_transaction`], which take the bare id; reach for those
+    /// where a thread per transaction is not wanted. (The Go SDK spells that
+    /// choice `AttachTx(id, &AttachTxOptions{AutoPingable: false})`.)
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// # let id_from_elsewhere = String::new();
+    /// let tx = client.attach_transaction(&id_from_elsewhere)?;
+    ///
+    /// tx.create("table", "//tmp/out")?;   // inside the shared transaction
+    /// tx.commit()?;                       // and now published, by this process
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the transaction does not exist or the
+    /// timeout cannot be read. The error names the id and the operation
+    /// itself, because the cluster's own answer does not always do either.
+    /// Both spellings were observed on a local cluster: an expired id earns
+    /// `Error resolving path #<id>/@timeout` around `No such object <id>` —
+    /// object, not transaction, since the id is addressed as one — while an
+    /// id that never named anything is refused as `Unknown cell tag 0`, with
+    /// no id in it at all.
+    pub fn attach_transaction(&self, id: impl Into<String>) -> Result<Transaction> {
+        Transaction::attach(self, id.into())
+    }
+
+    /// Tells the cluster a transaction is still wanted, by bare id.
+    ///
+    /// A held [`Transaction`] does this on its own thread; this is for a
+    /// process that has nothing but the id — between a [`Transaction::detach`]
+    /// in one process and the commit in another, *somebody* must say the
+    /// transaction is still wanted, or it expires its timeout after its last
+    /// ping (30 seconds by default; verified on a local cluster with a
+    /// two-second timeout left alone for four). A ping is also the cheapest
+    /// liveness probe: the cluster answers one for a transaction that is gone
+    /// with `No such transaction`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the transaction has expired, was aborted, or
+    /// never existed.
+    pub fn ping_transaction(&self, id: &str) -> Result<()> {
+        transaction::ping(self, id)
+    }
+
+    /// Publishes everything done in a transaction, by bare id.
+    ///
+    /// What lets a process finish a transaction it did not start — the other
+    /// end of a [`Transaction::detach`], without the round trip and the ping
+    /// thread of [`Client::attach_transaction`].
+    ///
+    /// Sent under a mutation ID, because **a commit is not idempotent**: the
+    /// second commit of the same transaction is refused with `No such
+    /// transaction`, which reads like the first one failed. The mutation ID
+    /// makes a retried commit the same commit rather than a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the commit fails — including `No such
+    /// transaction` for one that expired, was aborted, or was already
+    /// committed.
+    pub fn commit_transaction(&self, id: &str) -> Result<()> {
+        transaction::commit_by_id(self, id)
+    }
+
+    /// Discards everything done in a transaction, by bare id.
+    ///
+    /// **Forgiving, unlike [`Client::abort_operation`]**: aborting a
+    /// transaction that already committed, aborted or expired — or one that
+    /// never existed — answers `{}`, verified on a local cluster. So this is
+    /// safe to send on any cleanup path, and it is retried freely on the same
+    /// grounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails. The transaction expires
+    /// on its own either way, once nothing is pinging it.
+    pub fn abort_transaction(&self, id: &str) -> Result<()> {
+        transaction::abort_by_id(self, id)
     }
 
     /// Asks the cluster for the least-loaded heavy proxy, if it has one.

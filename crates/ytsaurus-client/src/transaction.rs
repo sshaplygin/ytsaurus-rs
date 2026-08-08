@@ -19,6 +19,23 @@
 //! it is also the trap: a `read_table` from a client that is not in the
 //! transaction reads the table as it was before, and a second writer blocks on
 //! the lock the first one took.
+//!
+//! # Handing one to another process
+//!
+//! [`Transaction::detach`] stops the keep-alive and leaves the transaction
+//! running; what remains is the id. [`Client::attach_transaction`] turns an id
+//! back into a handle — pinging again, able to commit or abort — and
+//! [`Client::ping_transaction`], [`Client::commit_transaction`] and
+//! [`Client::abort_transaction`] finish one from a process that holds nothing
+//! but the id. Between the detach and the next ping the transaction is on the
+//! cluster's clock: it expires its timeout after its last ping, 30 seconds by
+//! default.
+//!
+//! What `Drop` does depends on where the handle came from. A **started**
+//! handle aborts on drop — that is what makes `?` safe inside a transaction. An
+//! **attached** one detaches on drop: the attacher walking away must not
+//! destroy what the process that started the transaction is still counting on.
+//! The C++ client's destructor draws the same line.
 
 use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -73,9 +90,23 @@ pub struct Transaction {
     /// A client bound to this transaction.
     client: Client,
     id: String,
-    /// Set by whichever of commit/abort ran, so `Drop` does not send a second.
+    /// Set by whichever of commit/abort/detach ran, so `Drop` sends nothing.
     done: bool,
     keep_alive: Option<KeepAlive>,
+    origin: Origin,
+}
+
+/// How a handle came to hold its transaction, which is what `Drop` turns on.
+#[derive(Clone, Copy, Debug)]
+enum Origin {
+    /// Started by this handle. Dropping it aborts: a `?` inside a transaction
+    /// must leave the cluster as it was.
+    Started,
+    /// Attached to a transaction something else started. Dropping it detaches
+    /// — stops the pinging, sends nothing — because walking away from a
+    /// borrowed transaction must not destroy what its owner is still counting
+    /// on. The C++ client's destructor makes the same distinction.
+    Attached,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -112,6 +143,28 @@ impl Transaction {
         };
         let id = String::from_utf8_lossy(bytes).into_owned();
 
+        Ok(Self::held(client, id, timeout, Origin::Started))
+    }
+
+    pub(crate) fn attach(client: &Client, id: String) -> Result<Self> {
+        // The transaction's own timeout, read off the object itself: pinging
+        // needs the interval, and the id alone does not carry it. The read is
+        // also what makes attaching to a transaction that is gone fail *here*
+        // rather than later, on the first command sent through the handle.
+        let value = client
+            .get(&format!("#{id}/@timeout"))
+            .map_err(|error| attach_failed(&id, error))?;
+        let millis = value.as_i64().ok_or_else(|| ClientError::Decode {
+            command: "attach_transaction".to_owned(),
+            reason: format!("#{id}/@timeout is not an integer: {:?}", value.node),
+        })?;
+        let timeout = Duration::from_millis(u64::try_from(millis).unwrap_or(0));
+
+        Ok(Self::held(client, id, timeout, Origin::Attached))
+    }
+
+    /// A handle around `id`, pinging every third of `timeout`.
+    fn held(client: &Client, id: String, timeout: Duration, origin: Origin) -> Self {
         let client = client.clone().with_transaction(&id);
         let interval = ping_interval(timeout);
 
@@ -128,12 +181,13 @@ impl Transaction {
             .set_timeout(ping_request_timeout(interval));
         let keep_alive = KeepAlive::spawn(ping_client, id.clone(), interval);
 
-        Ok(Self {
+        Self {
             client,
             id,
             done: false,
             keep_alive,
-        })
+            origin,
+        }
     }
 
     /// The transaction's ID, as the cluster named it.
@@ -191,6 +245,33 @@ impl Transaction {
     /// Returns [`ClientError`] if the transaction has expired or was aborted.
     pub fn ping(&self) -> Result<()> {
         ping(&self.client, &self.id)
+    }
+
+    /// Stops keeping the transaction alive and leaves it running.
+    ///
+    /// The deliberate exception to what `Drop` promises: the transaction
+    /// survives the handle. Nothing at all is sent — to the cluster a detached
+    /// transaction looks exactly like a held one — so from here it lives on
+    /// the cluster's terms: it expires its timeout after its last ping, 30
+    /// seconds by default, unless something else keeps it alive. That
+    /// something is the point: hand the returned id to another process, which
+    /// re-holds it with [`Client::attach_transaction`] or finishes it outright
+    /// with [`Client::commit_transaction`] or [`Client::abort_transaction`].
+    ///
+    /// No ping is in flight when this returns. The keep-alive thread is asked
+    /// to stop and then waited for, so a caller can kill the process the
+    /// moment this returns without a stray request behind it; the wait is
+    /// bounded by one ping's own budget, half the ping interval. What C++
+    /// spells `ITransaction::Detach()`.
+    #[must_use = "the id is the only way left to reach the transaction"]
+    pub fn detach(mut self) -> String {
+        // `Drop` still runs when this consumes the handle; `done` is what
+        // makes it send nothing.
+        self.done = true;
+        if let Some(keep_alive) = self.keep_alive.take() {
+            keep_alive.stop_and_join();
+        }
+        self.id.clone()
     }
 
     fn finish(&mut self, command: &'static str) -> Result<()> {
@@ -254,6 +335,17 @@ impl Drop for Transaction {
             return;
         }
 
+        if matches!(self.origin, Origin::Attached) {
+            // An attached handle borrowed the transaction; it does not own the
+            // fate of it. Dropping one detaches — the pings stop, nothing is
+            // sent — and the transaction is back where `detach` left it: alive,
+            // and expiring on the cluster's schedule unless somebody pings it.
+            // Aborting here would let any attacher's `?` destroy work the
+            // process that started the transaction still holds a handle to.
+            self.stop_pinging();
+            return;
+        }
+
         // Abandoning it would work too — an unpinged transaction expires — but
         // it would hold its locks until then, and a failed launcher should not
         // block the next attempt for half a minute. The error is dropped
@@ -272,7 +364,7 @@ impl Drop for Transaction {
 }
 
 /// Sends one ping.
-fn ping(client: &Client, id: &str) -> Result<()> {
+pub(crate) fn ping(client: &Client, id: &str) -> Result<()> {
     let params = yson_build::map([("transaction_id", yson_build::string(id))]);
     client.transport.call(
         Method::Post,
@@ -280,6 +372,66 @@ fn ping(client: &Client, id: &str) -> Result<()> {
         &params,
         Payload::None,
         // A ping says "still here"; sending it twice says it twice.
+        Repeatable::Freely,
+    )?;
+    Ok(())
+}
+
+/// Commits a transaction that is held as nothing but an id.
+///
+/// The handle's own [`Transaction::commit`] goes through `finish` instead,
+/// because it also has pings to stop and a `done` flag to keep honest.
+pub(crate) fn commit_by_id(client: &Client, id: &str) -> Result<()> {
+    let params = yson_build::map([("transaction_id", yson_build::string(id))]);
+    client.transport.call(
+        Method::Post,
+        "commit_transaction",
+        &params,
+        Payload::None,
+        // A commit is not idempotent: the second is refused with `No such
+        // transaction`, which reads like the *first* one failed. The mutation
+        // ID makes a retried commit the same commit.
+        Repeatable::WithMutationId,
+    )?;
+    Ok(())
+}
+
+/// The timeout read failing is the attach failing, and the error should say
+/// so.
+///
+/// The caller handed over a transaction id, not a `get`, and the cluster's own
+/// answer does not always name what was asked about: an id that was never a
+/// transaction is refused as `cluster error 1: Unknown cell tag 0` — observed
+/// on a local cluster for `1-2-3-4` — which names neither the id nor a
+/// transaction. Only an id whose cell exists earns the resolve error that
+/// does. So the command is rewritten to name the operation and the message to
+/// name the id, and everything else — the code, the raw document — is kept, so
+/// a caller can still branch on what the cluster actually said.
+fn attach_failed(id: &str, error: ClientError) -> ClientError {
+    match error {
+        ClientError::Cluster {
+            code, message, raw, ..
+        } => ClientError::Cluster {
+            command: "attach_transaction".to_owned(),
+            code,
+            message: format!("cannot attach to transaction {id}: {message}"),
+            raw,
+        },
+        other => other,
+    }
+}
+
+/// Aborts a transaction that is held as nothing but an id.
+pub(crate) fn abort_by_id(client: &Client, id: &str) -> Result<()> {
+    let params = yson_build::map([("transaction_id", yson_build::string(id))]);
+    client.transport.call(
+        Method::Post,
+        "abort_transaction",
+        &params,
+        Payload::None,
+        // An abort is forgiving — aborting a transaction that is already gone
+        // answers `{}`, verified on a local cluster — so a repeat is the same
+        // shrug and needs no mutation ID.
         Repeatable::Freely,
     )?;
     Ok(())
@@ -327,6 +479,9 @@ fn transaction_is_gone(error: &ClientError) -> bool {
 struct KeepAlive {
     /// Raised to ask the thread to stop; the condvar wakes it out of its wait.
     stop: Arc<(Mutex<bool>, Condvar)>,
+    /// The thread itself, kept for the one caller that must wait for it:
+    /// [`Transaction::detach`] promises no ping in flight when it returns.
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl KeepAlive {
@@ -376,7 +531,7 @@ impl KeepAlive {
                 }
             })
             .ok()
-            .map(|_handle| Self { stop })
+            .map(|thread| Self { stop, thread })
     }
 
     /// Asks the thread to stop, without waiting for it.
@@ -387,6 +542,27 @@ impl KeepAlive {
     /// worse bargain than letting a stray ping land on a committed
     /// transaction, which the cluster answers with an error nobody reads.
     fn stop(self) {
+        self.raise();
+    }
+
+    /// Asks the thread to stop and waits until it has.
+    ///
+    /// For [`Transaction::detach`], which has a caller to wait for it — unlike
+    /// the destructor above — and which promises that no ping lands after it
+    /// returns: a stray ping is harmless on a committed transaction but not on
+    /// a detached one, where it would quietly extend a lifetime the caller has
+    /// just finished reasoning about. The wait is bounded: the ping client
+    /// makes one attempt with a request timeout of half the interval, so the
+    /// worst case is the tail of one ping already in flight.
+    fn stop_and_join(self) {
+        self.raise();
+        // An `Err` here is the thread having panicked; the ping loop has
+        // nothing in it that panics, and a destructor-adjacent path must not
+        // turn someone else's panic into its own.
+        let _ = self.thread.join();
+    }
+
+    fn raise(&self) {
         let (lock, wake) = &*self.stop;
         *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
         wake.notify_all();
@@ -430,6 +606,7 @@ mod tests {
             id: "1-2-3-4".to_owned(),
             done: false,
             keep_alive: None,
+            origin: Origin::Started,
         }
     }
 
@@ -518,5 +695,72 @@ mod tests {
             *stop.0.lock().expect("not poisoned"),
             "stop() must raise the flag the thread waits on"
         );
+    }
+
+    #[test]
+    fn stop_and_join_outlives_the_thread_it_stops() {
+        // The join is what lets `detach` promise "no ping after this returns".
+        // Every ping here fails instantly (port 1), so the only way this test
+        // hangs is the thread not honouring the stop — and a hang is the
+        // failure mode, caught by the harness timeout rather than an assert.
+        let client = Client::new("http://127.0.0.1:1").with_retries(crate::RetryPolicy::none());
+        let keep_alive = KeepAlive::spawn(client, "1-2-3-4".to_owned(), Duration::from_millis(1))
+            .expect("the thread starts");
+
+        keep_alive.stop_and_join();
+    }
+
+    #[test]
+    fn detach_hands_back_the_id_and_disarms_drop() {
+        // `detach` consumes the handle, so `Drop` still runs inside it — with
+        // `done` set, on a client that could only fail loudly if it sent
+        // anything. Returning at all is half the assertion; the wire-level
+        // proof that nothing was sent is in tests/transaction_lifecycle.rs.
+        let tx = doomed();
+        assert_eq!(tx.detach(), "1-2-3-4");
+    }
+
+    #[test]
+    fn a_failed_attach_names_the_id_and_keeps_the_clusters_verdict() {
+        // What the cluster says about `1-2-3-4` is `cluster error 1: Unknown
+        // cell tag 0` — no id, no mention of a transaction. The rebranding
+        // must add both without discarding what a caller can branch on.
+        let from_cluster = ClientError::Cluster {
+            command: "get".into(),
+            code: 1,
+            message: "Unknown cell tag 0".into(),
+            raw: r#"{"code":1}"#.into(),
+        };
+
+        let rebranded = attach_failed("1-2-3-4", from_cluster);
+        let ClientError::Cluster {
+            command,
+            code,
+            message,
+            raw,
+        } = &rebranded
+        else {
+            panic!("the variant must survive: {rebranded:?}");
+        };
+        assert_eq!(command, "attach_transaction");
+        assert_eq!(*code, 1, "the cluster's code is the caller's to branch on");
+        assert!(message.contains("1-2-3-4"), "{message}");
+        assert!(message.contains("Unknown cell tag 0"), "{message}");
+        assert_eq!(raw, r#"{"code":1}"#, "the raw document is evidence");
+
+        // A transport failure says nothing about the id and is left alone.
+        let transport = attach_failed("1-2-3-4", ClientError::Config("x".into()));
+        assert!(matches!(transport, ClientError::Config(_)));
+    }
+
+    #[test]
+    fn an_attached_handle_dropped_mid_work_sends_nothing() {
+        // Same shape as above: an attached handle that is *not* finished. A
+        // started one in this state reaches for the cluster to abort; an
+        // attached one must not reach for anything. Nothing observable here
+        // beyond "no panic" — the wire test pins the absence of the abort.
+        let mut tx = doomed();
+        tx.origin = Origin::Attached;
+        drop(tx);
     }
 }

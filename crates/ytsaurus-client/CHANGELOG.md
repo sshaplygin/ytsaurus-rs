@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### A transaction can outlive its handle
+
+- **Added** `Transaction::detach` (#13): stops the keep-alive thread and
+  leaves the transaction running, returning the id — what C++ spells
+  `ITransaction::Detach()`. Nothing is sent, so from there the transaction
+  lives on the cluster's terms: it expires its timeout after its last ping,
+  30 s by default, unless whoever received the id keeps it alive. The thread
+  is joined before `detach` returns, so no ping is in flight afterwards — a
+  detach racing its own ping neither panics nor extends anything.
+
+- **Added** `Client::attach_transaction(id)`: the receiving half. Turns an id
+  into a real `Transaction` — bound client, ping thread, working
+  `commit`/`abort`/`ping` — where `with_transaction` only binds commands. The
+  ping interval is read from `#<id>/@timeout`, because the id alone does not
+  carry it; that one round trip is also what makes attaching to a transaction
+  that is gone fail immediately, with the cluster's resolve error naming the
+  id. **Dropping an attached handle detaches rather than aborts**, following
+  the C++ destructor's line: an attacher's `?` must not destroy work the
+  process that started the transaction still holds a handle to. The handle
+  always pings — Go's `AttachTx(id, {AutoPingable: false})` maps onto
+  `with_transaction` plus the by-id commands below.
+
+- **Added** `Client::ping_transaction`, `Client::commit_transaction` and
+  `Client::abort_transaction`, taking the bare id, so a process that holds
+  nothing else can finish someone else's transaction. Commit rides under a
+  mutation ID (it is not idempotent — the second commit is answered `No such
+  transaction`, which reads like the first one failed); abort is retried
+  freely on the cluster's own forgiveness (aborting a transaction that is
+  gone answers `{}`); a ping doubles as the liveness probe.
+
+- **Unchanged, and deliberately**: dropping a transaction this process
+  *started* still aborts it. That is what makes `?` safe inside a
+  transaction, and `examples/transaction.rs` still demonstrates exactly that;
+  `tests/transaction_lifecycle.rs` pins all four drop/detach shapes at the
+  wire level, stub-served in-process. The new `detach` example runs the
+  handoff against a cluster: start, detach, drop, attach from a second
+  client, hold past the transaction's own timeout, commit.
+
 ### Heavy proxies: a pool, picked at random, refreshed — never one host for life
 
 - **Changed** how heavy commands choose their proxy, to parity with the C++
