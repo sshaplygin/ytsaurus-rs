@@ -285,6 +285,10 @@ machine where the CLI already works needs nothing else. A token read from a file
 is trimmed — `echo token > ~/.yt/token` leaves a newline, and sending it fails
 authentication with an error that never mentions a newline.
 
+**Table and file data goes to a proxy that will accept it**, which is the one
+way a real installation differs from a local one that the caller would otherwise
+have to know about — see [where a heavy command goes](#where-a-heavy-command-goes).
+
 **A cluster behind a private CA needs its CA named.** A bare host name in
 `YT_PROXY` means `https://`, and TLS here is `rustls` with the Mozilla root
 bundle compiled in — so an installation whose certificate chains to a corporate
@@ -597,12 +601,89 @@ cluster implements that:
 is explicit that they cannot be, and [a transaction](#all-at-once-or-not-at-all)
 is the way to make an upload atomic.
 
-## Limits worth knowing
+## Where a heavy command goes
 
-**Heavy commands go to the address you gave it.** Large installations separate
-light and heavy proxies and answer an upload on a light proxy with 503. Use
-[`Client::heavy_proxy`] to discover one and point a second client at it. A local
-cluster needs none of this.
+Table and file data — `write_table`, `read_table`, `write_file`,
+`upload_worker`, and the streaming form of each — is what YTsaurus calls a
+*heavy* command, and a large installation serves those on a separate set of
+proxies. **The client routes them itself**: the first heavy command asks
+`/hosts` and the answer is kept for the client's lifetime. Light commands stay
+on the address you gave.
+
+**A proxy that stops answering is dropped for the next name in that same
+answer.** The whole list is kept, best first, and a heavy command that fails for
+a reason another proxy might not have moves the client on. Only when every name
+in the answer has failed does it fall back to the address you configured — and
+then only until it asks the cluster again ten seconds later
+(`Client::with_hosts_retry_after`). The order matters: with separate proxy
+roles, the address you configured is usually a control proxy, so falling back on
+the first hiccup would answer a transient 503 with ten seconds of guaranteed
+refusals.
+
+A cluster that names no heavy proxy is answered by using that address, so a
+single-node installation is unaffected — and one reached at `localhost` is not
+asked at all, because the address a proxy publishes for itself is not reachable
+from the other end of a port mapping or a tunnel.
+`Client::with_proxy_discovery` overrides both, and [`Client::heavy_proxy`] still
+answers the question directly.
+
+**The lookup has its own budget** — one attempt, 800 ms — rather than the
+client's five attempts and two-minute timeout. It sits in front of your first
+upload, and not getting an answer costs nothing worse than the routing this
+crate had none of a release ago. `Client::with_hosts_timeout` moves that budget
+in **both** directions: it used to be the smaller of 800 ms and your own
+timeout, so a cluster answering `/hosts` in 900 ms could not be routed to at
+all.
+
+**A discovered host has to share your address's domain.** So
+`https://cluster.example.net` will follow `n0132-sas.example.net` and will not
+follow `n0132-sas.somewhere-else.net`; a bare cluster name — `YT_PROXY=hume`,
+the usual spelling — is matched as a *label*, so it follows
+`n0008-sas.hume.yt.yandex.net`; the scheme and the port come from your address,
+not from the answer; and a name carrying `://`, `/`, `@` or whitespace is not a
+name. When a whole answer is declined the client says so, once, naming what it
+refused and why.
+
+Read that rule for what it is: **a guard against a typo in your configuration
+and against an obviously foreign name.** It is not what keeps your token where
+you put it. To steer a heavy command with a `/hosts` body somebody has to
+control that body — over `https://` that means owning the proxy, which has your
+token already, and over `http://` it means being a man-in-the-middle, who reads
+your token out of every light command without coming near this. The case it does
+cover is a proxy registering itself in the cluster's coordinator under a name
+its operators did not intend; and even there the rule is coarse, because a
+suffix rule with no public-suffix list behind it treats
+`yt-1234.us-east-1.elb.amazonaws.com` as sharing a domain with every other load
+balancer in that region.
+
+Three ways to say which names are allowed, then:
+
+| | |
+| --- | --- |
+| default | the domain rule above |
+| `Client::with_heavy_proxies_in([…])` | exactly these names — the one that is a boundary, because you wrote it |
+| `Client::with_heavy_proxies_anywhere(true)` | wherever `/hosts` says |
+
+The symptom of needing either of the last two is an upload refused at your own
+address — `Control proxy may not serve heavy requests with input data` — while
+`heavy_proxy()` shows a perfectly good one the client declined to use. That
+refusal now says as much itself.
+
+Without any of this, the failure is not obvious. The refusal arrives as
+`cluster error 1: Control proxy may not serve heavy requests with input data` —
+this crate's errors do not print the HTTP status beside the cluster's own, so
+the status is not what to look for. The cluster splits on whether the request
+carries input data: a heavy **write** is refused with 503, a heavy **read** is
+answered with a 307 to a data proxy. And a deployment behind a balancer is the
+case that breaks rather than the case that works — the balancer fronts the
+control proxies.
+
+One deliberate difference from the C++ and Go clients: they re-query `/hosts`
+periodically, as [the documentation
+recommends](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload), and
+this one does not. See [docs/sdk-comparison.md](../../docs/sdk-comparison.md).
+
+## Limits worth knowing
 
 **Trailers are not read.** The proxy reports a failure discovered mid-stream in
 an `X-YT-Error` trailer, and `ureq` 3.3 exposes none — rechecked against its

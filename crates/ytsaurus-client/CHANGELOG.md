@@ -2,78 +2,68 @@
 
 ## Unreleased
 
-### A cluster behind a private CA is reachable
+### A cache that refuses you, and the upload that goes anyway
 
-- **Added** `YT_CA_BUNDLE`, a PEM file of root certificates to verify the
-  cluster against instead of the Mozilla bundle `ureq` compiles in, and the
-  **`platform-verifier`** feature, which trusts whatever the operating system
-  trusts. Both are off by default and the default is unchanged: a client may be
-  running outside the network it is talking to, where the machine's own trust
-  store is the less trustworthy of the two.
+- **Fixed** `Client::upload_worker_cached` dying at the first upload on an
+  installation that maintains `//tmp/yt_wrapper/file_storage` itself. The
+  `create` on the miss branch is answered `cluster error 901: Access denied for
+  user …: "write | modify_children" … is not allowed by any matching ACE`, and
+  four of the shipped examples never got past it — `vanilla`, `statistics`,
+  `cached_upload` and `profile` (#32). A 901 on the cache's **own** writes —
+  creating the cache directory, creating the staging node inside it, and the
+  handover to `put_file_to_cache` — now means "no cache for you": the worker
+  goes up under `//tmp` on a path of its own and the launch carries on.
 
-  Until now there was no way to name a CA at all, so an on-premises
-  installation whose chain ends at a corporate root was simply unreachable over
-  `https://` — which is the scheme a bare host name in `YT_PROXY` selects.
-  `curl` reaches the same URL, because it reads the OS trust store. There was no
-  workaround in this crate's public API. Both official clients and the `yt` CLI
-  let a deployment point at its own CA; this is that (#29).
+  Precisely those three. A 901 on the bytes themselves is about the node this
+  client has just created, not about the cache, and the same bytes sent
+  elsewhere would earn the same answer; a create that failed for a resolve
+  error or a lock held elsewhere is not a permission problem at all. Both are
+  returned as they always were, because a fallback that swallowed either would
+  upload twice and then report success.
 
-  **A bundle that yields no certificates is refused**, with an error naming the
-  file, rather than quietly becoming the Mozilla roots — a fallback would answer
-  a deliberate request with the very `UnknownIssuer` the variable exists to end,
-  and name neither the file nor the reason. So is one that cannot be read. The
-  refusal is discovered while the agent is being built, where there is nothing
-  to fail, so it waits for the first request that would have needed it. A
-  cluster reached over plain HTTP is not refused: there is no handshake for the
-  bundle to have configured.
+  The code is looked for anywhere in the error document rather than only at the
+  top, as the retry classifier and the transaction one already do: every
+  transcript seen so far is flat, and an outer code is routinely a category with
+  the reason nested under it.
 
-  **And so is a `BEGIN CERTIFICATE` block that is not an X.509 certificate.**
-  PEM is only an envelope: the reader splits the sections and base64-decodes
-  them, and `rustls` then discards a block it cannot parse *without telling
-  anyone*. So a PKCS#7 `.p7b` re-armoured under that label — how a Windows-born
-  bundle usually arrives — was accepted here, produced an empty root store, and
-  failed every request with exactly the `UnknownIssuer` that naming a CA is
-  supposed to prevent, mentioning neither the file nor the variable. Every block
-  is now checked to be a certificate, and one that is not refuses the whole
-  file, naming it and saying how many blocks were wrong: a root store silently
-  shorter than the one the caller wrote down is the same failure a step later.
+- **Breaking** `CachedFile` gained a `cached` field. Code that matches the
+  struct by name or reads its fields is unaffected; code that destructures every
+  field needs `..`.
 
-  The bundle wins where both are set. It is the more specific answer, and the
-  one the caller went out of their way to give.
+  It is there because `uploaded` was answering two questions with one bit. It is
+  true both for a file the cache accepted and for one that went to `//tmp`
+  because the cache would not, and `path` was the only difference — so a
+  launcher that cleans up after itself was deleting the installation's **shared
+  cache entry** on an ordinary cluster, evicting the binary for everyone else,
+  and one that does not clean up leaks a node per launch on the cluster where
+  the fallback fires, since nothing expires those. `cached` is the field to
+  branch on: true for a hit and for an accepted upload, false only for the
+  fallback.
 
-  The file is read **once per process** and capped at 16 MB, and it must be a
-  regular file. `Client::new` cannot fail and the client's global timeout covers
-  requests rather than files, so there was nothing above the read to bound it: a
-  variable naming a FIFO hung the constructor for ever, and one naming something
-  enormous was paid for in memory before anyone could be told. Once per process
-  because an agent is rebuilt more often than it looks — `Client::with_timeout`
-  makes a new one, and a transaction's start and drop each build a client.
+- **Added** a warning when that happens, on stderr and as a `WARN` event where
+  the `tracing` feature is on. The state is permanent until someone acts and
+  invisible otherwise — every launch re-sends the whole binary and leaves a node
+  behind. The message names the path that was refused, quotes the cluster so an
+  ACL failure is not mistaken for a flaky proxy, and names
+  `Client::with_file_cache`, which already existed and is the one line that puts
+  a cache back.
 
-  **No new direct dependency, and the musl worker graph is unchanged.** `ureq`
-  3.3 already offers both routes; both sit behind the `tls` feature, which
-  `examples/` — what `build-worker.sh` cross-compiles — turns off. The CI guard
-  now searches for `rustls-platform-verifier` alongside `tracing`, `rustls` and
-  `ring`.
+- **Documented** what the fallback node is: an ordinary `//tmp` node with
+  whatever ACL `//tmp` carries, no expiry, and a name unguessable only as far
+  as a mutation ID is — the entropy behind one says of itself that its callers
+  need an id to be *unique, not unpredictable*, having been built to
+  deduplicate a retry rather than to withhold a name. On shared scratch space a
+  co-tenant can rewrite the worker's bytes between the upload and the job that
+  execs them. It is the ordinary exposure of anything left in `//tmp`, and it
+  is the reason to point `with_file_cache` at a directory of your own rather
+  than to accept the fallback as a settled state.
 
-- **Fixed** a certificate error being retried five times. An unknown issuer is
-  not a transient failure — the same roots reject the same certificate on the
-  fifth attempt — but it arrived as a transport error, and every transport error
-  was retriable, so a misconfigured CA took about fifteen seconds of doubling
-  backoff to report. It is reported at the first attempt now.
-
-  Deliberately narrow, and narrower than "the certificate was rejected". Only
-  `UnknownIssuer` and `NotValidForName` are settled, because both are decided by
-  *this client's* root store and *this client's* URL, neither of which the next
-  attempt changes. Every other TLS complaint is still retried: an expired or
-  revoked certificate is a property of the fleet member that answered, and a
-  round-robin set mid-rotation may answer with a renewed one; a revocation list
-  that could not be fetched is transient by definition; and
-  `rustls-platform-verifier` — which the new `platform-verifier` feature turns
-  on — reports a failed revocation lookup or a momentarily unreadable trust
-  store as `Other(…)` under the same prefix, so classifying that would have made
-  enabling the feature a way of turning a bad afternoon on this machine into a
-  permanent failure. A reset connection, a refused one and a timeout are all
-  still retried, as is every protocol-level disagreement mid-handshake.
+**Not verified against a cluster.** A local cluster in Docker makes the caller
+`root` and can never answer `Access denied`, which is why this was found on a
+real multi-node installation and not before. `tests/file_cache.rs` scripts a
+cluster on a socket in-process and asserts the sequence of commands, which is
+what is actually under test: which call was refused, and what the client did
+next.
 
 ### A token no longer follows a redirect to a host nobody chose
 
@@ -190,68 +180,291 @@
 [rfc3986]: https://www.rfc-editor.org/rfc/rfc3986#section-4.2
 [rfc3986-5.3]: https://www.rfc-editor.org/rfc/rfc3986#section-5.3
 
-### A cache that refuses you, and the upload that goes anyway
+### A cluster behind a private CA is reachable
 
-- **Fixed** `Client::upload_worker_cached` dying at the first upload on an
-  installation that maintains `//tmp/yt_wrapper/file_storage` itself. The
-  `create` on the miss branch is answered `cluster error 901: Access denied for
-  user …: "write | modify_children" … is not allowed by any matching ACE`, and
-  four of the shipped examples never got past it — `vanilla`, `statistics`,
-  `cached_upload` and `profile` (#32). A 901 on the cache's **own** writes —
-  creating the cache directory, creating the staging node inside it, and the
-  handover to `put_file_to_cache` — now means "no cache for you": the worker
-  goes up under `//tmp` on a path of its own and the launch carries on.
+- **Added** `YT_CA_BUNDLE`, a PEM file of root certificates to verify the
+  cluster against instead of the Mozilla bundle `ureq` compiles in, and the
+  **`platform-verifier`** feature, which trusts whatever the operating system
+  trusts. Both are off by default and the default is unchanged: a client may be
+  running outside the network it is talking to, where the machine's own trust
+  store is the less trustworthy of the two.
 
-  Precisely those three. A 901 on the bytes themselves is about the node this
-  client has just created, not about the cache, and the same bytes sent
-  elsewhere would earn the same answer; a create that failed for a resolve
-  error or a lock held elsewhere is not a permission problem at all. Both are
-  returned as they always were, because a fallback that swallowed either would
-  upload twice and then report success.
+  Until now there was no way to name a CA at all, so an on-premises
+  installation whose chain ends at a corporate root was simply unreachable over
+  `https://` — which is the scheme a bare host name in `YT_PROXY` selects.
+  `curl` reaches the same URL, because it reads the OS trust store. There was no
+  workaround in this crate's public API. Both official clients and the `yt` CLI
+  let a deployment point at its own CA; this is that (#29).
 
-  The code is looked for anywhere in the error document rather than only at the
-  top, as the retry classifier and the transaction one already do: every
-  transcript seen so far is flat, and an outer code is routinely a category with
-  the reason nested under it.
+  **A bundle that yields no certificates is refused**, with an error naming the
+  file, rather than quietly becoming the Mozilla roots — a fallback would answer
+  a deliberate request with the very `UnknownIssuer` the variable exists to end,
+  and name neither the file nor the reason. So is one that cannot be read. The
+  refusal is discovered while the agent is being built, where there is nothing
+  to fail, so it waits for the first request that would have needed it. A
+  cluster reached over plain HTTP is not refused: there is no handshake for the
+  bundle to have configured.
 
-- **Breaking** `CachedFile` gained a `cached` field. Code that matches the
-  struct by name or reads its fields is unaffected; code that destructures every
-  field needs `..`.
+  **And so is a `BEGIN CERTIFICATE` block that is not an X.509 certificate.**
+  PEM is only an envelope: the reader splits the sections and base64-decodes
+  them, and `rustls` then discards a block it cannot parse *without telling
+  anyone*. So a PKCS#7 `.p7b` re-armoured under that label — how a Windows-born
+  bundle usually arrives — was accepted here, produced an empty root store, and
+  failed every request with exactly the `UnknownIssuer` that naming a CA is
+  supposed to prevent, mentioning neither the file nor the variable. Every block
+  is now checked to be a certificate, and one that is not refuses the whole
+  file, naming it and saying how many blocks were wrong: a root store silently
+  shorter than the one the caller wrote down is the same failure a step later.
 
-  It is there because `uploaded` was answering two questions with one bit. It is
-  true both for a file the cache accepted and for one that went to `//tmp`
-  because the cache would not, and `path` was the only difference — so a
-  launcher that cleans up after itself was deleting the installation's **shared
-  cache entry** on an ordinary cluster, evicting the binary for everyone else,
-  and one that does not clean up leaks a node per launch on the cluster where
-  the fallback fires, since nothing expires those. `cached` is the field to
-  branch on: true for a hit and for an accepted upload, false only for the
-  fallback.
+  The bundle wins where both are set. It is the more specific answer, and the
+  one the caller went out of their way to give.
 
-- **Added** a warning when that happens, on stderr and as a `WARN` event where
-  the `tracing` feature is on. The state is permanent until someone acts and
-  invisible otherwise — every launch re-sends the whole binary and leaves a node
-  behind. The message names the path that was refused, quotes the cluster so an
-  ACL failure is not mistaken for a flaky proxy, and names
-  `Client::with_file_cache`, which already existed and is the one line that puts
-  a cache back.
+  The file is read **once per process** and capped at 16 MB, and it must be a
+  regular file. `Client::new` cannot fail and the client's global timeout covers
+  requests rather than files, so there was nothing above the read to bound it: a
+  variable naming a FIFO hung the constructor for ever, and one naming something
+  enormous was paid for in memory before anyone could be told. Once per process
+  because an agent is rebuilt more often than it looks — `Client::with_timeout`
+  makes a new one, and a transaction's start and drop each build a client.
 
-- **Documented** what the fallback node is: an ordinary `//tmp` node with
-  whatever ACL `//tmp` carries, no expiry, and a name unguessable only as far
-  as a mutation ID is — the entropy behind one says of itself that its callers
-  need an id to be *unique, not unpredictable*, having been built to
-  deduplicate a retry rather than to withhold a name. On shared scratch space a
-  co-tenant can rewrite the worker's bytes between the upload and the job that
-  execs them. It is the ordinary exposure of anything left in `//tmp`, and it
-  is the reason to point `with_file_cache` at a directory of your own rather
-  than to accept the fallback as a settled state.
+  **No new direct dependency, and the musl worker graph is unchanged.** `ureq`
+  3.3 already offers both routes; both sit behind the `tls` feature, which
+  `examples/` — what `build-worker.sh` cross-compiles — turns off. The CI guard
+  now searches for `rustls-platform-verifier` alongside `tracing`, `rustls` and
+  `ring`.
 
-**Not verified against a cluster.** A local cluster in Docker makes the caller
-`root` and can never answer `Access denied`, which is why this was found on a
-real multi-node installation and not before. `tests/file_cache.rs` scripts a
-cluster on a socket in-process and asserts the sequence of commands, which is
-what is actually under test: which call was refused, and what the client did
-next.
+- **Fixed** a certificate error being retried five times. An unknown issuer is
+  not a transient failure — the same roots reject the same certificate on the
+  fifth attempt — but it arrived as a transport error, and every transport error
+  was retriable, so a misconfigured CA took about fifteen seconds of doubling
+  backoff to report. It is reported at the first attempt now.
+
+  Deliberately narrow, and narrower than "the certificate was rejected". Only
+  `UnknownIssuer` and `NotValidForName` are settled, because both are decided by
+  *this client's* root store and *this client's* URL, neither of which the next
+  attempt changes. Every other TLS complaint is still retried: an expired or
+  revoked certificate is a property of the fleet member that answered, and a
+  round-robin set mid-rotation may answer with a renewed one; a revocation list
+  that could not be fetched is transient by definition; and
+  `rustls-platform-verifier` — which the new `platform-verifier` feature turns
+  on — reports a failed revocation lookup or a momentarily unreadable trust
+  store as `Other(…)` under the same prefix, so classifying that would have made
+  enabling the feature a way of turning a bad afternoon on this machine into a
+  permanent failure. A reset connection, a refused one and a timeout are all
+  still retried, as is every protocol-level disagreement mid-handshake.
+### Heavy commands go to a heavy proxy, without being asked to
+
+`Client::heavy_proxy` has always worked, and **nothing ever called it**. Every
+heavy command — `write_table`, `write_file`, `read_table`, `upload_worker`,
+`write_table_rows`, the streaming forms of each — went to whatever `YT_PROXY`
+held, which on an installation that separates proxy roles is a control proxy,
+and a control proxy refuses one. Run against a real multi-node cluster rather
+than a local Docker one, that failed **19 of the 21 shipped examples** at their
+first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
+
+- **Added** automatic routing. The first heavy command asks `/hosts`, the
+  answer is kept for the client's lifetime and shared by every clone of it, and
+  a heavy command that fails for a reason another proxy might not have gives up
+  the host it used for the next name in that same answer. The failed command
+  itself is not re-sent: heavy commands are not retried, and by then a streamed
+  body is gone.
+
+- **A failure moves to the next proxy, not back to the configured address.**
+  The first cut of this feature had no ban list — Go's has one, and its absence
+  was disclosed in `docs/sdk-comparison.md` rather than reconsidered — so one
+  transient 503 from a draining data proxy, or one refused connection during a
+  restart, sent the next ten seconds of heavy commands to the address the
+  caller configured. On the deployment this whole feature was written for that
+  address is a balancer in front of the **control** proxies, which refuse every
+  heavy command with input data: the fallback reproduced [#30] on demand, once
+  per hiccup, and heavy commands are not retried, so every command in the
+  window failed. `/hosts` had already named the alternatives. Now the answer is
+  kept whole, best first, the failed host is dropped, and only an answer whose
+  every name has failed falls back to the configured address — for ten seconds,
+  and then the cluster is asked again.
+
+  A proxy that refuses heavy work **because of the role it has** is given up
+  the same way. `/hosts` lists whatever `default_role_filter` says, which is a
+  coordinator config parameter rather than a guarantee, so a control proxy can
+  appear in it; its refusal is a cluster error that no retry could ever fix and
+  that asking the coordinator again fixes immediately — which is exactly the
+  distinction `worth_asking_again` was split out for.
+
+- **Added** `Client::with_heavy_proxies_in`, a list of proxies written out by
+  hand. The domain rule below is a guard against a typo, not a boundary; and
+  `with_heavy_proxies_anywhere` was all-or-nothing, so the only cure for a rule
+  that missed by one label was to remove the rule. Names are compared without
+  case, and with a port only where both sides name one.
+
+- **Added** `Client::with_hosts_timeout` and `Client::with_hosts_retry_after`.
+  The lookup budget was `min(800 ms, the client's own timeout)`, so
+  `with_timeout` could only ever lower it and a cluster answering `/hosts` in
+  900 ms was unroutable by any configuration at all — while the first heavy
+  command, which is often a client's first request, pays DNS, TCP and a TLS
+  handshake out of the same 800 ms. The retry window is settable for a smaller
+  reason that turned out to matter: at a fixed ten seconds no test outlived one,
+  so `HeavyProxy::Configured` and `HeavyProxy::FellBack` were observationally
+  identical and either could be written where the other was with the whole suite
+  green. Both are now pinned by a test that sets the window to nothing.
+
+- **A `/hosts` answer this client declines in full is announced**, once, naming
+  what was refused and why — on stderr, or as a `WARN` event where the `tracing`
+  feature is on, and muted inside a job like every other thing this client says.
+  And when a heavy command is then refused at the configured address, the
+  cluster's `Control proxy may not serve heavy requests with input data` carries
+  the sentence the cluster cannot know: that this client asked, declined the
+  answer, and which builder call changes that. Silence there was the whole
+  failure mode — the operator gets back the error from #30 with nothing to
+  connect it to.
+
+  The refusal that prompted this is not hypothetical. `Client::new("hume")` — a
+  bare cluster name, which `Transport::new` supports on purpose and which is how
+  `YT_PROXY` is usually written — has no parent domain to take a leftmost label
+  off, so the rule degenerated to "the name itself" and refused
+  `["n0008-sas.hume.yt.yandex.net"]` in full, permanently and in silence. A
+  configured name with no dot is now matched as a **label** of the discovered
+  name, and not as its leftmost one: `hume` follows
+  `n0008-sas.hume.yt.yandex.net` and not `hume.evil.com`. The same break was
+  waiting in Kubernetes for anyone addressing the service by its short name.
+
+- **A bracketed name has to hold an IPv6 literal.** The rule was "an unbracketed
+  name with more than one colon is refused", which waved through anything that
+  started with `[`. Probed against `ureq` 3.3:
+  `https://[n0132.example.com]evil.attacker.com` parses with the host
+  `[n0132.example.com]` — the brackets are stripped only for a literal — so the
+  token went nowhere, and the cost was worse than a leak of nothing. The address
+  was remembered, every heavy command failed to resolve it, and (before the ban
+  list above) the failure repeated for as long as the client lived. A port is
+  now digits on either shape of name, too.
+
+[#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
+
+- **The classification is the one the crate already had.** `Repeatable` encodes
+  the two bits the cluster's own command registry declares, `isVolatile` and
+  `isHeavy`, and `Repeatable::Never` was carrying both "heavy" and "mutating
+  where no mutation cache covers it". Those are now `Repeatable::Heavy` and
+  `Repeatable::Never`, so the heavy commands are the ones already marked heavy
+  rather than a second list beside the first, free to drift from it. The two
+  streaming seams — `Transport::open` and `Transport::upload` — are heavy by
+  construction, so a raw streaming command is routed too.
+
+  **Breaking** `Repeatable` gained a variant *and* `#[non_exhaustive]`. Code
+  that matches it exhaustively needs a `_` arm — and will not need another one
+  the next time the registry earns a name here.
+
+- **A discovered host is checked rather than pasted**: same domain as the
+  configured address (or the configured host itself), scheme and port from the
+  configured address, and no `://`, `/`, `@` or whitespace. Measured on the
+  first cut of this feature: `http://n0132` from an `https://` client stripped
+  TLS and put the token on the wire in cleartext, `real.example.net@evil.example.net`
+  connected to `evil.example.net`, and a configured `:8443` was dropped.
+  A refused name is passed over and the rest of the list tried; a `/hosts`
+  answer refused entirely leaves the upload going where it went before there
+  was a lookup.
+
+  **What the domain rule is worth** was overstated when it landed, and is worth
+  stating plainly instead. It is a guard against a typo in a configuration and
+  against an obviously foreign name — not what keeps the token where the caller
+  put it. Steering a heavy command with a `/hosts` body means controlling that
+  body: over `https://` that is owning the proxy, which has the token already,
+  and over `http://` it is being a man-in-the-middle, who reads the token out of
+  every light command without coming near this code. The threat it does cover is
+  a proxy registering itself in the coordinator under an unintended name, and
+  even there it is coarse, because a suffix rule with no public-suffix list
+  behind it — a dependency deliberately not taken — reads
+  `yt-1234.us-east-1.elb.amazonaws.com` as sharing a domain with every other
+  load balancer in the region. The scheme, the port and the `@`/`/`/`://`
+  refusals are the parts that hold up on their own.
+
+  **Added** `Client::with_heavy_proxies_anywhere`, the opt-in for an
+  installation whose `/hosts` genuinely names another domain. It relaxes the
+  domain rule and nothing else.
+
+- **The lookup has its own budget**: one attempt bounded by 800 ms, not the
+  client's five attempts of up to two minutes with fifteen seconds of backoff
+  between them — all of which used to run while holding the lock every other
+  heavy command wants. Measured: a `/hosts` answering 503 cost a heavy command
+  **15.03 s**, and one that accepted the question and never answered cost it
+  **615 s**. Both are now under a second (3 ms and 804 ms). A lookup that failed
+  for a reason that might pass leaves the configured address in use for ten
+  seconds and is then asked again, which is the same retry spread out where it
+  queues nobody: **eight threads against a hanging `/hosts` took 240 s and
+  performed 40 lookups, and now take 809 ms and perform one.** Eight threads
+  against a healthy one still ask exactly once, which they already did.
+
+- **A heavy proxy that cannot be reached is given up.** Before, the answer was
+  thrown away, the same question asked, the same dead host resolved, and every
+  upload for the rest of the client's life failed the same way — the shipped
+  test asserted exactly that. The measured trigger is ordinary: a single-node
+  container reached from the host is not on loopback (`172.17.0.2`), so
+  discovery runs and `/hosts` answers with a container-internal name. Now the
+  first upload fails, the next name in the answer takes over, and when there is
+  none the second upload succeeds against the configured address with the
+  cluster asked again ten seconds later.
+
+- **A cluster that names no heavy proxy keeps serving them itself.** That is
+  what leaves a single-node installation working exactly as it did, and an
+  absent `/hosts` (404) is remembered as such so it is not asked again before
+  every upload. So is a body that is not a list of host names, and so is an
+  answer whose every name was refused.
+
+- **A cluster on loopback is not asked at all**, which is the other half of
+  leaving local alone: `localhost` is this machine's own cluster or a tunnel to
+  one, and the address a proxy publishes for itself is not reachable from the
+  near end of either. Following it would break every upload that works today,
+  and the round trip could not have helped in the first place.
+  **Added** `Client::with_proxy_discovery` to override that in both directions
+  — on for a port-forward into a real installation, off to pin everything to
+  the address given. With it off, a heavy failure now takes no lock and reads
+  no state, rather than mutating an answer the client will never look at.
+
+- **A routed failure names the host it went to.** `write_table: transport
+  error: io: Connection refused` is a true report about an address that appears
+  nowhere in the caller's own code — the client chose it, out of a list the
+  cluster gave it, and then said nothing about the choice. It now reads
+  `write_table at n0132-sas.example.net:9013: …`.
+
+- **"Would waiting help?" and "would asking again help?" are two questions**,
+  and `retry::is_retriable` was being asked both. The second is now
+  `worth_asking_again`, used by the two places that decide whether to keep or
+  discard what `/hosts` said. They agree on every failure this release can
+  produce; the point of splitting them is the ones the next release can — a
+  refused redirect is worth asking again and a rejected certificate is not, and
+  neither answer is the retry policy's.
+
+- **Corrected** what this crate said about the refusal, twice over. The claim
+  that it is "not a 503, it is an HTTP 200" was never observed: `ClientError`
+  renders a cluster error without its status, so a 503 carrying an `X-YT-Error`
+  header looks exactly like a 200 carrying one. The cluster's own rule
+  (`TContext::TryRedirectHeavyRequests`) splits on whether the request carries
+  input data — a heavy **write** gets 503 with `Retry-After: 60` and the string
+  `Control proxy may not serve heavy requests with input data`, a heavy **read**
+  gets a **307** to a data proxy — and the documentation gives one half in its
+  `/hosts` section and the other in its return-code table. Only the error string
+  is first-hand here. "`/hosts` defaults to the `data` role" was asserted with
+  no citation and now has one: it is `default_role_filter`, a coordinator config
+  parameter whose compiled-in default is `data`, so an operator can change it.
+  And a deployment **behind a balancer is the case that breaks**, not the case
+  that works — the balancer fronts the control proxies. `heavy_proxy` remains,
+  no longer as the escape hatch that makes an upload work but as the way to see
+  the address or hand it to something that is not this client.
+
+- **Not done, and written down instead:** the documentation asks for `/hosts` to
+  be re-queried "every minute or every few queries", and both official clients
+  do. This one asks once per client and then walks the answer it was given,
+  asking again only when the answer runs out. That is a load-balancing
+  regression the cluster absorbs, not a correctness one, and it is now disclosed
+  in `docs/sdk-comparison.md` rather than left to be discovered.
+
+- **Tested offline**, because none of it can be verified here: two listeners in
+  `tests/request_shape.rs`, one answering `/hosts` with the other's address, and
+  assertions about which one each command reached. A cluster answers a heavy
+  command the same way whichever proxy was asked, so nothing about the answers
+  could have caught this. Every one of the three unpinned heavy call sites —
+  `write_file`, `write_skiff_table`, `read_skiff_table` — is now in that test's
+  exact request list; `write_file` is the one that mattered, because
+  `upload_worker`, `upload_current_exe` and `upload_worker_cached` all funnel
+  through it.
 
 ### An operation is no longer a string and four commands
 

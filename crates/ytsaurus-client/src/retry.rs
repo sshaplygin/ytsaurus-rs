@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use crate::error::{ClientError, Result};
 
-/// How a command may be repeated.
+/// How a command may be repeated — and, for a heavy one, where it goes.
 ///
 /// The classification is the cluster's, not this crate's: each command declares
 /// whether it mutates and whether it is heavy, and the rules at the top of this
@@ -41,7 +41,12 @@ use crate::error::{ClientError, Result};
 /// the command — it does not cover the scheduler, which is why
 /// [`Client::abort_operation`](crate::Client::abort_operation) is `Never`
 /// despite being both light and mutating.
+///
+/// The enum is `#[non_exhaustive]`: the cluster's registry has more shapes than
+/// this crate has needed so far, and a caller that matches on it exhaustively
+/// would break the next time one of them earns a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Repeatable {
     /// Safe to repeat unchanged, with no mutation ID to deduplicate by.
     ///
@@ -64,9 +69,34 @@ pub enum Repeatable {
     /// The cluster keeps the first response for five to ten minutes and hands
     /// it back rather than applying the change twice. See [`MutationId`].
     WithMutationId,
-    /// Heavy, or mutating outside the master's mutation cache. Sent once,
-    /// whatever the policy says.
+    /// Mutating outside the master's mutation cache. Sent once, whatever the
+    /// policy says, because there is nothing that would deduplicate a second
+    /// send and the first may already have been applied.
     Never,
+    /// **Heavy**: table and file data, in either direction.
+    ///
+    /// Sent once, like [`Repeatable::Never`] and for the documented reason —
+    /// the way to make a heavy command atomic is a transaction, not a retry.
+    ///
+    /// It also decides **where** the command goes. A large installation gives
+    /// its proxies roles and refuses a heavy request on a control proxy, so
+    /// the client asks `/hosts` for one that will take it, once per client
+    /// and only if a heavy command needs it. Nothing about the call site
+    /// changes: this is the same `isHeavy` bit of the cluster's command
+    /// registry that says the command cannot be repeated, and both answers
+    /// follow from writing it down once. The discovered host is constrained to
+    /// the configured address's own domain — see
+    /// [`Client::with_heavy_proxies_anywhere`](crate::Client::with_heavy_proxies_anywhere).
+    ///
+    /// `write_table`, `read_table`, `write_file`, `get_job_input` and
+    /// `get_job_stderr` are the modelled ones — every one of them declared
+    /// `isHeavy = true` in `REGISTER_ALL`/`REGISTER` in the cluster's
+    /// [driver registry](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp),
+    /// whose argument order is `(command, name, inDataType, outDataType,
+    /// isVolatile, isHeavy)`. A raw command that streams in either direction is
+    /// sent this way whatever the caller says, because streaming *is* the heavy
+    /// shape.
+    Heavy,
 }
 
 /// YTsaurus error codes worth a second attempt.
@@ -223,6 +253,17 @@ impl RetryPolicy {
         self
     }
 
+    /// Whether this policy says anything out loud at all.
+    ///
+    /// Read by the transport as well as by [`run`]: the one thing the client
+    /// announces that is not a retry — a `/hosts` answer it declined, see
+    /// [`crate::observe::declined`] — has to be muted by the same switch, for
+    /// the same reason. A job's stderr is the cluster's bounded diagnostic
+    /// buffer whatever the client is talking about.
+    pub(crate) fn reports(self) -> bool {
+        self.report
+    }
+
     /// How long to wait after the `attempt`-th failure, counting from one.
     fn backoff(self, attempt: u32) -> Duration {
         let doubled = self
@@ -329,7 +370,12 @@ fn generate() -> String {
     )
 }
 
-/// Whether repeating the request could plausibly succeed.
+/// Whether **waiting** and sending the same request again could plausibly
+/// succeed.
+///
+/// This is the question the retry loop asks, and only that one. "Would asking
+/// somewhere else help?" is a different question with a different answer —
+/// see [`worth_asking_again`].
 pub(crate) fn is_retriable(error: &ClientError) -> bool {
     match error {
         // The request never got an answer: a refused connection, a reset, a
@@ -427,6 +473,73 @@ fn contains_code(value: &serde_json::Value, wanted: &[i64]) -> bool {
         .is_some_and(|inner| inner.iter().any(|error| contains_code(error, wanted)))
 }
 
+/// Whether putting the **question** to the cluster again could plausibly get a
+/// different answer.
+///
+/// Not the same question as [`is_retriable`], and the difference is the whole
+/// reason this exists. `is_retriable` asks *would waiting help?* — it decides
+/// whether to send the same request to the same place after a pause. This one
+/// asks *would asking again ever help?*, and its callers are the two places
+/// that decide whether the client keeps or discards what `/hosts` told it:
+/// `Transport::base_for` and `Transport::after_heavy`. Neither is going to
+/// re-send anything; both are choosing between "remember this answer" and "ask
+/// once more later".
+///
+/// They differ for exactly the failures where the *addressee* is what was
+/// wrong rather than the moment. Every reason to wait is also a reason to ask
+/// again — a proxy that was restarting is one the coordinator may well name
+/// differently in a minute — so this starts from `is_retriable` and adds to it.
+///
+/// **Two arms belong here that this branch cannot yet write**, because the
+/// variants they name are introduced by sibling pull requests. Each is one
+/// line, and this function is shaped so that it is:
+///
+/// - **`ClientError::Redirected` → `true`** (#36, redirect credentials). A
+///   balancer that answered with a `Location` this client refuses to follow is
+///   not a permanent verdict on heavy routing: its routing may be different for
+///   the next request, and the thing that must not happen is *following* the
+///   redirect, not *asking* again. Left as `is_retriable`'s `false`, one such
+///   answer would disable heavy routing for the client's whole life.
+/// - **a rejected certificate → `false`** (#39, TLS CA bundle). A host this
+///   process does not trust will not become trusted by being asked twice, and
+///   the fix is a CA bundle rather than another question. That arm needs no
+///   line here: #39 narrows `is_retriable` to answer `false` for one, and
+///   `false` is the right answer on this side too.
+///
+/// Both sibling PRs have now landed, so both arms this function was shaped for
+/// are in place. #39 narrowed [`is_retriable`] to answer `false` for a rejected
+/// certificate, which is the right answer here too and needs no line of its own.
+/// #36's [`ClientError::Redirected`] is the line below: a balancer that answered
+/// `/hosts` with a `Location` this client refuses to follow is not a permanent
+/// verdict on heavy routing — its routing may differ for the next request — so
+/// the coordinator is worth asking again. Left at `is_retriable`'s `false`, one
+/// such answer would disable heavy routing for the client's whole life (#30
+/// behind a new message), which the merge integration test in
+/// `tests/combination.rs` guards against.
+pub(crate) fn worth_asking_again(error: &ClientError) -> bool {
+    is_retriable(error)
+        || refused_for_being_the_wrong_proxy(error)
+        || matches!(error, ClientError::Redirected { .. })
+}
+
+/// Whether the proxy refused this because of the **role it has**.
+///
+/// The purest case of "waiting would not help and asking somewhere else would",
+/// and the reason the two predicates are separate. `Control proxy may not serve
+/// heavy requests with input data` arrives as an ordinary cluster error with
+/// code 1, which [`is_retriable`] correctly judges hopeless: sending it there
+/// again will be refused again, forever. Asking the *coordinator* again, on the
+/// other hand, is the entire fix — and a client that has been routed onto a
+/// control proxy (an operator can change `default_role_filter`, and `/hosts`
+/// then lists proxies that refuse this) would otherwise keep that address for
+/// its whole life and fail every heavy command with it.
+fn refused_for_being_the_wrong_proxy(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Cluster { message, .. } if message.contains(crate::http::CONTROL_REFUSAL)
+    )
+}
+
 /// Whether a fresh client should announce its retries.
 ///
 /// Not inside a job. `YT_JOB_ID` is set by the node that starts one, and a
@@ -461,7 +574,7 @@ pub(crate) fn run<T>(
     mut action: impl FnMut(bool) -> Result<T>,
 ) -> Result<T> {
     let allowed = match repeatable {
-        Repeatable::Never => 1,
+        Repeatable::Never | Repeatable::Heavy => 1,
         _ => policy.attempts,
     };
 
@@ -699,6 +812,65 @@ mod tests {
     }
 
     #[test]
+    fn asking_again_is_a_different_question_from_waiting() {
+        // Two predicates, two questions. Everything worth waiting for is worth
+        // asking about again — a proxy that was restarting is one the
+        // coordinator may name differently in a minute — so this direction of
+        // the implication is the one that must hold on every branch.
+        for worth_waiting in [
+            ClientError::Transport {
+                command: "write_table".to_owned(),
+                source: Box::new(ureq::Error::HostNotFound),
+            },
+            ClientError::Http {
+                command: "hosts".to_owned(),
+                status: 503,
+                body: String::new(),
+            },
+            cluster_error(2100, r#"{"code":2100}"#),
+        ] {
+            assert!(is_retriable(&worth_waiting), "{worth_waiting}");
+            assert!(worth_asking_again(&worth_waiting), "{worth_waiting}");
+        }
+
+        // And the case that makes the split earn its keep: a proxy refusing a
+        // heavy command because of the role it has. Waiting cannot help — it
+        // will refuse the next one identically, forever — and asking the
+        // coordinator for another proxy is the entire fix. `/hosts` lists
+        // whatever `default_role_filter` says, which an operator can change, so
+        // a control proxy really can turn up in the answer.
+        let wrong_proxy = ClientError::Cluster {
+            command: "write_table".to_owned(),
+            code: 1,
+            message: "Control proxy may not serve heavy requests with input data".to_owned(),
+            raw: r#"{"code":1}"#.to_owned(),
+        };
+        assert!(!is_retriable(&wrong_proxy), "{wrong_proxy}");
+        assert!(worth_asking_again(&wrong_proxy), "{wrong_proxy}");
+
+        // And a settled answer is settled for both. A cluster with no `/hosts`
+        // endpoint answers 404 every time, so the lookup is remembered as
+        // "this cluster serves its own heavy commands" rather than repeated
+        // before every upload.
+        for settled in [
+            ClientError::Http {
+                command: "hosts".to_owned(),
+                status: 404,
+                body: String::new(),
+            },
+            ClientError::Decode {
+                command: "hosts".to_owned(),
+                reason: "not a list of host names".to_owned(),
+            },
+            ClientError::Config("no proxy".to_owned()),
+            cluster_error(500, r#"{"code":500}"#),
+        ] {
+            assert!(!is_retriable(&settled), "{settled}");
+            assert!(!worth_asking_again(&settled), "{settled}");
+        }
+    }
+
+    #[test]
     fn decode_and_config_errors_are_never_retried() {
         assert!(!is_retriable(&ClientError::Config("no proxy".to_owned())));
         assert!(!is_retriable(&ClientError::Decode {
@@ -741,19 +913,21 @@ mod tests {
 
     #[test]
     fn a_heavy_command_is_sent_once() {
-        let calls = std::cell::Cell::new(0);
+        for once in [Repeatable::Heavy, Repeatable::Never] {
+            let calls = std::cell::Cell::new(0);
 
-        let result: Result<()> = run(instant(5), Repeatable::Never, "write_table", |_| {
-            calls.set(calls.get() + 1);
-            Err(cluster_error(105, r#"{"code":105}"#))
-        });
+            let result: Result<()> = run(instant(5), once, "write_table", |_| {
+                calls.set(calls.get() + 1);
+                Err(cluster_error(105, r#"{"code":105}"#))
+            });
 
-        assert!(result.is_err());
-        assert_eq!(
-            calls.get(),
-            1,
-            "heavy commands cannot be retried, whatever the policy says"
-        );
+            assert!(result.is_err());
+            assert_eq!(
+                calls.get(),
+                1,
+                "{once:?}: heavy commands cannot be retried, whatever the policy says"
+            );
+        }
     }
 
     #[test]

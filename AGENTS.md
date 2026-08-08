@@ -66,7 +66,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 517 tests
+cargo test --workspace            # 618 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -334,53 +334,6 @@ per command. Cluster facts:
   a crate linked into musl worker binaries, which is a human's call.
 - A local cluster **accepts any token**, so the file lookup is unit-tested and
   whether a real installation likes the token cannot be checked here.
-- **TLS trusts the Mozilla bundle unless told otherwise**, which is
-  `webpki-roots` compiled in through `ureq`'s `rustls` feature. A bare host name
-  in `YT_PROXY` means `https://`, so an on-premises installation behind a
-  corporate CA was unreachable — `invalid peer certificate: UnknownIssuer`,
-  where `curl` succeeds by reading the OS trust store. `YT_CA_BUNDLE` names a
-  PEM file instead; the `platform-verifier` feature trusts what the OS trusts;
-  the bundle wins where both are set. A **bundle that parses to no certificates
-  is refused**, naming the file — the fallback would be the same silent
-  `UnknownIssuer`. Verified against a real multi-node installation with a
-  three-deep, self-signed chain (#29); a local cluster is plain HTTP and cannot
-  exercise any of it.
-- **PEM is an envelope and proves nothing about what is inside it.**
-  `ureq::tls::parse_pem` splits the sections and base64-decodes them; the
-  `Certificate` it hands back is documented as unvalidated, and `rustls`'
-  `add_parsable_certificates` then **discards what it cannot parse and reports
-  the count to nobody**. So a PKCS#7 `.p7b` re-armoured under a
-  `BEGIN CERTIFICATE` label — how a Windows-born bundle usually arrives — was
-  accepted, produced an empty root store, and failed every request with the
-  same `UnknownIssuer` the variable exists to end. `http::is_x509` checks the
-  DER skeleton (`SEQUENCE { SEQUENCE, SEQUENCE, BIT STRING }`, and the head of
-  the `TBSCertificate` inside it) and **one bad block refuses the whole file**;
-  a `ContentInfo` parts company at its first member, which is an OBJECT
-  IDENTIFIER rather than the `tbsCertificate` sequence. The bundle is also
-  `stat`ed before it is opened, because opening a FIFO blocks for ever and
-  `Client::new` is infallible with nothing above it to time a file read out.
-- **A rejected certificate is not retried — for two of the reasons, not all of
-  them.** It arrives as `ureq::Error::Io` of kind `InvalidData` wrapping a
-  `rustls::Error`, rendered `invalid peer certificate: <CertificateError>`, and
-  was retried five times as an ordinary transport failure, which put ~15 s of
-  backoff in front of a verdict that cannot change. Only `UnknownIssuer` and
-  the name mismatch are that verdict: both are decided by *this client's* roots
-  and *this client's* URL, which the next attempt does not change.
-
-  **Match the rendering, not the variant name.** `rustls` renders that error
-  with `Display`, and `Display for CertificateError` writes prose for the
-  context-carrying variants while falling back to `Debug` for the rest. So
-  `UnknownIssuer` arrives under its own name, but a hostname mismatch arrives
-  as `certificate not valid for name "…"; certificate is only valid for …` —
-  and the webpki verifier builds *only* `NotValidForNameContext`, never the
-  bare variant, so matching `NotValidForName` alone settles nothing in the
-  default build. Both spellings are listed for that reason. Everything else stays retriable, and deliberately so —
-  `rustls-platform-verifier` maps a failed revocation lookup or an unreadable
-  trust store to `Other(…)` under the same prefix, and classifying those would
-  make enabling `platform-verifier` a way of turning a transient OS condition
-  into a permanent failure; `Expired` and `Revoked` are properties of the fleet
-  member that answered, and a round-robin set mid-rotation may answer with a
-  renewed one next time.
 - **A heavy read through a control proxy is answered with a cross-host `307`**
   naming a data proxy. The
   [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)
@@ -443,6 +396,53 @@ per command. Cluster facts:
   a heavy proxy". It is the cluster's `isHeavy` bit, so it covers commands only
   `raw_command` can send; **it must be reconciled with `Repeatable::Heavy` when
   #38 merges**, and the source carries that marker.
+- **TLS trusts the Mozilla bundle unless told otherwise**, which is
+  `webpki-roots` compiled in through `ureq`'s `rustls` feature. A bare host name
+  in `YT_PROXY` means `https://`, so an on-premises installation behind a
+  corporate CA was unreachable — `invalid peer certificate: UnknownIssuer`,
+  where `curl` succeeds by reading the OS trust store. `YT_CA_BUNDLE` names a
+  PEM file instead; the `platform-verifier` feature trusts what the OS trusts;
+  the bundle wins where both are set. A **bundle that parses to no certificates
+  is refused**, naming the file — the fallback would be the same silent
+  `UnknownIssuer`. Verified against a real multi-node installation with a
+  three-deep, self-signed chain (#29); a local cluster is plain HTTP and cannot
+  exercise any of it.
+- **PEM is an envelope and proves nothing about what is inside it.**
+  `ureq::tls::parse_pem` splits the sections and base64-decodes them; the
+  `Certificate` it hands back is documented as unvalidated, and `rustls`'
+  `add_parsable_certificates` then **discards what it cannot parse and reports
+  the count to nobody**. So a PKCS#7 `.p7b` re-armoured under a
+  `BEGIN CERTIFICATE` label — how a Windows-born bundle usually arrives — was
+  accepted, produced an empty root store, and failed every request with the
+  same `UnknownIssuer` the variable exists to end. `http::is_x509` checks the
+  DER skeleton (`SEQUENCE { SEQUENCE, SEQUENCE, BIT STRING }`, and the head of
+  the `TBSCertificate` inside it) and **one bad block refuses the whole file**;
+  a `ContentInfo` parts company at its first member, which is an OBJECT
+  IDENTIFIER rather than the `tbsCertificate` sequence. The bundle is also
+  `stat`ed before it is opened, because opening a FIFO blocks for ever and
+  `Client::new` is infallible with nothing above it to time a file read out.
+- **A rejected certificate is not retried — for two of the reasons, not all of
+  them.** It arrives as `ureq::Error::Io` of kind `InvalidData` wrapping a
+  `rustls::Error`, rendered `invalid peer certificate: <CertificateError>`, and
+  was retried five times as an ordinary transport failure, which put ~15 s of
+  backoff in front of a verdict that cannot change. Only `UnknownIssuer` and
+  the name mismatch are that verdict: both are decided by *this client's* roots
+  and *this client's* URL, which the next attempt does not change.
+
+  **Match the rendering, not the variant name.** `rustls` renders that error
+  with `Display`, and `Display for CertificateError` writes prose for the
+  context-carrying variants while falling back to `Debug` for the rest. So
+  `UnknownIssuer` arrives under its own name, but a hostname mismatch arrives
+  as `certificate not valid for name "…"; certificate is only valid for …` —
+  and the webpki verifier builds *only* `NotValidForNameContext`, never the
+  bare variant, so matching `NotValidForName` alone settles nothing in the
+  default build. Both spellings are listed for that reason. Everything else stays retriable, and deliberately so —
+  `rustls-platform-verifier` maps a failed revocation lookup or an unreadable
+  trust store to `Other(…)` under the same prefix, and classifying those would
+  make enabling `platform-verifier` a way of turning a transient OS condition
+  into a permanent failure; `Expired` and `Revoked` are properties of the fleet
+  member that answered, and a round-robin set mid-rotation may answer with a
+  renewed one next time.
 
 ### The operation lifecycle
 
@@ -586,6 +586,109 @@ of the response, so one `curl` per case says what it did with the header.
   (response) are the documented, non-trace way to find a request in the proxy
   log. Not sent or read yet — and reading either would mean handing response
   headers back, which no method does today.
+
+### Where a heavy command goes
+
+Observed on a real multi-node installation rather than a local Docker one — see
+[#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30) — and then read back
+out of the documentation and the cluster's own source, because the observation
+and the documentation disagreed and the source is what settles it.
+
+- **A control proxy will not serve a heavy request, and what it does instead
+  depends on whether the request carries input data.** The rule is
+  `TContext::TryRedirectHeavyRequests` in
+  [`yt/yt/server/http_proxy/context.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/server/http_proxy/context.cpp):
+
+  | Request | Answer |
+  | --- | --- |
+  | heavy **with** input data — `write_table`, `write_file` | **503** + `Retry-After: 60`, carrying `Control proxy may not serve heavy requests with input data` |
+  | heavy **without** — `read_table`, `read_file`, `get_job_input`, `get_job_stderr` | **307** to a data proxy |
+  | heavy read, no data proxy available | **503**, `There are no data proxies available` |
+  | any of them with `X-YT-Suppress-Redirect` | served by the control proxy after all |
+
+  The `inDataType` column of the driver registry is exactly that test, so the
+  split is mechanical rather than a judgement.
+
+  **This crate recorded the refusal as an HTTP 200 and that was wrong.** The
+  status was never observed: `ClientError::Cluster` renders as `{command}:
+  cluster error {code}: {message}` and does not print the status at all, so a
+  503 carrying an `X-YT-Error` header looks exactly like a 200 carrying one.
+  Only the error string is first-hand here.
+
+  The documentation gives both halves of the rule and neither whole. The
+  [`/hosts` section](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)
+  says "When you try to execute a heavy command, light proxies return code
+  503"; the return-code table on the same page lists "307 — Redirecting heavy
+  queries from light to heavy proxies".
+- **The role that refuses is spelled `control`, exactly.**
+  `TCoordinator::CanHandleHeavyRequests` is `Role != "control"`, so a proxy
+  with any other role — including `default` — serves heavy commands.
+- **A deployment behind a balancer is the case that breaks**, not the case that
+  works: the balancer fronts the *control* proxies, so every upload arrives at
+  one. Pointing `YT_PROXY` at an address from `/hosts` makes the same examples
+  pass unchanged, which is what proved the cause.
+- **`/hosts` answers a JSON list of bare host names, best first.** The
+  [HTTP proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)
+  shows the wire form — `["n0008-sas.cluster-name", …]` — and the
+  [reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)
+  the ordering: "ordered by load … the very first proxy in the resulting list
+  is the least loaded". No scheme and usually no port, so both come from the
+  address the caller configured. (`TCoordinator::ListProxies` shuffles the
+  better half of the list before returning it, so "first" means "one of the
+  good ones", not "the best".)
+- **"Defaults to the `data` role" is not in the documentation** — it was
+  asserted here without one for a release. It is `default_role_filter`, a
+  coordinator **config parameter**, defaulted in `TCoordinatorConfig::Register`
+  to `NApi::DefaultHttpProxyRole`, which
+  [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h)
+  spells `"data"`. A compiled-in default an operator can change, then, not a
+  protocol guarantee — which is why this client validates what it is handed
+  rather than trusting the role. `?role=`, `/hosts/all` (which alone shows
+  banned and dead proxies) and the plain-text form selected by an exact
+  `Accept: text/plain` are all source-only too.
+- **The documentation asks for the list to be re-queried, and this client does
+  not.** From the [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload):
+  "A good strategy is to re-query the `/hosts` list every minute or every few
+  queries and change the current proxy to which queries are made." This client
+  asks once and keeps the whole answer for the client's lifetime
+  (`Transport::base_for`), re-asking only when every name in it has failed.
+  That is a deliberate deviation, recorded in
+  [docs/sdk-comparison.md](docs/sdk-comparison.md); it trades load-balancing
+  quality for one round trip per client.
+- **A failed heavy command moves to the next name in the answer, not back to
+  the configured address.** The distinction is the whole feature: with separate
+  roles the configured address is a control proxy, so falling back there
+  answers one transient 503 with a window of guaranteed refusals — issue #30
+  reproduced on demand. Only an answer whose every name has failed falls back,
+  and then for `HOSTS_RETRY_AFTER` before the cluster is asked again. A proxy
+  that refuses heavy work *because of its role* counts as failed too:
+  `retry::worth_asking_again` says so where `is_retriable` cannot, which is why
+  the two predicates are separate.
+- An empty or absent list means "the configured address serves everything",
+  which is what a single-node cluster is. **A cluster on loopback is not asked
+  at all**: what it publishes for itself is an address behind the port mapping
+  or tunnel that `localhost` stands for, and following it would break every
+  upload that works today. That last point is reasoning, not a measurement —
+  no local cluster's `/hosts` answer has been captured here.
+- **A name from `/hosts` is checked before it is used.** The documentation says
+  nothing at all about which hosts a token may be sent to — the `/hosts` flow
+  and the `Authorization: OAuth` header are documented on the same page and
+  never connected — so the answer is this client's to choose: same domain as the
+  configured address, scheme and port from the configured address, no `://`,
+  `/`, `@` or whitespace, and a bracketed name only for an IPv6 literal (`ureq`
+  3.3 hands `[not.an.ip]` straight to the resolver, so accepting it buys a
+  permanently unresolvable address).
+  **The domain rule is a typo guard, not a token boundary** — say so when
+  writing about it. Steering the `/hosts` body means owning the proxy (which
+  has the token) or the wire (which reads it off every light command), and a
+  suffix rule with no public-suffix list treats every tenant of a hosting
+  platform as a neighbour. `Client::with_heavy_proxies_in` is the version that
+  is a boundary; `Client::with_heavy_proxies_anywhere` removes the rule.
+- **A configured name with no dot is matched as a label.** `YT_PROXY=hume` is
+  the ordinary spelling and has no parent domain, so the domain rule
+  degenerated to "the name itself" and refused
+  `["n0008-sas.hume.yt.yandex.net"]` in full and for good. It now has to appear
+  as a label of the discovered name and not as its leftmost one.
 
 ### Connections
 

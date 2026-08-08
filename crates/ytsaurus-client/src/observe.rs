@@ -262,6 +262,79 @@ fn retry_message(
     )
 }
 
+/// How many refused names the message spells out before counting the rest.
+const NAMED_REFUSALS: usize = 3;
+
+/// Says that `/hosts` named heavy proxies and this client used none of them.
+///
+/// **Once per client**, because the state it announces is resolved once: the
+/// answer settles as "the configured address serves heavy commands", and is
+/// never asked about again. Without this the only symptom is a cluster error
+/// arriving from the control proxy much later — `Control proxy may not serve
+/// heavy requests with input data`, which names neither `/hosts` nor the
+/// decision this client made about its answer. A configured address that
+/// misses the discovered names by one label is then indistinguishable from a
+/// cluster with no heavy proxies at all.
+///
+/// `refused` is one rendered clause per name, already carrying the reason.
+/// Muted by [`RetryPolicy::quiet`], and therefore inside a job, for the same
+/// reason [`retrying`] is.
+///
+/// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
+#[cfg(feature = "tracing")]
+pub(crate) fn declined(configured: &str, refused: &[String]) {
+    tracing::warn!(
+        configured = %configured,
+        refused = refused.len(),
+        names = %refused.join("; "),
+        "no proxy from /hosts was used; heavy commands stay on the configured address"
+    );
+
+    // As with a retry: the event is the message when somebody is listening,
+    // and the line is still owed when nobody is.
+    let listening = !tracing::dispatcher::get_default(
+        tracing::Dispatch::is::<tracing::subscriber::NoSubscriber>,
+    );
+    if !listening {
+        eprintln!("{}", declined_message(configured, refused));
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+pub(crate) fn declined(configured: &str, refused: &[String]) {
+    eprintln!("{}", declined_message(configured, refused));
+}
+
+/// The announcement as a line of text, split out so a test can hold it.
+fn declined_message(configured: &str, refused: &[String]) -> String {
+    let named = refused
+        .iter()
+        .take(NAMED_REFUSALS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let rest = refused.len().saturating_sub(NAMED_REFUSALS);
+    let and_more = if rest > 0 {
+        format!("; and {rest} more")
+    } else {
+        String::new()
+    };
+
+    format!(
+        "ytsaurus-client: /hosts named {} heavy {}, and none was used, \
+         so heavy commands go to {configured} — which is what an installation \
+         with separate proxy roles refuses. {named}{and_more}. \
+         Client::with_heavy_proxies_in([…]) or \
+         Client::with_heavy_proxies_anywhere(true) allows them.",
+        refused.len(),
+        if refused.len() == 1 {
+            "proxy"
+        } else {
+            "proxies"
+        },
+    )
+}
+
 /// The stderr spelling, which is what a default build prints.
 ///
 /// Not gated on the feature — that is the whole point. The module below is
@@ -352,6 +425,43 @@ mod message_tests {
         assert!(line.contains("//tmp/mine/cache"), "{line}");
         assert!(line.contains("Access denied"), "{line}");
         assert!(line.contains("Client::with_file_cache"), "{line}");
+    }
+
+    #[test]
+    fn the_declined_message_names_the_reasons_and_the_way_out() {
+        let line = declined_message(
+            "https://hume",
+            &[
+                r#""n0008-sas.hume.yt.yandex.net" is not under the domain of hume"#.to_owned(),
+                r#""" is not a host name"#.to_owned(),
+            ],
+        );
+
+        // The address the uploads are now going to, which is the address that
+        // is about to refuse them.
+        assert!(line.contains("https://hume"), "{line}");
+        // The name that was declined, and why — the two facts that are
+        // otherwise nowhere at all.
+        assert!(line.contains("n0008-sas.hume.yt.yandex.net"), "{line}");
+        assert!(line.contains("not under the domain of hume"), "{line}");
+        // And what to do about it.
+        assert!(line.contains("with_heavy_proxies_in"), "{line}");
+        assert!(line.contains("with_heavy_proxies_anywhere"), "{line}");
+    }
+
+    #[test]
+    fn a_long_refusal_list_is_counted_rather_than_recited() {
+        // `/hosts` on a large installation names tens of proxies. A message
+        // that spelled every one of them out would be unreadable exactly where
+        // it matters most.
+        let many: Vec<String> = (0..12)
+            .map(|i| format!("{i:?} is not a host name"))
+            .collect();
+        let line = declined_message("https://hume", &many);
+
+        assert!(line.contains("/hosts named 12 heavy proxies"), "{line}");
+        assert!(line.contains("and 9 more"), "{line}");
+        assert!(!line.contains(r#""11""#), "{line}");
     }
 
     #[test]
@@ -690,6 +800,32 @@ mod tests {
             )),
             None,
             "a subscriber is installed and the warning would be printed twice"
+        );
+    }
+
+    #[test]
+    fn a_declined_hosts_answer_is_a_warning_with_the_names_in_it() {
+        // The one thing this client says that is not about a retry, and it says
+        // it once per client: a `/hosts` answer it refused in full, which is
+        // otherwise indistinguishable from a cluster that has no heavy proxies
+        // until a control proxy refuses an upload much later.
+        let lines = recorded(|| {
+            declined(
+                "https://hume",
+                &[r#""n0008-sas.hume.yt.yandex.net" is not under the domain of hume"#.to_owned()],
+            );
+        });
+
+        let warning = lines
+            .iter()
+            .find(|line| line.starts_with("event WARN"))
+            .unwrap_or_else(|| panic!("no warning was emitted: {lines:?}"));
+
+        assert!(warning.contains("configured=https://hume"), "{warning}");
+        assert!(warning.contains("refused=1"), "{warning}");
+        assert!(
+            warning.contains("n0008-sas.hume.yt.yandex.net"),
+            "the names are the whole point of the event: {warning}"
         );
     }
 
