@@ -1091,9 +1091,12 @@ pub struct EraseSpec {
 impl EraseSpec {
     /// Erases the rows `table` names.
     ///
-    /// Ranges are written into the path itself: [`TablePath`](crate::TablePath)
-    /// models the write-side attributes, not read-side ranges, so this takes the
-    /// path as text.
+    /// Ranges are written into the path itself, as text.
+    /// [`TablePath`](crate::TablePath) now models typed ranges for the table
+    /// read commands, but an erase is its own case — the range here selects
+    /// what an *operation* deletes, the cluster honours it, and adopting the
+    /// typed form for specs is a separate decision this constructor does not
+    /// make.
     #[must_use]
     pub fn new(table: impl Into<String>) -> Self {
         Self {

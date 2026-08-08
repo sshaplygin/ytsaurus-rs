@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### The read half of a rich path
+
+- **Added** column and row selection to `TablePath`: `columns(…)` and
+  `range(…)`, with `RowRange` and `Key` behind the latter. Three columns of a
+  hundred rows now cost three columns of a hundred rows on the wire, not the
+  whole table. The selections travel as the `columns` and `ranges` attributes
+  *on the path* — the same mechanism as `<append=%true>`, and for the same
+  reason: a sibling parameter is silently dropped. Spellings are the
+  [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath),
+  and `ypath.Rich` in the Go SDK renders the identical shapes.
+
+- **Added** row ranges as plain Rust ranges — `path.range(0..100)`,
+  `range(100..)`, `range(..)` — because Rust's `..` and the cluster's
+  `row_index` limits mean the same thing: inclusive below, exclusive above.
+  Key ranges on sorted tables take the same shape,
+  `RowRange::keys(Key::from("a")..Key::from("b"))`, and the inclusivity
+  travels with the range: the two bounds the `key` selector says natively are
+  sent as `key`, the other two (`..=`, `Bound::Excluded` below) as the
+  cluster's `key_bound=[relation;prefix]` form, whose relation is the only one
+  the reference allows on that side. `RowRange::exact_key` is the `exact`
+  selector. A range never mixes `exact` with a limit because no constructor
+  can write that.
+
+- **Changed** `read_table`, `read_table_with_format`, `read_skiff_table`,
+  `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`,
+  as the write methods already did. Call sites that pass `&str`, `String`,
+  `&String`, `&&str` or `Cow<str>` compile unchanged; a call that leaned on
+  inference (`path.as_ref()`) may need to say `&str` once.
+
+- **Breaking** a *write* to a path carrying a read selection is refused
+  locally, as `ClientError::Config`, before anything is sent. The cluster
+  ignores a selection on a write and replaces the whole table with a 200 —
+  measured in both spellings: `write_table_rows("//tmp/t[#0:#2]", rows)`
+  replaced everything and reported success, and a `write_table` whose path
+  carried `ranges` as a typed *attribute* did exactly the same, 200 and three
+  rows replaced by one — so the only honest write is no write.
+  The same refusal covers selection syntax spelled into the path *string* on a
+  write: a leading `<…>` block, or an unescaped `[` / `{` (a literal bracket
+  in a node name is escaped, `\[`, and still writable). Reads keep taking
+  string-spelled paths verbatim, because the cluster honours them there and
+  always has — except a string-spelled selection *combined with* a typed one,
+  which is two spellings of a selection on one path and is refused too.
+
+- **Breaking** `TablePath` no longer derives `Eq` (a key bound may hold a
+  double, which has no `Eq`); `PartialEq` remains. `read_skiff_table` refuses
+  a path with `TablePath::columns` set — the Skiff format's fields already are
+  the column selection — while a `TablePath::range` joins it freely.
+
 ### Heavy proxies: a pool, picked at random, refreshed — never one host for life
 
 - **Changed** how heavy commands choose their proxy, to parity with the C++

@@ -15,8 +15,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use ytsaurus_client::{
-    Client, ClientError, DataFormat, Method, OperationFilter, OperationParameters, RetryPolicy,
-    SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType, TablePath, TraceContext, yson_build,
+    Client, ClientError, DataFormat, Key, Method, OperationFilter, OperationParameters,
+    RetryPolicy, RowRange, SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType, TablePath,
+    TraceContext, yson_build,
 };
 
 /// Serves exactly one request and returns its headers as text.
@@ -209,6 +210,293 @@ fn all_three_writers_can_append() {
             "{command} sent a path without the attribute:\n{head}"
         );
     }
+}
+
+// The reads below ignore their result on purpose: the stub's reply is not a
+// binary YSON fragment, so the read errors *after* the request — the thing
+// under test — is already on the wire.
+
+#[test]
+fn a_column_selection_travels_as_an_attribute_on_the_path() {
+    // Same trap as append, read side: `columns` is an attribute ON the path —
+    // the rich YPath reference lists it as recognized by `read_table` — and a
+    // sibling parameter would be silently dropped.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table(TablePath::new("//tmp/wide").columns(["host", "status"]));
+    });
+
+    assert!(
+        head.starts_with("GET /api/v4/read_table"),
+        "not a read_table:\n{head}"
+    );
+    assert!(
+        parameters(&head).contains(r#"path=<columns=[host;status]>"//tmp/wide""#),
+        "the selection is not on the path:\n{head}"
+    );
+}
+
+#[test]
+fn a_row_range_travels_in_the_documented_limits() {
+    // `0..2` is rows 0 and 1 on both sides of the wire: the reference says
+    // every limit but key_bound is inclusive below and exclusive above, which
+    // is exactly Rust's `..`.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table(TablePath::new("//tmp/t").range(0..2));
+    });
+
+    assert!(
+        parameters(&head).contains(
+            r#"path=<ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>"//tmp/t""#
+        ),
+        "the range is not on the path:\n{head}"
+    );
+}
+
+#[test]
+fn key_bounds_travel_in_the_clusters_representation() {
+    // The two bounds `key` says natively go as `key`; the two it cannot go as
+    // `key_bound=[relation;prefix]`, with the only relation the reference
+    // allows on that side. Every literal is fixed, so asserting the rendered
+    // text is safe.
+    let plain = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table(
+            TablePath::new("//tmp/sorted")
+                .range(RowRange::keys(Key::from("alice")..Key::from("bob"))),
+        );
+    });
+    assert!(
+        parameters(&plain).contains(
+            r#"path=<ranges=[{lower_limit={key=[alice]};upper_limit={key=[bob]}}]>"//tmp/sorted""#
+        ),
+        "an inclusive..exclusive key range is not the plain key form:\n{plain}"
+    );
+
+    let bounds = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table(TablePath::new("//tmp/sorted").range(RowRange::keys((
+            std::ops::Bound::Excluded(Key::from("alice")),
+            std::ops::Bound::Included(Key::from("bob")),
+        ))));
+    });
+    assert!(
+        parameters(&bounds).contains(
+            r#"path=<ranges=[{lower_limit={key_bound=[">";[alice]]};upper_limit={key_bound=["<=";[bob]]}}]>"//tmp/sorted""#
+        ),
+        "the other two inclusivities are not key_bound:\n{bounds}"
+    );
+}
+
+#[test]
+fn an_exact_key_read_asks_in_the_clusters_word_for_it() {
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table(
+            TablePath::new("//tmp/sorted").range(RowRange::exact_key(Key::from("alice"))),
+        );
+    });
+
+    assert!(
+        parameters(&head).contains(r#"path=<ranges=[{exact={key=[alice]}}]>"//tmp/sorted""#),
+        "the exact selector is not on the path:\n{head}"
+    );
+}
+
+#[test]
+fn all_three_readers_carry_the_selection() {
+    // `read_table`, `read_table_rows` and `read_table_streaming` build their
+    // parameter block separately; a selection lost on one route would quietly
+    // read the whole table — the cost the selection exists to avoid.
+    let selected = || TablePath::new("//tmp/wide").columns(["host"]).range(0..100);
+    let expected = r#"path=<columns=[host];ranges=[{lower_limit={row_index=0};upper_limit={row_index=100}}]>"//tmp/wide""#;
+
+    let heads = [
+        (
+            "read_table",
+            capture(|proxy| {
+                let client = Client::new(proxy).with_retries(RetryPolicy::none());
+                let _ = client.read_table(selected());
+            }),
+        ),
+        (
+            "read_table_rows",
+            capture(|proxy| {
+                let client = Client::new(proxy).with_retries(RetryPolicy::none());
+                let _ =
+                    client.read_table_rows::<std::collections::BTreeMap<String, i64>>(selected());
+            }),
+        ),
+        (
+            "read_table_streaming",
+            capture(|proxy| {
+                let client = Client::new(proxy).with_retries(RetryPolicy::none());
+                let _ = client.read_table_streaming(selected());
+            }),
+        ),
+    ];
+
+    for (command, head) in heads {
+        assert!(
+            parameters(&head).contains(expected),
+            "{command} sent a path without the selection:\n{head}"
+        );
+    }
+}
+
+#[test]
+fn a_skiff_read_merges_a_row_range_with_its_schema_columns() {
+    // The Skiff format's fields are the column selection; a typed range says
+    // which rows. Different questions, one path — both attributes must
+    // arrive, or the read silently covers the wrong slice of the table.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_skiff_table(TablePath::new("//tmp/t").range(0..2), &one_column());
+    });
+
+    let sent = parameters(&head);
+    assert!(
+        sent.contains("columns=[n]")
+            && sent.contains(r#"ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]"#),
+        "the Skiff read lost half the selection:\n{head}"
+    );
+}
+
+#[test]
+fn a_skiff_read_refuses_a_second_column_selection() {
+    // Two projections — the schema's fields and TablePath::columns — with one
+    // positional wire format between them. Whichever the cluster picked, the
+    // decoder would disagree with it; refused before anything is sent.
+    let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
+    let error = client
+        .read_skiff_table(TablePath::new("//tmp/t").columns(["n"]), &one_column())
+        .expect_err("refused");
+
+    assert!(
+        matches!(&error, ClientError::Config(reason) if reason.contains("columns")),
+        "not the local refusal: {error}"
+    );
+}
+
+#[test]
+fn a_write_with_a_read_selection_is_refused_before_anything_is_sent() {
+    // The decision this crate makes about columns and ranges on a write:
+    // refuse locally. The cluster's answer is to ignore them and replace the
+    // whole table with a 200 — measured, and recorded in AGENTS.md — so
+    // sending them is silent data loss with nicer syntax. The client points
+    // at an address that answers nothing: had a request been attempted, the
+    // error would be Transport, not Config.
+    let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
+    let row = std::collections::BTreeMap::from([("n", 1_i64)]);
+
+    let refusals: Vec<(&str, ClientError)> = vec![
+        (
+            "write_table with columns",
+            client
+                .write_table(TablePath::new("//tmp/out").columns(["a"]), b"")
+                .expect_err("refused"),
+        ),
+        (
+            "write_table with a range",
+            client
+                .write_table(TablePath::new("//tmp/out").range(0..2), b"")
+                .expect_err("refused"),
+        ),
+        (
+            "write_table_rows with a range",
+            client
+                .write_table_rows(TablePath::new("//tmp/out").range(0..2), [row])
+                .expect_err("refused"),
+        ),
+        (
+            "write_table_streaming with columns",
+            client
+                .write_table_streaming(
+                    TablePath::new("//tmp/out").columns(["a"]),
+                    std::io::Cursor::new(Vec::new()),
+                )
+                .expect_err("refused"),
+        ),
+        (
+            "write_skiff_table with a range",
+            client
+                .write_skiff_table(TablePath::new("//tmp/out").range(0..2), b"", &one_column())
+                .expect_err("refused"),
+        ),
+    ];
+
+    for (writer, error) in refusals {
+        assert!(
+            matches!(&error, ClientError::Config(_)),
+            "{writer} did not refuse locally: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_write_path_string_spelling_a_selection_is_refused() {
+    // The measured trap, verbatim: write_table_rows("//tmp/t[#0:#2]", rows)
+    // replaced the whole table and returned success. The string is never
+    // parsed, so the only write this client will send is one whose string is
+    // a bare path.
+    let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
+
+    for path in ["//tmp/t[#0:#2]", "//tmp/t{a,b}", "<append=%true>//tmp/t"] {
+        let error = client.write_table(path, b"").expect_err("refused");
+        assert!(
+            matches!(&error, ClientError::Config(_)),
+            "{path} was not refused locally: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_escaped_bracket_is_a_node_name_and_still_writable() {
+    // Rich YPath escapes a literal bracket as `\[`, so this is a table named
+    // `t[x]`, not a range — refusing it would make that table unwritable.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        client.write_table(r"//tmp/t\[x\]", b"").expect("writes");
+    });
+
+    assert!(
+        head.starts_with("PUT /api/v4/write_table"),
+        "the write was not sent:\n{head}"
+    );
+}
+
+#[test]
+fn a_read_keeps_passing_a_string_spelled_path_through() {
+    // Reads honoured string-spelled ranges before TablePath modelled them,
+    // and the cluster reads them correctly; refusing now would break working
+    // code to protect it from nothing. The path travels as a bare string,
+    // syntax and all — not parsed, not rewritten.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table("//tmp/t[#0:#2]");
+    });
+
+    assert!(
+        parameters(&head).contains(r#"path="//tmp/t[#0:#2]""#),
+        "the string-spelled path was rewritten:\n{head}"
+    );
+}
+
+#[test]
+fn a_read_refuses_a_selection_spelled_twice() {
+    // A string that already carries `[…]` plus a typed range is two spellings
+    // of a selection on one path; whichever the cluster preferred, the caller
+    // would silently read the wrong rows.
+    let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
+    let error = client
+        .read_table(TablePath::new("//tmp/t[#0:#2]").range(0..2))
+        .expect_err("refused");
+
+    assert!(
+        matches!(&error, ClientError::Config(_)),
+        "not the local refusal: {error}"
+    );
 }
 
 #[test]
