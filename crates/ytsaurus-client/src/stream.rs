@@ -1,9 +1,10 @@
-//! Table I/O that does not go through memory.
+//! Table and file I/O that does not go through memory.
 //!
-//! [`Client::read_table`](crate::Client::read_table) and
-//! [`Client::write_table`](crate::Client::write_table) hold a whole table at
+//! [`Client::read_table`](crate::Client::read_table),
+//! [`Client::write_table`](crate::Client::write_table) and
+//! [`Client::read_file`](crate::Client::read_file) hold the whole thing at
 //! once, which is right for a launcher inspecting a result and wrong for
-//! anything the size of the data. The streaming pair moves the same bytes
+//! anything the size of the data. The streaming forms move the same bytes
 //! without ever holding more than a buffer of them.
 //!
 //! Both are the raw byte stream — a YSON list fragment — because that is what
@@ -36,12 +37,32 @@ use std::io::Read;
 /// applied.
 pub type TableReader = ResponseReader;
 
+/// A file's bytes, arriving as they are read.
+///
+/// This is [`ResponseReader`] under the name the file path uses, exactly as
+/// [`TableReader`] is for tables: what
+/// [`Client::read_file_streaming`](crate::Client::read_file_streaming) hands
+/// back is the response body, and nothing about reading one as it arrives is
+/// specific to files.
+///
+/// The check described on [`TableReader`] is given up here too, and with less
+/// underneath it: a table cut short leaves a record that does not parse, but a
+/// file's bytes carry no framing at all, so a body ended early by a mid-stream
+/// failure is indistinguishable from a complete one. [`bytes_read`] against
+/// the size the caller expects — which is what the buffered
+/// [`Client::read_file`](crate::Client::read_file) checks against the node's
+/// own `@uncompressed_data_size` — is the compensation available.
+///
+/// [`bytes_read`]: ResponseReader::bytes_read
+pub type FileReader = ResponseReader;
+
 /// A response body, arriving as it is read.
 ///
 /// What [`Client::read_table_streaming`](crate::Client::read_table_streaming)
-/// hands back under the name [`TableReader`], and what
+/// and [`Client::read_file_streaming`](crate::Client::read_file_streaming)
+/// hand back under the names [`TableReader`] and [`FileReader`], and what
 /// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming)
-/// hands back for a command this crate does not model — `read_file`, or
+/// hands back for a command this crate does not model — `read_blob_table`, or
 /// anything else whose answer is the data rather than a report about it.
 ///
 /// Uncapped, unlike the buffered path: a stream has no size a client should

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### A file can be read back
+
+- **Added** `Client::read_file` and `Client::read_file_streaming` — the mirror
+  `write_file` shipped without, and the sharpest asymmetry in the crate until
+  now: a worker binary could be uploaded and never fetched back (#10). The
+  pair takes the shape of `read_table`'s: buffered for a result a launcher
+  inspects, streaming for a file that does not fit — which a file is exactly
+  the thing to be. `read_file` is a heavy command without input data, so both
+  go to the proxy the cluster names, as the table reads do, and an
+  installation whose control proxy answers heavy reads with a cross-host 307
+  is handled by the same routing rather than by following the redirect with
+  the token stripped. Verified against a local cluster: 4 MB of non-UTF-8
+  bytes round-trip byte-for-byte through both halves, and an empty file reads
+  back empty. The buffered half holds the whole file in memory and the
+  transport refuses a body over 512 MiB, which its error now says in the same
+  breath as the name of the half that has no such limit.
+
+- **Added** the completeness check the buffered read needs where a table read
+  already had one. The proxy reports a mid-stream failure in a trailer `ureq`
+  cannot see, and a file's bytes carry no framing — where a truncated table
+  leaves a record that does not parse, a truncated file just ends, looking
+  exactly like a shorter file. So `read_file` compares the body against the
+  node's `@uncompressed_data_size`, one light `get` after the heavy read, and
+  a body of any other length is an error naming both numbers. The attribute is
+  the *logical* size — verified with `compression_codec=zlib_6`, 1 000 000
+  bytes reading back whole off 1983 on disk — and there is no `@file_size`,
+  whatever the name suggests: asked, the cluster answers `Attribute
+  "file_size" is not found`. An answer that is not an integer fails the read
+  too, because a check that quietly stopped checking would be worse than none.
+  The streaming path cannot check — the point is not to have the whole thing —
+  and `FileReader` says what to compare instead: `bytes_read` against the same
+  attribute.
+
+- **Added** `FileReader`, the streaming read's return type — `ResponseReader`
+  under the name the file path uses, exactly as `TableReader` is for tables.
+
 ### Heavy proxies: a pool, picked at random, refreshed — never one host for life
 
 - **Changed** how heavy commands choose their proxy, to parity with the C++

@@ -113,19 +113,19 @@
 //! # Heavy commands go where the cluster says
 //!
 //! Table and file data — [`Client::write_table`], [`Client::read_table`],
-//! [`Client::write_file`], [`Client::upload_worker`] and the streaming forms of
-//! each — is what YTsaurus calls a *heavy* command, and a large installation
-//! serves those on a separate set of proxies. This client asks `/hosts` the
-//! first time it sends a heavy command, keeps the whole answer as a **pool**,
-//! and sends each heavy command to a member **picked at random** — the way
-//! both official SDKs pick, because `/hosts` is ordered by load and a client
-//! that keeps one pick for its lifetime never rebalances: a draining host
-//! keeps every client that ever picked it. The answer is **refreshed** when
-//! it outlives [`Client::with_host_list_refresh_interval`] — a minute by
-//! default, the documentation's own advice — lazily, by the heavy command
-//! that finds it stale; there is no background thread, and a client that
-//! stops uploading stops asking. Light commands stay on the address it was
-//! configured with.
+//! [`Client::write_file`], [`Client::read_file`], [`Client::upload_worker`]
+//! and the streaming forms of each — is what YTsaurus calls a *heavy* command,
+//! and a large installation serves those on a separate set of proxies. This
+//! client asks `/hosts` the first time it sends a heavy command, keeps the
+//! whole answer as a **pool**, and sends each heavy command to a member
+//! **picked at random** — the way both official SDKs pick, because `/hosts`
+//! is ordered by load and a client that keeps one pick for its lifetime never
+//! rebalances: a draining host keeps every client that ever picked it. The
+//! answer is **refreshed** when it outlives
+//! [`Client::with_host_list_refresh_interval`] — a minute by default, the
+//! documentation's own advice — lazily, by the heavy command that finds it
+//! stale; there is no background thread, and a client that stops uploading
+//! stops asking. Light commands stay on the address it was configured with.
 //!
 //! **A proxy that fails is dropped from the pool, not committed to.** A heavy
 //! command that fails for a reason attributable to the host it went to — a
@@ -225,7 +225,7 @@ pub use crate::spec::{
     EraseSpec, MapReduceSpec, MapSpec, MergeMode, MergeSpec, OperationType, ReduceSpec,
     RemoteCopySpec, SortSpec, VanillaSpec, VanillaTask,
 };
-pub use crate::stream::{ResponseReader, TableReader};
+pub use crate::stream::{FileReader, ResponseReader, TableReader};
 pub use crate::trace::TraceContext;
 pub use crate::transaction::Transaction;
 pub use ytsaurus_format::DataFormat;
@@ -1736,6 +1736,135 @@ impl Client {
             Repeatable::Heavy,
         )?;
         Ok(())
+    }
+
+    /// Reads a whole Cypress file into memory.
+    ///
+    /// The mirror of [`Client::write_file`], and the buffered half of the
+    /// pair: for a worker binary fetched back, a config a launcher inspects —
+    /// results, not bulk data. For a file that does not fit,
+    /// [`Client::read_file_streaming`] moves the same bytes without holding
+    /// them.
+    ///
+    /// The body's length is checked against the size Cypress records for the
+    /// node. That is not pedantry — the proxy reports a mid-stream failure in
+    /// a trailer this client cannot see (see [`TableReader`] for the trailer
+    /// gap), and a file's bytes carry no framing of their own: where a
+    /// truncated table leaves a record that does not parse, a truncated file
+    /// just ends, looking exactly like a shorter file. So after the read, one
+    /// light `get` fetches the node's `@uncompressed_data_size` — the byte
+    /// count of the content, whatever compression the node's own codec applies
+    /// beneath it — and a body of any other length is an error rather than a
+    /// file.
+    ///
+    /// The two requests are not atomic. A writer replacing the file between
+    /// them can fail the check for a body that was complete when it was sent —
+    /// the ordinary hazard of reading what someone else is rewriting, surfaced
+    /// as an error rather than as a mix of the two versions. A reader who
+    /// needs a file pinned while others replace it takes a
+    /// [`LockMode::Snapshot`] lock in a transaction, which is exactly what
+    /// that mode is for.
+    ///
+    /// Verified against a local cluster: a 4 MB [`Client::write_file`] of
+    /// non-UTF-8 bytes comes back byte-for-byte through both halves of the
+    /// pair, an empty file reads back empty, and a node carrying
+    /// `compression_codec=zlib_6` — 1 000 000 logical bytes, 1983 on disk —
+    /// reads back its logical bytes with the check passing, which is the case
+    /// that would break if the attribute were the on-disk size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails, if the node's size cannot
+    /// be read — the check refuses loudly rather than quietly not happening —
+    /// or if the body's length is not the size the cluster records. A missing
+    /// path fails the read itself, before the size is ever asked for: code 1,
+    /// `Error getting basic attributes of user objects`, with the resolve
+    /// error nested inside — a category outside and the reason within, as a
+    /// missing table is reported too.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let params = yson_build::map([("path", yson_build::string(path))]);
+        let body = self.transport.call(
+            Method::Get,
+            "read_file",
+            &params,
+            Payload::None,
+            Repeatable::Heavy,
+        )?;
+
+        // After the body rather than before: a size read first would age
+        // across the whole transfer, and the point of comparing is to compare
+        // against what the file was when the proxy finished sending it.
+        let recorded = self.file_size(path)?;
+        if recorded != body.len() as i64 {
+            return Err(ClientError::Decode {
+                command: "read_file".to_owned(),
+                reason: format!(
+                    "{path}: the cluster records {recorded} bytes but the response carried {}; \
+                     either the stream was cut short — the proxy says so in a trailer this \
+                     client cannot read — or the file was rewritten while it was being read",
+                    body.len()
+                ),
+            });
+        }
+
+        Ok(body)
+    }
+
+    /// The byte count Cypress records for a file's content.
+    ///
+    /// `@uncompressed_data_size`, which is the content's logical length — a
+    /// `compression_codec` on the node changes what the chunks weigh
+    /// (`@compressed_data_size`), not what `read_file` returns. Both watched
+    /// on a local cluster; there is no `@file_size`, whatever the name
+    /// suggests — asked for one, the cluster answers `Attribute "file_size"
+    /// is not found`. An answer that is not an integer is refused rather than
+    /// skipped: a completeness check that quietly stopped checking would be
+    /// worse than none, because [`Client::read_file`] promises it.
+    fn file_size(&self, path: &str) -> Result<i64> {
+        let size = self.get(&format!("{path}/@uncompressed_data_size"))?;
+        size.as_i64().ok_or_else(|| ClientError::Decode {
+            command: "read_file".to_owned(),
+            reason: format!(
+                "{path}/@uncompressed_data_size is not an integer: {:?}; without it the \
+                 response cannot be checked for truncation",
+                size.node
+            ),
+        })
+    }
+
+    /// Reads a file as a stream, without holding it.
+    ///
+    /// The same bytes [`Client::read_file`] returns, arriving as they come off
+    /// the connection — and a file is exactly the thing that might not fit in
+    /// memory, which is why [`Client::write_file`]'s mirror comes in two
+    /// halves. What comes out is a plain `Read`:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::Client;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = Client::from_env()?;
+    /// let mut file = client.read_file_streaming("//tmp/worker")?;
+    /// std::io::copy(&mut file, &mut std::fs::File::create("worker")?)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`Client::read_file`] checks the body against the size the cluster
+    /// records; this cannot, because the point is not to have the whole thing
+    /// — and unlike a table, whose truncation leaves a record that does not
+    /// parse, a file cut short by a mid-stream failure simply ends. A caller
+    /// who needs certainty compares the reader's
+    /// [`bytes_read`](ResponseReader::bytes_read) against the node's
+    /// `@uncompressed_data_size` — see [`FileReader`] for why that gap exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the request fails. Failures *during* the
+    /// read arrive from the reader, not from here.
+    pub fn read_file_streaming(&self, path: &str) -> Result<FileReader> {
+        let params = yson_build::map([("path", yson_build::string(path))]);
+        let body = self.transport.open(Method::Get, "read_file", &params)?;
+        Ok(FileReader::new(body))
     }
 
     /// Sets a node attribute.
@@ -3376,8 +3505,8 @@ impl Client {
     /// Sends a command this crate does not model and hands back its response
     /// **unread**.
     ///
-    /// For a command whose answer is the data — `read_file`, `read_blob_table`,
-    /// anything the cluster declares heavy on the way out. [`Client::raw_command`]
+    /// For a command whose answer is the data — `read_blob_table`, anything
+    /// the cluster declares heavy on the way out. [`Client::raw_command`]
     /// would put all of it in memory first, which for those is the thing worth
     /// avoiding.
     ///
@@ -3385,9 +3514,11 @@ impl Client {
     /// # use ytsaurus_client::{Client, Method, yson_build};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let client = Client::from_env()?;
-    /// // `read_file` is not modelled here: files can be written and not read
-    /// // back. Until that changes, this is how one is read — and it never
-    /// // holds more of the file than a buffer.
+    /// // `read_file` has a method now — `Client::read_file_streaming` is
+    /// // this call with the parameters written down — and it stays as the
+    /// // example because its wire shape is verified against a cluster, where
+    /// // an unmodelled command's here would be a guess. The door sends any
+    /// // command the same way.
     /// let mut file = client.raw_command_streaming(
     ///     Method::Get,
     ///     "read_file",

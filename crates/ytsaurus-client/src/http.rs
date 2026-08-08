@@ -99,12 +99,13 @@ const MAX_REDIRECTS: usize = 10;
 /// text.
 ///
 /// The list is what the **cluster** declares heavy, not what this crate
-/// happens to model: `read_file` and `read_blob_table` have no method here and
-/// are reachable through
-/// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming) —
-/// which is how the documentation on that method reads a file — so leaving
-/// them out would take the advice away from exactly the caller who went to the
-/// trouble of streaming.
+/// happens to model: `read_blob_table` has no method here and is reachable
+/// through
+/// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming), so
+/// leaving it out would take the advice away from exactly the caller who went
+/// to the trouble of streaming. (`read_file` sat beside it until it grew
+/// [`Client::read_file`](crate::Client::read_file); its entry below predates
+/// the method and is unchanged by it.)
 ///
 /// Used for one thing only — whether a refused redirect is told to go to a
 /// heavy proxy. A command sent through
@@ -4177,18 +4178,17 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         for command in [
             "read_table",
             "write_table",
+            "read_file",
             "write_file",
             "get_job_input",
             "get_job_stderr",
         ] {
             assert!(HEAVY.contains(&command), "{command}");
         }
-        // And the ones reachable only through the raw door, which is the point
+        // And the one reachable only through the raw door, which is the point
         // of listing what the cluster calls heavy rather than what this crate
-        // models: the documentation on `raw_command_streaming` reads a file.
-        for command in ["read_file", "read_blob_table"] {
-            assert!(HEAVY.contains(&command), "{command}");
-        }
+        // models.
+        assert!(HEAVY.contains(&"read_blob_table"));
         for command in ["create", "exists", "start_operation", "get_job", "hosts"] {
             assert!(!HEAVY.contains(&command), "{command}");
         }
