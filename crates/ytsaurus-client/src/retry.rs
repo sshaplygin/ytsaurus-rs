@@ -80,8 +80,9 @@ pub enum Repeatable {
     ///
     /// It also decides **where** the command goes. A large installation gives
     /// its proxies roles and refuses a heavy request on a control proxy, so
-    /// the client asks `/hosts` for one that will take it, once per client
-    /// and only if a heavy command needs it. Nothing about the call site
+    /// the client asks `/hosts` for a pool of proxies that will take one —
+    /// only when a heavy command needs it, and again when the answer outlives
+    /// its refresh interval. Nothing about the call site
     /// changes: this is the same `isHeavy` bit of the cluster's command
     /// registry that says the command cannot be repeated, and both answers
     /// follow from writing it down once. The discovered host is constrained to
@@ -479,11 +480,14 @@ fn contains_code(value: &serde_json::Value, wanted: &[i64]) -> bool {
 /// Not the same question as [`is_retriable`], and the difference is the whole
 /// reason this exists. `is_retriable` asks *would waiting help?* — it decides
 /// whether to send the same request to the same place after a pause. This one
-/// asks *would asking again ever help?*, and its callers are the two places
-/// that decide whether the client keeps or discards what `/hosts` told it:
-/// `Transport::base_for` and `Transport::after_heavy`. Neither is going to
-/// re-send anything; both are choosing between "remember this answer" and "ask
-/// once more later".
+/// asks *would asking again ever help?*, and its caller is the place that
+/// decides whether the client keeps or discards what `/hosts` told it:
+/// `Transport::base_for`, judging a failed **lookup** — the initial one and
+/// the periodic refresh alike. It is not going to re-send anything; it is
+/// choosing between "ask again soon" and "ask again an interval from now".
+/// (`Transport::after_heavy`, judging a failed heavy *command*, used to key
+/// on this too and no longer does — dropping a host from the pool turns on
+/// [`attributable_to_the_host`], and the difference between the two is #40.)
 ///
 /// They differ for exactly the failures where the *addressee* is what was
 /// wrong rather than the moment. Every reason to wait is also a reason to ask
@@ -520,6 +524,39 @@ pub(crate) fn worth_asking_again(error: &ClientError) -> bool {
     is_retriable(error)
         || refused_for_being_the_wrong_proxy(error)
         || matches!(error, ClientError::Redirected { .. })
+}
+
+/// Whether a heavy command's failure is plausibly about the **host** it went
+/// to rather than about the request itself.
+///
+/// The third question, asked by exactly one caller: `Transport::after_heavy`,
+/// deciding whether to drop a discovered proxy from the pool so the next
+/// command picks another. It is *not* [`worth_asking_again`] — that one
+/// judges the `/hosts` lookup, and gating the drop on it was a real failure
+/// (#40): the two predicates agree everywhere except about a **rejected
+/// certificate**, which `is_retriable` deliberately answers `false` for
+/// (waiting cannot mend a verdict this client's own roots decided) and
+/// `worth_asking_again` inherits. But `NotValidForName` is a verdict about
+/// *one host's name* — the cluster's other proxies present certificates that
+/// match their own names perfectly well — so a client that would neither
+/// retry, nor re-ask, nor step past that host was pinned to it for the whole
+/// retry window, failing every heavy command against the one bad proxy in the
+/// fleet.
+///
+/// Both settled rejections belong here, not only the name mismatch.
+/// `UnknownIssuer` against one host of several is just as plausibly that
+/// host's own misissued chain, and the cost of being wrong is one dropped
+/// host per command until the pool empties — at which point the fallback and
+/// re-ask take over, which is where a fleet-wide misconfiguration was always
+/// going to end up.
+///
+/// Everything else is [`worth_asking_again`]'s answer unchanged: a refused
+/// connection, a 503, a control proxy refusing by role — the host's fault;
+/// a resolve error, a schema mismatch — the request's, and the pool keeps
+/// the host.
+pub(crate) fn attributable_to_the_host(error: &ClientError) -> bool {
+    matches!(error, ClientError::Transport { source, .. } if rejected_the_certificate(source))
+        || worth_asking_again(error)
 }
 
 /// Whether the proxy refused this because of the **role it has**.
@@ -867,6 +904,73 @@ mod tests {
         ] {
             assert!(!is_retriable(&settled), "{settled}");
             assert!(!worth_asking_again(&settled), "{settled}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_certificate_is_the_hosts_fault_though_not_worth_waiting_or_asking() {
+        // The three predicates part company exactly here, and the parting is
+        // #40. Waiting cannot mend a verdict this client's own roots and URL
+        // decided, so `is_retriable` says no; the coordinator's list is not
+        // what was wrong, so `worth_asking_again` inherits the no. But
+        // `NotValidForName` is a verdict about *one host's name* — the rest
+        // of the fleet matches its own names fine — so the pool must drop
+        // that host and pick another. Gating the drop on either other
+        // predicate is the mutation this test exists to fail.
+        for spelling in [
+            "invalid peer certificate: UnknownIssuer",
+            "invalid peer certificate: certificate not valid for name \"n0132.example.net\"; \
+             certificate is only valid for [\"cluster.example.net\"]",
+            "invalid peer certificate: NotValidForName",
+        ] {
+            let rejected = transport_error(std::io::ErrorKind::InvalidData, spelling);
+            assert!(!is_retriable(&rejected), "{spelling}");
+            assert!(!worth_asking_again(&rejected), "{spelling}");
+            assert!(attributable_to_the_host(&rejected), "{spelling}");
+        }
+
+        // Everything worth asking the coordinator about again is also the
+        // host's fault — the implication only runs one way, and this is the
+        // direction that must hold on every branch.
+        for hosts_fault in [
+            ClientError::Transport {
+                command: "write_table".to_owned(),
+                source: Box::new(ureq::Error::HostNotFound),
+            },
+            ClientError::Http {
+                command: "write_table".to_owned(),
+                status: 503,
+                body: String::new(),
+            },
+            ClientError::Cluster {
+                command: "write_table".to_owned(),
+                code: 1,
+                message: "Control proxy may not serve heavy requests with input data".to_owned(),
+                raw: r#"{"code":1}"#.to_owned(),
+            },
+        ] {
+            assert!(worth_asking_again(&hosts_fault), "{hosts_fault}");
+            assert!(attributable_to_the_host(&hosts_fault), "{hosts_fault}");
+        }
+
+        // And a failure about the request keeps the host: the same command
+        // will be exactly as wrong at every other proxy in the pool.
+        for requests_fault in [
+            ClientError::Http {
+                command: "write_table".to_owned(),
+                status: 404,
+                body: String::new(),
+            },
+            cluster_error(500, r#"{"code":500}"#),
+            ClientError::Decode {
+                command: "read_table".to_owned(),
+                reason: "cut short".to_owned(),
+            },
+        ] {
+            assert!(
+                !attributable_to_the_host(&requests_fault),
+                "{requests_fault}"
+            );
         }
     }
 

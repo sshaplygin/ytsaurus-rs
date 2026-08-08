@@ -646,24 +646,36 @@ and the documentation disagreed and the source is what settles it.
   rather than trusting the role. `?role=`, `/hosts/all` (which alone shows
   banned and dead proxies) and the plain-text form selected by an exact
   `Accept: text/plain` are all source-only too.
-- **The documentation asks for the list to be re-queried, and this client does
-  not.** From the [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload):
+- **The documentation asks for the list to be re-queried, and this client now
+  does.** From the [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload):
   "A good strategy is to re-query the `/hosts` list every minute or every few
-  queries and change the current proxy to which queries are made." This client
-  asks once and keeps the whole answer for the client's lifetime
-  (`Transport::base_for`), re-asking only when every name in it has failed.
-  That is a deliberate deviation, recorded in
-  [docs/sdk-comparison.md](docs/sdk-comparison.md); it trades load-balancing
-  quality for one round trip per client.
-- **A failed heavy command moves to the next name in the answer, not back to
+  queries and change the current proxy to which queries are made." The whole
+  answer is kept as a pool (`Transport::base_for`), each heavy command picks a
+  member **at random** — `/hosts` is ordered by load (better half shuffled,
+  see above), and a client that keeps its one pick for life never rebalances —
+  and the command that finds the answer older than
+  `with_host_list_refresh_interval` (one minute by default) re-asks first,
+  lazily, the way the C++ `THostManager` does; no background thread, and a
+  failed refresh keeps the previous answer in use and waits out another
+  interval. "The cluster named nobody" expires on the same interval rather
+  than settling for ever, so a first lookup that lands during a rolling
+  restart is not a verdict for life. The ask-once lifetime pin this replaced
+  was recorded as a deliberate deviation in
+  [docs/sdk-comparison.md](docs/sdk-comparison.md) and retired by #40.
+- **A failed heavy command drops the host it used from the pool, not back to
   the configured address.** The distinction is the whole feature: with separate
   roles the configured address is a control proxy, so falling back there
   answers one transient 503 with a window of guaranteed refusals — issue #30
-  reproduced on demand. Only an answer whose every name has failed falls back,
-  and then for `HOSTS_RETRY_AFTER` before the cluster is asked again. A proxy
-  that refuses heavy work *because of its role* counts as failed too:
-  `retry::worth_asking_again` says so where `is_retriable` cannot, which is why
-  the two predicates are separate.
+  reproduced on demand. Only a pool with nobody left in it falls back, and
+  then for `HOSTS_RETRY_AFTER` before the cluster is asked again; a refresh
+  is what restores a dropped host. The drop turns on
+  `retry::attributable_to_the_host`, **not** on `worth_asking_again`: the two
+  agree except about a rejected certificate, and that gap was #40's pinning
+  failure — `NotValidForName` is a verdict about *one host's name*, not about
+  the coordinator's list, so gating the drop on the lookup's predicate left
+  the client pinned to the one bad proxy in the fleet. A proxy that refuses
+  heavy work *because of its role* counts as the host's fault too, which
+  `is_retriable` alone cannot say; that is why the predicates are three.
 - An empty or absent list means "the configured address serves everything",
   which is what a single-node cluster is. **A cluster on loopback is not asked
   at all**: what it publishes for itself is an address behind the port mapping

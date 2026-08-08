@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+### Heavy proxies: a pool, picked at random, refreshed — never one host for life
+
+- **Changed** how heavy commands choose their proxy, to parity with the C++
+  and Go SDKs (#40). The `/hosts` answer used to be resolved once and its
+  first name pinned for the client's whole life, stepping to the next name
+  only on a failure the *lookup's* predicate recognised. Both official
+  clients deliberately never commit to one host, and the divergence produced
+  two real failures: a certificate rejected `NotValidForName` — a per-host
+  condition; the fleet's other proxies were fine — pinned every upload to
+  the one bad proxy for as long as the client lived, and a fleet of pinned
+  clients never rebalanced, each keeping whichever host its one lookup
+  happened to name through every drain and load shift afterwards. Now the
+  whole answer is a pool, each heavy command picks a member at random (the
+  crate's existing id source is the entropy — *unique, not unpredictable* is
+  the right bar for load-spreading, so no new dependency), and the list is
+  refreshed lazily by the first heavy command that finds it older than the
+  refresh interval, per the documentation's own "re-query every minute". A
+  failed refresh keeps the previous answer in use and waits out another
+  interval before asking again. No background thread; a client that stops
+  uploading stops asking.
+
+  Two behaviour changes a caller can observe, neither breaking an API:
+  a heavy command may now pay one `/hosts` round trip mid-life — bounded by
+  `with_hosts_timeout`, at most once per interval — where it could only pay
+  one up front before; and "the cluster named no heavy proxy" now expires
+  with the same interval instead of settling for ever, so a first lookup
+  that landed during a rolling restart is no longer a verdict for the
+  client's whole life. `with_proxy_discovery(false)` still pins everything
+  to the configured address, `heavy_proxy()` still answers with the
+  cluster's first pick, and `with_hosts_retry_after` still means what it
+  meant — how long the fallback lasts.
+
+- **Fixed** the pinning half of that divergence on its own terms: a heavy
+  command's failure now drops the host it went to on any failure
+  *attributable to the host* — a refused connection, a 503, a wrong-role
+  refusal, and now a rejected certificate — rather than only on the failures
+  `worth_asking_again` recognises, which is the predicate for the `/hosts`
+  lookup and answers `false` for a certificate verdict. The dropped host
+  stays out until a refresh names it again — so a host that is *persistently*
+  bad costs one failed command per interval until an operator fixes it,
+  rather than every command until the client is restarted; a pool with
+  nobody left falls back to the configured address for
+  `with_hosts_retry_after` and the cluster is then asked afresh, exactly as
+  before.
+
+- **Added** `Client::with_host_list_refresh_interval(Duration)`, defaulting
+  to one minute. `Duration::ZERO` re-asks before every heavy command;
+  `Duration::MAX` disables the refresh — the first answer is kept as long as
+  it keeps working, though a failed host is still dropped and an emptied
+  pool still falls back and re-asks.
+
 ### A cache that refuses you, and the upload that goes anyway
 
 - **Fixed** `Client::upload_worker_cached` dying at the first upload on an

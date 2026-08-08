@@ -830,6 +830,9 @@ enum Hosts {
     Hang,
     /// Answers this body, eventually — a cluster slower than the budget.
     Slow(std::time::Duration, String),
+    /// Answers each ask with the next `(status, body)`; the last one repeats.
+    /// A `/hosts` whose answer changes over time, for the refresh tests.
+    Sequence(Vec<(u16, String)>),
 }
 
 /// What a stand-in proxy does with a **heavy** command.
@@ -969,7 +972,13 @@ fn serve(
         let heavy = HEAVY_COMMANDS
             .iter()
             .any(|command| head.contains(&format!("/api/v4/{command} ")));
-        seen.lock().expect("nothing panicked holding it").push(head);
+        let asked_so_far = {
+            let mut seen = seen.lock().expect("nothing panicked holding it");
+            seen.push(head);
+            seen.iter()
+                .filter(|head| head.starts_with("GET /hosts "))
+                .count()
+        };
 
         let answer = if asked_where_to_go {
             match &hosts {
@@ -983,6 +992,10 @@ fn serve(
                 Hosts::Slow(delay, list) => {
                     std::thread::sleep(*delay);
                     reply(200, list.as_bytes())
+                }
+                Hosts::Sequence(answers) => {
+                    let (status, body) = &answers[(asked_so_far - 1).min(answers.len() - 1)];
+                    reply(*status, body.as_bytes())
                 }
             }
         } else if role == Role::Control && heavy {
@@ -1119,8 +1132,10 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
     // Buffered, streamed in, streamed out, files, Skiff in both directions and
     // a job's stderr: every route through the transport — `call`, `upload`,
     // `open` — that each had their own way of choosing an address. And one
-    // lookup between all of them, because the answer is kept for the client's
-    // lifetime.
+    // lookup between all of them, because the answer is kept until the
+    // refresh interval elapses — a minute by default, which nothing here
+    // outlives — not one lookup per command. The interval itself is pinned in
+    // `a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not`.
     //
     // The list is exact in both directions on purpose. Each of these call
     // sites is one word — `Repeatable::Heavy` — away from going to the control
@@ -1446,7 +1461,7 @@ fn the_control_proxy_in_these_tests_refuses_a_heavy_command_as_a_real_one_does()
 }
 
 #[test]
-fn a_proxy_that_stumbles_is_dropped_for_the_next_one_not_for_the_control_proxy() {
+fn a_proxy_that_stumbles_is_dropped_from_the_pool_not_for_the_control_proxy() {
     // The failure that arrived through the fix for the previous one. A data
     // proxy answering a single transient 503 — a drain, a restart — used to
     // send the client back to the *configured* address for ten seconds, and on
@@ -1455,30 +1470,366 @@ fn a_proxy_that_stumbles_is_dropped_for_the_next_one_not_for_the_control_proxy()
     // answered `Control proxy may not serve heavy requests with input data`:
     // #30 itself, reproducible on demand, once per hiccup.
     //
-    // `/hosts` had already named the alternatives. Now they are used.
-    let second = Proxy::new(None);
-    let first = Proxy::answering(Hosts::Absent, 503);
-    let control = Proxy::control(format!(r#"["{}", "{}"]"#, first.host(), second.host()));
+    // `/hosts` had already named the alternatives. Now they are used — and the
+    // pick is random (#40), so the shape here is not "first fails, second
+    // takes over" but "the bad host costs exactly one command, ever": writes
+    // land on the good proxy until chance routes one onto the bad, that one
+    // fails and drops it, and every write after that succeeds. The bound is
+    // 64 tries; the chance a coin lands one side 64 times is not a flake.
+    let bad = Proxy::answering(Hosts::Absent, 503);
+    let good = Proxy::new(None);
+    let control = Proxy::control(format!(r#"["{}", "{}"]"#, bad.host(), good.host()));
     let client = discovering(&control);
 
-    assert!(
-        client.write_table("//tmp/t", b"").is_err(),
-        "the first proxy answered 503"
-    );
-    client
-        .write_table("//tmp/t", b"")
-        .expect("the second proxy the cluster named is fine");
+    let mut failures = 0;
+    for _ in 0..64 {
+        if client.write_table("//tmp/t", b"").is_err() {
+            failures += 1;
+            break;
+        }
+    }
+    assert_eq!(failures, 1, "the bad host was never picked in 64 writes");
+
+    for _ in 0..8 {
+        client
+            .write_table("//tmp/t", b"")
+            .expect("a write after the drop still reached the dropped host");
+    }
 
     assert_eq!(
         control.requests(),
         ["GET /hosts HTTP/1.1"],
         "an upload went back to the control proxy, which is what refuses one"
     );
-    assert_eq!(first.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+    assert_eq!(
+        bad.requests(),
+        ["PUT /api/v4/write_table HTTP/1.1"],
+        "the host that failed was not dropped after its first failure"
+    );
+}
+
+#[test]
+fn heavy_commands_spread_across_the_pool_rather_than_piling_onto_the_first() {
+    // `/hosts` is ordered by load, so "take `[0]`" reads like the obviously
+    // right pick and is the pin: a client that keeps its one pick for life
+    // never rebalances, and a draining host keeps every client that ever
+    // picked it. Both official clients pick at random per command for exactly
+    // this reason, and now so does this one.
+    //
+    // Sixty-four commands across a pool of three: the chance a fair pick
+    // leaves any host unvisited is 3·(2/3)^64 ≈ 5e-12, so "every proxy served
+    // something" is an assertion about the picker, not about luck — a
+    // round-robin would pass it too, but a pick pinned to any subset fails.
+    let (a, b, c) = (Proxy::new(None), Proxy::new(None), Proxy::new(None));
+    let control = Proxy::control(format!(
+        r#"["{}", "{}", "{}"]"#,
+        a.host(),
+        b.host(),
+        c.host()
+    ));
+    let client = discovering(&control);
+
+    std::thread::scope(|scope| {
+        for _ in 0..64 {
+            scope.spawn(|| client.write_table("//tmp/t", b"").expect("writes"));
+        }
+    });
+
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1"],
+        "a fresh answer was re-asked, or an upload went to the control proxy"
+    );
+    for (name, proxy) in [("first", &a), ("second", &b), ("third", &c)] {
+        assert!(
+            !proxy.requests().is_empty(),
+            "64 uploads over a pool of three never once landed on the {name} host"
+        );
+    }
+}
+
+#[test]
+fn a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not() {
+    // The documentation's own strategy — "re-query the /hosts list every
+    // minute or every few queries" — which this client declined for a release
+    // and now follows (#40). Lazily, like the C++ SDK: the heavy command that
+    // finds the answer stale asks first, and no background thread exists to
+    // ask on its own.
+    //
+    // An interval of zero makes every answer already stale, so the second
+    // write must re-ask; the mutation "never refresh" fails here. The default
+    // interval is the other half — a fresh answer asked about once — and
+    // `every_heavy_shape_goes_there_and_the_cluster_is_asked_once` already
+    // pins it, but the pair belongs together: an hour-long interval here is
+    // what tells "refreshed on the interval" from "refreshed every time".
+    let heavy = Proxy::new(None);
+    let stale = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client = discovering(&stale).with_host_list_refresh_interval(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        stale.requests(),
+        ["GET /hosts HTTP/1.1", "GET /hosts HTTP/1.1"],
+        "a stale answer was not refreshed before the next heavy command"
+    );
+    assert_eq!(heavy.requests().len(), 2);
+
+    let heavy = Proxy::new(None);
+    let fresh = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client =
+        discovering(&fresh).with_host_list_refresh_interval(std::time::Duration::from_secs(3600));
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        fresh.requests(),
+        ["GET /hosts HTTP/1.1"],
+        "an answer well inside its interval was asked about again"
+    );
+    assert_eq!(heavy.requests().len(), 2);
+}
+
+/// An interval long enough for a test to do things "inside" it, short enough
+/// to sleep past. The sleeps that wait it out add ~0.4 s to the suite each;
+/// the alternative — an interval of zero — cannot tell "put off for another
+/// interval" from "retried in front of the very next upload", which is the
+/// distinction the refresh-failure tests exist to pin.
+const TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Sleeps `TEST_INTERVAL` out, with margin.
+fn outlive_the_interval() {
+    std::thread::sleep(TEST_INTERVAL + std::time::Duration::from_millis(100));
+}
+
+#[test]
+fn a_refresh_that_fails_keeps_the_pool_and_waits_out_another_interval() {
+    // A `/hosts` that answered once and then stopped — a coordinator
+    // restarting — must not take routing down with it: the hosts in hand are
+    // from an answer the cluster did give, and dropping them for the
+    // configured address would route uploads to a control proxy because a
+    // *lookup* hiccupped. And the failed question is put off for a whole
+    // interval rather than hurried back on the short retry window: unlike the
+    // initial lookup nothing is waiting on the answer, so retrying it sooner
+    // would put a lookup's stall in front of heavy traffic several times a
+    // minute for an answer the pool makes unnecessary. The third write here
+    // rides the deferral — with the short window this small (zero) and the
+    // interval outlived only once, a refresh retried on the wrong clock asks
+    // a third time and fails the count.
+    let heavy = Proxy::new(None);
+    let flaky = Proxy::answering(
+        Hosts::Sequence(vec![
+            (200, format!(r#"["{}"]"#, heavy.host())),
+            (503, String::new()),
+        ]),
+        200,
+    );
+    let client = discovering(&flaky)
+        .with_host_list_refresh_interval(TEST_INTERVAL)
+        .with_hosts_retry_after(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    outlive_the_interval();
+    client
+        .write_table("//tmp/t", b"")
+        .expect("a failed refresh dropped the pool");
+    client
+        .write_table("//tmp/t", b"")
+        .expect("a failed refresh dropped the pool");
+
+    assert_eq!(
+        flaky.requests(),
+        ["GET /hosts HTTP/1.1", "GET /hosts HTTP/1.1"],
+        "a refresh that failed was retried in front of the very next upload"
+    );
+    assert_eq!(
+        heavy.requests().len(),
+        3,
+        "an upload left the pool while the refresh was the only thing failing"
+    );
+}
+
+#[test]
+fn a_refresh_adopts_the_answer_it_fetched() {
+    // The half of "refreshed" that a second `GET /hosts` alone cannot prove:
+    // the fresh answer has to *replace* the pool, or the lookup is theatre.
+    // The cluster here names one host and then a different one, and the
+    // traffic has to move — which is also the property that restores a
+    // dropped host, since a replacement pool is built from the answer alone.
+    let (first, second) = (Proxy::new(None), Proxy::new(None));
+    let moving = Proxy::answering(
+        Hosts::Sequence(vec![
+            (200, format!(r#"["{}"]"#, first.host())),
+            (200, format!(r#"["{}"]"#, second.host())),
+        ]),
+        200,
+    );
+    let client = discovering(&moving).with_host_list_refresh_interval(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        first.requests(),
+        ["PUT /api/v4/write_table HTTP/1.1"],
+        "the first answer went unused, or was never given up"
+    );
     assert_eq!(
         second.requests(),
         ["PUT /api/v4/write_table HTTP/1.1"],
-        "the rest of the answer was thrown away with the host that failed"
+        "the refreshed answer was fetched and thrown away"
+    );
+}
+
+#[test]
+fn a_dropped_host_is_restored_by_the_next_refresh() {
+    // The deliberate price of dropping without a ban list: a host that is
+    // *persistently* bad — the misissued certificate that motivated #40 — is
+    // re-learned at one failed command per interval, in exchange for a host
+    // that was merely draining coming back as soon as the cluster vouches for
+    // it again. The proof it came back is that it can fail again: a second
+    // failure after the interval is a command reaching a host that a
+    // permanent drop would never have let another command reach.
+    let bad = Proxy::answering(Hosts::Absent, 503);
+    let good = Proxy::new(None);
+    let control = Proxy::control(format!(r#"["{}", "{}"]"#, bad.host(), good.host()));
+    let client = discovering(&control).with_host_list_refresh_interval(TEST_INTERVAL);
+
+    let mut failures = 0;
+    for _ in 0..64 {
+        if client.write_table("//tmp/t", b"").is_err() {
+            failures += 1;
+            break;
+        }
+    }
+    assert_eq!(failures, 1, "the bad host was never picked before the drop");
+
+    outlive_the_interval();
+
+    for _ in 0..64 {
+        if client.write_table("//tmp/t", b"").is_err() {
+            failures += 1;
+            break;
+        }
+    }
+    assert_eq!(
+        failures, 2,
+        "the dropped host was never restored by the refresh"
+    );
+    assert_eq!(
+        bad.requests().len(),
+        2,
+        "restoration reached the bad host more (or less) than the drop accounts for"
+    );
+}
+
+#[test]
+fn a_refresh_that_answers_nobody_keeps_the_pool_in_hand() {
+    // A fleet mid-rotation can briefly answer `[]`. Adopting that would end
+    // routing — and an adopted empty pool would have nothing to pick from at
+    // all — where waiting out another interval costs nothing: the hosts in
+    // hand are from an answer the cluster did give. The uploads must keep
+    // reaching the discovered host, not the configured address.
+    let heavy = Proxy::new(None);
+    let briefly_empty = Proxy::answering(
+        Hosts::Sequence(vec![
+            (200, format!(r#"["{}"]"#, heavy.host())),
+            (200, "[]".to_owned()),
+        ]),
+        200,
+    );
+    let client =
+        discovering(&briefly_empty).with_host_list_refresh_interval(std::time::Duration::ZERO);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        heavy.requests().len(),
+        3,
+        "an empty refresh answer took the pool down with it"
+    );
+}
+
+#[test]
+fn an_emptied_pool_asks_the_cluster_again_after_the_window() {
+    // The other half of the fallback's name: it ends. A pool whose every host
+    // has been dropped uses the configured address for the retry window, and
+    // the first heavy command past the window puts the question again rather
+    // than living at the fallback for ever.
+    let dead = nowhere();
+    let control = Proxy::new(Some(format!(r#"["{dead}"]"#)));
+    let client = discovering(&control).with_hosts_retry_after(std::time::Duration::ZERO);
+
+    let first = client.write_table("//tmp/t", b"");
+    assert!(first.is_err(), "nothing was listening on {dead}");
+    let _ = client.write_table("//tmp/t", b"");
+
+    let asked = control
+        .requests()
+        .iter()
+        .filter(|line| line.starts_with("GET /hosts"))
+        .count();
+    assert_eq!(asked, 2, "the fallback never ended");
+}
+
+#[test]
+fn an_interval_of_forever_disables_the_refresh() {
+    // `Duration::MAX` never elapses, which has to hold by arithmetic that
+    // cannot panic — the pool judges its age with `elapsed()` against the
+    // interval rather than by adding the interval to an `Instant`, which
+    // `Duration::MAX` would overflow.
+    let heavy = Proxy::new(None);
+    let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
+    let client = discovering(&control).with_host_list_refresh_interval(std::time::Duration::MAX);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        control.requests(),
+        ["GET /hosts HTTP/1.1"],
+        "an interval of forever still refreshed"
+    );
+    assert_eq!(heavy.requests().len(), 2);
+}
+
+#[test]
+fn a_cluster_that_named_nobody_is_asked_again_an_interval_later() {
+    // "The cluster names no heavy proxy" used to settle for ever, and a
+    // permanent answer from one lookup is a pin of its own: a launcher whose
+    // first upload landed in the few seconds of a rolling restart when
+    // `/hosts` answers `[]` sent every heavy command to the control proxy for
+    // the rest of its life. The verdict now expires with the same refresh
+    // interval as a pool, so the discovery that ends the window is watched
+    // here: an empty answer, then a real one, and the third upload routes.
+    let heavy = Proxy::new(None);
+    let recovering = Proxy::answering(
+        Hosts::Sequence(vec![
+            (200, "[]".to_owned()),
+            (200, format!(r#"["{}"]"#, heavy.host())),
+        ]),
+        200,
+    );
+    let client = discovering(&recovering).with_host_list_refresh_interval(TEST_INTERVAL);
+
+    client.write_table("//tmp/t", b"").expect("writes");
+    client.write_table("//tmp/t", b"").expect("writes");
+    assert!(
+        heavy.requests().is_empty(),
+        "an answer well inside its interval was given up early"
+    );
+
+    outlive_the_interval();
+    client.write_table("//tmp/t", b"").expect("writes");
+
+    assert_eq!(
+        heavy.requests(),
+        ["PUT /api/v4/write_table HTTP/1.1"],
+        "a cluster that named nobody was never asked again"
     );
 }
 
@@ -1487,20 +1838,35 @@ fn a_proxy_that_refuses_heavy_work_is_given_up_like_one_that_cannot_be_reached()
     // `/hosts` lists what `default_role_filter` says, and that is a coordinator
     // config parameter an operator can change — not a protocol guarantee that
     // the names are data proxies. A control proxy among them refuses with an
-    // ordinary cluster error, code 1, which is hopeless to *retry* and the
-    // clearest case there is for asking somewhere else: the two questions
-    // `worth_asking_again` exists to keep apart.
+    // ordinary cluster error, code 1, which is hopeless to *retry* and plainly
+    // the host's own fault: the same command is served happily next door. So
+    // it is dropped from the pool exactly as an unreachable host is — at most
+    // one command ever reaches it, and everything after the drop succeeds.
     let good = Proxy::new(None);
     let wrong_role = Proxy::control("[]".to_owned());
     let control = Proxy::control(format!(r#"["{}", "{}"]"#, wrong_role.host(), good.host()));
     let client = discovering(&control);
 
-    assert!(client.write_table("//tmp/t", b"").is_err());
-    client
-        .write_table("//tmp/t", b"")
-        .expect("the second is fine");
+    let mut failures = 0;
+    for _ in 0..64 {
+        if client.write_table("//tmp/t", b"").is_err() {
+            failures += 1;
+            break;
+        }
+    }
+    assert_eq!(failures, 1, "the wrong-role host was never picked");
 
-    assert_eq!(good.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
+    for _ in 0..8 {
+        client
+            .write_table("//tmp/t", b"")
+            .expect("a write after the drop still reached the refusing host");
+    }
+
+    assert_eq!(
+        wrong_role.requests().len(),
+        1,
+        "the refusing host was not dropped after its first refusal"
+    );
     assert_eq!(control.requests(), ["GET /hosts HTTP/1.1"]);
 }
 
