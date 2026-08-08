@@ -56,6 +56,18 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 3. Protocol facts are verified against the official YTsaurus documentation and
    against a real cluster. If code and docs disagree, **re-read the docs first**,
    then change the code. Cite the doc at the point of use.
+   **Client behaviour the protocol does not dictate — retries, routing, proxy
+   selection, banning, refresh — is checked against the official clients'
+   source before it is designed here**: C++ (`yt/cpp/mapreduce`) and Go
+   (`yt/go`), and the Python wrapper where it is the reference (the retry
+   list). Where the two disagree, say which was followed and why; where this
+   client deviates from both, the deviation is a deliberate decision recorded
+   in [docs/sdk-comparison.md](docs/sdk-comparison.md) — that record is what
+   turned the heavy-proxy lifetime pin from a silent bug into #40, a filed
+   divergence with a known fix. [docs/go-parity.md](docs/go-parity.md) is the
+   same rule for API surface: read it before adding client API, because a
+   feature list written by the people who built the thing is worth more than
+   one written by the people reimplementing it.
 4. Every change ends with green CI: `cargo fmt --check`, `cargo clippy
    --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
 5. **No scope creep.** RPC proxy, protobuf row format, dynamic tables, non-Linux
