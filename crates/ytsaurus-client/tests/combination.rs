@@ -151,18 +151,18 @@ fn the_redirected_lookup_is_still_reported_as_a_redirect_when_asked_directly() {
 
 #[test]
 fn a_discovered_proxy_that_fails_non_retriably_is_not_re_resolved() {
-    // #38 × #39. `after_heavy` and `base_for` both key on `worth_asking_again`,
-    // which is `is_retriable || wrong-proxy || Redirected`. #39 made a rejected
-    // certificate NON-retriable, and it is neither of the other two — so a
-    // discovered heavy proxy that fails that way is judged "settled": the
-    // client neither steps to the next name `/hosts` gave nor re-resolves.
-    //
-    // A real `NotValidForName` needs a TLS handshake a stub cannot stage, so
-    // this stands the class up with another non-retriable failure (cluster
-    // code 500) and shows the *routing* consequence: the proxy is kept. That is
-    // correct for a resolve error (the table is missing everywhere) but is the
-    // same branch a per-host certificate rejection lands in, where it is not —
-    // the other discovered proxies are never tried. See the report.
+    // #38 × #39, and the seam #40 then split. Dropping a host from the pool
+    // keys on `attributable_to_the_host` — `worth_asking_again` PLUS a
+    // rejected certificate — precisely so the per-host verdict a certificate
+    // is (`NotValidForName` names one host) drops that host where it used to
+    // pin the client. What this test stands up is the class that stays on the
+    // other side of the line: a failure about the *request* — cluster code
+    // 500, a resolve error — is not the host's fault, the table is missing
+    // everywhere, and the discovered proxy is rightly kept and not
+    // re-resolved. The certificate side of the line is pinned in
+    // `http::tests::a_rejected_certificate_drops_the_host_and_a_wrong_command_does_not`,
+    // where the error can be built without the TLS handshake a stub cannot
+    // stage.
     let heavy = Proxy::new(Hosts::naming_itself().failing_commands_with(500));
     let control = Proxy::new(Hosts::listing(&heavy.host()));
 

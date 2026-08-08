@@ -651,12 +651,16 @@ and the documentation disagreed and the source is what settles it.
   "A good strategy is to re-query the `/hosts` list every minute or every few
   queries and change the current proxy to which queries are made." The whole
   answer is kept as a pool (`Transport::base_for`), each heavy command picks a
-  member **at random** — `/hosts` is ordered least-loaded-first, so N clients
-  that all took `[0]` would stampede one host — and the command that finds the
-  answer older than `with_host_list_refresh_interval` (one minute by default)
-  re-asks first, lazily, the way the C++ `THostManager` does; no background
-  thread, and a failed refresh keeps the previous answer in use. The ask-once
-  lifetime pin this replaced was recorded as a deliberate deviation in
+  member **at random** — `/hosts` is ordered by load (better half shuffled,
+  see above), and a client that keeps its one pick for life never rebalances —
+  and the command that finds the answer older than
+  `with_host_list_refresh_interval` (one minute by default) re-asks first,
+  lazily, the way the C++ `THostManager` does; no background thread, and a
+  failed refresh keeps the previous answer in use and waits out another
+  interval. "The cluster named nobody" expires on the same interval rather
+  than settling for ever, so a first lookup that lands during a rolling
+  restart is not a verdict for life. The ask-once lifetime pin this replaced
+  was recorded as a deliberate deviation in
   [docs/sdk-comparison.md](docs/sdk-comparison.md) and retired by #40.
 - **A failed heavy command drops the host it used from the pool, not back to
   the configured address.** The distinction is the whole feature: with separate

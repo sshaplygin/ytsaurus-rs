@@ -20,6 +20,13 @@ static WORDS: AtomicU64 = AtomicU64::new(0);
 /// need an id to be *unique*, not unpredictable, and that is a poor reason to
 /// add a random-number crate to a dependency list this short.
 ///
+/// A third caller leans on a property between those two: the heavy-proxy pool
+/// (`http::HeavyPool::pick`) indexes with `word() % n` and needs the result
+/// **roughly uniform**, or the pool degenerates toward a pinned pick — the
+/// load-spreading it exists for. The hash of a counter delivers that; a
+/// rewrite of this function into something patterned (the bare counter, say)
+/// would still satisfy "unique" and silently break that caller.
+///
 /// `salt` separates the several words that make up one id. A fresh
 /// `RandomState` per call already has its own keys, so two words are not two
 /// views of one 64-bit value; the salt says so at the call site as well.

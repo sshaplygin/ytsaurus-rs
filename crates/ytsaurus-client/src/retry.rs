@@ -80,8 +80,9 @@ pub enum Repeatable {
     ///
     /// It also decides **where** the command goes. A large installation gives
     /// its proxies roles and refuses a heavy request on a control proxy, so
-    /// the client asks `/hosts` for one that will take it, once per client
-    /// and only if a heavy command needs it. Nothing about the call site
+    /// the client asks `/hosts` for a pool of proxies that will take one —
+    /// only when a heavy command needs it, and again when the answer outlives
+    /// its refresh interval. Nothing about the call site
     /// changes: this is the same `isHeavy` bit of the cluster's command
     /// registry that says the command cannot be repeated, and both answers
     /// follow from writing it down once. The discovered host is constrained to
@@ -479,11 +480,14 @@ fn contains_code(value: &serde_json::Value, wanted: &[i64]) -> bool {
 /// Not the same question as [`is_retriable`], and the difference is the whole
 /// reason this exists. `is_retriable` asks *would waiting help?* — it decides
 /// whether to send the same request to the same place after a pause. This one
-/// asks *would asking again ever help?*, and its callers are the two places
-/// that decide whether the client keeps or discards what `/hosts` told it:
-/// `Transport::base_for` and `Transport::after_heavy`. Neither is going to
-/// re-send anything; both are choosing between "remember this answer" and "ask
-/// once more later".
+/// asks *would asking again ever help?*, and its caller is the place that
+/// decides whether the client keeps or discards what `/hosts` told it:
+/// `Transport::base_for`, judging a failed **lookup** — the initial one and
+/// the periodic refresh alike. It is not going to re-send anything; it is
+/// choosing between "ask again soon" and "ask again an interval from now".
+/// (`Transport::after_heavy`, judging a failed heavy *command*, used to key
+/// on this too and no longer does — dropping a host from the pool turns on
+/// [`attributable_to_the_host`], and the difference between the two is #40.)
 ///
 /// They differ for exactly the failures where the *addressee* is what was
 /// wrong rather than the moment. Every reason to wait is also a reason to ask
@@ -551,12 +555,8 @@ pub(crate) fn worth_asking_again(error: &ClientError) -> bool {
 /// a resolve error, a schema mismatch — the request's, and the pool keeps
 /// the host.
 pub(crate) fn attributable_to_the_host(error: &ClientError) -> bool {
-    if let ClientError::Transport { source, .. } = error
-        && rejected_the_certificate(source)
-    {
-        return true;
-    }
-    worth_asking_again(error)
+    matches!(error, ClientError::Transport { source, .. } if rejected_the_certificate(source))
+        || worth_asking_again(error)
 }
 
 /// Whether the proxy refused this because of the **role it has**.

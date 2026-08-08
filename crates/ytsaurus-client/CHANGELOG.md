@@ -10,21 +10,29 @@
   only on a failure the *lookup's* predicate recognised. Both official
   clients deliberately never commit to one host, and the divergence produced
   two real failures: a certificate rejected `NotValidForName` — a per-host
-  condition; the fleet's other proxies were fine — pinned every upload to the
-  one bad proxy, and N launchers started together were all handed the same
-  "least loaded" first entry and piled onto it for their whole lives. Now the
+  condition; the fleet's other proxies were fine — pinned every upload to
+  the one bad proxy for as long as the client lived, and a fleet of pinned
+  clients never rebalanced, each keeping whichever host its one lookup
+  happened to name through every drain and load shift afterwards. Now the
   whole answer is a pool, each heavy command picks a member at random (the
   crate's existing id source is the entropy — *unique, not unpredictable* is
   the right bar for load-spreading, so no new dependency), and the list is
   refreshed lazily by the first heavy command that finds it older than the
   refresh interval, per the documentation's own "re-query every minute". A
-  failed refresh keeps the previous answer in use. No background thread; a
-  client that stops uploading stops asking.
+  failed refresh keeps the previous answer in use and waits out another
+  interval before asking again. No background thread; a client that stops
+  uploading stops asking.
 
-  A non-breaking behaviour change: `with_proxy_discovery(false)` still pins
-  everything to the configured address, `heavy_proxy()` still answers with
-  the cluster's first pick, and a cluster that names no heavy proxy is still
-  served by the configured address, asked once.
+  Two behaviour changes a caller can observe, neither breaking an API:
+  a heavy command may now pay one `/hosts` round trip mid-life — bounded by
+  `with_hosts_timeout`, at most once per interval — where it could only pay
+  one up front before; and "the cluster named no heavy proxy" now expires
+  with the same interval instead of settling for ever, so a first lookup
+  that landed during a rolling restart is no longer a verdict for the
+  client's whole life. `with_proxy_discovery(false)` still pins everything
+  to the configured address, `heavy_proxy()` still answers with the
+  cluster's first pick, and `with_hosts_retry_after` still means what it
+  meant — how long the fallback lasts.
 
 - **Fixed** the pinning half of that divergence on its own terms: a heavy
   command's failure now drops the host it went to on any failure
@@ -32,13 +40,18 @@
   refusal, and now a rejected certificate — rather than only on the failures
   `worth_asking_again` recognises, which is the predicate for the `/hosts`
   lookup and answers `false` for a certificate verdict. The dropped host
-  stays out until a refresh names it again; a pool with nobody left falls
-  back to the configured address for `with_hosts_retry_after` and the
-  cluster is then asked afresh, exactly as before.
+  stays out until a refresh names it again — so a host that is *persistently*
+  bad costs one failed command per interval until an operator fixes it,
+  rather than every command until the client is restarted; a pool with
+  nobody left falls back to the configured address for
+  `with_hosts_retry_after` and the cluster is then asked afresh, exactly as
+  before.
 
 - **Added** `Client::with_host_list_refresh_interval(Duration)`, defaulting
-  to one minute. `Duration::MAX` effectively restores the old ask-once
-  behaviour.
+  to one minute. `Duration::ZERO` re-asks before every heavy command;
+  `Duration::MAX` disables the refresh — the first answer is kept as long as
+  it keeps working, though a failed host is still dropped and an emptied
+  pool still falls back and re-asks.
 
 ### A cache that refuses you, and the upload that goes anyway
 

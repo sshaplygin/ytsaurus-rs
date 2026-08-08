@@ -607,25 +607,33 @@ Table and file data — `write_table`, `read_table`, `write_file`,
 `upload_worker`, and the streaming form of each — is what YTsaurus calls a
 *heavy* command, and a large installation serves those on a separate set of
 proxies. **The client routes them itself**: the first heavy command asks
-`/hosts` and the answer is kept for the client's lifetime. Light commands stay
-on the address you gave.
+`/hosts`, the whole answer becomes a pool, and every heavy command goes to a
+member **picked at random** — the way both official SDKs pick, because a
+client that kept one pick for its lifetime would never rebalance. The answer
+is **refreshed** when it outlives `Client::with_host_list_refresh_interval` —
+one minute by default, the documentation's own "re-query every minute" —
+lazily, by the heavy command that finds it stale; there is no background
+thread, and a refresh that fails keeps the previous answer in use. Light
+commands stay on the address you gave.
 
-**A proxy that stops answering is dropped for the next name in that same
-answer.** The whole list is kept, best first, and a heavy command that fails for
-a reason another proxy might not have moves the client on. Only when every name
-in the answer has failed does it fall back to the address you configured — and
-then only until it asks the cluster again ten seconds later
-(`Client::with_hosts_retry_after`). The order matters: with separate proxy
-roles, the address you configured is usually a control proxy, so falling back on
-the first hiccup would answer a transient 503 with ten seconds of guaranteed
-refusals.
+**A proxy a command fails at is dropped from the pool, not committed to.** A
+failure attributable to the host it went to — a refused connection, a 503, a
+certificate that does not match that host's own name — takes it out of the
+pool, and the next command picks from what remains; the next refresh that
+still names it puts it back. Only a pool with nobody left falls back to the
+address you configured — and then only until it asks the cluster again ten
+seconds later (`Client::with_hosts_retry_after`). The order matters: with
+separate proxy roles, the address you configured is usually a control proxy,
+so falling back on the first hiccup would answer a transient 503 with ten
+seconds of guaranteed refusals.
 
-A cluster that names no heavy proxy is answered by using that address, so a
-single-node installation is unaffected — and one reached at `localhost` is not
-asked at all, because the address a proxy publishes for itself is not reachable
-from the other end of a port mapping or a tunnel.
-`Client::with_proxy_discovery` overrides both, and [`Client::heavy_proxy`] still
-answers the question directly.
+A cluster that names no heavy proxy is answered by using that address — asked
+about again one refresh interval later, so an unlucky first lookup during a
+rolling restart is not a verdict for life — and a single-node installation is
+unaffected. One reached at `localhost` is not asked at all, because the
+address a proxy publishes for itself is not reachable from the other end of a
+port mapping or a tunnel. `Client::with_proxy_discovery` overrides both, and
+[`Client::heavy_proxy`] still answers the question directly.
 
 **The lookup has its own budget** — one attempt, 800 ms — rather than the
 client's five attempts and two-minute timeout. It sits in front of your first

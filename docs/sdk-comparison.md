@@ -71,12 +71,13 @@ by a shorter road.
 The heavy-proxy row recorded this table's one deliberate divergence for a
 release — "one answer, never refreshed, walked host by host as it fails" —
 and #40 retired it. The official clients disagree on trimmings (C++ refreshes
-lazily on access and never bans; Go refreshes in the background and bans for
+lazily on access; Go refreshes in the background and bans a failing proxy for
 five minutes) but agree on the core, **never commit to one host**, and that
 property earned its keep here the hard way: a certificate valid for every
-proxy but one pinned the client to the one bad host, and N launchers started
-together were all handed the same "least loaded" first entry and piled onto
-it. Now:
+proxy but one pinned the client to the one bad host for as long as it lived,
+and a fleet of pinned clients never rebalanced — whichever host a client's
+one lookup happened to name kept that client through every drain and load
+shift afterwards. Now:
 
 **Selection is random per command**, from the pool the answer named, as both
 official clients pick — `THostManager` with `RandomNumber`, Go's
@@ -94,15 +95,19 @@ previous answer in use.
 
 **A failing host is dropped, not walked to the next and not pinned.** The ban
 is shorter-lived than Go's five minutes: a dropped host stays out until a
-refresh names it again, at most one interval away. The drop turns on "was
-this failure attributable to the host" — deliberately including a rejected
-certificate, the per-host condition the old walk's predicate gated out — and
-a pool with nobody left falls back to the configured address for ten seconds
-before the cluster is asked again. Falling back any earlier was itself a bug
-once: the fallback address on a deployment with separate roles is a *control*
-proxy, so a single transient 503 answered ten seconds of uploads with
-`Control proxy may not serve heavy requests with input data` — the very
-failure the routing was written for.
+refresh names it again, at most one interval away — so a host that was merely
+draining comes back within a minute of the cluster vouching for it, and a
+*persistently* bad one (the misissued certificate that motivated #40) is
+re-learned at one failed command per interval until an operator fixes it,
+the price of not keeping a second clock. The drop turns on "was this failure
+attributable to the host" — deliberately including a rejected certificate,
+the per-host condition the old walk's predicate gated out — and a pool with
+nobody left falls back to the configured address for ten seconds before the
+cluster is asked again. Falling back any earlier was itself a bug once: the
+fallback address on a deployment with separate roles is a *control* proxy, so
+a single transient 503 answered ten seconds of uploads with `Control proxy
+may not serve heavy requests with input data` — the very failure the routing
+was written for.
 
 **And a discovered host is constrained**, which neither other client does: a
 name is used only if it shares the configured address's domain, and the scheme
