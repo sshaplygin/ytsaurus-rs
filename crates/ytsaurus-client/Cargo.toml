@@ -19,6 +19,12 @@ default = ["tls"]
 # a C toolchain — `rustls` pulls in `ring`, which needs one. A local cluster is
 # reached over plain HTTP and needs none of it.
 tls = ["ureq/rustls"]
+# Trust whatever the operating system trusts, rather than the Mozilla bundle
+# compiled into `webpki-roots`. Off by default: it pulls in
+# `rustls-platform-verifier`, and the Mozilla bundle is the safer default for a
+# client that may run outside the network it is talking to. `YT_CA_BUNDLE`
+# covers the same ground without the dependency, and is checked first.
+platform-verifier = ["tls", "ureq/platform-verifier"]
 # `#[derive(TableRow)]`, so a schema is read off the struct the rows already
 # have. Off by default: it is a compiler plugin, and a crate that only launches
 # operations should not pay to build one.

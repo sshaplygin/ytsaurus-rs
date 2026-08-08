@@ -88,7 +88,9 @@ jobs:
       # cross-compiler, and a worker should carry only what it runs on. Neither
       # is off by accident — `examples/` takes the client with
       # `default-features = false` — so this asserts the invariant rather than
-      # trusting it.
+      # trusting it. `rustls-platform-verifier` is the third name for the same
+      # reason: the `platform-verifier` feature is gated on `tls`, and this is
+      # what says so out loud.
       #
       # Listed once and searched, rather than three `cargo tree -i` calls whose
       # *failure* was the passing signal. `-i` exits 101 both when the crate is
@@ -112,7 +114,7 @@ jobs:
             echo "ERROR: the worker graph does not contain ytsaurus-client"
             echo "$graph"; exit 1; }
 
-          for crate in tracing rustls ring; do
+          for crate in tracing rustls ring rustls-platform-verifier; do
             if echo "$graph" | grep -qx "$crate"; then
               echo "ERROR: $crate reached the worker build"
               cargo tree -p ytsaurus-examples \
