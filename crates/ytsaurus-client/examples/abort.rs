@@ -82,17 +82,16 @@ fn run() -> Result<(), ClientError> {
         stopped.as_secs_f64()
     ));
 
-    // The jobs go with it. The scheduler drops an aborted operation's jobs from
-    // `list_jobs` rather than showing them as aborted, so what is checked here
-    // is that nothing is left running — which is the part that costs.
-    let left = client.list_jobs(&id, None, 10)?;
-    check(
-        &format!(
-            "and no job is still running ({} left in the list)",
-            left.len()
-        ),
-        left.iter().all(|j| j.state != "running"),
-    )?;
+    // The operation's terminal state comes before its job has necessarily
+    // stopped. On a multi-node cluster, the node can still report the job as
+    // `running` while it tears it down. A local scheduler drops aborted jobs
+    // from `list_jobs` instead, which is equally the condition we need: no job
+    // is still costing a node.
+    let drained = wait_for_no_running_jobs(&client, &id, PATIENCE)?;
+    done(&format!(
+        "and its job stopped {:.1}s after the operation did",
+        drained.as_secs_f64()
+    ));
 
     step("Reading back why it stopped");
     // The reason is not kept beside the operation; it is folded into the error
@@ -269,6 +268,31 @@ fn wait_for_a_running_job(
 
     Err(ClientError::Config(format!(
         "operation {id} had no running job within {:.0}s",
+        patience.as_secs_f64()
+    )))
+}
+
+/// Waits until `list_jobs` no longer reports a job that is still running.
+///
+/// An operation becomes `aborted` before every node has completed job teardown,
+/// so its terminal state is not this condition. The `running` filter makes the
+/// one-item answer all this vanilla operation needs to inspect.
+fn wait_for_no_running_jobs(
+    client: &Client,
+    id: &str,
+    patience: Duration,
+) -> Result<Duration, ClientError> {
+    let started = Instant::now();
+
+    while started.elapsed() < patience {
+        if client.list_jobs(id, Some("running"), 1)?.is_empty() {
+            return Ok(started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(ClientError::Config(format!(
+        "operation {id} still had a running job within {:.0}s",
         patience.as_secs_f64()
     )))
 }
