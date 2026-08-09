@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 651 tests
+cargo test --workspace            # 652 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -320,7 +320,21 @@ Handing one to another process (`detach` / `attach_transaction`, #13):
 - **A detached transaction is indistinguishable from a held one**, so the only
   evidence a test can read is which requests stop arriving — which is what
   `crates/ytsaurus-client/tests/transaction_lifecycle.rs` does, against a stub
-  cluster in-process, plus wall-clock timing for the join `detach` promises.
+  cluster in-process, plus wall-clock timing for the join `detach` does.
+- **`detach`'s wait covers the ping only up to a 30 s timeout.** The join is
+  bounded at five seconds and a ping's request budget is
+  `clamp(interval / 2, 1 s, 120 s)` on an `interval` of `max(timeout / 3, 1 s)`
+  — so the budget fits inside the bound while the timeout is under 30 s, equals
+  it at the 30 s default, and exceeds it above. The master honours the asked-for
+  timeout verbatim, so that arithmetic is the caller's to do: `#<id>/@timeout`
+  read back `3600000`, `30000` and `20000` for transactions started at each,
+  observed on a local cluster — budgets of 120 s, 5 s and 3.3 s. Above the
+  default a stalled ping outlives the detach and can restart the cluster's
+  clock afterwards; the docs say so, and this is why they cannot say "no ping
+  is in flight" flatly. Both directions are pinned in `transaction.rs`'s unit
+  tests — one asserts the wait happens, one asserts it ends — and the second is
+  what a `drop(alive)` in the ping thread's body fails; nothing else in the
+  workspace does.
 
 ### Picking a verb, and what is a command at all
 

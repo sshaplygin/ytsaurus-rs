@@ -72,8 +72,17 @@ const DROP_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`crate::DEFAULT_TIMEOUT`], two minutes, for a transaction whose timeout is
 /// an hour. `detach` reads as instant at every call site, so the wait has its
 /// own bound instead: past this, a ping that is still stalled is left to land
-/// on its own, which costs one interval of extra life on a transaction the
-/// caller was handing on anyway.
+/// on its own.
+///
+/// **When that can happen, and what it costs.** Five seconds covers a ping's
+/// whole budget while the transaction's timeout is under 30 s, and equals it
+/// at the 30 s default — `clamp(interval / 2, 1 s, 120 s)` on an `interval` of
+/// `max(timeout / 3, 1 s)` — so only above the default can a ping outlast the
+/// wait. When one does, it lands up to `min(interval / 2, 120 s)` after the
+/// detach and the transaction then lives a **full timeout from there**, not
+/// one interval. The thread is not leaked: it re-reads the stop flag the
+/// moment its ping ends, so at most one ping is outstanding and it exits
+/// inside that same budget.
 const DETACH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A transaction, alive for as long as this handle is.
@@ -145,6 +154,16 @@ impl Transaction {
             // Under a mutation ID, so a retried start cannot leave a
             // transaction nobody holds a handle to — it would hold its locks
             // until it expired.
+            //
+            // What that leaves, noted rather than paid for: a start that *was*
+            // retried hands back the transaction the first attempt created,
+            // whose clock started there — so a retry sequence costing more
+            // than the timeout returns a handle whose own first ping is
+            // already late, the same staleness `attach` below pings to close.
+            // It takes a lost answer *and* retries slower than the timeout, so
+            // this is rarer than the handoff `attach` fixes, where the window
+            // was every handoff past two thirds of the timeout; a ping on
+            // every start would spend a round trip on all of them to close it.
             Repeatable::WithMutationId,
         )?;
 
@@ -182,6 +201,13 @@ impl Transaction {
         // transaction that is already gone into this call's error, which has a
         // caller to report it to. A *started* handle needs none of this: its
         // clock starts at the reply it was born from.
+        //
+        // On the *caller's* client, so under the caller's retry policy — the
+        // same terms as the `get` above, and unlike the keep-alive's own ping
+        // client, which is one attempt on half an interval. That is the right
+        // way round here: this ping has a caller waiting on its verdict and
+        // should not fail over one dropped packet, where a keep-alive ping is
+        // retried by simply being sent again next interval.
         ping(client, &id).map_err(|error| attach_failed(&id, error))?;
 
         Ok(Self::held(client, id, timeout, Origin::Attached))
@@ -283,9 +309,26 @@ impl Transaction {
     /// So this is for a holder that keeps a transaction across something long:
     /// a false answer means only that no ping has been *answered* that way
     /// yet, which is the strongest thing a handle can say without asking, and
-    /// [`Transaction::ping`] is how to ask. A handle whose thread never
-    /// started — the spawn failed — answers false: nothing has been lost, and
-    /// nothing is pinging either.
+    /// [`Transaction::ping`] is how to ask.
+    ///
+    /// **False is not "something is pinging".** Two other states read false
+    /// with nothing keeping the transaction alive:
+    ///
+    /// - the thread never started, because the spawn failed. Nothing has been
+    ///   lost and nothing is pinging either, so the transaction runs on the
+    ///   cluster's clock from whenever it was last pinged.
+    /// - the thread panicked. Nothing on the ping path panics as it stands —
+    ///   a poisoned lock is recovered rather than unwrapped — so this is about
+    ///   a future edit to that path rather than about the code today.
+    ///
+    /// Neither is visible from the handle, and a ping does not expose them
+    /// either: it answers for the *transaction*, not for the thread, so it
+    /// goes on succeeding until the transaction actually expires. What they
+    /// have in common is the remedy — ping, or attach afresh.
+    ///
+    /// This is also `&self` while [`Transaction::detach`] consumes the handle,
+    /// so there is nothing left to ask once a transaction has been detached.
+    /// From there the only probe is [`Client::ping_transaction`] on the id.
     #[must_use]
     pub fn is_lost(&self) -> bool {
         self.keep_alive.as_ref().is_some_and(KeepAlive::lost)
@@ -303,20 +346,31 @@ impl Transaction {
     /// finishes it outright with [`Client::commit_transaction`] or
     /// [`Client::abort_transaction`].
     ///
-    /// **No ping is in flight when this returns**, which is what lets a caller
-    /// kill the process the moment it does without a stray request behind it.
-    /// The keep-alive thread is asked to stop and then waited for. Two things
-    /// that promise is careful about:
+    /// **The keep-alive is asked to stop and then waited for, for up to five
+    /// seconds.** Inside that bound nothing is left in flight, and the caller
+    /// can kill the process the moment this returns without a stray request
+    /// behind it. What the wait is for, and where it gives up:
     ///
     /// - The keep-alive may get *one last ping* away — it can be past its own
     ///   stop check and about to send when `detach` raises the flag — so the
     ///   transaction's clock may restart once more, at up to one ping after
-    ///   this was called. That ping is waited for; it is not left in flight.
-    /// - The wait is bounded by `DETACH_JOIN_TIMEOUT`, five seconds. It is
-    ///   normally over in the time one ping takes, but a ping stalled on a
-    ///   hung proxy has a budget of its own — `min(interval / 2, 120 s)`,
-    ///   which is two minutes for an hour-long transaction — and `detach` will
-    ///   not hold its caller's thread for that.
+    ///   this was called. That ping is what the wait is for.
+    /// - **Past five seconds the ping is left in flight and this returns
+    ///   anyway**, rather than hold the caller's thread. A ping has a request
+    ///   budget of its own — `min(interval / 2, 120 s)`, on an `interval` of a
+    ///   third of the transaction's timeout — and five seconds covers that
+    ///   whole budget while the timeout is **under 30 seconds**, equalling it
+    ///   at the 30 s default. So at or below the default the wait genuinely
+    ///   ends in the thread's exit. **Above the default it need not**: an
+    ///   hour-long launcher transaction pings on a two-minute budget, and a
+    ///   ping stalled on a proxy that has stopped answering outlasts the wait,
+    ///   reaches the master *after* `detach` returned, and restarts the expiry
+    ///   clock there — the transaction lives a full timeout from wherever that
+    ///   ping landed rather than from this call. Nothing is leaked: the thread
+    ///   re-reads the stop flag as soon as its ping ends, so at most one ping
+    ///   is outstanding and it exits inside that same budget. But it is alive
+    ///   and unreaped past the detach, and a caller whose timeout is above the
+    ///   default cannot treat this call as the transaction's last ping.
     ///
     /// What C++ spells `ITransaction::Detach()`. It is also the honest way to
     /// let a transaction outlive its handle: `mem::forget` on a [`Transaction`]
@@ -372,6 +426,14 @@ impl Transaction {
         outcome.map(|_| ())
     }
 
+    /// Asks the keep-alive to stop, and drops it.
+    ///
+    /// Taking the `Option` is what makes it idempotent. Every caller today is
+    /// terminal — `finish` and `Drop` — so nothing reads the handle again, and
+    /// this is worth knowing before that stops being true: dropping the
+    /// keep-alive drops the flag [`Transaction::is_lost`] reads, so a `&mut
+    /// self` method that called this would silently reset a true verdict to
+    /// false. Such a method would have to carry the verdict out first.
     fn stop_pinging(&mut self) {
         if let Some(keep_alive) = self.keep_alive.take() {
             keep_alive.stop();
@@ -666,7 +728,7 @@ impl KeepAlive {
     /// Asks the thread to stop and waits until it has.
     ///
     /// For [`Transaction::detach`], which has a caller to wait for it — unlike
-    /// the destructor above — and which promises that no ping lands after it
+    /// the destructor above — and which wants no ping landing after it
     /// returns: a stray ping is harmless on a committed transaction but not on
     /// a detached one, where it would quietly extend a lifetime the caller has
     /// just finished reasoning about.
@@ -677,6 +739,10 @@ impl KeepAlive {
     /// against a proxy that has stopped answering. So the wait is a
     /// `recv_timeout` on a channel the thread's own `Sender` closes when its
     /// body ends, which is the timed join `std` does not have.
+    ///
+    /// The bound is the reason `detach` can only promise that much: past it
+    /// the ping is on its own, which [`DETACH_JOIN_TIMEOUT`] and
+    /// [`Transaction::detach`] both spell out.
     fn stop_and_join(self) {
         self.raise();
         if matches!(
@@ -922,6 +988,67 @@ mod tests {
         assert!(
             waited >= HELD / 2,
             "stop_and_join returned in {waited:?}, so it did not wait out the ping it caught"
+        );
+    }
+
+    #[test]
+    fn stop_and_join_gives_up_on_a_ping_that_outlasts_the_bound() {
+        // The other half of the bound, and the half nothing guarded. The test
+        // above asserts only that `stop_and_join` *waits*; a plain unbounded
+        // `join()` passes it just as well, and then `detach` on an hour-long
+        // transaction against a hung proxy holds its caller for the ping's own
+        // two-minute budget. This is the upper bound.
+        //
+        // It is what makes the mechanism testable rather than the wait: the
+        // proxy accepts and never answers or closes, and the ping's request
+        // timeout is set six times [`DETACH_JOIN_TIMEOUT`], so a
+        // `stop_and_join` that had degraded to a plain join — which is exactly
+        // what dropping the thread's `_alive` sender produces, since the
+        // channel then reports `Disconnected` at once — returns at the request
+        // timeout instead, six times late.
+        const PING_BUDGET: Duration = Duration::from_secs(30);
+        // Two seconds of headroom on a five-second bound, and 25 s of distance
+        // to the failure it looks for. Alone among the timing assertions here
+        // this one is an *upper* bound, so load pushes it toward its threshold
+        // rather than away — but all that is between the bound and this
+        // measurement is a `recv_timeout` waking and one `Instant::elapsed`,
+        // which scheduler latency moves by a constant, not proportionally.
+        // Measured over the bound: 0.3–5.1 ms idle, worst 6.0 ms across five
+        // runs at load average 71 on ten cores. The mutation lands at 30.0 s.
+        const HEADROOM: Duration = Duration::from_secs(2);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = format!("http://{}", listener.local_addr().expect("has an address"));
+        let (accepted, an_accept) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Held open, never answered and never closed, so the ping can only
+            // end at its own request timeout.
+            let mut stalled = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                stalled.push(stream);
+                accepted.send(()).ok();
+            }
+        });
+
+        let mut ping_client = Client::new(&proxy).with_retries(crate::RetryPolicy::none());
+        ping_client.transport.set_timeout(PING_BUDGET);
+        let keep_alive =
+            KeepAlive::spawn(ping_client, "1-2-3-4".to_owned(), Duration::from_millis(1))
+                .expect("the thread starts");
+
+        an_accept
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a ping reached the proxy");
+
+        let waited = std::time::Instant::now();
+        keep_alive.stop_and_join();
+        let waited = waited.elapsed();
+
+        assert!(
+            waited < DETACH_JOIN_TIMEOUT + HEADROOM,
+            "stop_and_join waited {waited:?} on a ping with a {PING_BUDGET:?} budget: \
+             the bound is gone, and detach is back to waiting the ping out"
         );
     }
 

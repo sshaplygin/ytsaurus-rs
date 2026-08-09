@@ -826,6 +826,13 @@ impl Client {
     /// the cluster's clock at the attach, and doubles as the liveness probe
     /// this call reports on.
     ///
+    /// So this is **two retryable round trips**, both on this client and so
+    /// under its retry policy — five attempts of two minutes by default,
+    /// backoff between — where the keep-alive's own pings run one attempt on a
+    /// budget of half the ping interval. A ping the caller is waiting on
+    /// should not fail over one dropped packet; a keep-alive ping is retried
+    /// by being sent again next interval.
+    ///
     /// **Nothing stops two attaches to the same id.** Each is a real handle
     /// with a thread of its own, and they simply ping the same transaction
     /// twice as often; whichever commits or aborts first decides it, and the

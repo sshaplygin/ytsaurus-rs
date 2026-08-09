@@ -9,15 +9,28 @@
   `ITransaction::Detach()`. Nothing is committed, aborted or otherwise
   decided, so from there the transaction lives on the cluster's terms: it
   expires its timeout after its last ping, 30 s by default, unless whoever
-  received the id keeps it alive. The thread is waited for before `detach`
-  returns, so no ping is in flight afterwards — a detach racing its own ping
-  neither panics nor leaves a request behind to restart the expiry clock after
-  the caller has finished reasoning about it. The keep-alive may still get one
-  last ping away before it sees the stop, and that ping is waited for too. The
-  wait itself is bounded at five seconds rather than by the ping's own request
-  budget, which is `min(interval / 2, 120 s)` — two minutes for an hour-long
-  transaction against a proxy that has stopped answering, and `detach` reads
-  as instant at every call site.
+  received the id keeps it alive. The keep-alive thread is asked to stop and
+  then waited for, **for up to five seconds** — a detach racing its own ping
+  neither panics nor, inside that bound, leaves a request behind to restart
+  the expiry clock after the caller has finished reasoning about it. The
+  keep-alive may still get one last ping away before it sees the stop, and
+  that ping is what the wait is for. The bound is deliberate, in place of the
+  ping's own request budget of `min(interval / 2, 120 s)` — two minutes for an
+  hour-long transaction against a proxy that has stopped answering — because
+  `detach` reads as instant at every call site.
+
+  **The bound is reachable, and then the promise stops.** Five seconds covers
+  a ping's whole budget while the transaction's timeout is under 30 s and
+  equals it at the 30 s default, so at or below the default the wait always
+  ends in the thread's exit. Above it — every long-running launcher
+  transaction — a ping stalled on a proxy that has stopped answering outlasts
+  the wait, is left in flight, and can reach the master *after* `detach`
+  returned, restarting the clock there: the transaction then lives a full
+  timeout from wherever that ping landed rather than from the detach. Nothing
+  leaks — the thread re-reads the stop flag as soon as its ping ends, so at
+  most one ping is outstanding and it exits inside that same budget — but a
+  caller above the default cannot treat `detach` as the transaction's last
+  ping. Both bounds are on `Transaction::detach`.
 
 - **Added** `Client::attach_transaction(id)`: the receiving half. Turns an id
   into a real `Transaction` — bound client, ping thread, working
@@ -46,6 +59,13 @@
   transaction", which is final — and that exit used to be invisible, leaving a
   handle that pings nothing looking exactly like a healthy one. Go reports the
   same thing by pushing on `Tx.Finished()`; this is polled.
+
+  **False is not "something is pinging"**, and the doc now says which other
+  states read false: a thread that never started because the spawn failed, and
+  a thread that panicked (nothing on the ping path panics as it stands). A
+  ping does not expose either — it answers for the transaction, not for the
+  thread. `is_lost` is also `&self` where `detach` consumes the handle, so
+  after a detach the only probe left is `Client::ping_transaction` on the id.
 
 - **Added** `Client::ping_transaction`, `Client::commit_transaction` and
   `Client::abort_transaction`, taking the bare id, so a process that holds
