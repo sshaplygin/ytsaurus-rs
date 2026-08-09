@@ -2,6 +2,94 @@
 
 ## Unreleased
 
+### A file can be read back
+
+- **Added** `Client::read_file` and `Client::read_file_streaming` — the mirror
+  `write_file` shipped without, and the sharpest asymmetry in the crate until
+  now: a worker binary could be uploaded and never fetched back (#10). The
+  pair takes the shape of `read_table`'s: buffered for a result a launcher
+  inspects, streaming for a file that does not fit — which a file is exactly
+  the thing to be. `read_file` is a heavy command without input data, so both
+  go to the proxy the cluster names, as the table reads do, and an
+  installation whose control proxy answers heavy reads with a cross-host 307
+  is handled by the same routing rather than by following the redirect with
+  the token stripped. Verified against a local cluster: 4 MB of non-UTF-8
+  bytes round-trip byte-for-byte through both halves, and an empty file reads
+  back empty. The buffered half holds the whole file in memory, and the cap on
+  that is the bullet below.
+
+- **Added** the completeness check the buffered read needs where a table read
+  already had one. The proxy reports a mid-stream failure in a trailer `ureq`
+  cannot see, and a file's bytes carry no framing — where a truncated table
+  leaves a record that does not parse, a truncated file just ends, looking
+  exactly like a shorter file. So `read_file` compares the body against the
+  node's `@uncompressed_data_size`, one light `get` after the heavy read, and
+  a body of any other length is an error naming both numbers. The attribute is
+  the *logical* size — verified with `compression_codec=zlib_6`, 1 000 000
+  bytes reading back whole off 4 214 on disk — and there is no `@file_size`,
+  whatever the name suggests: asked, the cluster answers `Attribute
+  "file_size" is not found`. An answer that is not an integer fails the read
+  too, because a check that quietly stopped checking would be worse than none.
+  The streaming path cannot check — the point is not to have the whole thing —
+  and `FileReader` says what to compare instead: `bytes_read` against the same
+  attribute.
+
+- **Added** `FileReader`, the streaming read's return type — `ResponseReader`
+  under the name the file path uses, exactly as `TableReader` is for tables.
+
+### The 512 MiB cap on a buffered response, which was not one
+
+- **Fixed** the cap itself, which counted the wrong bytes and so bounded
+  nothing worth bounding. `ureq`'s `limit()` wraps the *raw* body source and
+  builds the gzip decoder on top of it, so the number it takes is a limit on
+  what arrives on the wire — and every request this crate sends carries
+  `Accept-Encoding: gzip`. Measured against a cluster: a 600 MiB file of zeros
+  read back through `read_file` crosses the wire in 611 522 bytes, and the code
+  as it stood — `.limit(536870912).read_to_vec()` — handed back all
+  629 145 600 without an error. At that ratio a 512 MiB wire cap admits
+  hundreds of gigabytes into memory. The cap now sits **above** the decoder and
+  counts the bytes that land in the `Vec`, so the promise the documentation
+  made is the one the code keeps: the same read is now refused, and
+  `read_file_streaming` still moves all 600 MiB of it. A body of *exactly* the
+  cap also passes now, where the old guard failed it — `ureq`'s reader errors
+  on the read that finds the end, so "larger than the limit" was a byte off,
+  and deflate expands what it cannot compress, so the wire backstop underneath
+  has to allow the largest permitted body room to arrive *bigger*: 4 096
+  incompressible bytes gzip to 4 119. The backstop is `deflateBound`'s worth of
+  slack, which still bounds the case it exists for — an endless stream of empty
+  deflate blocks, which decodes to nothing and so is invisible to a cap on
+  decoded bytes — at about 584 MiB of transfer.
+
+  **Observable:** a buffered response that decodes to more than 512 MiB used
+  to succeed, allocating however much it decoded to. It now fails.
+  `read_table_streaming`, `read_file_streaming` and `write_table` are
+  unaffected — none of them buffers.
+
+  **The cap is on what is held, not on what a process needs.** The bytes land
+  in a `Vec` that grows by doubling and copies as it grows, so peak residency
+  runs above the ceiling: measured, a 600 MiB read refused by the cap peaks at
+  611 385 344 bytes of resident set and one that holds 512 MiB peaks at
+  544 178 176, with about 1.5× the worst case the growth implies. And it is
+  the buffered commands and uploads that are capped, not the crate: two error
+  paths — the non-2xx branch of a streaming open, and the `/hosts` lookup —
+  still take `ureq`'s wire-only default.
+
+- **Changed** the error class for a buffered response over the cap, from
+  `ClientError::Transport` to a new `ClientError::ResponseTooLarge { command,
+  limit }`. It reaches `read_table`, `read_table_with_format`,
+  `read_skiff_table`, `read_table_rows`, a buffered `raw_command`, and any
+  light command with an answer that large. A caller matching
+  `ClientError::Transport { .. }` to back off and retry will stop matching —
+  which is the point. `Transport` means *the request never got its answer*, and
+  every predicate that narrows it by looking inside (`is_retriable`, and
+  through it `worth_asking_again` and `attributable_to_the_host`) answered
+  `true` here, because `BodyExceedsLimit` is not an `Io` error. So an over-cap
+  heavy read was retried, and it **dropped a healthy data proxy from the pool**
+  — enough of them empty it, and the fallback window then answers unrelated
+  writes with the control-proxy refusal #30 exists to prevent. The new variant
+  is retried by nothing and blamed on nobody, and its message names the cap and
+  the streaming half of the same command. `ClientError` is `#[non_exhaustive]`,
+  so a new variant cannot break an exhaustive match.
 ### The read half of a rich path
 
 - **Added** column and row selection to `TablePath`: `columns(…)` and

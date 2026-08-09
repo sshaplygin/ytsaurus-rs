@@ -557,9 +557,12 @@ Three things the cluster settled that could not be settled by reading:
   rather than assuming one, and there are 71 compression codecs behind it.
 - **`write_file` and `read_file` round-trip through the raw door**, 4 MB
   byte-for-byte, with neither direction holding the file: the upload came from
-  a reader and the download was summed as it arrived. `read_file` is not
-  modelled by this crate, so this is the whole of how a file is read back
-  today.
+  a reader and the download was summed as it arrived. `read_file` was not
+  modelled when this was captured — this run is what verified the wire shape
+  `Client::read_file` and `Client::read_file_streaming` (#10) were then built
+  on, and the same 4 MB round trip was re-verified through the methods
+  themselves, plus an empty file, a `compression_codec=zlib_6` node, and a
+  missing path.
 - **A raw command is genuinely inside the transaction it was sent through.**
   The staged node is invisible to a second client until the commit, which is
   the claim that would be silently false if the raw door bypassed

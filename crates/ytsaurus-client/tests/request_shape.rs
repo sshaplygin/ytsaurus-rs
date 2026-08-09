@@ -1579,13 +1579,21 @@ fn one_column() -> SkiffFormat {
 
 #[test]
 fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
-    // Buffered, streamed in, streamed out, files, Skiff in both directions and
-    // a job's stderr: every route through the transport — `call`, `upload`,
-    // `open` — that each had their own way of choosing an address. And one
-    // lookup between all of them, because the answer is kept until the
-    // refresh interval elapses — a minute by default, which nothing here
-    // outlives — not one lookup per command. The interval itself is pinned in
+    // Buffered, streamed in, streamed out, files in both directions, Skiff in
+    // both directions and a job's stderr: every route through the transport —
+    // `call`, `upload`, `open` — that each had their own way of choosing an
+    // address. And one lookup between all of them, because the answer is kept
+    // until the refresh interval elapses — a minute by default, which nothing
+    // here outlives — not one lookup per command. The interval itself is
+    // pinned in
     // `a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not`.
+    //
+    // The exact request lists below survive the random pick (#40) because the
+    // pool has one host in it: `/hosts` names `heavy` and nobody else, so
+    // there is nothing to choose between and the order is the order these
+    // calls are made in. Nor does anything here empty that pool — the reads
+    // fail on the *answer*, after a 200 the host served perfectly well, which
+    // is not a failure attributable to the host and so drops nobody.
     //
     // The list is exact in both directions on purpose. Each of these call
     // sites is one word — `Repeatable::Heavy` — away from going to the control
@@ -1614,11 +1622,17 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
     let _ = client.read_table("//tmp/t");
     let _ = client.read_table_streaming("//tmp/t");
     let _ = client.read_skiff_table("//tmp/t", &skiff);
+    let _ = client.read_file("//tmp/f");
+    let _ = client.read_file_streaming("//tmp/f");
     let _ = client.get_job_stderr("1-2-3-4", "5-6-7-8");
 
+    // The `get` is the buffered `read_file`'s completeness check — one light
+    // command beside the heavy read, and light commands stay on the address
+    // the caller configured. Routing it away would be the same mistake as not
+    // routing the read, pointing the other way.
     assert_eq!(
         control.requests(),
-        ["GET /hosts HTTP/1.1"],
+        ["GET /hosts HTTP/1.1", "GET /api/v4/get HTTP/1.1"],
         "a heavy command was served by the control proxy"
     );
     assert_eq!(
@@ -1631,6 +1645,8 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
             "GET /api/v4/read_table HTTP/1.1",
             "GET /api/v4/read_table HTTP/1.1",
             "GET /api/v4/read_table HTTP/1.1",
+            "GET /api/v4/read_file HTTP/1.1",
+            "GET /api/v4/read_file HTTP/1.1",
             "GET /api/v4/get_job_stderr HTTP/1.1",
         ]
     );

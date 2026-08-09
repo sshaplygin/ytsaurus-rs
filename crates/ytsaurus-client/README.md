@@ -47,10 +47,10 @@ cargo run -p ytsaurus-client --example launch
 | Cypress | `create`, `create_table`, `alter_table`, `remove`, `exists`, `get`, `list`, `row_count`, `table_schema` |
 | Naming | `copy`, `move_node`, `link` — each with a `_replacing` twin that overwrites |
 | Locks | `lock`, `lock_waiting` |
-| Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `write_table`, `read_table`, `set_attribute` |
+| Data | `upload_worker`, `upload_worker_cached`, `upload_current_exe`, `write_file`, `read_file`, `write_table`, `read_table`, `set_attribute` |
 | Formats | `write_table_with_format`, `read_table_with_format`, `write_skiff_table`, `read_skiff_table` |
 | Typed | `write_table_rows`, `read_table_rows`, `get_as` |
-| Streaming | `read_table_streaming`, `write_table_streaming` |
+| Streaming | `read_table_streaming`, `write_table_streaming`, `read_file_streaming` |
 | File cache | `file_from_cache`, `put_file_to_cache` |
 | Operations | `start_map`, `start_reduce`, `start_sort`, `start_map_reduce`, `start_vanilla`, `start_merge`, `start_erase`, `start_remote_copy`, `start_operation`, `operation_state`, `wait_for_operation`, `operation_result_error` |
 | Lifecycle | `abort_operation`, `suspend_operation`, `resume_operation`, `complete_operation`, `update_operation_parameters`, `operation_suspended`, `operation_status`, `attach_operation` → `Operation` |
@@ -651,7 +651,7 @@ is the way to make an upload atomic.
 
 ## Where a heavy command goes
 
-Table and file data — `write_table`, `read_table`, `write_file`,
+Table and file data — `write_table`, `read_table`, `write_file`, `read_file`,
 `upload_worker`, and the streaming form of each — is what YTsaurus calls a
 *heavy* command, and a large installation serves those on a separate set of
 proxies. **The client routes them itself**: the first heavy command asks
@@ -734,10 +734,12 @@ answered with a 307 to a data proxy. And a deployment behind a balancer is the
 case that breaks rather than the case that works — the balancer fronts the
 control proxies.
 
-One deliberate difference from the C++ and Go clients: they re-query `/hosts`
-periodically, as [the documentation
-recommends](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload), and
-this one does not. See [docs/sdk-comparison.md](../../docs/sdk-comparison.md).
+The C++ and Go clients re-query `/hosts` periodically, as [the documentation
+recommends](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload); so
+does this one, lazily and on the C++ client's schedule rather than in a
+background thread. See
+[docs/sdk-comparison.md](../../docs/sdk-comparison.md) for where the three
+still differ.
 
 ## Limits worth knowing
 
@@ -745,12 +747,33 @@ this one does not. See [docs/sdk-comparison.md](../../docs/sdk-comparison.md).
 an `X-YT-Error` trailer, and `ureq` 3.3 exposes none — rechecked against its
 source, where the word does not appear. `read_table` compensates by checking the
 response is a complete YSON list fragment, so a truncated read is caught; a
-mid-stream failure that still yields well-formed output would not be.
+mid-stream failure that still yields well-formed output would not be. A file's
+bytes carry no such framing — a body cut short just ends, looking like a
+shorter file — so `read_file` compares what arrived against the node's
+`@uncompressed_data_size` instead, one light `get` after the read.
+`read_file_streaming` cannot do either, and says so: compare its
+`bytes_read()` against the same attribute yourself.
 
 **`read_table` and `write_table` hold the whole table**, as do their
-`_with_format` and `_skiff_table` variants. They are for results a launcher
-inspects; `read_table_streaming` and `write_table_streaming` are for everything
-larger.
+`_with_format` and `_skiff_table` variants, and `read_file` holds the whole
+file. They are for results a launcher inspects; `read_table_streaming`,
+`write_table_streaming` and `read_file_streaming` are for everything larger.
+**A buffered response is capped at 512 MiB of decoded bytes** — past that the
+read is refused rather than truncated, with a `ClientError::ResponseTooLarge`
+naming the cap and the streaming half. Decoded, not transferred: responses
+arrive gzipped (see above), and a 600 MiB file of zeros crosses the wire in
+611 522 bytes, so a cap counted there would bound nothing that matters.
+
+Two things the cap is not. It is not a **process** budget: the bytes land in a
+`Vec` that grows by doubling and copies as it grows, so peak residency runs
+above the ceiling — measured, a 600 MiB read refused by the cap peaked at
+611 385 344 bytes of resident set, and one that held 512 MiB peaked at
+544 178 176 — with about 1.5× as the worst case the growth implies. Size for
+that, not for the cap. And it is not **crate-wide**: it covers the buffered
+commands and uploads, which read through the guard. Two error paths still take
+`ureq`'s own wire-only default — the non-2xx branch of a streaming open, and
+the `/hosts` discovery lookup — and a gzipped body on either is bounded on the
+wire rather than in memory.
 
 ## A command this crate does not model
 
@@ -772,8 +795,10 @@ let body = client.raw_command(
 ```
 
 `raw_command_streaming` and `raw_command_upload` are the same door for a
-command whose answer is the data (`read_file`) or whose request is
-(`write_file`), so neither has to fit in memory.
+command whose answer is the data (`read_blob_table`) or whose request is, so
+neither has to fit in memory. `read_file` goes through it in the `raw` example
+because that shape is verified against a cluster — it has had methods of its
+own, `read_file` and `read_file_streaming`, since #10.
 
 What you give up is the parameters and the answer — the crate has no opinion
 about either. What you keep is everything else: the token, the timeout, TLS,
