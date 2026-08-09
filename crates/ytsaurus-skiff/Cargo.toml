@@ -8,9 +8,13 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Schema and streaming codec for the YTsaurus Skiff format (work in progress)"
-# Pre-release: the README says so, and the Skiff ship gates in
-# docs/skiff-compatibility.md are not all green. Publishing needs a human.
-publish = false
+# Published from 0.2.5, by the human decision Hard rule 1 asks for. The ship
+# gates in docs/skiff-compatibility.md are **still not all green** — required
+# test 4, cluster fixtures, is open — and this crate remains pre-release in
+# everything but its presence on crates.io: the version is 0.x, the README says
+# what is unsettled, and the API may change in a patch release. What the publish
+# buys is `ytsaurus-job` and `ytsaurus-client`, which depend on this and could
+# not otherwise reach crates.io at all.
 readme = "README.md"
 keywords = ["ytsaurus", "skiff", "serialization", "mapreduce"]
 categories = ["encoding"]

@@ -8,9 +8,8 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Shared YTsaurus table and worker data-format selection"
-# Pre-release for as long as it re-exports ytsaurus-skiff, which cannot be
-# published either.
-publish = false
+# Published from 0.2.5, with ytsaurus-skiff, which it re-exports and whose
+# pre-release status it inherits.
 readme = "README.md"
 keywords = ["ytsaurus", "yson", "skiff"]
 categories = ["encoding"]

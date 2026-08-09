@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.5 - 2026-08-10
+
+First release on crates.io.
 
 ### A managed installation is configurable from the environment
 
