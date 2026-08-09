@@ -1746,6 +1746,35 @@ impl Client {
     /// [`Client::read_file_streaming`] moves the same bytes without holding
     /// them.
     ///
+    /// **The whole file is held in memory, and there is a ceiling: 512 MiB.**
+    /// That is the transport's cap on any buffered response, and a file past
+    /// it is refused rather than truncated — with an error that names the
+    /// number and names the streaming half. A worker binary is comfortably
+    /// under it; a dataset someone stored as a file may not be, and that is
+    /// exactly the case the pair comes in two halves for.
+    ///
+    /// `path` is a **plain node path** — `//tmp/worker`. Not a rich one, and
+    /// the reason is worth spelling out, because a rich path here does not
+    /// fail so much as quietly do nothing. Measured on a cluster, on a file of
+    /// 1000 bytes:
+    ///
+    /// - `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads back
+    ///   **all 1000 bytes** and passes the size check. A file is sliced by the
+    ///   command's own `offset` and `length` parameters, not by limits on the
+    ///   path, so limits written there are accepted and ignored — and the
+    ///   caller who thought they had asked for ten bytes is told nothing.
+    ///   `<append=%false>//tmp/f` is the same story with a harmless attribute.
+    /// - `//tmp/f[#0:#10]` also reads back all 1000 bytes, and then fails: the
+    ///   size check builds `{path}/@uncompressed_data_size` out of this string
+    ///   textually, and `//tmp/f[#0:#10]/@uncompressed_data_size` is not a path
+    ///   the cluster will parse — `Error reading parameter /path: Unexpected
+    ///   token "/" of type "slash"`. A whole file downloaded and then refused
+    ///   over a range that was never going to be honoured.
+    ///
+    /// So: a plain path. Selection on reads is [#12], and belongs in
+    /// parameters this method would have to grow, not smuggled in through
+    /// this argument.
+    ///
     /// The body's length is checked against the size Cypress records for the
     /// node. That is not pedantry — the proxy reports a mid-stream failure in
     /// a trailer this client cannot see (see [`TableReader`] for the trailer
@@ -1757,13 +1786,20 @@ impl Client {
     /// beneath it — and a body of any other length is an error rather than a
     /// file.
     ///
-    /// The two requests are not atomic. A writer replacing the file between
-    /// them can fail the check for a body that was complete when it was sent —
-    /// the ordinary hazard of reading what someone else is rewriting, surfaced
-    /// as an error rather than as a mix of the two versions. A reader who
-    /// needs a file pinned while others replace it takes a
-    /// [`LockMode::Snapshot`] lock in a transaction, which is exactly what
-    /// that mode is for.
+    /// The two requests are not atomic, and the race runs both ways. A writer
+    /// replacing the file between them can fail the check for a body that was
+    /// complete when it was sent — the ordinary hazard of reading what someone
+    /// else is rewriting, surfaced as an error rather than as a mix of the two
+    /// versions. The converse is rarer and quieter: a body genuinely cut short
+    /// at N bytes, racing a replacement whose own
+    /// `@uncompressed_data_size` is exactly N, passes the check, and a
+    /// truncated read of the old version is returned as a whole file. That one
+    /// cannot be closed from here — the only in-band verdict on a cut stream
+    /// is the proxy's trailer, which `ureq` 3.3 does not read, so there is no
+    /// header to prefer over the second request. A reader who needs a file
+    /// pinned while others replace it takes a [`LockMode::Snapshot`] lock in a
+    /// transaction, which is exactly what that mode is for, and closes both
+    /// directions at once.
     ///
     /// Verified against a local cluster: a 4 MB [`Client::write_file`] of
     /// non-UTF-8 bytes comes back byte-for-byte through both halves of the
@@ -1774,13 +1810,16 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, if the node's size cannot
-    /// be read — the check refuses loudly rather than quietly not happening —
-    /// or if the body's length is not the size the cluster records. A missing
+    /// Returns [`ClientError`] if the request fails, if the file is larger
+    /// than the 512 MiB this holds in memory, if the node's size cannot be
+    /// read — the check refuses loudly rather than quietly not happening — or
+    /// if the body's length is not the size the cluster records. A missing
     /// path fails the read itself, before the size is ever asked for: code 1,
     /// `Error getting basic attributes of user objects`, with the resolve
     /// error nested inside — a category outside and the reason within, as a
     /// missing table is reported too.
+    ///
+    /// [#12]: https://github.com/sshaplygin/ytsaurus-rs/issues/12
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let params = yson_build::map([("path", yson_build::string(path))]);
         let body = self.transport.call(
@@ -1820,8 +1859,25 @@ impl Client {
     /// is not found`. An answer that is not an integer is refused rather than
     /// skipped: a completeness check that quietly stopped checking would be
     /// worse than none, because [`Client::read_file`] promises it.
+    ///
+    /// Both ways of failing are reported as `read_file`, and the `get`'s own
+    /// error is quoted inside rather than handed back as itself. The `get` is
+    /// an implementation detail of the read, and it fails *after* the file's
+    /// bytes have already arrived — so a bare `get: transport error …` names
+    /// a command the caller never sent, and the obvious remedy for it, sending
+    /// it again, is not what their retry will do: it will download the whole
+    /// file a second time. The message says which command failed and which
+    /// part of it did.
     fn file_size(&self, path: &str) -> Result<i64> {
-        let size = self.get(&format!("{path}/@uncompressed_data_size"))?;
+        let size = self
+            .get(&format!("{path}/@uncompressed_data_size"))
+            .map_err(|error| ClientError::Decode {
+                command: "read_file".to_owned(),
+                reason: format!(
+                    "the file's bytes arrived, but the size they were to be checked \
+                     against could not be read: {error}"
+                ),
+            })?;
         size.as_i64().ok_or_else(|| ClientError::Decode {
             command: "read_file".to_owned(),
             reason: format!(

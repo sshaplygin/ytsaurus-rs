@@ -133,6 +133,33 @@ fn a_size_the_cluster_cannot_answer_fails_the_read_rather_than_skipping_the_chec
 }
 
 #[test]
+fn a_size_check_that_never_got_an_answer_is_reported_as_the_read_it_belongs_to() {
+    // The `get` is `read_file`'s own machinery, and it fails *after* the whole
+    // file has already arrived. Handed back as itself, it reads `get:
+    // unexpected HTTP 500` — a command the caller never sent, whose obvious
+    // remedy is to send it again, which is not what their retry will do: it
+    // will download the file a second time and then ask again. So the error
+    // says `read_file`, says which part of it failed, and quotes the `get`'s
+    // own words rather than swallowing them.
+    let stub = FileStub::serving(file_of(100), Size::Unanswerable);
+
+    let error = stub
+        .client()
+        .read_file(PATH)
+        .expect_err("the size the body was to be checked against never arrived");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.starts_with("read_file"),
+        "the caller is sent after a command they never sent: {rendered}"
+    );
+    assert!(
+        rendered.contains("500"),
+        "the underlying failure was swallowed rather than quoted: {rendered}"
+    );
+}
+
+#[test]
 fn an_empty_file_reads_back_empty() {
     // Zero bytes recorded, zero bytes served: a legitimate file, not an edge
     // the check may refuse.
@@ -179,13 +206,18 @@ enum Size {
     Bytes(i64),
     /// `{"value"=%true}` — well-formed, and not a size.
     NotAnInteger,
+    /// Not answered at all: a 500 with no error document, which is what a
+    /// master hiccup between the two requests looks like from here.
+    Unanswerable,
 }
 
 impl Size {
-    fn body(&self) -> String {
+    /// The status line and body the stub answers a size `get` with.
+    fn reply(&self) -> (&'static str, String) {
         match self {
-            Size::Bytes(n) => format!(r#"{{"value"={n}}}"#),
-            Size::NotAnInteger => r#"{"value"=%true}"#.to_owned(),
+            Size::Bytes(n) => ("200 OK", format!(r#"{{"value"={n}}}"#)),
+            Size::NotAnInteger => ("200 OK", r#"{"value"=%true}"#.to_owned()),
+            Size::Unanswerable => ("500 Internal Server Error", String::new()),
         }
     }
 }
@@ -206,7 +238,7 @@ impl FileStub {
         let connections = Arc::new(Mutex::new(0_usize));
 
         let file = Arc::new(file);
-        let size = Arc::new(size.body());
+        let size = Arc::new(size.reply());
         let seen = Arc::clone(&heads);
         let counted = Arc::clone(&connections);
         std::thread::spawn(move || {
@@ -256,7 +288,12 @@ impl FileStub {
 }
 
 /// Answers requests on one connection until the client hangs up.
-fn serve(stream: &TcpStream, file: &[u8], size: &str, seen: &Mutex<Vec<String>>) {
+fn serve(
+    stream: &TcpStream,
+    file: &[u8],
+    size: &(&'static str, String),
+    seen: &Mutex<Vec<String>>,
+) {
     // So a connection the client keeps pooled but never uses again does not
     // hold a thread for the lifetime of the test binary.
     stream
@@ -266,15 +303,15 @@ fn serve(stream: &TcpStream, file: &[u8], size: &str, seen: &Mutex<Vec<String>>)
     let mut reader = BufReader::new(stream.try_clone().expect("clones"));
 
     while let Some(head) = read_request(&mut reader) {
-        let body: &[u8] = if head.starts_with("GET /api/v4/read_file ") {
-            file
+        let (status, body): (&str, &[u8]) = if head.starts_with("GET /api/v4/read_file ") {
+            ("200 OK", file)
         } else {
-            size.as_bytes()
+            (size.0, size.1.as_bytes())
         };
         seen.lock().expect("not poisoned").push(head);
 
         let reply = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
             body.len()
         );
         if writer.write_all(reply.as_bytes()).is_err() || writer.write_all(body).is_err() {

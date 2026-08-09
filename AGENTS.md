@@ -317,7 +317,10 @@ per command. Cluster facts:
 - `check_permission`, `read_file` and `get_supported_features` are all
   registered and none is modelled here; they are the natural first users of the
   raw door. *(`list_operations` was on this list until the operation lifecycle
-  landed; it has a method now.)*
+  landed; it has a method now. So does `read_file`: `Client::read_file` and
+  `Client::read_file_streaming`, which leaves `check_permission` and
+  `get_supported_features` — and leaves the `raw` example reading a file
+  because its wire shape is now verified, not because nothing else can.)*
 - **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
   envelope is keyed by what the command returns, the same trap that made
   `exists` read the wrong key for two releases. Captured from a local cluster:
@@ -328,7 +331,23 @@ per command. Cluster facts:
   `user_tokens_metadata`.
 - **`read_file` streams and `write_file` takes a chunked body**, verified with
   a 4 MB round trip through `Client::raw_command_streaming` and
-  `raw_command_upload` — neither direction holds the file.
+  `raw_command_upload` — neither direction holds the file. `Client::read_file`
+  and `Client::read_file_streaming` are that round trip written down, and the
+  buffered half needs a check the streaming half cannot have: a file's bytes
+  carry no framing, so a body cut short by a mid-stream failure looks exactly
+  like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot
+  read. It compares the body against the node's `@uncompressed_data_size` —
+  the *logical* size, measured against a `compression_codec=zlib_6` node
+  reading 1 000 000 bytes back off 1983 on disk. There is no `@file_size`:
+  asked for one, the cluster answers `Attribute "file_size" is not found`.
+- **A rich path does nothing to a file read**, measured on a 1000-byte file:
+  `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads back all
+  1000 bytes and says nothing — a file is sliced by the command's `offset` and
+  `length` parameters, never by limits on the path — and `//tmp/f[#0:#10]`
+  likewise returns all 1000, then fails `read_file`'s size check, because
+  `//tmp/f[#0:#10]/@uncompressed_data_size` is not a path the cluster parses
+  (`Error reading parameter /path: Unexpected token "/" of type "slash"`).
+  So `read_file` documents a plain node path; #12 is where selection goes.
 
 ### Authentication and compression
 

@@ -85,6 +85,18 @@ const LOCATION: &str = "Location";
 /// changed the policy and not the numbers.
 const MAX_REDIRECTS: usize = 10;
 
+/// How much of a response [`Transport::send`] will hold in memory — 512 MiB.
+///
+/// Buffered responses are small (a table or file read is the exception, and a
+/// launcher reads results, not bulk data), and `ureq`'s own default is
+/// conservative enough to truncate a modest table silently, which is the
+/// failure this number exists to avoid. It is not a promise that half a
+/// gigabyte in a `Vec` is a good idea: the two commands that reach it in
+/// practice — [`Client::read_table`](crate::Client::read_table) and
+/// [`Client::read_file`](crate::Client::read_file) — each have a streaming
+/// half that holds nothing, and the error names it (see [`body_failure`]).
+const RESPONSE_LIMIT: u64 = 512 * 1024 * 1024;
+
 /// The commands that carry a data stream, and so belong on a heavy proxy.
 ///
 /// The
@@ -112,14 +124,14 @@ const MAX_REDIRECTS: usize = 10;
 /// [`Client::raw_command`](crate::Client::raw_command) that is heavy and not
 /// listed here loses the advice, not the refusal.
 ///
-/// **Merge marker.** `Repeatable` grows a `Heavy` variant on
-/// `feature/heavy-proxy-routing` (#38), which encodes the cluster's `isHeavy`
-/// bit for routing. The two lists say the same thing about the same commands
-/// and are written down twice, so **whoever merges that branch must check this
-/// list against every `Repeatable::Heavy` call site** and reconcile the two —
-/// a command routed to a heavy proxy but missing here is refused a redirect
-/// with `heavy: false`, and told nothing it can act on. There is no test to
-/// catch it from this side: `Repeatable::Heavy` does not exist on this branch.
+/// **The same fact is written down twice.** [`Repeatable::Heavy`] encodes the
+/// cluster's `isHeavy` bit for *routing* (#38, since merged), and this list
+/// encodes it for the redirect advice; they say the same thing about the same
+/// commands. A command routed to a heavy proxy but missing here is refused a
+/// redirect with `heavy: false` and told nothing it can act on, so a new
+/// `Repeatable::Heavy` call site must be checked against this list. The one
+/// entry that has no call site to check against is `read_blob_table`, and
+/// that is the point of the paragraph above.
 const HEAVY: &[&str] = &[
     "read_table",
     "write_table",
@@ -1190,19 +1202,9 @@ impl Transport {
         let body = response
             .body_mut()
             .with_config()
-            // Responses are small (a table read is the exception, and a
-            // launcher reads results, not bulk data). The default cap is
-            // conservative enough to truncate a modest table silently.
-            .limit(512 * 1024 * 1024)
+            .limit(RESPONSE_LIMIT)
             .read_to_vec()
-            // A `Transport` error, not `Decode`: a connection cut while the
-            // body streams in is the same network failure as one cut a packet
-            // earlier, and `Decode` is the one thing the retry policy never
-            // repeats.
-            .map_err(|e| ClientError::Transport {
-                command: command.to_owned(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| body_failure(command, e))?;
 
         if !(200..300).contains(&status) {
             return Err(ClientError::Http {
@@ -2108,6 +2110,58 @@ fn refusal_hint(error: ClientError, why: &str) -> ClientError {
             raw,
         },
         other => other,
+    }
+}
+
+/// Which error a buffered response body failed with, and whose fault it is.
+///
+/// Two failures arrive down the same road and mean opposite things.
+///
+/// A connection cut while the body streams in is the same network failure as
+/// one cut a packet earlier, so it stays a [`ClientError::Transport`]: worth
+/// waiting and repeating where the command allows it, and — for a heavy
+/// command — a fair reason to drop the host it went to.
+///
+/// A body that ran past [`RESPONSE_LIMIT`] is neither, and left as a
+/// `Transport` it would be read as both. `ureq` reports it as
+/// `Error::BodyExceedsLimit`, which is not an `Io` error, so every predicate
+/// that narrows `Transport` by looking inside — [`crate::retry::is_retriable`],
+/// and through it [`crate::retry::worth_asking_again`] and
+/// [`crate::retry::attributable_to_the_host`] — answers `true` for it. The
+/// consequences are not this caller's alone: a 600 MiB
+/// [`Client::read_file`](crate::Client::read_file) would download 512 MiB,
+/// fail, and take a **healthy** data proxy out of the pool for it; enough of
+/// them empty the pool, and the fallback window then answers unrelated
+/// *writes* with the control-proxy refusal [#30] exists to prevent. Nothing
+/// about that is the host's doing — it served the request perfectly — and no
+/// amount of waiting shrinks the file.
+///
+/// So it becomes a [`ClientError::Decode`], which is the class that means
+/// *settled, and about the request rather than the addressee*: never retried,
+/// never blamed on a host. The message names the cap and the way past it,
+/// because "transport error: the response body is larger than request limit:
+/// 536870912" names neither, and the caller's own next move — the streaming
+/// half of the same command — is a method they may not know exists.
+///
+/// [#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
+fn body_failure(command: &str, error: ureq::Error) -> ClientError {
+    let ureq::Error::BodyExceedsLimit(limit) = error else {
+        return ClientError::Transport {
+            command: command.to_owned(),
+            source: Box::new(error),
+        };
+    };
+
+    let instead = match command {
+        "read_file" => " — Client::read_file_streaming moves the same bytes without holding them",
+        "read_table" => " — Client::read_table_streaming moves the same bytes without holding them",
+        _ => "",
+    };
+    ClientError::Decode {
+        command: command.to_owned(),
+        reason: format!(
+            "the response ran past the {limit} bytes this client will hold in memory{instead}"
+        ),
     }
 }
 
@@ -4173,8 +4227,9 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         // Every command this crate itself sends heavily is here. `get_job_stderr`
         // was the one that was not, and it is the one a launcher reaches for
         // while it is already diagnosing a failure — the worst moment to be
-        // handed a refusal with no advice in it. See the merge marker on
-        // [`HEAVY`]: #38 writes the same fact down a second time.
+        // handed a refusal with no advice in it. See [`HEAVY`]:
+        // `Repeatable::Heavy` writes the same fact down a second time, and the
+        // two have to agree.
         for command in [
             "read_table",
             "write_table",
@@ -4192,6 +4247,61 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         for command in ["create", "exists", "start_operation", "get_job", "hosts"] {
             assert!(!HEAVY.contains(&command), "{command}");
         }
+    }
+
+    #[test]
+    fn a_body_over_the_cap_blames_the_request_and_not_the_proxy_that_served_it() {
+        // The mutation this exists to fail is the obvious one — `map_err(|e|
+        // ClientError::Transport { .. })` over the whole `read_to_vec`, which
+        // is what was here. `ureq` reports the cap as `BodyExceedsLimit`,
+        // which is not an `Io` error, so all three predicates that narrow a
+        // `Transport` by looking inside it wave it through: the read would be
+        // *retried* where the command allows it, and a heavy one would drop
+        // the host from the pool. The host did nothing wrong. Enough 600 MiB
+        // reads on a split-role installation empty the pool that way and the
+        // fallback window answers unrelated writes with the control proxy's
+        // refusal, which is #30 arriving from a caller who only asked for a
+        // large file.
+        let error = body_failure("read_file", ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT));
+
+        assert!(matches!(error, ClientError::Decode { .. }), "{error:?}");
+        assert!(!crate::retry::is_retriable(&error), "{error}");
+        assert!(!crate::retry::worth_asking_again(&error), "{error}");
+        assert!(!crate::retry::attributable_to_the_host(&error), "{error}");
+
+        // And it says both things the caller needs: how big is too big, and
+        // what to call instead. `transport error: the response body is larger
+        // than request limit: 536870912` said neither.
+        let message = error.to_string();
+        assert!(message.contains("536870912"), "{message}");
+        assert!(message.contains("read_file_streaming"), "{message}");
+
+        // Each buffered read points at its own streaming half, and a command
+        // that has none promises nothing.
+        let table =
+            body_failure("read_table", ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT)).to_string();
+        assert!(table.contains("read_table_streaming"), "{table}");
+        let get = body_failure("get", ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT)).to_string();
+        assert!(!get.contains("streaming"), "{get}");
+    }
+
+    #[test]
+    fn a_body_cut_short_is_still_the_network_failure_it_always_was() {
+        // The other half, and the reason the split is a `match` rather than a
+        // blanket `Decode`: a connection cut while the body streams in is the
+        // same failure as one cut a packet earlier, worth waiting for and —
+        // for a heavy command — worth trying another host for.
+        let error = body_failure(
+            "read_file",
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        );
+
+        assert!(matches!(error, ClientError::Transport { .. }), "{error:?}");
+        assert!(crate::retry::is_retriable(&error), "{error}");
+        assert!(crate::retry::attributable_to_the_host(&error), "{error}");
     }
 
     #[test]
