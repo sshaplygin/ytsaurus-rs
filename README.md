@@ -90,10 +90,28 @@ its source changes. If it fails, the error carries the job's own stderr rather
 than a state string. See [examples/src/bin/selfrun.rs](examples/src/bin/selfrun.rs);
 the full walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 
+```sh
+# a local cluster is plain HTTP
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun
+
+# an https cluster needs the launcher to have TLS
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun --features tls
+```
+
+The flag changes the **launcher** only: `examples/` turns `ytsaurus-client`'s
+`tls` feature off so `build-worker.sh` can cross-compile to musl with nothing
+but the Rust toolchain, and the musl worker still carries no TLS either way.
+
+**Against a cluster that is not a local one** — a private CA, heavy proxies in
+another domain, a shared file cache — see [the runbook in
+tests/e2e/README.md](tests/e2e/README.md#against-a-cluster-that-is-not-the-local-one).
+
 ## Build and test
 
 ```sh
-cargo test --workspace          # 343 tests
+cargo test --workspace          # 759 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```
@@ -161,10 +179,12 @@ RSS at all** — 46.6 MiB before and after on Linux CI, 1.9 → 2.0 MiB on macOS
 (the absolute figure is the test binary's own footprint, which differs by
 platform; the invariant is that it does not grow). Streaming a 67.7 MiB table
 out of a cluster costs **1.0 MiB** of peak RSS against 70.9 MiB to read it into
-memory. Decoding YSON is **~10 %** of the pilot job's time on a cluster, against
-66 % for a job that does nothing but decode — which is the measurement Skiff has
-to beat to be worth switching to. Fuzzing ran 6.5 M iterations across both YSON
-formats without a crash.
+memory. Decoding YSON is **~10 %** of the pilot job's time on the local Docker
+cluster and **36 %** of the same job on a production one, against 66 % for a job
+that does nothing but decode — two readings 3.4× apart, which is why the Skiff
+question is recorded as **open** rather than answered; see
+[docs/benchmarking.md](docs/benchmarking.md). Fuzzing ran 6.5 M iterations
+across both YSON formats without a crash.
 
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).

@@ -24,8 +24,15 @@
 //! ```
 //!
 //! `YT_PROFILE_MIB` sets the table size (default 48) and `YT_PROFILE_ROUNDS`
-//! how many times to run each mode (default 3, of which the **fastest** counts
+//! how many times to run each mode (default 5, of which the **fastest** counts
 //! — a slow round is interference, a fast one cannot be).
+//!
+//! The default was 3, and on a shared production cluster 3 was not enough to
+//! produce an answer at all: the modes came out in the wrong order and the
+//! example correctly refused to report a number. A busy cluster is a noisier
+//! instrument than a quiet local one, and the rounds are what buys the quiet
+//! back — raise it further, rather than believing a run that says it could not
+//! separate the phases.
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -67,7 +74,7 @@ fn run() -> Result<(), ClientError> {
     }
 
     let mib = number("YT_PROFILE_MIB", 48);
-    let rounds = number("YT_PROFILE_ROUNDS", 3).max(1);
+    let rounds = number("YT_PROFILE_ROUNDS", 5).max(1);
     let input = format!("{BASE}/events");
 
     step(&format!("Writing about {mib} MiB of access-log events"));
@@ -187,12 +194,64 @@ fn run() -> Result<(), ClientError> {
              question turns on."
         );
     }
-    println!(
-        "One local cluster, x86-64 under emulation on this machine. A number to \
-         start an argument with, not to end one: docs/benchmarking.md says what \
-         settles it."
-    );
+    println!("{}", caption(&client, rounds, mib, &measured, separable));
     Ok(())
+}
+
+/// The sentence under the table, built out of the run that produced it.
+///
+/// It used to read *"one local cluster, x86-64 under emulation on this
+/// machine"*, which was true of the laptop the example was written on and of
+/// nothing else. On a production cluster it made a real measurement look like a
+/// fabricated one — the caveat was right to be there, it was just describing
+/// somewhere the numbers had not come from.
+///
+/// The cluster names itself in `//sys/@cluster_name`, which `cluster_info`
+/// already reads, and a cluster is under no obligation to have a name — so a
+/// missing one, or a failure to ask, leaves the sentence describing the run
+/// alone rather than failing a measurement that has already been taken. Asked
+/// without an `exists` in front of it, unlike `cluster_info`'s: there the read
+/// is the thing being demonstrated, here it is a caption, and a cluster with no
+/// name costs one refused request rather than an extra one every time.
+///
+/// The per-mode times are quoted because they are the whole of what "best of"
+/// is worth: a spread of 1395 to 3331 ms on a shared cluster is a noisier
+/// instrument than a quiet local one, and a reader who cannot see the spread
+/// cannot see that. They are the **modes**, not the phases in the table above —
+/// `parse` is everything up to and including decoding, and the table's
+/// `decoding them` is `parse` minus `frames`.
+///
+/// `separable` decides the last sentence. A run that has just said it could not
+/// separate the phases has no number to start an argument with, and offering
+/// one there is how a refusal gets misread as a result.
+fn caption(
+    client: &Client,
+    rounds: u64,
+    mib: u64,
+    measured: &[(&str, i64)],
+    separable: bool,
+) -> String {
+    let where_it_ran = match client.get_as::<String>("//sys/@cluster_name") {
+        Ok(name) if !name.trim().is_empty() => format!("Measured on {name}"),
+        _ => "Measured".to_owned(),
+    };
+    let best: Vec<String> = measured
+        .iter()
+        .map(|(label, ms)| format!("{label} {ms} ms"))
+        .collect();
+    let worth = if separable {
+        "A number to start an argument with, not to end one: docs/benchmarking.md \
+         says what settles it."
+    } else {
+        "docs/benchmarking.md says what a reading of this is worth even when the \
+         modes do come out in order."
+    };
+
+    format!(
+        "{where_it_ran} over {rounds} rounds of {mib} MiB, keeping the best of \
+         each mode ({}). {worth}",
+        best.join(", ")
+    )
 }
 
 fn number(name: &str, default: u64) -> u64 {

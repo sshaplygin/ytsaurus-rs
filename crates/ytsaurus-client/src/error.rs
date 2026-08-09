@@ -17,7 +17,7 @@ pub type Result<T, E = ClientError> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum ClientError {
     /// The request could not be made, or the connection failed.
-    #[error("{command}: transport error: {source}")]
+    #[error("{command}: transport error: {source}{}", certificate_advice(.source))]
     Transport {
         /// The API command being attempted.
         command: String,
@@ -315,6 +315,44 @@ pub enum RedirectRefusal {
     TooMany,
 }
 
+/// The sentence a rejected root store needs, and nothing else does.
+///
+/// `invalid peer certificate: UnknownIssuer` is the whole of what a cluster
+/// behind a private CA says on its first request, and it names neither the two
+/// things that fix it nor the fact that this client's roots are not the
+/// machine's. Every internal installation begins there — the `yt` CLI and the Go
+/// SDK read the system store, so the machine where `curl` works is exactly the
+/// machine where this fails — and the message that arrives is one word about a
+/// certificate.
+///
+/// Classified by [`crate::retry::settled_certificate_verdict`] rather than by
+/// looking for the word here. That function narrows three times — an
+/// `ureq::Error::Io` of kind `InvalidData`, carrying `rustls`'s `invalid peer
+/// certificate: ` prefix, whose reason **starts with** a settled verdict — and
+/// every one of them matters to this message. A plain `contains("UnknownIssuer")`
+/// would fire on `Other(OtherError("UnknownIssuer lookup failed"))`, which
+/// `retry` deliberately treats as retriable: it is `rustls-platform-verifier`
+/// reporting a passing condition of *this machine*, so the advice would tell a
+/// build that already has the platform verifier to go and enable it.
+///
+/// Only `UnknownIssuer` gets this. `NotValidForName` is a certificate that does
+/// not cover the host asked for, which no root store mends, and pointing its
+/// reader at a CA bundle would send them to rewrite the one thing that is
+/// working.
+fn certificate_advice(source: &ureq::Error) -> &'static str {
+    if crate::retry::settled_certificate_verdict(source) == Some("UnknownIssuer") {
+        " The chain does not end in a root this client trusts, which is the \
+         Mozilla bundle compiled in and not what the machine trusts: point \
+         YT_CA_BUNDLE at a PEM file of roots (the `yt` CLI reads the same \
+         variable; on Linux the system bundle is usually \
+         /etc/ssl/certs/ca-certificates.crt), or build with the \
+         `platform-verifier` feature to trust whatever the operating system \
+         does."
+    } else {
+        ""
+    }
+}
+
 /// The sentence only a heavy command can act on. See [`ClientError::Redirected`].
 fn redirect_advice(heavy: &bool) -> &'static str {
     if *heavy {
@@ -584,6 +622,57 @@ mod tests {
 
             assert!(text.ends_with(suffix), "limit {limit}: {kept:?}");
             assert!(suffix.len() <= limit.max(text.len()), "limit {limit}");
+        }
+    }
+
+    /// A transport failure carrying the `io::Error` `ureq` would have carried.
+    fn transport(message: &str) -> ClientError {
+        ClientError::Transport {
+            command: "get".to_owned(),
+            source: Box::new(ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message.to_owned(),
+            ))),
+        }
+    }
+
+    #[test]
+    fn an_untrusted_root_names_the_two_things_that_change_it() {
+        // Verbatim what a cluster behind a private CA answers on the very first
+        // request, before any YTsaurus logic runs. On its own it says nothing
+        // about whose roots were consulted or how to change them, and the
+        // machine it fails on is usually one where `curl` works.
+        let message = transport("invalid peer certificate: UnknownIssuer").to_string();
+
+        assert!(message.contains("UnknownIssuer"), "{message}");
+        assert!(message.contains("YT_CA_BUNDLE"), "{message}");
+        assert!(message.contains("platform-verifier"), "{message}");
+    }
+
+    #[test]
+    fn other_transport_failures_are_left_alone() {
+        // A certificate that does not cover the host asked for is not a root
+        // store problem, and a connection refused is not a TLS problem at all.
+        // Advising a CA bundle for either sends the reader to rewrite the one
+        // part of the configuration that is working.
+        for message in [
+            "invalid peer certificate: certificate not valid for name \
+             \"cluster.example.net\"",
+            "connection refused",
+            // The one that a `contains` would get wrong, and the reason this
+            // goes through `retry`'s classifier rather than looking for the
+            // word: `Other(..)` is `rustls-platform-verifier` reporting a
+            // passing condition of this machine — a revocation lookup that
+            // timed out, a trust store briefly unreadable — which `retry`
+            // treats as worth another attempt. Only that verifier produces it,
+            // so advising `platform-verifier` here would be advice to enable
+            // what is already on.
+            "invalid peer certificate: Other(OtherError(\"UnknownIssuer lookup failed\"))",
+        ] {
+            let rendered = transport(message).to_string();
+            // `ureq` renders an `Error::Io` with an `io: ` of its own, so this
+            // is the whole message and nothing has been appended to it.
+            assert_eq!(rendered, format!("get: transport error: io: {message}"));
         }
     }
 }

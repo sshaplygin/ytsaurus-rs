@@ -287,15 +287,33 @@ machine where the CLI already works needs nothing else. A token read from a file
 is trimmed — `echo token > ~/.yt/token` leaves a newline, and sending it fails
 authentication with an error that never mentions a newline.
 
-**Table and file data goes to a proxy that will accept it**, which is the one
-way a real installation differs from a local one that the caller would otherwise
-have to know about — see [where a heavy command goes](#where-a-heavy-command-goes).
+**Table and file data goes to a proxy that will accept it**, which is the
+difference between a real installation and a local one that costs the most time
+— see [where a heavy command goes](#where-a-heavy-command-goes).
+
+Four more variables exist because every example ships built on `from_env`, and a
+policy settable only in Rust is a policy those examples cannot be run under.
+Each is inert when unset, so a machine that sets none gets exactly what
+`Client::new` gives:
+
+| | |
+| --- | --- |
+| `YT_PROXY_SUFFIX` | Completes a bare cluster name — `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Applied only to a name with no dot, no colon and no `localhost` in it, the gate the Go SDK uses. No suffix is compiled in: this client is not one installation's. |
+| `YT_HEAVY_PROXY_DOMAINS` | `Client::with_heavy_proxies_under`, comma- or space-separated. |
+| `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes` for `Client::with_heavy_proxies_anywhere`. Applied after the domains, so the wider of the two wins rather than whichever was exported last. |
+| `YT_FILE_CACHE` | `Client::with_file_cache`, for an installation whose shared worker cache is read-only to you. |
+
+A variable set to nothing counts as unset — `export YT_FILE_CACHE=` is how a
+shell profile turns one back off — and that goes for `YT_PROXY` too, which then
+earns the same message as a missing one.
 
 **A cluster behind a private CA needs its CA named.** A bare host name in
 `YT_PROXY` means `https://`, and TLS here is `rustls` with the Mozilla root
 bundle compiled in — so an installation whose certificate chains to a corporate
 CA is refused with `invalid peer certificate: UnknownIssuer`, however happily
-`curl` talks to it. `YT_CA_BUNDLE` names a PEM file to trust instead:
+`curl` talks to it. That refusal now carries both ways out with it, because
+nothing else about it suggests whose roots were consulted. `YT_CA_BUNDLE` names
+a PEM file to trust instead:
 
 ```sh
 export YT_PROXY=cluster.example.net
@@ -697,7 +715,7 @@ all.
 `https://cluster.example.net` will follow `n0132-sas.example.net` and will not
 follow `n0132-sas.somewhere-else.net`; a bare cluster name — `YT_PROXY=hume`,
 the usual spelling — is matched as a *label*, so it follows
-`n0008-sas.hume.yt.yandex.net`; the scheme and the port come from your address,
+`n0008-sas.hume.yt.example.net`; the scheme and the port come from your address,
 not from the answer; and a name carrying `://`, `/`, `@` or whitespace is not a
 name. When a whole answer is declined the client says so, once, naming what it
 refused and why.
@@ -714,18 +732,26 @@ suffix rule with no public-suffix list behind it treats
 `yt-1234.us-east-1.elb.amazonaws.com` as sharing a domain with every other load
 balancer in that region.
 
-Three ways to say which names are allowed, then:
+Four ways to say which names are allowed, then:
 
-| | |
-| --- | --- |
-| default | the domain rule above |
-| `Client::with_heavy_proxies_in([…])` | exactly these names — the one that is a boundary, because you wrote it |
-| `Client::with_heavy_proxies_anywhere(true)` | wherever `/hosts` says |
+| | | From the environment |
+| --- | --- | --- |
+| default | the domain rule above | |
+| `Client::with_heavy_proxies_under([…])` | that domain **and** the ones you name — for an installation whose heavy proxies live in a zone of their own | `YT_HEAVY_PROXY_DOMAINS` |
+| `Client::with_heavy_proxies_in([…])` | exactly these names — the one that is a boundary, because you wrote it | |
+| `Client::with_heavy_proxies_anywhere(true)` | wherever `/hosts` says — which is what the official Go SDK does | `YT_HEAVY_PROXIES_ANYWHERE=1` |
 
-The symptom of needing either of the last two is an upload refused at your own
+The symptom of needing any of the last three is an upload refused at your own
 address — `Control proxy may not serve heavy requests with input data` — while
 `heavy_proxy()` shows a perfectly good one the client declined to use. That
-refusal now says as much itself.
+refusal now says as much itself, and names all three.
+
+The middle one is the one a large installation usually wants. Naming a domain
+survives a proxy rotation, where a written-out list of seventy-nine names does
+not, and it is still a boundary rather than the absence of one. The environment
+can only ever **widen** this rule: `with_heavy_proxies_in` is the mode that is a
+boundary, and a boundary a variable could set is a boundary a variable could
+move.
 
 Without any of this, the failure is not obvious. The refusal arrives as
 `cluster error 1: Control proxy may not serve heavy requests with input data` —

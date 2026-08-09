@@ -31,11 +31,21 @@ module version is available.
 | `SkiffJobWriter` | **Implemented for dynamic rows** | one single-table Skiff stream per descriptor; input-only system fields rejected; real `skiff_cat` worker e2e |
 | Shared worker/client format selection | **Implemented** | non-exhaustive `DataFormat` enum drives worker I/O, operation specs, and direct table I/O; YSON and Skiff remain explicit row representations |
 | Map / map-reduce / reduce / vanilla Skiff operation formats | **Implemented** | rendered spec tests for map, mapper, reducer and vanilla task; a format whose table-schema count cannot describe the operation's tables is refused before the spec is sent; binary YSON remains the default |
-| Skiff table client I/O | **Implemented for validated dynamic streams** | mock-proxy request-shape/truncation tests and runnable `skiff_launch`; real-cluster Go/Rust table tests still required |
+| Skiff table client I/O | **Implemented; the single-table map path is cluster-verified** | mock-proxy request-shape/truncation tests, plus `skiff_launch` run against a managed multi-node cluster on 2026-08-09: a Skiff stream written, mapped and read back, both rows compared element by element including non-UTF-8 `string32`. That covers **one** table and **one** output descriptor; the multi-table shapes of required test 4 and the Go-against-the-cluster half are still required. |
 
 No typed row codec or inference API is claimed compatible until its ship gate is
 green. The implemented dynamic APIs remain pre-release until the real-cluster
 and bidirectional Go gates below are green.
+
+**What the 2026-08-09 cluster run did and did not settle.** It settles that the
+dynamic Skiff *map* path works against a real multi-node installation end to end
+— which until then had only been asserted against a mock proxy and a local
+worker. It settles nothing about table indexes, row or range indexes, key
+switches or multiple output descriptors, because a one-table, one-output map
+never emits any of them; and the Go side ran only against checked-in vectors,
+never against the cluster. Required test 4 below is therefore still open, and
+the sentence to use about all this is "the dynamic Skiff map path is
+cluster-verified", not "Skiff is cluster-verified".
 
 ## Required tests
 
@@ -58,6 +68,11 @@ and bidirectional Go gates below are green.
    canonical and decoded values otherwise.
 4. **Cluster fixtures.** Capture raw Skiff streams from real jobs. Cover table
    indexes, row/range indexes, key switches and multiple output descriptors.
+   **Open.** `skiff_launch` has now run on a real cluster (see the matrix row
+   above) and covers none of these four: it is one input table and one output
+   descriptor by construction. The piece that does not need Go on the cluster is
+   a two-input, two-output Skiff shape — the same gap `cat --tables 2` fills for
+   the YSON path — and that is the next thing to write here.
 5. **Regression.** Existing binary-YSON unit, offline e2e and cluster e2e tests
    stay green. Skiff is additive and must not alter their byte-exact behavior.
 

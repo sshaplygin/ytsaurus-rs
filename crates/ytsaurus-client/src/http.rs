@@ -575,7 +575,7 @@ impl Destination<'_> {
 
 /// Which of the names `/hosts` gives back this client is willing to use.
 ///
-/// Three answers, because the two the crate shipped with were "everything the
+/// Four answers, because the two the crate shipped with were "everything the
 /// domain rule allows" and "everything at all" — and the only cure for a domain
 /// rule that misses by one label was to give up the control entirely. See
 /// [`heavy_base`] for what the rule is and, more to the point, what it is worth.
@@ -583,6 +583,27 @@ impl Destination<'_> {
 enum HeavyHosts {
     /// The configured address's own domain, the default. See [`same_domain`].
     SameDomain,
+    /// That domain **and** the ones named here, which is what an installation
+    /// publishing its heavy proxies in a second zone actually has: a cluster at
+    /// `cluster.example.net` whose `/hosts` answers
+    /// `n0132-sas.rack7.proxy-zone.net` needs `proxy-zone.net`
+    /// added, not the rule removed. See [`under_domain`].
+    Under {
+        /// The domains as [`Transport::set_heavy_proxies_under`] normalised
+        /// them: lowercased, without wildcard, scheme, port or stray dots, and
+        /// without duplicates.
+        domains: Vec<String>,
+        /// What was handed in and could not be used — an entry with no dot left
+        /// in it, which would admit a whole top-level domain if honoured.
+        ///
+        /// **Kept in order to be reported.** The setter has no failure path, so
+        /// an entry it drops would otherwise vanish: the rule stays where it
+        /// was, every refusal reads exactly as if the caller had configured
+        /// nothing, and `YT_HEAVY_PROXY_DOMAINS=net` looks from the outside like
+        /// a variable that was ignored — which is the shape of the very problem
+        /// this mode exists to end. [`Declined::because`] names these.
+        ignored: Vec<String>,
+    },
     /// Wherever `/hosts` says, checked for being a host name and nothing else.
     Anywhere,
     /// Exactly these names, compared without case — and a port only where both
@@ -602,6 +623,12 @@ impl HeavyHosts {
     fn admits(&self, configured: &str, discovered: &str) -> bool {
         match self {
             Self::SameDomain => same_domain(host_of(configured), host_of(discovered)),
+            Self::Under { domains, .. } => {
+                same_domain(host_of(configured), host_of(discovered))
+                    || domains
+                        .iter()
+                        .any(|domain| under_domain(domain, host_of(discovered)))
+            }
             Self::Anywhere => true,
             Self::Only(names) => names.iter().any(|name| same_name(name, discovered)),
         }
@@ -649,6 +676,25 @@ impl Declined {
             (Self::Malformed, _) => "is not a host name".to_owned(),
             (Self::Elsewhere, HeavyHosts::Only(_)) => {
                 "is not one of the names with_heavy_proxies_in was given".to_owned()
+            }
+            // The domains are named because the whole point of this mode is
+            // that one more was needed: an operator reading the refusal has to
+            // see the list they wrote, or the next guess is that it was ignored.
+            // And what was dropped is named for the same reason, the other way
+            // round: an entry that is not a domain would otherwise change
+            // nothing and say nothing, which reads exactly like a variable this
+            // client never looked at.
+            (Self::Elsewhere, HeavyHosts::Under { domains, ignored })
+                if !domains.is_empty() || !ignored.is_empty() =>
+            {
+                let mut why = format!("is not under the domain of {}", host_of(configured));
+                if !domains.is_empty() {
+                    why.push_str(&format!(" or under {}", domains.join(", ")));
+                }
+                if !ignored.is_empty() {
+                    why.push_str(&format!(" (ignored, not a domain: {})", ignored.join(", ")));
+                }
+                why
             }
             (Self::Elsewhere, _) => {
                 format!("is not under the domain of {}", host_of(configured))
@@ -800,6 +846,78 @@ impl Transport {
         self.forget_heavy();
     }
 
+    /// Widens the domain rule by the domains named, keeping the configured
+    /// address's own.
+    ///
+    /// Normalised here rather than at each comparison: a domain arrives from a
+    /// configuration file or an environment variable as often as from a
+    /// literal, and every way a person writes one has to mean the same thing.
+    /// `*.Proxy-Zone.NET. `, `https://proxy-zone.net` and `proxy-zone.net:443`
+    /// all normalise to `proxy-zone.net` — the wildcard because that is how a
+    /// zone gets described in prose and in a certificate, the scheme and port
+    /// because [`same_name`] tolerates both for
+    /// [`crate::Client::with_heavy_proxies_in`] and a caller has no reason to
+    /// expect these two to differ.
+    ///
+    /// **An entry with no dot left in it is not used.** `net` is a plausible
+    /// typo for a real domain and would admit every `.net` host `/hosts` could
+    /// name, which is [`crate::Client::with_heavy_proxies_anywhere`] with extra
+    /// steps. [`same_domain`] never shortens below two labels for the same
+    /// reason; that floor is not the public-suffix argument, and dropping it
+    /// because a human typed the value rather than deriving it would be
+    /// backwards. `""` goes the same way — it would make the suffix test
+    /// `ends_with(".")`, which is no test at all.
+    ///
+    /// Such an entry is **kept in `ignored` and named in the refusal**, not
+    /// forgotten. This is a builder with no failure path, so dropping one in
+    /// silence would leave the rule where it was and every message reading
+    /// exactly as though the caller had configured nothing — an operator who
+    /// sets `YT_HEAVY_PROXY_DOMAINS` and sees no change learns nothing about
+    /// why, which is the shape of the problem this mode exists to end. See
+    /// [`Declined::because`].
+    ///
+    /// Duplicates go too, and the four spellings above are why: they all
+    /// normalise to one string, and a refusal listing `proxy-zone.net,
+    /// proxy-zone.net` reads as a bug in the client to the one person it is
+    /// written for. Order is the caller's, first mention winning.
+    pub(crate) fn set_heavy_proxies_under(&mut self, domains: Vec<String>) {
+        let mut kept: Vec<String> = Vec::with_capacity(domains.len());
+        let mut ignored: Vec<String> = Vec::new();
+
+        for domain in &domains {
+            // `host_of` first, then the dots: it reads a URL, so a trailing dot
+            // trimmed off `https://proxy-zone.net./` before it would leave the
+            // path behind and the dot in place.
+            let normalised = host_of(domain.trim())
+                .trim_start_matches('*')
+                .trim_matches('.')
+                .to_ascii_lowercase();
+
+            // An entry that is nothing at all is a list artefact — a trailing
+            // comma in `YT_HEAVY_PROXY_DOMAINS`, a blank line in a config — and
+            // reporting it would put "(ignored, not a domain: )" in front of
+            // somebody who did not write anything to be told about.
+            if normalised.is_empty() {
+                continue;
+            }
+
+            let (into, value) = if normalised.contains('.') {
+                (&mut kept, normalised)
+            } else {
+                (&mut ignored, domain.trim().to_owned())
+            };
+            if !into.contains(&value) {
+                into.push(value);
+            }
+        }
+
+        self.hosts = HeavyHosts::Under {
+            domains: kept,
+            ignored,
+        };
+        self.forget_heavy();
+    }
+
     /// Overrides the budget for one `/hosts` lookup.
     pub(crate) fn set_hosts_timeout(&mut self, timeout: Duration) {
         self.hosts_timeout = timeout;
@@ -813,6 +931,23 @@ impl Transport {
     /// Overrides how old a `/hosts` answer may grow before it is refreshed.
     pub(crate) fn set_host_list_refresh_interval(&mut self, interval: Duration) {
         self.host_list_refresh = interval;
+    }
+
+    /// The address the caller configured, for a test that has to see where a
+    /// client was pointed without sending anything to it.
+    #[cfg(test)]
+    pub(crate) fn configured_address(&self) -> &str {
+        &self.base
+    }
+
+    /// Which discovered hosts this transport would use, rendered.
+    ///
+    /// `#[cfg(test)]`, and a string rather than the enum: [`HeavyHosts`] is
+    /// private to this module and worth keeping that way — the rule is chosen
+    /// through `Client`, not inspected.
+    #[cfg(test)]
+    pub(crate) fn heavy_hosts_debug(&self) -> String {
+        format!("{:?}", self.hosts)
     }
 
     /// Lowers the buffered-response cap, so a test can reach it.
@@ -2095,7 +2230,7 @@ fn is_port(port: &str) -> bool {
 /// name with no dots in it, which `Transport::new` supports on purpose by
 /// putting `https://` in front. Such a name has nothing to take a leftmost
 /// label off, so the parent-domain rule degenerates to "the name itself" —
-/// and then a `/hosts` answering `["n0008-sas.hume.yt.yandex.net"]`, which is
+/// and then a `/hosts` answering `["n0008-sas.hume.yt.example.net"]`, which is
 /// the real shape of a real installation, is refused **entirely and
 /// permanently**: the state settles as `Configured`, the lookup is never
 /// repeated, and every upload goes back to being refused by a control proxy
@@ -2104,7 +2239,7 @@ fn is_port(port: &str) -> bool {
 ///
 /// So a configured name with no dot is matched as a **label** of the discovered
 /// name, and not as its leftmost one: `hume` admits
-/// `n0008-sas.hume.yt.yandex.net` and `n0008-sas.hume`, and refuses
+/// `n0008-sas.hume.yt.example.net` and `n0008-sas.hume`, and refuses
 /// `hume.evil.com` — where the cluster's name has been put in the position a
 /// *host* name occupies rather than the position a domain does.
 ///
@@ -2135,6 +2270,29 @@ fn same_domain(configured: &str, discovered: &str) -> bool {
                 .any(|label| label == configured);
         }
     };
+
+    discovered == domain || discovered.ends_with(&format!(".{domain}"))
+}
+
+/// Whether `discovered` sits under a domain the caller added by hand.
+///
+/// The plain suffix rule, and deliberately not [`same_domain`]'s: there the
+/// domain has to be *derived* from a host name, and the leftmost-label and
+/// bare-label cases exist because `YT_PROXY` is a host and not a domain. Here
+/// the caller wrote a domain down, so it is used as one — `proxy-zone.net`
+/// admits `n0132-sas.rack7.proxy-zone.net` and itself, and nothing
+/// else.
+///
+/// `domain` is already trimmed, lowercased and stripped of stray dots by
+/// [`Transport::set_heavy_proxies_under`], and is never empty.
+///
+/// This does not make the rule a boundary — the suffix caveat in [`heavy_base`]
+/// applies to a domain somebody typed exactly as it applies to one that was
+/// derived, and `HeavyHosts::Only` is still the version that is a boundary. What
+/// it does is stop "the rule missed by one label" from having to be answered by
+/// removing the rule.
+fn under_domain(domain: &str, discovered: &str) -> bool {
+    let discovered = discovered.to_ascii_lowercase();
 
     discovered == domain || discovered.ends_with(&format!(".{domain}"))
 }
@@ -2183,8 +2341,11 @@ fn declined_routing(state: &HeavyProxy) -> &'static str {
     match state {
         HeavyProxy::Configured { .. } => {
             "/hosts named no heavy proxy this client would use — \
+             Client::with_heavy_proxies_under([…]) or YT_HEAVY_PROXY_DOMAINS \
+             names the domain they are in, Client::with_heavy_proxies_in([…]) \
+             names the proxies themselves, and \
              Client::with_heavy_proxies_anywhere(true) or \
-             Client::with_heavy_proxies_in([…]) allows a name it refused"
+             YT_HEAVY_PROXIES_ANYWHERE=1 allows any name it refused"
         }
         HeavyProxy::FellBack { .. } => {
             "the heavy proxies /hosts named have all just failed, \
@@ -3705,11 +3866,11 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         // spelling, and `Transport::new` supports it on purpose. It has no
         // leftmost label to take off, so the parent-domain rule degenerated to
         // "the name itself" and refused the real answer of a real installation:
-        // `["n0008-sas.hume.yt.yandex.net"]` was declined in full, the state
+        // `["n0008-sas.hume.yt.example.net"]` was declined in full, the state
         // settled as "this cluster has no heavy proxies", and it is never asked
         // again — leaving the operator with the cluster error from #30 and
         // nothing to connect it to.
-        assert!(same_domain("hume", "n0008-sas.hume.yt.yandex.net"));
+        assert!(same_domain("hume", "n0008-sas.hume.yt.example.net"));
         // The documentation's own example shape, which is the same rule.
         assert!(same_domain("cluster-name", "n0008-sas.cluster-name"));
         // And Kubernetes, where a service addressed by its short name answers
@@ -3724,7 +3885,7 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         // cluster, in somebody else's zone.
         assert!(!same_domain("hume", "hume.evil.com"));
         // A whole label, not a prefix of one.
-        assert!(!same_domain("hume", "n0008-sas.humeier.yt.yandex.net"));
+        assert!(!same_domain("hume", "n0008-sas.humeier.yt.example.net"));
         assert!(!same_domain("hume", "evil.com"));
         // The configured name itself is still the configured name.
         assert!(same_domain("hume", "hume"));
@@ -3734,8 +3895,8 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         // ("hume")` is `https://hume`, and the answer above is what a real
         // installation returns for it.
         assert_eq!(
-            routed("https://hume", "n0008-sas.hume.yt.yandex.net"),
-            Some("https://n0008-sas.hume.yt.yandex.net".to_owned())
+            routed("https://hume", "n0008-sas.hume.yt.example.net"),
+            Some("https://n0008-sas.hume.yt.example.net".to_owned())
         );
     }
 
@@ -3975,6 +4136,237 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
                 &HeavyHosts::Only(Vec::new())
             ),
             Err(Declined::Elsewhere)
+        );
+    }
+
+    #[test]
+    fn a_named_domain_widens_the_rule_without_removing_it() {
+        // The shape a large installation has: the cluster is addressed as
+        // `cluster.example.net` and
+        // `/hosts` answers seventy-nine names under `proxy-zone.net`. The two
+        // settings that existed were writing all seventy-nine down — stale the
+        // moment one rotates — and taking the rule away.
+        let under = HeavyHosts::Under {
+            domains: vec!["proxy-zone.net".to_owned()],
+            ignored: Vec::new(),
+        };
+        let configured = "https://cluster.example.net";
+
+        assert_eq!(
+            heavy_base(configured, "n0132-sas.rack7.proxy-zone.net", &under),
+            Ok("https://n0132-sas.rack7.proxy-zone.net".to_owned())
+        );
+        // Case is not part of a host name here either.
+        assert_eq!(
+            heavy_base(configured, "N0133-SAS.rack7.PROXY-ZONE.net", &under),
+            Ok("https://N0133-SAS.rack7.PROXY-ZONE.net".to_owned())
+        );
+        // The domain itself, not only what is under it.
+        assert_eq!(
+            heavy_base(configured, "proxy-zone.net", &under),
+            Ok("https://proxy-zone.net".to_owned())
+        );
+        // It widens rather than replaces: the configured address's own domain
+        // still admits its own proxies.
+        assert_eq!(
+            heavy_base(configured, "n0008-sas.example.net", &under),
+            Ok("https://n0008-sas.example.net".to_owned())
+        );
+        // And it is still a rule. A neighbour that only looks like the domain
+        // is not under it, and everything else is where it was.
+        for elsewhere in [
+            "proxy-zone.net.evil.com",
+            "evil-proxy-zone.net",
+            "n0132-sas.somewhere-else.net",
+        ] {
+            assert_eq!(
+                heavy_base(configured, elsewhere, &under),
+                Err(Declined::Elsewhere),
+                "{elsewhere}"
+            );
+        }
+        // A name that is not a name is refused before any of this: naming a
+        // domain says which hosts, not what a host may look like.
+        assert_eq!(
+            heavy_base(configured, "http://n0132-sas.rack7.proxy-zone.net", &under),
+            Err(Declined::Malformed)
+        );
+        // An empty list is exactly the default, so a variable set to nothing
+        // cannot quietly widen anything.
+        assert_eq!(
+            heavy_base(
+                configured,
+                "n0132-sas.rack7.proxy-zone.net",
+                &HeavyHosts::Under {
+                    domains: Vec::new(),
+                    ignored: Vec::new(),
+                }
+            ),
+            Err(Declined::Elsewhere)
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_domains_that_were_added() {
+        // The refusal is the whole of what an operator has to work from, and
+        // one that named only the configured address would read as though the
+        // list had been ignored.
+        let under = HeavyHosts::Under {
+            domains: vec!["proxy-zone.net".to_owned()],
+            ignored: Vec::new(),
+        };
+        let because = Declined::Elsewhere.because(&under, "https://cluster.example.net");
+
+        assert!(because.contains("cluster.example.net"), "{because}");
+        assert!(because.contains("proxy-zone.net"), "{because}");
+
+        // With nothing added there is nothing extra to name, and the sentence
+        // is the one the default rule has always given.
+        assert_eq!(
+            Declined::Elsewhere.because(
+                &HeavyHosts::Under {
+                    domains: Vec::new(),
+                    ignored: Vec::new(),
+                },
+                "https://cluster.example.net"
+            ),
+            Declined::Elsewhere.because(&HeavyHosts::SameDomain, "https://cluster.example.net")
+        );
+    }
+
+    #[test]
+    fn a_written_domain_is_normalised_the_way_it_gets_written() {
+        // These arrive from `YT_HEAVY_PROXY_DOMAINS` and from configuration
+        // files as often as from a literal, so every spelling a person uses for
+        // one domain has to reach the same rule. The wildcard is the one that
+        // matters most: `*.proxy-zone.net` is how a zone is described in prose
+        // and in a certificate, and kept verbatim it would test
+        // `ends_with(".*.proxy-zone.net")` and match nothing at all — the
+        // feature a silent no-op, and the heavy commands still failing.
+        //
+        // And they are one domain, not six: a refusal that read `not under
+        // cluster.example.net or under proxy-zone.net, proxy-zone.net,
+        // proxy-zone.net` looks like a bug in the client to the one person it
+        // is written for.
+        let mut transport = Transport::new("https://cluster.example.net", None, HOSTS_TIMEOUT);
+        transport.set_heavy_proxies_under(vec![
+            "  .Proxy-Zone.net. ".to_owned(),
+            "*.proxy-zone.net".to_owned(),
+            "https://proxy-zone.net".to_owned(),
+            "proxy-zone.net:443".to_owned(),
+            "https://proxy-zone.net./".to_owned(),
+            "proxy-zone.net.:443".to_owned(),
+        ]);
+
+        assert_eq!(
+            transport.heavy_hosts_debug(),
+            r#"Under { domains: ["proxy-zone.net"], ignored: [] }"#
+        );
+        assert_eq!(
+            heavy_base(
+                &transport.base,
+                "n0132-sas.rack7.proxy-zone.net",
+                &transport.hosts
+            ),
+            Ok("https://n0132-sas.rack7.proxy-zone.net".to_owned()),
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_domain_is_dropped_rather_than_believed() {
+        // A single label is the dangerous one: `net` is a plausible typo for a
+        // real domain, and honoured as a suffix it would admit every `.net`
+        // host `/hosts` could name — `with_heavy_proxies_anywhere` by accident.
+        // It is kept aside rather than forgotten, because a setting that
+        // changes nothing and says nothing is indistinguishable from one this
+        // client never read. An entry that is nothing at all is a trailing
+        // comma, and nobody needs to hear about it.
+        let mut transport = Transport::new("https://cluster.example.net", None, HOSTS_TIMEOUT);
+        transport.set_heavy_proxies_under(vec![
+            "net".to_owned(),
+            "   ".to_owned(),
+            String::new(),
+            ".".to_owned(),
+            "*".to_owned(),
+        ]);
+
+        assert_eq!(
+            transport.heavy_hosts_debug(),
+            r#"Under { domains: [], ignored: ["net"] }"#
+        );
+        // And it is in the refusal, which is the only place an operator looks.
+        let because = Declined::Elsewhere.because(&transport.hosts, &transport.base);
+        assert!(because.contains("ignored, not a domain: net"), "{because}");
+        // And with everything dropped the rule is exactly the default: the
+        // configured address's own domain admits its own proxies, and nothing
+        // else is admitted at all.
+        assert_eq!(
+            heavy_base(&transport.base, "n0132-sas.example.net", &transport.hosts),
+            Ok("https://n0132-sas.example.net".to_owned())
+        );
+        assert_eq!(
+            heavy_base(
+                &transport.base,
+                "n0132-sas.rack7.proxy-zone.net",
+                &transport.hosts
+            ),
+            Err(Declined::Elsewhere)
+        );
+    }
+
+    #[test]
+    fn an_added_domain_carries_the_configured_port_and_keeps_a_named_one() {
+        // Nothing about naming a domain changes where the port comes from: the
+        // configured address's, unless `/hosts` named one itself.
+        let under = HeavyHosts::Under {
+            domains: vec!["proxy-zone.net".to_owned()],
+            ignored: Vec::new(),
+        };
+
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net:8443",
+                "n0132-sas.rack7.proxy-zone.net",
+                &under
+            ),
+            Ok("https://n0132-sas.rack7.proxy-zone.net:8443".to_owned())
+        );
+        assert_eq!(
+            heavy_base(
+                "https://cluster.example.net:8443",
+                "n0132-sas.rack7.proxy-zone.net:9013",
+                &under
+            ),
+            Ok("https://n0132-sas.rack7.proxy-zone.net:9013".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_dotless_configured_name_keeps_its_label_rule_when_a_domain_is_added() {
+        // `YT_PROXY=hume` is matched as a *label* of the discovered name rather
+        // than as a domain — see `same_domain` — and adding a domain must not
+        // cost that: `Under` is the label rule plus the domains, not instead of
+        // them. Reachable without a resolver search list now that
+        // `YT_PROXY_SUFFIX` exists, which is what makes this worth pinning.
+        let under = HeavyHosts::Under {
+            domains: vec!["proxy-zone.net".to_owned()],
+            ignored: Vec::new(),
+        };
+
+        assert_eq!(
+            heavy_base("https://hume", "n0008-sas.hume.yt.example.net", &under),
+            Ok("https://n0008-sas.hume.yt.example.net".to_owned()),
+            "the label rule still applies"
+        );
+        assert_eq!(
+            heavy_base("https://hume", "n0132-sas.rack7.proxy-zone.net", &under),
+            Ok("https://n0132-sas.rack7.proxy-zone.net".to_owned()),
+            "and the added domain applies beside it"
+        );
+        assert_eq!(
+            heavy_base("https://hume", "hume.evil.com", &under),
+            Err(Declined::Elsewhere),
+            "and neither admits the cluster's name in a host's position"
         );
     }
 

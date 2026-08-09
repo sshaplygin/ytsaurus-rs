@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 741 tests: 668 unit and integration, 73 doc
+cargo test --workspace            # 759 tests: 685 unit and integration, 74 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -888,8 +888,32 @@ and the documentation disagreed and the source is what settles it.
 - **A configured name with no dot is matched as a label.** `YT_PROXY=hume` is
   the ordinary spelling and has no parent domain, so the domain rule
   degenerated to "the name itself" and refused
-  `["n0008-sas.hume.yt.yandex.net"]` in full and for good. It now has to appear
-  as a label of the discovered name and not as its leftmost one.
+  `["n0008-sas.hume.yt.example.net"]` in full and for good. It now has to appear
+  as a label of the discovered name and not as its leftmost one. That rule was
+  also **out of reach without a resolver search list** until `YT_PROXY_SUFFIX`
+  existed: it only fires for a dotless `YT_PROXY`, and a dotless `YT_PROXY`
+  became `https://hume`, which resolves nowhere unless the machine's own DNS
+  configuration completes it. Two features that each worked alone depended on a
+  third thing neither of them owned.
+- **The domain rule has a middle setting, because a real installation needed
+  one.** A managed installation answered `/hosts` with 79 heavy proxies in a
+  zone of its own — a domain the configured address does not share — so the
+  default rule refused every one of them and no heavy command could be sent at
+  all: `Control proxy may not serve heavy requests with input data`. Listing 79 names by hand goes stale the moment one
+  rotates, and removing the rule is the whole rule. `with_heavy_proxies_under`
+  is the third answer: the configured address's domain **plus** the ones named.
+  It is still a suffix rule and still worth what a suffix rule is worth — the
+  boundary is `with_heavy_proxies_in`. Note for anyone weighing the default: the
+  **Go SDK filters `/hosts` not at all** (`listHeavyProxies` returns the list
+  verbatim, `proxy_set.go` adds every name), so `with_heavy_proxies_anywhere` is
+  not a weakening relative to the official client — it *is* the official
+  client's behaviour, and this client is the stricter of the two.
+- **`Client::from_env` is the only constructor the examples use**, so anything a
+  cluster can differ in has to be reachable from the environment or it cannot be
+  run against. `YT_PROXY_SUFFIX`, `YT_HEAVY_PROXY_DOMAINS`,
+  `YT_HEAVY_PROXIES_ANYWHERE` and `YT_FILE_CACHE` exist for that reason and for
+  no other; each is inert unset. Adding a `with_…` knob without one is how the
+  suite came to need a source patch to run on a managed installation at all.
 
 ### Connections
 
@@ -1143,6 +1167,18 @@ These cost time once. They are recorded so they do not cost it again.
   between the upload and the exec. That is the ordinary exposure of `//tmp`, and
   the reason `with_file_cache` pointed at a directory of your own beats
   accepting the fallback as a settled state.
+- **A managed cache is read-only to an ordinary user, `remove` included** —
+  which the client survives and an *example* need not. On
+  a managed installation, `check_permission` on
+  `//tmp/yt_wrapper/file_storage/new_cache` answers `read allow`, and `write`,
+  `remove` and `create` all `deny`. `upload_worker_cached` degrades to a plain
+  upload, as above; `cached_upload`'s setup step, which clears its own entry so
+  the first call is a real miss, is refused with code 901 and nothing degrades
+  it. The example therefore brings a cache of its own — **beside** its `BASE`
+  and not under it, since it removes that tree whole on every run and a cache
+  inside would be gone before the clearing step could find anything in it — and
+  `YT_FILE_CACHE` points it back at a shared one. A demonstration that has to
+  clear a cache has to own one, and has to let it outlive the run.
 - **A cached file keeps its name from the hash, not from the upload.** Reference
   it in `file_paths` as `<file_name="my_job">//tmp/.../ab/cdef…` or the job's
   command finds nothing to run.
@@ -1365,10 +1401,16 @@ needs a human — see below.
   ([`docs/benchmarking.md`](docs/benchmarking.md)) but that decision needs a
   ≥ 10 GB table and C++/Python baselines. Decoding is 66 % of job CPU for a job
   that does nothing else, which is the worst case for YSON, not a verdict — and
-  **~10 % for the pilot**, a job that does something with its rows, measured on
-  the local cluster by `cargo run -p ytsaurus-client --example profile`. That is
-  well under the 30 % threshold, so the question has lost urgency without being
-  settled.
+  for the pilot, a job that does something with its rows, `cargo run -p
+  ytsaurus-client --example profile` says **~10 % on the local Docker cluster
+  and 36 % on a production one**. The threshold is 30 %, and the two
+  readings sit either side of it: **the question is open, not settled and not
+  lost**. The production cluster's fixed costs are a fifth of the emulated
+  local one's — 474 ms against 2225 ms to be handed the rows — and decoding is
+  the part that did not shrink with them, which is
+  the shape to expect — but both readings scatter by 2× across rounds, so what
+  is owed is a spread from repeated production runs, not a third single number.
+  Do not quote the 10 % on its own again.
 - **Upstreaming** to
   [ytsaurus/ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk) —
   the maintainers' stance in ytsaurus#6 is "PRs welcome". **Do not start without

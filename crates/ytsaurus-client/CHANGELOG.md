@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+### A managed installation is configurable from the environment
+
+Everything here comes from one run of the whole example suite against a managed
+multi-node installation rather than the local Docker cluster. Four of the
+differences stopped the suite outright, and none of them could be answered by
+configuration: every example builds its client with `Client::from_env`, so a
+policy settable only in Rust is a policy an example cannot be run under. The
+run needed a source patch, and that is the bug these entries fix.
+
+- **Added** `Client::with_heavy_proxies_under(domains)`: the configured
+  address's own domain **plus** the ones named. The installation published all
+  79 of its heavy proxies in a zone of its own — a domain the configured address
+  does not share — so the default rule refused every one of them and no heavy
+  command could be sent at all, each upload dying at the control proxy with
+  `Control proxy may not serve heavy requests with input data`. The two settings
+  that existed were `with_heavy_proxies_in`, which meant writing 79 names down
+  and re-writing them whenever a proxy rotated, and `with_heavy_proxies_anywhere`,
+  which is the rule removed. A domain is what an installation actually has.
+
+  It is still a suffix rule and still worth what one is worth — a guard against
+  a typo and an obviously foreign name, not a boundary that holds a credential;
+  `with_heavy_proxies_in` remains the boundary. Entries are normalised the way
+  people write them (space, a leading or trailing dot, a leading `*`, a scheme,
+  a port), and one left with **no dot in it** is dropped rather than honoured:
+  `net` would admit every `.net` host the cluster could name, which is
+  `with_heavy_proxies_anywhere` by accident. Worth recording beside this: the
+  **Go SDK filters `/hosts` not at all**, so `anywhere` is not a weakening
+  relative to the official client — it is the official client's behaviour.
+
+- **Added** four variables to `Client::from_env`. Each is inert when unset, and
+  all of them — `YT_PROXY` now included — are **trimmed**, with a variable set
+  to nothing read as unset. That last part changes `YT_PROXY` itself:
+  `YT_PROXY=" http://localhost:8000 "` used to reach `Client::new` verbatim and
+  fail as a malformed URL, and `YT_PROXY=` used to address `https://`.
+
+  | Variable | Effect |
+  | --- | --- |
+  | `YT_PROXY_SUFFIX` | Completes a bare cluster name — `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net` — behind the Go SDK's gate: no colon, no dot, no `localhost`. No suffix is compiled in, because this client is not one installation's. |
+  | `YT_HEAVY_PROXY_DOMAINS` | Comma- or space-separated, into `with_heavy_proxies_under`. |
+  | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes`, into `with_heavy_proxies_anywhere`. Applied after the domains, so the wider of the two wins rather than whichever was exported last. |
+  | `YT_FILE_CACHE` | Into `with_file_cache`, for an installation whose shared cache is read-only. |
+
+  The environment can **widen** the heavy-proxy rule and cannot narrow it:
+  `with_heavy_proxies_in` is the mode that is a boundary, and a boundary a
+  variable could set is a boundary a variable could move.
+
+  `YT_PROXY_SUFFIX` also makes the label rule reachable without a resolver
+  search list. That rule matches a dotless `YT_PROXY` as a label of the
+  discovered name, and until now a dotless `YT_PROXY` could only be connected to
+  if the machine's DNS configuration completed it.
+
+- **Changed** the message a rejected root store produces. `invalid peer
+  certificate: UnknownIssuer` is the whole of what a cluster behind a private CA
+  says on its first request, before any YTsaurus logic runs, and it named
+  neither `YT_CA_BUNDLE` nor the `platform-verifier` feature — on a machine
+  where `curl` reaches the same cluster, nothing else about it suggests whose
+  roots were consulted. `ClientError::Transport` now carries both, for that
+  verdict only: `NotValidForName` is a certificate that does not cover the host
+  asked for, which no root store mends. Classified through `retry`'s existing
+  narrowing rather than by looking for the word, so
+  `Other(OtherError("UnknownIssuer lookup failed"))` — a transient
+  platform-verifier condition the client deliberately retries — does not collect
+  advice to enable the verifier it already has.
+
+- **Changed** both refusals an operator reads when `/hosts` is declined. They
+  offered `with_heavy_proxies_in` and `with_heavy_proxies_anywhere`: write out
+  79 names, or take the rule away. Both now offer all three, with the
+  environment spellings beside them — the announcement made once at the first
+  lookup, and the sentence appended to the cluster's own refusal on every heavy
+  command after it. A domain that could not be used — one with no dot in it,
+  which would admit a whole top-level domain — is named there too, rather than
+  dropped in silence and leaving the setting looking unread.
+
+- **Changed** `cached_upload` to bring its own file cache. It clears one entry
+  so the first upload is a real miss, and a shared managed cache refuses that —
+  `remove` is denied to an ordinary user, code 901 — which stopped the example
+  in setup on an installation where the client itself was fine. `YT_FILE_CACHE`
+  points it back at a shared one, and it now stops with an explanation instead
+  of timing two warm uploads against each other.
+
+- **Changed** `profile` to build its closing caption from the run — the cluster's
+  own `//sys/@cluster_name`, the rounds and the size — rather than printing a
+  hardcoded description of the laptop it was written on, and raised the default
+  `YT_PROFILE_ROUNDS` from 3 to 5: at 3 the example could not separate the phases
+  on a shared cluster and said so, which is the guard working and a poor default.
+
 ### A transaction can outlive its handle
 
 - **Added** `Transaction::detach` (#13): stops the keep-alive thread and
@@ -869,10 +955,10 @@ first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
   bare cluster name, which `Transport::new` supports on purpose and which is how
   `YT_PROXY` is usually written — has no parent domain to take a leftmost label
   off, so the rule degenerated to "the name itself" and refused
-  `["n0008-sas.hume.yt.yandex.net"]` in full, permanently and in silence. A
+  `["n0008-sas.hume.yt.example.net"]` in full, permanently and in silence. A
   configured name with no dot is now matched as a **label** of the discovered
   name, and not as its leftmost one: `hume` follows
-  `n0008-sas.hume.yt.yandex.net` and not `hume.evil.com`. The same break was
+  `n0008-sas.hume.yt.example.net` and not `hume.evil.com`. The same break was
   waiting in Kubernetes for anyone addressing the service by its short name.
 
 - **A bracketed name has to hold an IPv6 literal.** The rule was "an unbracketed

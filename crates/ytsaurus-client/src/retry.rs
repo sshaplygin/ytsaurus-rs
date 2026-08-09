@@ -419,26 +419,46 @@ pub(crate) fn is_retriable(error: &ClientError) -> bool {
 /// passing condition of this machine, and reading it as a verdict would make
 /// enabling the platform verifier a way of turning the operating system's bad
 /// afternoon into a permanent failure.
+///
+/// All three narrowings live in [`settled_certificate_verdict`], which answers
+/// *which* verdict rather than *whether* there was one. This is that question
+/// asked the way retrying needs it.
 fn rejected_the_certificate(error: &ureq::Error) -> bool {
+    settled_certificate_verdict(error).is_some()
+}
+
+/// Which settled verdict the TLS layer returned, if it returned one.
+///
+/// The three narrowings of [`rejected_the_certificate`], answering *which*
+/// rather than *whether*, because one caller needs to tell the verdicts apart:
+/// [`crate::error::certificate_advice`] has something to say about
+/// `UnknownIssuer` — the root store is not the machine's — and nothing to say
+/// about `NotValidForName`, which no root store mends.
+///
+/// Shared rather than re-derived there. Matching another crate's rendered prose
+/// is a thing to do **once**: a second site that reached for `contains` would
+/// re-open the `Other(OtherError("UnknownIssuer lookup failed"))` hole this one
+/// closes with `starts_with`, and would advise a `platform-verifier` build to
+/// enable the platform verifier.
+pub(crate) fn settled_certificate_verdict(error: &ureq::Error) -> Option<&'static str> {
     let ureq::Error::Io(io) = error else {
-        return false;
+        return None;
     };
 
     if io.kind() != std::io::ErrorKind::InvalidData {
-        return false;
+        return None;
     }
 
     let message = io.to_string();
-    let Some((_, reason)) = message.split_once(CERTIFICATE_VERDICT) else {
-        return false;
-    };
+    let (_, reason) = message.split_once(CERTIFICATE_VERDICT)?;
 
     // `starts_with` and not `contains`: `Other(..)` wraps a message this crate
     // did not write, and one that happened to quote `UnknownIssuer` would
     // otherwise be read as one.
     SETTLED_REJECTIONS
         .iter()
-        .any(|settled| reason.starts_with(settled))
+        .find(|settled| reason.starts_with(*settled))
+        .copied()
 }
 
 /// Looks for one of `wanted` anywhere in an error document.

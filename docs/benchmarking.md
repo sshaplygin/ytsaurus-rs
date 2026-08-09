@@ -55,9 +55,11 @@ threshold question **cannot be answered without a real workload**, which is
 exactly why this is a joint decision rather than a benchmark result.
 
 The pilot on a cluster (§3) is the other end of that range: a job that does
-something with its rows spends **~10 %** on decoding, not 66 %. The true answer
-for any given workload sits between the two, and closer to the pilot's end for
-anything that does real work per row.
+something with its rows spends **~10 %** on decoding, not 66 % — on the local
+Docker cluster. The same pilot on a production cluster spent **36 %** (§4), so
+the other end of the range is not one number. The true answer for any given
+workload sits between 10 % and 66 %, and where in there depends on the machine
+as much as on the job.
 
 Two findings are actionable regardless of how Skiff goes:
 
@@ -82,7 +84,9 @@ The method is subtraction. The same mapper runs three times over one table,
 stopped at three depths — `map-frames` finds record boundaries and decodes
 nothing, `map-parse` decodes each row into the mapper's own struct, `map` is the
 pilot — and the scheduler's `time/exec` for each is what it cost. One job per
-operation, three rounds per mode, fastest round counted.
+operation, three rounds per mode, fastest round counted. (Three was the default
+when this was run. It is five now, because three did not survive contact with a
+production cluster — see §4.)
 
 48 MiB of generated events, 245 521 rows, on the local Docker cluster:
 
@@ -96,11 +100,11 @@ operation, three rounds per mode, fastest round counted.
 At 16 MiB the decode share was 6.6 %; the rise with size is process startup
 being amortised, since that sits in the first bucket.
 
-**Decoding is not what this job spends its time on.** ~10 %, against ~46 % to
-be handed the rows and ~44 % to validate and write them — the last of which is
-mostly *output* encoding, since the validation is a handful of comparisons. On
-these numbers the Skiff question loses urgency, and if anything the write path
-is the more interesting place to look.
+**Decoding is not what this job spends its time on, here.** ~10 %, against
+~46 % to be handed the rows and ~44 % to validate and write them — the last of
+which is mostly *output* encoding, since the validation is a handful of
+comparisons. On these numbers the write path is the more interesting place to
+look.
 
 Three reasons this is a reading and not a verdict:
 
@@ -115,9 +119,56 @@ Three reasons this is a reading and not a verdict:
   apart, reported 1776 ms and 897 ms — the same work, twice the time. Anything
   read off one round is worthless, and three is the least that is not.
 
-What it does establish is a bound: decoding is not 30 % of this job, and it is
-not close. It would take a very different workload — or a very much faster
-cluster making the fixed costs smaller — to change that.
+What it establishes is a bound **on this cluster**: decoding is not 30 % of this
+job there, and it is not close. It would take a very different workload — or a
+very much faster cluster making the fixed costs smaller — to change that.
+
+A very much faster cluster is exactly what the next section is.
+
+### 4. The same pilot, on a production cluster
+
+Run on 2026-08-09 against a managed multi-node installation — a shared
+production cluster with separate proxy roles, not named here — and it
+disagrees.
+
+At the then-default three rounds the example **refused to answer**: a shallower
+mode measured slower than a deeper one (1507, 1107, 2752 ms), which is the
+guard working — on a shared cluster the scheduler's noise is larger than the
+quantity being measured, and the run said so instead of reporting a number.
+That refusal is why the default is now five rounds rather than three.
+
+At `YT_PROFILE_ROUNDS=7`, same 48 MiB:
+
+| | | |
+| --- | ---: | ---: |
+| being handed the rows | 474 ms | 34.0 % |
+| **decoding them** | **505 ms** | **36.2 %** |
+| validating and writing | 415 ms | 29.8 % |
+| the pilot's map | 1394 ms | 100 % |
+
+**36.2 % against 10.6 %**, and on the far side of the 30 % threshold the whole
+question is framed around. The job is the same job; what changed is the machine
+under it. The fixed costs — process start, the pipe, being handed the rows —
+are a fifth of what they were on the emulated local cluster — 474 ms against
+2225 ms — and decoding is
+the part that did not shrink with them. That is the shape you would predict, and
+it is the reason the local reading is the one least like production.
+
+**Believe it about as far as the last one.** The rounds still scatter badly —
+round 6 took 3331 ms and round 7 took 1395 ms — and the estimator takes the
+minimum per mode, so a shared production cluster is a noisier instrument than a
+quiet local one, not a quieter one. Two readings that disagree by 3.4× mean the
+question is **open**, not settled either way:
+
+- the 10.6 % came from one local cluster, x86-64 under emulation, which is not
+  the environment any of this is for;
+- the 36.2 % came from one production cluster, on rounds that scatter by 2×;
+- neither has been repeated enough times to record a spread rather than a
+  number, and doing that is the next measurement this document wants.
+
+Until then, no conclusion about Skiff rests on either figure. See
+[skiff-compatibility.md](skiff-compatibility.md) for what the format itself
+still has open, which is a separate question from whether it would pay.
 
 ## What has *not* been measured
 
@@ -170,7 +221,10 @@ Implement `ytsaurus-skiff` if **both** hold:
 1. **Parsing is the bottleneck.** `parse_borrowed - pass_through`, or the
    equivalent measured on the cluster, exceeds ~30 % of job CPU. Below that,
    Skiff optimises something that is not the problem. *The one workload measured
-   this way so far — the pilot, §3 — came out at ~10 %.*
+   this way so far — the pilot — came out at ~10 % on a local cluster (§3) and
+   36 % on a production one (§4). This criterion is therefore **not met and not
+   missed**: it is unmeasured, and a spread across repeated production runs is
+   what would settle it.*
 2. **The Rust job is not already fast enough.** If it already beats the C++
    baseline on CPU per byte, the remaining headroom is unlikely to justify a
    second wire format, its schema negotiation, and the ongoing compatibility

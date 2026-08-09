@@ -237,7 +237,8 @@ fn cache_message(cache: &str, error: &ClientError) -> String {
     format!(
         "ytsaurus-client: the file cache at {cache} cannot be written to \
          ({error}); uploading the worker uncached, which re-sends it on every \
-         launch. Client::with_file_cache points it at a path you can write to."
+         launch. Client::with_file_cache — or YT_FILE_CACHE, for a client built \
+         by Client::from_env — points it at a path you can write to."
     )
 }
 
@@ -324,8 +325,10 @@ fn declined_message(configured: &str, refused: &[String]) -> String {
         "ytsaurus-client: /hosts named {} heavy {}, and none was used, \
          so heavy commands go to {configured} — which is what an installation \
          with separate proxy roles refuses. {named}{and_more}. \
-         Client::with_heavy_proxies_in([…]) or \
-         Client::with_heavy_proxies_anywhere(true) allows them.",
+         Client::with_heavy_proxies_under([…]) — YT_HEAVY_PROXY_DOMAINS — names \
+         the domain they are in; Client::with_heavy_proxies_in([…]) names the \
+         proxies themselves; Client::with_heavy_proxies_anywhere(true) — \
+         YT_HEAVY_PROXIES_ANYWHERE=1 — takes the rule away.",
         refused.len(),
         if refused.len() == 1 {
             "proxy"
@@ -432,7 +435,7 @@ mod message_tests {
         let line = declined_message(
             "https://hume",
             &[
-                r#""n0008-sas.hume.yt.yandex.net" is not under the domain of hume"#.to_owned(),
+                r#""n0008-sas.hume.yt.example.net" is not under the domain of hume"#.to_owned(),
                 r#""" is not a host name"#.to_owned(),
             ],
         );
@@ -442,11 +445,21 @@ mod message_tests {
         assert!(line.contains("https://hume"), "{line}");
         // The name that was declined, and why — the two facts that are
         // otherwise nowhere at all.
-        assert!(line.contains("n0008-sas.hume.yt.yandex.net"), "{line}");
+        assert!(line.contains("n0008-sas.hume.yt.example.net"), "{line}");
         assert!(line.contains("not under the domain of hume"), "{line}");
-        // And what to do about it.
+        // And what to do about it — all three answers, because this line is
+        // the only place an operator meets them. The middle one is the one an
+        // installation whose proxies live in a second domain actually wants,
+        // and a message that offered only "write out all 79 names" and "take
+        // the rule away" is what sent the first such installation to patch the
+        // source instead.
+        assert!(line.contains("with_heavy_proxies_under"), "{line}");
         assert!(line.contains("with_heavy_proxies_in"), "{line}");
         assert!(line.contains("with_heavy_proxies_anywhere"), "{line}");
+        // Every example builds its client with `from_env`, so the Rust name
+        // alone is advice the reader cannot take.
+        assert!(line.contains("YT_HEAVY_PROXY_DOMAINS"), "{line}");
+        assert!(line.contains("YT_HEAVY_PROXIES_ANYWHERE"), "{line}");
     }
 
     #[test]
@@ -812,7 +825,7 @@ mod tests {
         let lines = recorded(|| {
             declined(
                 "https://hume",
-                &[r#""n0008-sas.hume.yt.yandex.net" is not under the domain of hume"#.to_owned()],
+                &[r#""n0008-sas.hume.yt.example.net" is not under the domain of hume"#.to_owned()],
             );
         });
 
@@ -824,7 +837,7 @@ mod tests {
         assert!(warning.contains("configured=https://hume"), "{warning}");
         assert!(warning.contains("refused=1"), "{warning}");
         assert!(
-            warning.contains("n0008-sas.hume.yt.yandex.net"),
+            warning.contains("n0008-sas.hume.yt.example.net"),
             "the names are the whole point of the event: {warning}"
         );
     }
