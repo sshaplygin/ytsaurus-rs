@@ -183,6 +183,7 @@
 
 use std::time::{Duration, Instant};
 
+mod batch;
 /// Errors.
 pub mod error;
 mod http;
@@ -208,6 +209,7 @@ mod worker;
 /// Constructors for YSON documents, for specs this crate does not model.
 pub mod yson_build;
 
+pub use crate::batch::BatchRequest;
 pub use crate::error::{ClientError, RedirectRefusal, Result};
 pub use crate::http::Method;
 pub use crate::jobs::{JobFailure, JobInfo};
@@ -1338,6 +1340,324 @@ impl Client {
             command: "get".to_owned(),
             reason: format!("{path}/@row_count is not an integer"),
         })
+    }
+
+    // ------------------------------------------------------------- batches
+
+    /// Executes every part of a [`BatchRequest`] in **one round trip**, and
+    /// answers with a `Result` **per part**.
+    ///
+    /// The parts fail individually — that is the entire point of the shape.
+    /// One part hitting a node that already exists does not cost the other
+    /// eleven their tables, and collapsing the answers into one `Result`
+    /// would lose exactly the thing batching makes harder to see. The outer
+    /// `Result` is for the envelope alone: the request that could not be
+    /// sent, the response that could not be read.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{BatchRequest, Client};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let mut batch = BatchRequest::new();
+    /// batch
+    ///     .create("map_node", "//tmp/pipeline")
+    ///     .create("table", "//tmp/pipeline/clicks")
+    ///     .exists("//tmp/elsewhere");
+    ///
+    /// for part in client.execute_batch(&batch)? {
+    ///     match part {
+    ///         // The envelope is keyed by what each command returns —
+    ///         // `{node_id=…}` for a create, `{value=…}` for an exists.
+    ///         Ok(answer) => println!("{answer:?}"),
+    ///         Err(error) => eprintln!("{error}"),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Each `Ok` carries the part's own answer exactly as that command would
+    /// have answered alone — `{node_id=…}`, `{value=…}`, `{}` for a `set` —
+    /// and each `Err` is a [`ClientError::Cluster`] named after the part's
+    /// command, flattened outer-plus-innermost like every other cluster error
+    /// here. Results come back **in the order the parts went in**; watched on
+    /// a local cluster, where a batch of create·set·get·remove answered
+    /// `[error 501, ok, ok, error 500]` in exactly that order. An answer with
+    /// the wrong number of results, or a part result shaped like nothing this
+    /// client knows, fails the whole call as [`ClientError::Decode`] rather
+    /// than being read as somebody's success.
+    ///
+    /// # The wire
+    ///
+    /// The command is `execute_batch` — `REGISTER_ALL(TExecuteBatchCommand,
+    /// "execute_batch", Null, Structured, true, false)` in the cluster's own
+    /// [registry](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp):
+    /// volatile and light, so a POST. The parts travel as
+    /// `requests=[{command=…; parameters={…}; input=…}]` and the answer is the
+    /// v4 envelope `{results=[{output=…}|{error=…}]}`
+    /// ([command reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch);
+    /// `TExecuteBatchCommand` in
+    /// [`etc_commands.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/etc_commands.cpp);
+    /// both shapes confirmed against a local cluster).
+    ///
+    /// **The parameters go in the request body**, not the `X-YT-Parameters`
+    /// header that carries every other command's. A batch's parameters *are*
+    /// the batched commands, and a header has a size nobody promises; the C++
+    /// client makes the same choice for this same command
+    /// (`THttpRawBatchRequest::ExecuteBatch` sends the parameter node as the
+    /// POST body), and the proxy reads body parameters for any POST and
+    /// merges them with the header's
+    /// (`TContext::CaptureParameters` in
+    /// [`context.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/server/http_proxy/context.cpp)
+    /// — query string, then header, then body). Measured here: `requests` in
+    /// the body and `mutation_id` in the header land as one parameter set.
+    ///
+    /// # Retries, and what makes them safe
+    ///
+    /// A batch of the typed parts retries like any light command, and a
+    /// mutating one retries **under a mutation id** — because the cluster
+    /// spreads that id over the parts. The driver takes the batch's own id
+    /// and hands part *k* the id plus *k*
+    /// (`Options.GetOrGenerateMutationId()` then
+    /// `NRpc::GenerateNextBatchMutationId` per part in
+    /// `TExecuteBatchCommand::DoExecute`; the increment is `++id.Parts32[0]`,
+    /// `yt/yt/core/rpc/helpers.cpp`), stamping it and the batch's `retry`
+    /// flag into every **volatile** part. A replay of the whole batch
+    /// therefore replays every part under its original id, and the master's
+    /// mutation cache answers each with its first response. **Measured on a
+    /// local cluster**: a two-[`BatchRequest::create_table`] batch sent under
+    /// an explicit id, then sent again with `retry=%true`, answered the *same
+    /// two node ids* both times — where the same batch under a fresh id got two
+    /// `501 already exists`.
+    ///
+    /// The measurement uses `create_table` and not
+    /// [`BatchRequest::create`] on purpose, and repeating it with `create`
+    /// proves nothing: `create` sends `ignore_existing`, so a second send
+    /// answers with the *old* node's id whether or not the cluster recognised a
+    /// replay. Measured that way too — `create` under a **fresh** id returned
+    /// the same two ids as the first send, with no mutation cache involved at
+    /// all. `create_table` omits `ignore_existing`, so its second send fails
+    /// unless it was deduplicated, which is what makes the identical ids mean
+    /// something.
+    ///
+    /// That safety is the master's, which is why the default is per-part
+    /// kind: parts this crate models are Cypress commands the master's cache
+    /// covers, so their batches go out [`Repeatable::WithMutationId`] (or
+    /// [`Repeatable::Freely`] when every part is a read, since such a batch
+    /// mutates nothing). A [`BatchRequest::raw`] part may name a command the
+    /// cache does not cover — the scheduler commands are the measured example,
+    /// where a replayed id turns a success into `No such operation` — so a
+    /// batch carrying one is **sent once**, exactly as
+    /// [`Client::raw_command`] is.
+    ///
+    /// # Transactions
+    ///
+    /// A client bound to a transaction puts the parts in it — each part is
+    /// stamped with `transaction_id`, not the envelope. The envelope has no
+    /// transaction to be in, and the distinction is measurable: an outer
+    /// `transaction_id` was dropped in silence by a local cluster, the
+    /// part's create landing outside the transaction and surviving its
+    /// abort. A part that already names a transaction keeps its own, and a
+    /// part whose command takes none is left alone, both as the transport
+    /// itself would have it.
+    ///
+    /// # A big batch is several requests, and a failed one leaves a prefix
+    ///
+    /// More parts than [`BatchRequest::with_max_part_size`] allows are split
+    /// into consecutive `execute_batch` requests — the C++ client's
+    /// `BatchPartMaxSize` behaviour, defaults included — with the results
+    /// stitched back in part order and a mutation id per request. There is no
+    /// rollback across them: when a later request fails **wholesale**, the
+    /// earlier ones have already run and their parts have taken effect, the
+    /// same way the C++ client's `ExecuteBatch` throws with the earlier
+    /// requests applied.
+    ///
+    /// What this method does *not* do is throw that prefix away. A split batch
+    /// that stops part of the way through fails with
+    /// [`ClientError::BatchInterrupted`], which carries every answer already
+    /// received, in part order, beside the failure that stopped it — so a
+    /// caller can see which parts landed and pick up from `answered.len()`.
+    /// Re-running the same [`BatchRequest`] is *not* how to recover: a second
+    /// execution mints fresh mutation ids, so the parts that already applied
+    /// are applied again rather than deduplicated. Keep a batch inside one
+    /// request's worth if that matters, or give the sequence a transaction.
+    ///
+    /// `answered` is what came **back**, which is not the same as what was
+    /// applied, and the difference is the whole failed request. A request
+    /// refused *while executing* has no per-part results and has nonetheless
+    /// run **every one of its parts** — the driver collects the sub-requests
+    /// into callbacks, runs them all through
+    /// `CancelableRunWithBoundedConcurrency`, and then throws away the entire
+    /// result list at `.ValueOrThrow()` the moment one entry is a throw.
+    /// Dispatch is never aborted, so this is not a race and there is no way to
+    /// arrange the parts to limit it: measured on a local cluster, a `create`
+    /// beside a part naming an unknown command created its node with the bad
+    /// part first *and* last, two creates around one both landed, and at
+    /// `concurrency=1` eight creates followed by the bad part all eight landed
+    /// — every time answered `Unknown command …` with no results at all.
+    ///
+    /// The bound worth knowing is the other one: a request refused *while its
+    /// parameters are being read* runs nothing. `Validation failed at
+    /// /concurrency`, `Error loading parameter /requests` and
+    /// `Missing required parameter /requests` all left a `create` in the same
+    /// request with no node behind it. Parse-time failure means none of it ran;
+    /// execution-time failure means all of it did.
+    ///
+    /// So the parts before `answered.len()` are settled, and the request that
+    /// failed is unknown territory — not because some of it might have run, but
+    /// because all of it did and none of it said what happened. That is what a
+    /// transaction is for.
+    ///
+    /// # A redirect this batch cannot follow
+    ///
+    /// The parts travel in the body, so this is the crate's first light
+    /// command with bytes in one — and the redirect rule reads a body as data
+    /// a redirect must not hand to another origin
+    /// ([`RedirectRefusal::Payload`]). A cross-origin `3xx` on a batch is
+    /// therefore refused where the *same* creates sent one at a time are
+    /// bodiless `POST`s the rule deliberately lets through. It is narrow — a
+    /// client with a token is refused a cross-origin hop anyway, by the
+    /// credentials rule — but a **tokenless** client behind a balancer that
+    /// canonicalises to another origin finds batching breaks what individual
+    /// calls did. Address the origin the balancer canonicalises to, and the
+    /// hop never happens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Config`] for an empty batch — the cluster would
+    /// answer `{results=[]}` and this crate does not report a no-op as work
+    /// done — [`ClientError::BatchInterrupted`] when a split batch stops after
+    /// some of its requests have applied, and otherwise [`ClientError`] as any
+    /// command fails. Per-part failures are **not** errors of this method:
+    /// they are the `Err` halves of the vector.
+    pub fn execute_batch(&self, batch: &BatchRequest) -> Result<Vec<Result<YsonValue>>> {
+        self.execute_batch_with(batch, None)
+    }
+
+    /// As [`Client::execute_batch`], with a caller-supplied [`MutationId`].
+    ///
+    /// The guarantee is the one [`Client::raw_command_with`] describes and the
+    /// one a single process cannot give itself: persist the id, and a batch
+    /// replayed after a crash is deduplicated against the send that already
+    /// happened instead of applying every part a second time. **Measured on a
+    /// local cluster through this method**: a batch of two
+    /// [`BatchRequest::create_table`] parts sent under an explicit id, then
+    /// sent again under `id.as_retry()`, answered the *same two node ids* both
+    /// times — where the same batch under a fresh id got two
+    /// `501 already exists`.
+    ///
+    /// Reach for `create_table` and not [`BatchRequest::create`] when checking
+    /// this by hand. `create` sends `ignore_existing`, which makes a second
+    /// send answer with the old node's id on its own: measured, a two-`create`
+    /// batch under a **fresh** id returned ids identical to the first send's,
+    /// which looks exactly like a deduplicated replay and is not one.
+    /// `create_table` sends no `ignore_existing`, so identical ids there can
+    /// only be the mutation cache.
+    ///
+    /// That works because the cluster spreads the id over the parts rather
+    /// than deduplicating the envelope: the driver hands part *k* the batch's
+    /// id plus *k*, so a replay replays each part under the id its first send
+    /// used. It is also why **an id covers one request and not a split batch**
+    /// — see the refusal below.
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{BatchRequest, Client, MutationId};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// # let mut batch = BatchRequest::new();
+    /// # batch.create("table", "//tmp/pipeline/clicks");
+    /// let id = MutationId::new();
+    /// // …persist `id.as_str()` here, before sending…
+    /// let made = match client.execute_batch_with(&batch, Some(&id)) {
+    ///     Ok(made) => made,
+    ///     // After a crash, the same id marked as a replay: the cluster
+    ///     // answers with what the first send did, whether or not it landed.
+    ///     Err(_) => client.execute_batch_with(&batch, Some(&id.as_retry()))?,
+    /// };
+    /// # let _ = made;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// An id is stamped whatever the batch's own retry class works out to,
+    /// including on an all-read batch that would otherwise carry none — the
+    /// two answer different questions, as [`Client::raw_command_with`] spells
+    /// out. It does not make a send-once batch retriable in-process: a batch
+    /// holding an unclassified [`BatchRequest::raw`] part is still sent once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::execute_batch`], and additionally [`ClientError::Config`]
+    /// when an id is given for a batch that would be **split** into more than
+    /// one request. One id cannot cover several: the driver derives each
+    /// part's id by incrementing the batch's, so a second request under
+    /// anything derived from the same id would collide with the first
+    /// request's parts and be answered with their results. Raise
+    /// [`BatchRequest::with_max_part_size`] until the batch fits one request,
+    /// or send it without an id.
+    pub fn execute_batch_with(
+        &self,
+        batch: &BatchRequest,
+        mutation_id: Option<&MutationId>,
+    ) -> Result<Vec<Result<YsonValue>>> {
+        if batch.is_empty() {
+            return Err(ClientError::Config(
+                "an empty batch is not a request worth sending: the cluster \
+                 would answer with no results, and reporting that as success \
+                 would call a no-op work done"
+                    .to_owned(),
+            ));
+        }
+
+        let max_part_size = batch.max_part_size();
+        if mutation_id.is_some() && batch.len() > max_part_size {
+            return Err(ClientError::Config(format!(
+                "a batch of {} parts is sent as several requests at {max_part_size} \
+                 parts each, and one mutation id cannot cover them: the cluster \
+                 derives each part's id by incrementing the batch's, so a second \
+                 request under the same id would be answered with the first \
+                 request's results. Raise with_max_part_size past {}, or send it \
+                 without an id.",
+                batch.len(),
+                batch.len()
+            )));
+        }
+
+        let repeatable = batch.repeatable();
+        let mut results = Vec::with_capacity(batch.len());
+
+        for chunk in batch.parts().chunks(max_part_size) {
+            let answered = batch::render_chunk(chunk, batch.concurrency(), self.transaction_id())
+                .and_then(|body| {
+                    self.transport.call_with(
+                        Method::Post,
+                        "execute_batch",
+                        &yson_build::empty_map(),
+                        Payload::Bytes(&body),
+                        repeatable,
+                        mutation_id,
+                    )
+                })
+                .and_then(|answer| batch::parse_results(&answer, chunk));
+
+            match answered {
+                Ok(answers) => results.extend(answers),
+                // Nothing has been applied yet, so there is no prefix to
+                // report and the failure speaks for itself.
+                Err(cause) if results.is_empty() => return Err(cause),
+                // Earlier requests have run. Reporting only the failure would
+                // hide that they did.
+                Err(cause) => {
+                    return Err(ClientError::BatchInterrupted {
+                        answered: results,
+                        parts: batch.len(),
+                        cause: Box::new(cause),
+                    });
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     // ---------------------------------------------------------------- data

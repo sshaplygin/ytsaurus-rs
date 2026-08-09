@@ -55,7 +55,7 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — a pool picked at random, refreshed lazily every minute, a failed host dropped until a refresh restores it; constrained to the configured domain, or to a list you write |
 | Compression | configurable, off by default | zstd both ways | gzip **inbound only** |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
-| Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
+| Batching several commands | `CreateBatchRequest` → futures | `NewBatchRequest` → `BatchResponse[T]` | `BatchRequest` → `Vec<Result<…>>`, per-part; **no per-part retry**, where C++ re-queues a retriable part; a split batch that stops reports the prefix it applied, where C++ throws with it lost |
 | Retries | three policies by request class | interceptor chain | one policy × `Repeatable` |
 | Client logging | global `ILogger` | `Config.Logger`, structured | optional `tracing` feature, off by default |
 | Distributed tracing | `EnableClientTracing` | `TraceFn` + Jaeger and OTel adapters | `TraceContext` → `traceparent`, no dependency |
@@ -242,11 +242,15 @@ Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
-four on that list are **now built**: logging and tracing — a `traceparent` the
+five on that list are **now built**: logging and tracing — a `traceparent` the
 cluster joins, and an optional `tracing` feature — the operation object and
 its lifecycle, which is what the table above came to, read-side column and
-range selection (`TablePath::columns` / `::range`), and `read_file` with its
-streaming half (#10). What is left is batch requests and transaction `Detach`.
+range selection (`TablePath::columns` / `::range`), `read_file` with its
+streaming half (#10), and batch requests: `BatchRequest` and
+`Client::execute_batch`, per-part `Result`s with the C++ client's
+`Concurrency` and `BatchPartMaxSize` options, plus one thing neither official
+client offers — a split batch that stops names the prefix it already applied,
+rather than reporting only the failure. What is left is transaction `Detach`.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,

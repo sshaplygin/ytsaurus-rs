@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 690 tests: 622 unit and integration, 68 doc
+cargo test --workspace            # 721 tests: 649 unit and integration, 72 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -915,6 +915,128 @@ and the documentation disagreed and the source is what settles it.
   of that request queues forever instead. Hence the deadline on `lock_waiting`.
 - `unlock` exists and is not modelled: its rules about a transaction that has
   already modified the node were not verified here.
+
+### Batched commands
+
+`execute_batch` sends several light commands in one request — `BatchRequest` +
+`Client::execute_batch`, exercised by
+`cargo run -p ytsaurus-client --example batch`. All of the following was watched
+on the local cluster, not read:
+
+- **The saving is real and it is the whole point.** Twelve `create`s went as
+  **one** request in **9.16 ms**, against **140.77 ms** for the same twelve sent
+  one at a time — measured through a counting TCP relay in front of the proxy,
+  because a client has no way to count its own round trips. `tests/batch.rs`
+  pins the count against an in-process socket; a program on a cluster cannot,
+  which is why the example does not claim it.
+- **An envelope `transaction_id` is silently dropped.** `TExecuteBatchOptions :
+  TMutatingOptions` has no transactional half, so a batch stamped with one
+  created its node **outside** the transaction — visible at once, untouched by
+  the abort. The silent escape a transaction exists to prevent. The client
+  stamps each **part** instead, which the cluster honours, and `execute_batch`
+  is on the `NO_TRANSACTION` list so the blanket stamp cannot dress the envelope
+  up in a parameter known to mean nothing.
+- **A part naming an unknown command fails the whole batch** — HTTP 400,
+  `Unknown command "frobnicate"`, and **no per-part results at all**, because
+  the driver resolves each command's descriptor before per-part error handling
+  begins (`TRequestExecutor::Run` throws first).
+- **…and that refused batch ran every part. It is not a race.** The failure
+  destroys the *answers*, not the work. `TExecuteBatchCommand` collects the
+  sub-requests into callbacks, runs them all through
+  `CancelableRunWithBoundedConcurrency`, and only then calls `.ValueOrThrow()`
+  on the collected list, which discards every result together as soon as one is
+  the unknown-name throw — **dispatch is never aborted**. Probed five ways, and
+  none of the obvious mitigations mitigate:
+
+  | batch | HTTP | applied |
+  | --- | --- | --- |
+  | `[create a1, frobnicate]` | 400, no results | `a1` exists |
+  | `[frobnicate, create b1]` — bad part **first** | 400 | `b1` exists |
+  | `[create c1, frobnicate, create c2]` | 400 | **both** exist |
+  | `concurrency=1`, `[frobnicate, create d1, create d2]` | 400 | **both** exist |
+  | `concurrency=1`, 8 creates then `frobnicate` | 400 | **all 8** exist |
+
+  Putting the bad part first does not limit the damage and neither does
+  `concurrency=1`. So a wholesale failure says nothing about what was applied,
+  and there are no per-part results to ask — which is why
+  `Client::execute_batch` reports the prefix it was *answered* for and does not
+  claim to know what landed, and why `ClientError::BatchInterrupted`'s own
+  one-liner refuses to call that prefix "applied".
+- **The one bound that does hold: parameter parsing versus execution.** A batch
+  refused while its parameters are being read runs **nothing**; a batch that
+  reaches execution runs **all of it**. Measured with a `create` sitting in each
+  refused request:
+
+  | probe | message | applied |
+  | --- | --- | --- |
+  | `concurrency=0` + create | `Validation failed at /concurrency` | **nothing** |
+  | part missing `command` | `Error loading parameter /requests` | **nothing** |
+  | part `parameters` not a dict | `Error loading parameter /requests` | **nothing** |
+  | `requests` not a list | `Error loading parameter /requests` | **nothing** |
+  | `requests` missing | `Missing required parameter /requests` | n/a |
+
+  This is the only fact that lets a caller reason about a 400 at all: the
+  message tells you which side of the line you are on.
+- **Parts run in parallel, and the documentation means it.** A batch that
+  created a node and asked `exists` about it in the same breath was answered
+  `%false`: both parts succeeded, and the read simply ran first. A part and its
+  consequence belong in two batches.
+- **A batch replayed under one mutation id is deduplicated per part.** The
+  driver hands part *k* the batch's id plus *k*
+  (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`) and stamps the
+  batch's `retry` flag into every volatile part. Measured with parts that carry
+  **no `ignore_existing`** — `BatchRequest::create_table`, not
+  `BatchRequest::create` — because that is the only spelling where the result
+  means anything:
+
+  ```text
+  first  (id)          : ["2-2e82-10191-d4fdeff4", "2-2e83-10191-b0f0b0cd"]
+  replay (id, retry)   : ["2-2e82-10191-d4fdeff4", "2-2e83-10191-b0f0b0cd"]   IDENTICAL
+  fresh  (new id)      : [501 "already exists", 501 "already exists"]
+  ```
+
+  **Do not run this check with `BatchRequest::create`.** It sends
+  `ignore_existing`, so a second send answers with the *old* node's id whether
+  or not a replay was recognised — measured, a two-`create` batch under a
+  **fresh** id returned ids identical to the first send's, which looks exactly
+  like a deduplicated replay and is not one. One id covers **one** request,
+  though: because the per-part ids are derived by incrementing, a second request
+  under anything derived from the same id would collide with the first request's
+  parts, so a split batch carrying a caller's id is refused.
+- **`isHeavy` is not what decides whether a command can be a part — the data
+  types are.** The driver throws `Command %Qv cannot be part of a batch since it
+  has inappropriate output type %Qlv` before any part runs, so one such name
+  fails the whole request. Measured against the registry the cluster serves at
+  `GET /api/v4` (190 commands) and confirmed name by name: a part is refused
+  when its **output type** is `tabular` or `binary`, or its **input type** is
+  `binary` — 21 names, against the 7 on the crate's `HEAVY` list. The two lists
+  differ in *both* directions: `get_job_spec` is `is_heavy: true` and was
+  **accepted** as a part (ordinary per-part error), while `alter_query` and
+  `push_queue_producer` are `is_heavy: false` and are refused. And `write_table`
+  — `is_heavy: true`, input `tabular`, output `structured` — was **accepted and
+  applied**: a `write_table` part with its rows in the part's `input` wrote
+  them, so the crate's refusal of it is the crate's own policy (bulk data does
+  not belong inline in a batch body headed for a light proxy) and not the
+  cluster's. `select_rows` and `lookup_rows` are the names a caller would
+  plausibly try; both are refused, and `[create x1, select_rows]` was answered
+  400 `inappropriate output type "tabular"` **with `x1` created anyway**. Two
+  more whole-batch refusals no name list can catch: a part whose command takes
+  input and is given none (`Command %Qv requires input`, measured for
+  `insert_rows`, `write_table` and seven others), and an unknown name.
+- **No modelled command answers a bare `{}` under API v4.** Measured one part
+  apiece: `create` → `{"output":{"node_id":…}}`, `set` → `{"output":{}}`,
+  `remove` → `{"output":{}}`, `exists` → `{"output":{"value":false}}`. The bare
+  `{}` the command reference's example shows for a `set` belongs to **v3**: the
+  registry the cluster serves at `GET /api/v4` lists `remove` and `set` as
+  `output_type: structured`, and only `/api/v3` lists them `null`. So the
+  registry's output-type bit does not separate `set` from `create` on the
+  version this crate speaks, and a guard built on it — refusing only a bare `{}`
+  — is dead against its own motivating scenario, because the shape a v4 cluster
+  would really produce is `{"output":{}}`, and that is a legitimate `set`
+  success the parser cannot tell from a broken `create`. The parser therefore
+  checks **the key the answer carries** (`node_id` for `create`, `value` for
+  `exists`/`get`/`list`), which catches a `create` with no `node_id` however it
+  is wrapped.
 
 ### Control records
 

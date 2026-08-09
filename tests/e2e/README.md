@@ -112,6 +112,7 @@ cargo run --release -p ytsaurus-client --example append  # adding rows, against 
 cargo run -p ytsaurus-client --example rich_path    # which columns and rows a path names
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
+cargo run -p ytsaurus-client --example batch        # a dozen commands, one round trip, answers apiece
 cargo run -p ytsaurus-client --example raw          # commands the crate does not model
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
 cargo run --release -p ytsaurus-client --example profile     # what the pilot spends on decoding

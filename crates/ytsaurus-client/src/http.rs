@@ -177,6 +177,22 @@ const HEAVY: &[&str] = &[
     "get_job_input",
     "get_job_stderr",
 ];
+
+/// Whether `command` is one the cluster declares heavy.
+///
+/// Read by the redirect advice, and by
+/// [`BatchRequest::raw`](crate::BatchRequest::raw) for a **narrower** job than
+/// it once had. `isHeavy` is not the cluster's rule for what may be a batch
+/// part — that rule is the command's data types, and lives in
+/// `batch::NOT_A_BATCH_PART`; measured, `get_job_spec` is heavy and is taken as
+/// a part, while `write_table` is heavy and is taken as a part *and applies*.
+/// What this list still decides for a batch is this crate's own policy: bulk
+/// data does not travel inline in a batch body to a light proxy, whatever the
+/// cluster would tolerate.
+pub(crate) fn is_heavy(command: &str) -> bool {
+    HEAVY.contains(&command)
+}
+
 /// The W3C trace context, in the spelling the proxy parses. See
 /// [`TraceContext`](crate::TraceContext).
 const TRACEPARENT: &str = "traceparent";
@@ -233,7 +249,18 @@ pub(crate) const CONTROL_REFUSAL: &str = "may not serve heavy requests";
 /// `start_operation` is deliberately *not* here: an operation genuinely can run
 /// inside a transaction, which is how its output tables stay invisible until
 /// the launcher commits.
+///
+/// `execute_batch` is here for a different reason than its neighbours: it is
+/// served by the proxy's own driver, but its options are `TExecuteBatchOptions
+/// : TMutatingOptions` — no transactional half — so an outer `transaction_id`
+/// means nothing. **Measured on a local cluster**: a batch stamped with one
+/// created its node *outside* the transaction, visible at once and untouched
+/// by the abort. `Client::execute_batch` stamps the transaction into each
+/// part's parameters instead, which the same measurement shows the cluster
+/// honours; the entry here keeps the blanket stamp from dressing the envelope
+/// up in a parameter the cluster is known to drop.
 const NO_TRANSACTION: &[&str] = &[
+    "execute_batch",
     "get_operation",
     "list_operations",
     "list_operation_events",
@@ -249,6 +276,16 @@ const NO_TRANSACTION: &[&str] = &[
     "abort_job",
     "poll_job_shell",
 ];
+
+/// Whether `command` is one the blanket transaction stamp skips.
+///
+/// Read by `Client::execute_batch` as well as by
+/// [`Transport::in_transaction`], because a batch *part* is a command too: a
+/// `get_operation` that takes no `transaction_id` outside a batch takes none
+/// inside one, and two copies of the list would drift.
+pub(crate) fn takes_no_transaction(command: &str) -> bool {
+    NO_TRANSACTION.contains(&command)
+}
 
 /// Applies a header list to either builder flavour.
 ///
@@ -915,7 +952,7 @@ impl Transport {
     fn in_transaction(&self, command: &str, parameters: &YsonValue) -> Option<YsonValue> {
         let id = self.transaction.as_ref()?;
 
-        if NO_TRANSACTION.contains(&command) {
+        if takes_no_transaction(command) {
             return None;
         }
 
@@ -1758,7 +1795,7 @@ impl Transport {
                 status: status.as_u16(),
                 location: target.clone(),
                 refusal,
-                heavy: HEAVY.contains(&command),
+                heavy: is_heavy(command),
             })
         };
 
