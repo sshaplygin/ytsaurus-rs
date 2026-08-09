@@ -118,8 +118,8 @@ cargo run -p ytsaurus-client --example raw          # commands the crate does no
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
 cargo run --release -p ytsaurus-client --example profile     # what the pilot spends on decoding
 
-# One binary that is both launcher and job. On macOS the launcher cannot be the
-# uploaded file, so point it at the musl build of the same source.
+# One source, two build outputs: `cargo run` makes a host launcher on every
+# platform, so point it at the static musl worker built above.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
     cargo run -p ytsaurus-examples --bin selfrun
 ```
@@ -168,9 +168,8 @@ refused before it can be uploaded:
 so a Linux node cannot exec it. Build the worker with scripts/build-worker.sh …
 ```
 
-and the real one-binary path — the binary uploading *itself* — was verified by
-running the musl build as the launcher inside Linux, which is what a Linux
-developer's machine would do:
+The optional direct-static path — the binary uploading *itself* — was also
+verified by running the musl build as the launcher inside Linux:
 
 ```sh
 docker cp target/x86_64-unknown-linux-musl/release-worker/selfrun yt.backend:/tmp/selfrun
@@ -178,7 +177,7 @@ docker exec -e YT_PROXY=http://localhost:80 yt.backend /tmp/selfrun
 ```
 
 ```text
-== Uploading this very binary
+== Uploading the worker
    ok /tmp/selfrun -> //tmp/ytsaurus_rs_selfrun/selfrun
 == Waiting for it
    ok completed

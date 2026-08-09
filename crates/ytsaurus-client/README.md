@@ -256,10 +256,11 @@ waits forever without a word.
 [`examples/cypress.rs`](examples/cypress.rs) runs all of it, ending with three
 transactions competing for one lock.
 
-## One binary, two roles
+## One static binary, two roles
 
-`upload_current_exe` uploads the *running* executable, so the same program can
-launch the operation and be the job it runs:
+When the running executable is a static Linux x86-64 binary,
+`upload_current_exe` uploads it, so the same program can launch the operation
+and be the job it runs:
 
 ```rust
 fn main() {
@@ -268,13 +269,14 @@ fn main() {
 }
 ```
 
-There is no second artifact to forget to rebuild. The running executable has to
-be something a node can exec, so its ELF header is checked first — Linux,
-x86-64, statically linked — and refused with `ClientError::NotAWorker` when it
-is not, rather than failing on the node minutes later. On macOS the launcher is
-Mach-O and cannot be the uploaded file: build the worker with
-`scripts/build-worker.sh` and upload that with `upload_worker`. The source is
-still one file — see
+That direct-static path has no second artifact to forget to rebuild. The running
+executable has to be something a node can exec, so its ELF header is checked
+first — Linux, x86-64, statically linked — and refused with
+`ClientError::NotAWorker` when it is not, rather than failing on the node
+minutes later. The default launcher built with `cargo run` is Mach-O on macOS
+or normally dynamically linked on Linux, so it cannot be the uploaded file.
+Build the worker with `scripts/build-worker.sh` and upload that with
+`upload_worker`. The source is still one file — see
 [`examples/src/bin/selfrun.rs`](../../examples/src/bin/selfrun.rs).
 
 ## Talking to a real installation

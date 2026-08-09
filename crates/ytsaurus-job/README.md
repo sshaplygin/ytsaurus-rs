@@ -76,8 +76,10 @@ writer.finish()
   }
   ```
 
-  With `ytsaurus-client`'s `upload_current_exe`, the binary uploads itself —
-  there is no second artifact to forget to rebuild.
+  When that launcher is a static Linux x86-64 binary,
+  `ytsaurus-client`'s `upload_current_exe` uploads itself — there is no second
+  artifact to forget to rebuild. A `cargo run` launcher instead needs a
+  separately built static worker.
 
 ## Design notes
 
