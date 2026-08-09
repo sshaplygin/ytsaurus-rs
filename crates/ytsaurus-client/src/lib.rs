@@ -1425,10 +1425,20 @@ impl Client {
     /// flag into every **volatile** part. A replay of the whole batch
     /// therefore replays every part under its original id, and the master's
     /// mutation cache answers each with its first response. **Measured on a
-    /// local cluster**: a two-create batch sent under an explicit id, then
-    /// sent again with `retry=%true`, answered the *same two node ids* both
-    /// times — where the same batch under a fresh id got two
+    /// local cluster**: a two-[`BatchRequest::create_table`] batch sent under
+    /// an explicit id, then sent again with `retry=%true`, answered the *same
+    /// two node ids* both times — where the same batch under a fresh id got two
     /// `501 already exists`.
+    ///
+    /// The measurement uses `create_table` and not
+    /// [`BatchRequest::create`] on purpose, and repeating it with `create`
+    /// proves nothing: `create` sends `ignore_existing`, so a second send
+    /// answers with the *old* node's id whether or not the cluster recognised a
+    /// replay. Measured that way too — `create` under a **fresh** id returned
+    /// the same two ids as the first send, with no mutation cache involved at
+    /// all. `create_table` omits `ignore_existing`, so its second send fails
+    /// unless it was deduplicated, which is what makes the identical ids mean
+    /// something.
     ///
     /// That safety is the master's, which is why the default is per-part
     /// kind: parts this crate models are Cypress commands the master's cache
@@ -1473,13 +1483,30 @@ impl Client {
     /// request's worth if that matters, or give the sequence a transaction.
     ///
     /// `answered` is what came **back**, which is not the same as what was
-    /// applied, and the difference is the failed request. A request refused
-    /// wholesale has no per-part results and may still have applied some of
-    /// its parts — measured on a local cluster, where a `create` beside a part
-    /// naming an unknown command created its node even though the batch was
-    /// answered `Unknown command …` with no results at all. The parts before
-    /// `answered.len()` are settled; the request that failed is unknown
-    /// territory, which is what a transaction is for.
+    /// applied, and the difference is the whole failed request. A request
+    /// refused *while executing* has no per-part results and has nonetheless
+    /// run **every one of its parts** — the driver collects the sub-requests
+    /// into callbacks, runs them all through
+    /// `CancelableRunWithBoundedConcurrency`, and then throws away the entire
+    /// result list at `.ValueOrThrow()` the moment one entry is a throw.
+    /// Dispatch is never aborted, so this is not a race and there is no way to
+    /// arrange the parts to limit it: measured on a local cluster, a `create`
+    /// beside a part naming an unknown command created its node with the bad
+    /// part first *and* last, two creates around one both landed, and at
+    /// `concurrency=1` eight creates followed by the bad part all eight landed
+    /// — every time answered `Unknown command …` with no results at all.
+    ///
+    /// The bound worth knowing is the other one: a request refused *while its
+    /// parameters are being read* runs nothing. `Validation failed at
+    /// /concurrency`, `Error loading parameter /requests` and
+    /// `Missing required parameter /requests` all left a `create` in the same
+    /// request with no node behind it. Parse-time failure means none of it ran;
+    /// execution-time failure means all of it did.
+    ///
+    /// So the parts before `answered.len()` are settled, and the request that
+    /// failed is unknown territory — not because some of it might have run, but
+    /// because all of it did and none of it said what happened. That is what a
+    /// transaction is for.
     ///
     /// # A redirect this batch cannot follow
     ///
@@ -1513,10 +1540,19 @@ impl Client {
     /// one a single process cannot give itself: persist the id, and a batch
     /// replayed after a crash is deduplicated against the send that already
     /// happened instead of applying every part a second time. **Measured on a
-    /// local cluster through this method**: a two-`create` batch sent under an
-    /// explicit id, then sent again under `id.as_retry()`, answered the *same
-    /// two node ids* both times — where the same batch under a fresh id got
-    /// two `501 already exists`.
+    /// local cluster through this method**: a batch of two
+    /// [`BatchRequest::create_table`] parts sent under an explicit id, then
+    /// sent again under `id.as_retry()`, answered the *same two node ids* both
+    /// times — where the same batch under a fresh id got two
+    /// `501 already exists`.
+    ///
+    /// Reach for `create_table` and not [`BatchRequest::create`] when checking
+    /// this by hand. `create` sends `ignore_existing`, which makes a second
+    /// send answer with the old node's id on its own: measured, a two-`create`
+    /// batch under a **fresh** id returned ids identical to the first send's,
+    /// which looks exactly like a deduplicated replay and is not one.
+    /// `create_table` sends no `ignore_existing`, so identical ids there can
+    /// only be the mutation cache.
     ///
     /// That works because the cluster spreads the id over the parts rather
     /// than deduplicating the envelope: the driver hands part *k* the batch's

@@ -111,15 +111,16 @@ pub enum ClientError {
     },
 
     /// A split batch stopped part of the way through, and the requests before
-    /// the failure are **already applied on the cluster**.
+    /// the failure have **already run on the cluster**.
     ///
     /// [`Client::execute_batch`](crate::Client::execute_batch) sends a batch
     /// larger than [`BatchRequest::with_max_part_size`](crate::BatchRequest::with_max_part_size)
     /// as several `execute_batch` requests. There is no rollback: when a later
-    /// request fails wholesale, the earlier ones have run and their parts have
-    /// taken effect. Reporting only the failure would hide that, and re-running
-    /// the same [`BatchRequest`](crate::BatchRequest) is not a recovery either
-    /// — a second execution mints fresh mutation ids, so the parts that already
+    /// request fails wholesale, the earlier ones have run and whichever of
+    /// their parts succeeded have taken effect. Reporting only the failure
+    /// would hide that, and re-running the same
+    /// [`BatchRequest`](crate::BatchRequest) is not a recovery either — a
+    /// second execution mints fresh mutation ids, so the parts that already
     /// landed are applied a second time rather than deduplicated.
     ///
     /// So the prefix comes back with the failure: `answered` holds one entry
@@ -134,9 +135,17 @@ pub enum ClientError {
     /// report. Put the sequence in a transaction, or keep it inside one
     /// request, if a partial application is not something the caller can act
     /// on.
+    ///
+    /// The rendered message says the same thing, deliberately. It is the
+    /// sentence that reaches a log line and an `unwrap()` panic, so it must not
+    /// draw a line the cluster does not honour: `answered.len()` is where the
+    /// *answers* stop, not where the effects stop. The request that failed runs
+    /// its parts whatever it answers — measured — and `answered` itself holds
+    /// `Err` entries, which applied nothing at all.
     #[error(
-        "execute_batch: the batch stopped after {} of {parts} parts, which are already \
-         applied on the cluster: {cause}",
+        "execute_batch: {} of {parts} parts were answered for before the batch stopped — \
+         that is where the answers stop, not where the effects do: the request that failed \
+         still ran its parts, and an Err among the answers applied nothing: {cause}",
         .answered.len()
     )]
     BatchInterrupted {

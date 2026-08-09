@@ -134,7 +134,7 @@ fn run() -> Result<(), ClientError> {
             }),
     )?;
 
-    step("A split batch that stops says which parts already applied");
+    step("A split batch that stops says which parts it was answered for");
     // A part naming a command the cluster has never heard of fails the *whole*
     // request — so putting one in the second chunk of a split batch is a
     // mid-sequence failure with the first chunk already committed. There is no
@@ -174,14 +174,16 @@ fn run() -> Result<(), ClientError> {
             && client.exists(&format!("{BASE}/applied1"))?,
     )?;
     // And the sharper half, which is why `answered` reports what came *back*
-    // rather than claiming what was applied: the request that failed is not a
-    // no-op either. The parts of it the driver could resolve ran before the
-    // unknown name threw, so a create sitting beside `frobnicate` lands even
-    // though the batch is refused with no per-part results at all. Reported,
-    // not asserted: it is the cluster's behaviour today, and a version that
-    // stopped doing it would be a fix rather than a regression.
+    // rather than claiming what was applied: the request that failed ran
+    // *every* part it never answered for. The driver collects the sub-requests,
+    // runs them all, and then throws the whole result list away because one
+    // entry is the unknown-name throw — dispatch is never aborted, so this is
+    // not a race, and neither putting the bad part first nor lowering
+    // `concurrency` limits it. Reported, not asserted: it is the cluster's
+    // behaviour today, and a version that stopped doing it would be a fix
+    // rather than a regression.
     done(&format!(
-        "the create beside the unknown command {} — a refused request is not a no-op",
+        "the create beside the unknown command {} — a refused request runs anyway",
         if client.exists(&format!("{BASE}/never"))? {
             "landed anyway"
         } else {

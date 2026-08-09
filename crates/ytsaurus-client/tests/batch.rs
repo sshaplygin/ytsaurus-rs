@@ -605,6 +605,15 @@ fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
     // two above and still deduplicate the third request into the first's
     // answer.
     assert_ne!(ids[0], ids[2]);
+    // And the property stated once, over all of them, so that no single
+    // deleted line can take the guarantee with it: an A,B,A recycling
+    // implementation has to fail here too.
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "every request needs its own mutation id, got {ids:?}"
+    );
 
     // Stitched back in part order, failure and all.
     assert_eq!(parts.len(), 5);
@@ -670,6 +679,19 @@ fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
     let said = error.to_string();
     assert!(said.contains("2 of 5"), "{said}");
     assert!(said.contains("503"), "{said}");
+    // And it must not claim the count is a line the cluster honours. This is
+    // the sentence that reaches a log and an unwrap() panic, and `answered`
+    // holds Err entries that applied nothing while the request that failed
+    // ran every part it never answered for. A message asserting the prefix is
+    // "already applied" is the one that gets a caller to corrupt state.
+    assert!(
+        !said.contains("already applied"),
+        "the one-liner must not claim the answered prefix is what applied: {said}"
+    );
+    assert!(
+        said.contains("not where the effects"),
+        "the one-liner must say what the count is and is not: {said}"
+    );
 
     // The third request was never sent — this is a stop, not a skip.
     assert_eq!(stub.seen().len(), 2);
@@ -685,6 +707,45 @@ fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
     assert!(
         matches!(error, ClientError::Http { status: 503, .. }),
         "{error:?}"
+    );
+}
+
+#[test]
+fn every_request_of_a_split_batch_gets_its_own_mutation_id() {
+    // Stated on its own, over more chunks than the split test uses, because
+    // the property had exactly one assertion covering it: an implementation
+    // that recycled ids as A,B,A passed the whole workspace with that single
+    // line deleted. Recycling any id across requests would have the cluster
+    // answer the later request with the earlier request's results — the
+    // per-part ids are derived by incrementing the batch's, so a repeat is a
+    // collision across every part of both.
+    let answers = vec![r#"{"output"={"node_id"="0-0-0-0"}}"#; 2];
+    let stub = Stub::serving(vec![results(&answers); 5]);
+
+    let mut batch = BatchRequest::new().with_max_part_size(2);
+    for index in 0..10 {
+        batch.create("table", &format!("//tmp/t{index}"));
+    }
+    once(&stub).execute_batch(&batch).expect("executes");
+
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 5, "ten parts at two per request");
+
+    let ids: Vec<String> = seen
+        .iter()
+        .map(|(head, _)| {
+            field(&header_parameters(head), "mutation_id")
+                .and_then(YsonValue::as_str)
+                .expect("every chunk carries an id")
+                .to_owned()
+        })
+        .collect();
+
+    let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "every request needs its own mutation id, got {ids:?}"
     );
 }
 

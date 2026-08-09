@@ -75,11 +75,20 @@
   `remove_tree`, `set_attribute`) that send exactly what their `Client`
   namesakes send, plus a `raw` escape hatch. A builder is what lets the retry
   class be decided instead of guessed — see below — and what keeps a part
-  from being a shape the cluster refuses: only light commands with `null` or
-  `structured` input and output can be parts at all, and a `raw` part naming
-  one the cluster declares **heavy** — `write_table`, `read_file` and the rest
-  of that list — is refused where it is written rather than costing a round
-  trip and taking the *whole* batch down with it.
+  from being a shape the cluster refuses. **The cluster's rule is the
+  command's data types, not `isHeavy`**: a part is refused when its registered
+  output type is `tabular` or `binary`, or its input type is `binary`, and the
+  driver throws before any part runs, so one such name fails the *whole*
+  request. Measured against the registry the cluster serves at `GET /api/v4`
+  (190 commands) and confirmed name by name — 21 names, where the crate's
+  `HEAVY` list has 7, and the two differ in both directions: `get_job_spec` is
+  `is_heavy: true` and is **accepted** as a part, while `alter_query` and
+  `push_queue_producer` are `is_heavy: false` and are refused. `select_rows`
+  and `lookup_rows` are on it, and are what a caller would plausibly try. A
+  `raw` part naming one is refused where it is written rather than costing a
+  round trip and taking the other parts' answers with it. The list is a
+  snapshot of one cluster's registry, not a promise of completeness, and
+  `BatchRequest::raw_with` says so.
 
 - **Added** the two options both official clients expose:
   `with_concurrency`, the command's own server-side cap (“to avoid exhausting
@@ -106,12 +115,22 @@
   always was.
 
   `answered` is what came **back**, which is deliberately not a claim about
-  what was *applied*. Measured on a local cluster: a request refused wholesale
-  can still have applied some of its parts — a `create` beside a part naming
-  an unknown command created its node even though the batch was answered
-  `Unknown command …` with no per-part results at all. The parts before
-  `answered.len()` are settled; the request that failed is unknown territory,
-  which is what a transaction is for.
+  what was *applied* — and the rendered one-liner says so too, because that is
+  the sentence a log line and an `unwrap()` panic show. A request refused
+  *while executing* runs **every one of its parts** and then throws the whole
+  result list away: the driver collects the sub-requests into callbacks, runs
+  them all through `CancelableRunWithBoundedConcurrency`, and discards
+  everything at `.ValueOrThrow()`. Dispatch is never aborted, so this is not a
+  race and no arrangement of the parts limits it — measured, a `create` beside
+  a part naming an unknown command landed with the bad part first *and* last,
+  two creates around one both landed, and at `concurrency=1` eight creates
+  before the bad part all landed. The bound that does hold is the other one: a
+  request refused while its *parameters are being read* runs nothing
+  (`Validation failed at /concurrency`, `Error loading parameter /requests`,
+  `Missing required parameter /requests` all left no node behind). So the parts
+  before `answered.len()` are settled, and the request that failed is unknown
+  territory — not because some of it might have run, but because all of it did
+  and none of it said what happened. That is what a transaction is for.
 
 - **Added** `Client::execute_batch_with`, taking a caller-supplied
   `MutationId` — the same guarantee `Client::raw_command_with` offers and the
@@ -119,9 +138,15 @@
   replayed after a crash is deduplicated against the send that may already
   have happened. It was the one thing the feature's own headline safety claim
   rested on and the API could not express. **Reproduced through this method**
-  on a local cluster: a two-`create` batch sent under an explicit id and again
-  under `id.as_retry()` answered the same two node ids, where a fresh id got
-  two `501 already exists`.
+  on a local cluster, with `create_table` parts and not `create` ones: sent
+  under an explicit id and again under `id.as_retry()` it answered the same two
+  node ids, where a fresh id got two `501 already exists`. The spelling
+  matters — `BatchRequest::create` sends `ignore_existing`, so a second send
+  answers with the *old* node's id whether or not a replay was recognised, and
+  a two-`create` batch under a **fresh** id was measured returning ids
+  identical to the first send's. That looks exactly like a deduplicated replay
+  and is not one; `create_table` omits `ignore_existing`, which is what makes
+  the identical ids mean something.
 
   An id covers **one** request and a split batch with one is refused with
   `ClientError::Config`: the cluster derives each part's id by incrementing
@@ -135,17 +160,19 @@
   `check_permission`, `get_supported_features`, `parse_ypath` — demoted an
   otherwise all-read batch to send-once. A caller who knows the command's
   registry bits says so and keeps the retry. `Repeatable::Heavy` is refused:
-  it is not a class a part can have, since a heavy command cannot be a part
-  and a batch does not go to a heavy proxy.
+  it is not a class a part can have, since it asks for a heavy proxy and a
+  batch does not go to one.
 
 - **A mutating batch is retried under one mutation id, and that is safe
   because the cluster spreads it over the parts.** The driver hands part *k*
   the batch's id plus *k* (`GenerateNextBatchMutationId`) and stamps the
   batch's `retry` flag into every volatile part, so a replayed batch replays
   every part under its original id and the master's cache answers each with
-  its first response. Measured, not assumed: a two-create batch replayed
-  under its id with `retry=%true` answered the **same two node ids** both
-  times, where the same batch under a fresh id got two `501 already exists`.
+  its first response. Measured, not assumed, with `create_table` parts —
+  `create` sends `ignore_existing` and would have answered with the same ids
+  either way: replayed under its id with `retry=%true` the batch answered the
+  **same two node ids** both times, where the same batch under a fresh id got
+  two `501 already exists`.
   A batch of nothing but reads mutates nothing and carries no id; a batch
   holding a **`raw` part is sent once**, whatever the policy says, because a
   command this crate cannot classify may mutate somewhere no mutation cache
@@ -173,15 +200,25 @@
   its consequence belong in two batches. Also measured: a part naming an
   unknown command fails the **whole batch** (HTTP 400, `Unknown command
   "frobnicate"`, no per-part results), because the driver resolves the command
-  before per-part error handling begins — and the *other* parts of that
-  request had already reached the master, so the refusal is not a rollback.
+  before per-part error handling begins — and **every other part of that
+  request still ran**, at any position and at any concurrency, so the refusal
+  is not a rollback and not a race.
 
 - The parser refuses what it does not recognise — a `results` count that
   does not match the parts, an item that is neither `{output=…}` nor
-  `{error=…}` nor the empty map a `null`-output command answers with —
-  rather than reading it as somebody's success. This crate's envelope rules
-  were learned from `exists` answering under `value`; the paranoia is paid
-  for.
+  `{error=…}` nor a bare empty map — rather than reading it as somebody's
+  success, and it holds a part's success to **the key that command answers
+  under**: `node_id` for a `create`, `value` for an `exists`, `get` or `list`.
+  The key and not the wrapper, because a guard on the wrapper is dead on API
+  v4: measured one part apiece, `create` → `{output={node_id=…}}`, `set` →
+  `{output={}}`, `remove` → `{output={}}`, `exists` → `{output={value=%false}}`
+  — **no modelled command answers a bare `{}`**, and the registry the cluster
+  serves at `GET /api/v4` calls `remove` and `set` `structured` exactly as it
+  calls `create` (it is `/api/v3` that calls them `null`). So `{output={}}` is
+  a shape a v4 cluster really produces, it is a legitimate `set` success, and
+  only the key tells it from a `create` that would panic the caller at
+  `answer["node_id"]`. This crate's envelope rules were learned from `exists`
+  answering under `value`; the paranoia is paid for.
 
   **And the empty map is only for the commands that can answer with one.**
   `{}` means the driver wrote no `output` key, which it does only where the

@@ -131,12 +131,15 @@ const HEAVY: &[&str] = &[
 
 /// Whether `command` is one the cluster declares heavy.
 ///
-/// Read by [`BatchRequest::raw`](crate::BatchRequest::raw) as well as by the
-/// redirect advice: *"only light commands"* may be batch parts, so a heavy
-/// name is refused where the batch is built rather than costing a round trip
-/// and taking the **whole** batch down with it. The list is the same list, for
-/// the same reason the transaction one is read from two places — two copies
-/// would drift.
+/// Read by the redirect advice, and by
+/// [`BatchRequest::raw`](crate::BatchRequest::raw) for a **narrower** job than
+/// it once had. `isHeavy` is not the cluster's rule for what may be a batch
+/// part — that rule is the command's data types, and lives in
+/// `batch::NOT_A_BATCH_PART`; measured, `get_job_spec` is heavy and is taken as
+/// a part, while `write_table` is heavy and is taken as a part *and applies*.
+/// What this list still decides for a batch is this crate's own policy: bulk
+/// data does not travel inline in a batch body to a light proxy, whatever the
+/// cluster would tolerate.
 pub(crate) fn is_heavy(command: &str) -> bool {
     HEAVY.contains(&command)
 }
