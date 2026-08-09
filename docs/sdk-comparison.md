@@ -198,16 +198,34 @@ from the fact that all four are "mutating and light".
 | --- | --- | --- | --- |
 | Timeout / ping period | 120 s / 5 s | 15 s / 3 s | 30 s / timeout ÷ 3 |
 | Handle doubles as a client | `ITransaction : IClientBase` | `Tx` embeds the interfaces | `Deref<Target = Client>` |
-| Attach to one started elsewhere | yes, fully | yes | **binds commands only** — cannot ping, commit or abort |
-| `Detach` — stop pinging, leave it alive | **yes** | partial | **no — dropping always aborts** |
-| Learn it was lost without a command | no | **`Tx.Finished()` channel** | manual `ping()` |
+| Attach to one started elsewhere | yes, fully | yes | yes — `attach_transaction`, pinging included |
+| `Detach` — stop pinging, leave it alive | **yes** | partial | yes — and dropping an *attached* handle detaches too |
+| Learn it was lost without a command | no | **`Tx.Finished()` channel** | `is_lost()`, polled — or `ping()` |
 | Prerequisite transaction ids | yes | yes | no |
 | Wait for a waitable lock | `GetAcquiredFuture()` | **no helper** | **yes, with a mandatory deadline** |
 | Unlock | yes | yes | no |
 | Child-key / attribute locks | yes | yes | no — whole-node only |
 
-`Detach` is the sharpest of these: there is no way to hand a live transaction to
-another process from Rust.
+`Detach` used to be the sharpest of these — there was no way to hand a live
+transaction to another process from Rust. There is now: `Transaction::detach`
+stops the keep-alive and leaves the transaction running, `attach_transaction`
+turns the id back into a pinging handle elsewhere (reading the interval from
+`#<id>/@timeout`, as the attacher must), and `ping_transaction` /
+`commit_transaction` / `abort_transaction` finish one from nothing but the id.
+What `Drop` does follows the C++ destructor's line: a handle this process
+*started* still aborts on drop — that is what makes `?` safe inside a
+transaction — where an *attached* one detaches. Go's
+`AttachTx(id, {AutoPingable: false})` maps onto `with_transaction` plus the
+by-id commands; the Rust `attach_transaction` always pings, because a
+non-pinging handle would duplicate exactly that pair. It also pings *before*
+returning, which neither of the others does: `@timeout` is the configured
+lifetime and the id says nothing about how much of it a handoff has already
+spent.
+
+The remaining Go advantage in that table is `Tx.Finished()`, which is pushed
+rather than polled. `Transaction::is_lost` answers the same question — the
+keep-alive stops for exactly one reason, and this is that verdict made
+visible — but a holder has to ask.
 
 ## Dynamic tables, administration, the rest
 
@@ -242,15 +260,15 @@ Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
-five on that list are **now built**: logging and tracing — a `traceparent` the
-cluster joins, and an optional `tracing` feature — the operation object and
+all six on that list are **now built**: logging and tracing — a `traceparent`
+the cluster joins, and an optional `tracing` feature — the operation object and
 its lifecycle, which is what the table above came to, read-side column and
 range selection (`TablePath::columns` / `::range`), `read_file` with its
-streaming half (#10), and batch requests: `BatchRequest` and
+streaming half (#10), batch requests (`BatchRequest` and
 `Client::execute_batch`, per-part `Result`s with the C++ client's
 `Concurrency` and `BatchPartMaxSize` options, plus one thing neither official
-client offers — a split batch that stops names the prefix it already applied,
-rather than reporting only the failure. What is left is transaction `Detach`.
+client offers — a split batch that stops names the prefix it already applied),
+and transaction `Detach`, with attach and the by-id commands beside it.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,

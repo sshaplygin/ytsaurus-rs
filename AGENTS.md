@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 721 tests: 649 unit and integration, 72 doc
+cargo test --workspace            # 741 tests: 668 unit and integration, 73 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -294,6 +294,47 @@ per command. Cluster facts:
   inside `Error resolving path …`.
 - `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
   handle pings its own transaction.
+
+Handing one to another process (`detach` / `attach_transaction`, #13):
+
+- **`@timeout` is in milliseconds and comes back `Int64`.** `get
+  #<id>/@timeout` on a 30 s transaction answers `{"value"=30000;}` in text
+  YSON — no `u`, so not `Uint64`. `Transaction::attach` reads both anyway: a
+  duration in milliseconds is exactly the field a master could spell unsigned,
+  and this crate has been surprised by that class of thing before.
+- **The attribute says nothing about how much life is left.** It is the
+  configured timeout, not the remaining one, and the id carries no last-ping
+  time. That is why `attach` pings before it returns: without it, a handoff
+  taking longer than `timeout × 2/3` produces a handle whose own first ping —
+  one interval away — lands after the cluster has already expired the
+  transaction.
+- **Three different absences, three different errors**, all observed on a local
+  cluster:
+  - a garbage id (`1-2-3-4`): `cluster error 1: Unknown cell tag 0` — names
+    neither the id nor a transaction, which is what `attach_failed` rebrands;
+  - an expired or aborted id, addressed as an object: `Error resolving path
+    #<id>/@timeout` wrapping `No such object <id>` — **not** `No such
+    transaction`;
+  - the same id *pinged*: `No such transaction`, code 11000. Both spellings are
+    why `transaction_is_gone` looks for each, in the whole document.
+- **A detached transaction is indistinguishable from a held one**, so the only
+  evidence a test can read is which requests stop arriving — which is what
+  `crates/ytsaurus-client/tests/transaction_lifecycle.rs` does, against a stub
+  cluster in-process, plus wall-clock timing for the join `detach` does.
+- **`detach`'s wait covers the ping only up to a 30 s timeout.** The join is
+  bounded at five seconds and a ping's request budget is
+  `clamp(interval / 2, 1 s, 120 s)` on an `interval` of `max(timeout / 3, 1 s)`
+  — so the budget fits inside the bound while the timeout is under 30 s, equals
+  it at the 30 s default, and exceeds it above. The master honours the asked-for
+  timeout verbatim, so that arithmetic is the caller's to do: `#<id>/@timeout`
+  read back `3600000`, `30000` and `20000` for transactions started at each,
+  observed on a local cluster — budgets of 120 s, 5 s and 3.3 s. Above the
+  default a stalled ping outlives the detach and can restart the cluster's
+  clock afterwards; the docs say so, and this is why they cannot say "no ping
+  is in flight" flatly. Both directions are pinned in `transaction.rs`'s unit
+  tests — one asserts the wait happens, one asserts it ends — and the second is
+  what a `drop(alive)` in the ping thread's body fails; nothing else in the
+  workspace does.
 
 ### Picking a verb, and what is a command at all
 

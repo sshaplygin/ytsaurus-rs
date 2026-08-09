@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+### A transaction can outlive its handle
+
+- **Added** `Transaction::detach` (#13): stops the keep-alive thread and
+  leaves the transaction running, returning the id — what C++ spells
+  `ITransaction::Detach()`. Nothing is committed, aborted or otherwise
+  decided, so from there the transaction lives on the cluster's terms: it
+  expires its timeout after its last ping, 30 s by default, unless whoever
+  received the id keeps it alive. The keep-alive thread is asked to stop and
+  then waited for, **for up to five seconds** — a detach racing its own ping
+  neither panics nor, inside that bound, leaves a request behind to restart
+  the expiry clock after the caller has finished reasoning about it. The
+  keep-alive may still get one last ping away before it sees the stop, and
+  that ping is what the wait is for. The bound is deliberate, in place of the
+  ping's own request budget of `min(interval / 2, 120 s)` — two minutes for an
+  hour-long transaction against a proxy that has stopped answering — because
+  `detach` reads as instant at every call site.
+
+  **The bound is reachable, and then the promise stops.** Five seconds covers
+  a ping's whole budget while the transaction's timeout is under 30 s and
+  equals it at the 30 s default, so at or below the default the wait always
+  ends in the thread's exit. Above it — every long-running launcher
+  transaction — a ping stalled on a proxy that has stopped answering outlasts
+  the wait, is left in flight, and can reach the master *after* `detach`
+  returned, restarting the clock there: the transaction then lives a full
+  timeout from wherever that ping landed rather than from the detach. Nothing
+  leaks — the thread re-reads the stop flag as soon as its ping ends, so at
+  most one ping is outstanding and it exits inside that same budget — but a
+  caller above the default cannot treat `detach` as the transaction's last
+  ping. Both bounds are on `Transaction::detach`.
+
+- **Added** `Client::attach_transaction(id)`: the receiving half. Turns an id
+  into a real `Transaction` — bound client, ping thread, working
+  `commit`/`abort`/`ping` — where `with_transaction` only binds commands. The
+  ping interval is read from `#<id>/@timeout`, because the id alone does not
+  carry it; that round trip is also what makes attaching to a transaction that
+  is gone fail immediately, with the cluster's resolve error naming the id.
+  **Dropping an attached handle detaches rather than aborts**, following the
+  C++ destructor's line: an attacher's `?` must not destroy work the process
+  that started the transaction still holds a handle to. The handle always
+  pings — Go's `AttachTx(id, {AutoPingable: false})` maps onto
+  `with_transaction` plus the by-id commands below.
+
+  It also **pings once before returning**, a second round trip, because
+  `@timeout` is the *configured* lifetime and says nothing about how much of
+  it a handoff has already spent: an attach at t=21 s of a 30 s transaction
+  last pinged at t=0 would otherwise schedule its first ping for t=31 s, one
+  second after the cluster had expired it — and the reply, `No such
+  transaction`, would stop the keep-alive thread silently. Any handoff slower
+  than `timeout × 2/3` lost the transaction that way. The ping restarts the
+  clock at the attach and doubles as the probe, so a transaction that died in
+  the handoff is this call's error rather than a later command's.
+
+- **Added** `Transaction::is_lost`: whether the keep-alive has given up. It
+  stops on its own for exactly one reason — a ping answered "no such
+  transaction", which is final — and that exit used to be invisible, leaving a
+  handle that pings nothing looking exactly like a healthy one. Go reports the
+  same thing by pushing on `Tx.Finished()`; this is polled.
+
+  **False is not "something is pinging"**, and the doc now says which other
+  states read false: a thread that never started because the spawn failed, and
+  a thread that panicked (nothing on the ping path panics as it stands). A
+  ping does not expose either — it answers for the transaction, not for the
+  thread. `is_lost` is also `&self` where `detach` consumes the handle, so
+  after a detach the only probe left is `Client::ping_transaction` on the id.
+
+- **Added** `Client::ping_transaction`, `Client::commit_transaction` and
+  `Client::abort_transaction`, taking the bare id, so a process that holds
+  nothing else can finish someone else's transaction. Commit rides under a
+  mutation ID (it is not idempotent — the second commit is answered `No such
+  transaction`, which reads like the first one failed); abort is retried
+  freely on the cluster's own forgiveness (aborting a transaction that is
+  gone answers `{}`); a ping doubles as the liveness probe.
+
+- **Unchanged, and deliberately**: dropping a transaction this process
+  *started* still aborts it. That is what makes `?` safe inside a
+  transaction, and `examples/transaction.rs` still demonstrates exactly that;
+  `tests/transaction_lifecycle.rs` pins all four drop/detach shapes at the
+  wire level, stub-served in-process. The new `detach` example runs the
+  handoff against a cluster: start, detach, drop, attach from a second
+  client, hold past the transaction's own timeout, commit.
+
+- **Note for the paranoid**: `mem::forget` on a `Transaction` is not a way to
+  hand it on. It leaks the keep-alive thread, which goes on pinging for the
+  life of the process and holds the transaction and its locks open
+  indefinitely. `detach` is the sanctioned form, and it says so now. Nothing
+  stops two attaches to the same id either: each gets a handle and a thread of
+  its own, they ping the same transaction twice as often, and whichever
+  finishes it first decides it — deliberate, since a second process attaching
+  is the whole point, and documented on `attach_transaction`.
 ### A file can be read back
 
 - **Added** `Client::read_file` and `Client::read_file_streaming` — the mirror
