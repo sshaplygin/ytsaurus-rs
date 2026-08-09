@@ -1747,11 +1747,27 @@ impl Client {
     /// them.
     ///
     /// **The whole file is held in memory, and there is a ceiling: 512 MiB.**
-    /// That is the transport's cap on any buffered response, and a file past
-    /// it is refused rather than truncated — with an error that names the
-    /// number and names the streaming half. A worker binary is comfortably
-    /// under it; a dataset someone stored as a file may not be, and that is
-    /// exactly the case the pair comes in two halves for.
+    /// That is the transport's cap on any buffered response, counted in the
+    /// bytes that land in the `Vec` — and a file past it is refused rather
+    /// than truncated, with a [`ClientError::ResponseTooLarge`] that names the
+    /// number and names the streaming half. A file of exactly the ceiling is
+    /// not past it. A worker binary is comfortably under; a dataset someone
+    /// stored as a file may not be, and that is exactly the case the pair
+    /// comes in two halves for.
+    ///
+    /// **512 MiB held is not 512 MiB of process.** The buffer grows by
+    /// doubling and copies as it grows, so both halves are resident for the
+    /// length of a copy — up to about 1.5× the cap where the allocator cannot
+    /// extend in place. Measured in a release build: a read that hands back
+    /// 536 870 911 bytes peaks at 544 178 176 of resident set, and a 600 MiB
+    /// read refused by the cap peaks at 611 385 344. Size for that, not for
+    /// the ceiling.
+    ///
+    /// The cap counts *decoded* bytes because the compressed ones are not the
+    /// same quantity and are not close to it: this client asks for gzip, and
+    /// measured against a cluster, a 600 MiB file of zeros crosses the wire in
+    /// 611 522 bytes. A cap on what arrives would have let all 600 MiB into
+    /// memory — which is what it did until this was fixed.
     ///
     /// `path` is a **plain node path** — `//tmp/worker`. Not a rich one, and
     /// the reason is worth spelling out, because a rich path here does not
@@ -1804,14 +1820,18 @@ impl Client {
     /// Verified against a local cluster: a 4 MB [`Client::write_file`] of
     /// non-UTF-8 bytes comes back byte-for-byte through both halves of the
     /// pair, an empty file reads back empty, and a node carrying
-    /// `compression_codec=zlib_6` — 1 000 000 logical bytes, 1983 on disk —
+    /// `compression_codec=zlib_6` — 1 000 000 logical bytes, 4 214 on disk —
     /// reads back its logical bytes with the check passing, which is the case
-    /// that would break if the attribute were the on-disk size.
+    /// that would break if the attribute were the on-disk size. And a 600 MiB
+    /// file of zeros — 611 522 bytes on the wire — is refused rather than held,
+    /// while `read_file_streaming` moves all 629 145 600 of it.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, if the file is larger
-    /// than the 512 MiB this holds in memory, if the node's size cannot be
+    /// Returns [`ClientError`] if the request fails, if the response is larger
+    /// than the 512 MiB this holds in memory — a
+    /// [`ClientError::ResponseTooLarge`], which is never retried and never
+    /// blamed on the proxy that served it — if the node's size cannot be
     /// read — the check refuses loudly rather than quietly not happening — or
     /// if the body's length is not the size the cluster records. A missing
     /// path fails the read itself, before the size is ever asked for: code 1,
@@ -4556,6 +4576,78 @@ mod tests {
         assert!(refuse_body_on_get(Method::Get, "get", false).is_ok());
         assert!(refuse_body_on_get(Method::Put, "write_file", true).is_ok());
         assert!(refuse_body_on_get(Method::Post, "create", true).is_ok());
+    }
+
+    #[test]
+    fn read_file_refuses_a_body_it_will_not_hold() {
+        // `http`'s own tests drive `Transport::send` at a small cap; this is
+        // the method a caller actually calls, all the way through — parameters,
+        // heavy routing, `retry::run`, `after_heavy`, and the size check that
+        // would otherwise have swallowed the verdict.
+        //
+        // The cap the transport was built with is what decides it, which is
+        // exactly what a hardcoded `RESPONSE_LIMIT` at the read would not be:
+        // 40 000 bytes of zeros are half a gigabyte short of the real ceiling,
+        // so a `send` that ignored the field would sail past this and fail
+        // later, on the size `get` this listener never answers — a different
+        // error, from a request that should never have been sent.
+        let (proxy, served) = one_gzip_request_proxy(vec![0_u8; 40_000]);
+        let mut client = Client::new(&proxy);
+        client.transport.set_response_limit(4_096);
+
+        let error = client
+            .read_file("//tmp/f")
+            .expect_err("40 000 bytes past a 4 096-byte ceiling");
+
+        assert!(
+            matches!(error, ClientError::ResponseTooLarge { limit: 4_096, .. }),
+            "{error:?}"
+        );
+
+        // Named, numbered, and pointed at the half that would have worked.
+        let message = error.to_string();
+        assert!(message.contains("read_file"), "{message}");
+        assert!(message.contains("4096"), "{message}");
+        assert!(message.contains("read_file_streaming"), "{message}");
+
+        // One request, and it was the read: refused where the bytes arrive,
+        // not after a second round trip.
+        let request = served.join().unwrap();
+        assert!(
+            request.starts_with(b"GET /api/v4/read_file HTTP/1.1\r\n"),
+            "{}",
+            String::from_utf8_lossy(&request)
+        );
+    }
+
+    /// `one_request_proxy`, with the body gzipped and announced as such.
+    ///
+    /// The wire and the `Vec` are only different quantities when something
+    /// compresses them, and the cap's whole claim is about which of the two it
+    /// counts. Every request this client sends asks for gzip already.
+    fn one_gzip_request_proxy(payload: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let body = encoder.finish().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            request
+        });
+        (format!("http://{address}"), task)
     }
 
     fn one_request_proxy(body: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {

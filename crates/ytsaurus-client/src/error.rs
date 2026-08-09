@@ -110,6 +110,40 @@ pub enum ClientError {
         reason: String,
     },
 
+    /// A buffered response ran past what this client will hold in memory.
+    ///
+    /// Its own variant rather than a [`ClientError::Decode`], which is what it
+    /// was first written as. Every other `Decode` in this crate means *the
+    /// bytes were read and were not the shape expected* — a YSON document that
+    /// does not parse, a Skiff frame that ends early, an envelope missing the
+    /// key the command answers under. This body was never read at all, and the
+    /// difference is the whole of what the caller can do next: a `Decode`
+    /// invites a look at the data, and this invites the streaming half of the
+    /// same command, which the message names.
+    ///
+    /// Refused rather than truncated, and never retried — no amount of waiting
+    /// shrinks a response, and the host that served it did nothing wrong. That
+    /// second half is not this caller's concern alone: a heavy read blamed on
+    /// its host takes a healthy data proxy out of the pool, and enough of them
+    /// empty it. See `http::body_failure`.
+    ///
+    /// `limit` counts bytes **after** decompression, which is where they are
+    /// actually held — and it is what this client *holds*, not what the
+    /// process needs: the buffer grows by doubling and copies, so peak
+    /// residency runs above the number. See `http::RESPONSE_LIMIT`.
+    #[error(
+        "{command}: the response ran past the {} this client will hold in \
+         memory{}",
+        cap_size(.limit),
+        streaming_advice(.command)
+    )]
+    ResponseTooLarge {
+        /// The API command whose response was too large.
+        command: String,
+        /// The ceiling it ran past, in decoded bytes.
+        limit: u64,
+    },
+
     /// Reading a local file failed.
     #[error("reading {path}: {source}")]
     Io {
@@ -239,6 +273,41 @@ fn redirect_advice(heavy: &bool) -> &'static str {
          (`Client::heavy_proxy`) and address it directly."
     } else {
         ""
+    }
+}
+
+/// The cap, written the way the caller thinks about it.
+///
+/// `536870912` is the number a matcher wants and not the one a reader wants;
+/// `512 MiB` is the reverse. Both, then — the round one first, because the
+/// question the message answers is *how big is too big*, and nobody sizes a
+/// machine in bytes. Only a whole number of mebibytes gets the treatment: a
+/// test's cap of 4 096 reads better as itself than as `0.00390625 MiB`.
+fn cap_size(limit: &u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+
+    if *limit >= MIB && limit.is_multiple_of(MIB) {
+        format!("{} MiB ({limit} bytes)", limit / MIB)
+    } else {
+        format!("{limit} bytes")
+    }
+}
+
+/// The way past the cap, for a command that has one. See
+/// [`ClientError::ResponseTooLarge`].
+///
+/// `the response body is larger than request limit: 536870912` — what `ureq`
+/// says — names neither the number a caller can plan around nor the method
+/// that makes the number irrelevant, and the streaming half of a read is a
+/// method a caller may not know exists. A command with no streaming half
+/// promises nothing.
+fn streaming_advice(command: &str) -> &'static str {
+    match command {
+        // Every `read_table` shape — `_with_format`, `_skiff_table`, `_rows` —
+        // sends this one command name.
+        "read_table" => " — Client::read_table_streaming moves the same bytes without holding them",
+        "read_file" => " — Client::read_file_streaming moves the same bytes without holding them",
+        _ => "",
     }
 }
 

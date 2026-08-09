@@ -314,13 +314,12 @@ per command. Cluster facts:
   not to `/api/v4/`. `get_supported_features` is the real "no parameters,
   small answer" command — `Null` in, `Structured` out, non-volatile,
   non-heavy — and is what the doctest and the `raw` example use.
-- `check_permission`, `read_file` and `get_supported_features` are all
-  registered and none is modelled here; they are the natural first users of the
-  raw door. *(`list_operations` was on this list until the operation lifecycle
-  landed; it has a method now. So does `read_file`: `Client::read_file` and
-  `Client::read_file_streaming`, which leaves `check_permission` and
-  `get_supported_features` — and leaves the `raw` example reading a file
-  because its wire shape is now verified, not because nothing else can.)*
+- `check_permission` and `get_supported_features` are registered and not
+  modelled here; they are the natural first users of the raw door.
+  *(`list_operations` and `read_file` were both on this list and both came off
+  it — the first with the operation lifecycle, the second as `Client::read_file`
+  and `Client::read_file_streaming`. The `raw` example still reads a file, now
+  because that wire shape is verified rather than because nothing else could.)*
 - **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
   envelope is keyed by what the command returns, the same trap that made
   `exists` read the wrong key for two releases. Captured from a local cluster:
@@ -337,9 +336,34 @@ per command. Cluster facts:
   carry no framing, so a body cut short by a mid-stream failure looks exactly
   like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot
   read. It compares the body against the node's `@uncompressed_data_size` —
-  the *logical* size, measured against a `compression_codec=zlib_6` node
-  reading 1 000 000 bytes back off 1983 on disk. There is no `@file_size`:
-  asked for one, the cluster answers `Attribute "file_size" is not found`.
+  the *logical* size, measured against `compression_codec=zlib_6` nodes of
+  1 000 000 bytes each: `@compressed_data_size` is 4 214 for the cycling
+  `i % 256` bytes the tests write, 999 for all zeros and 1 000 324 for
+  `os.urandom` — none of them the logical size, and the read passes against
+  all three. There is no `@file_size`: asked for one, the cluster answers
+  `Attribute "file_size" is not found`.
+- **`ureq`'s `limit()` does not bound memory.** `BodyWithConfig::do_build`
+  wraps the raw source in a `LimitReader` and builds the gzip decoder on top,
+  so the number bounds *transferred* bytes — and every request this crate
+  sends carries `Accept-Encoding: gzip`. Measured: a `read_file` of 600 MiB of
+  zeros arrives in 611 522 wire bytes, and `.limit(536870912)` on it returned
+  all 629 145 600. A ceiling that counts memory has to sit above the decoder,
+  which is what `http::CapReader` is for. **A wire limit is still needed
+  underneath it** — a chunked stream of empty deflate stored blocks
+  (`00 00 00 ff ff`) decodes to nothing, so a cap on decoded bytes never spends
+  a byte against it and `flate2` loops inside a single `read`; with the wire
+  limit taken away, that read does not return. **And the wire limit cannot be
+  the memory cap**: deflate expands what it cannot compress, so the largest
+  permitted body can arrive larger than the cap — 4 096 incompressible bytes
+  gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip
+  wrapper, for that reason.
+- **A memory cap is not a process budget.** `read_to_end` grows a `Vec` by
+  doubling and copies as it grows, so both buffers are resident for the length
+  of a copy — about 1.5× where the allocator cannot extend in place. Measured
+  in a release build against a local listener: a read handing back
+  536 870 911 bytes peaks at 544 178 176 of resident set, and a 600 MiB read
+  *refused* by the 512 MiB cap peaks at 611 385 344. Quote the cap as what is
+  held, never as what to size a container for.
 - **A rich path does nothing to a file read**, measured on a 1000-byte file:
   `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads back all
   1000 bytes and says nothing — a file is sliced by the command's `offset` and
@@ -759,8 +783,9 @@ and the documentation disagreed and the source is what settles it.
 - The proxy **accepts a chunked request body** for `write_table`, so a table can
   be written from a `Read` that never has all of it.
 - `ureq` 3.3 caps `read_to_vec` at 10 MB unless told otherwise but leaves a
-  **reader uncapped**, which is the right way round: the buffered path passes an
-  explicit limit, the streaming path passes none.
+  **reader uncapped**, which is the right way round: the buffered path enforces
+  a limit of its own, the streaming path none. `ureq`'s number is not that
+  limit and cannot be — see the API-shape note above on where `limit()` sits.
 - **`ureq` 3.3 still exposes no trailers** — rechecked in its source, where the
   word does not appear. So the `X-YT-Error` trailer a proxy uses to report a
   mid-stream failure remains unreadable, and the completeness check on

@@ -78,10 +78,11 @@ pub struct ResponseReader {
 impl ResponseReader {
     pub(crate) fn new(body: ureq::Body) -> Self {
         Self {
-            // A reader has no size cap, where `read_to_vec` — what the buffered
-            // path uses — stops at 10 MB unless told otherwise. That asymmetry
-            // is the right way round: a stream has no size a client should
-            // presume, and a table read into memory very much does.
+            // A reader has no size cap, where the buffered path enforces one
+            // of its own (`http::CapReader`) and `ureq`'s `read_to_vec` stops
+            // at 10 MB unless told otherwise. That asymmetry is the right way
+            // round: a stream has no size a client should presume, and a table
+            // read into memory very much does.
             inner: body.into_reader(),
             read: 0,
         }

@@ -710,8 +710,22 @@ shorter file — so `read_file` compares what arrived against the node's
 `_with_format` and `_skiff_table` variants, and `read_file` holds the whole
 file. They are for results a launcher inspects; `read_table_streaming`,
 `write_table_streaming` and `read_file_streaming` are for everything larger.
-**A buffered response is capped at 512 MiB** — past that the read is refused
-rather than truncated, with an error naming the cap and the streaming half.
+**A buffered response is capped at 512 MiB of decoded bytes** — past that the
+read is refused rather than truncated, with a `ClientError::ResponseTooLarge`
+naming the cap and the streaming half. Decoded, not transferred: responses
+arrive gzipped (see above), and a 600 MiB file of zeros crosses the wire in
+611 522 bytes, so a cap counted there would bound nothing that matters.
+
+Two things the cap is not. It is not a **process** budget: the bytes land in a
+`Vec` that grows by doubling and copies as it grows, so peak residency runs
+above the ceiling — measured, a 600 MiB read refused by the cap peaked at
+611 385 344 bytes of resident set, and one that held 512 MiB peaked at
+544 178 176 — with about 1.5× as the worst case the growth implies. Size for
+that, not for the cap. And it is not **crate-wide**: it covers the buffered
+commands and uploads, which read through the guard. Two error paths still take
+`ureq`'s own wire-only default — the non-2xx branch of a streaming open, and
+the `/hosts` discovery lookup — and a gzipped body on either is bounded on the
+wire rather than in memory.
 
 ## A command this crate does not model
 
