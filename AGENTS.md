@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 618 tests
+cargo test --workspace            # 651 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -294,6 +294,33 @@ per command. Cluster facts:
   inside `Error resolving path …`.
 - `ping_ancestor_transactions=%true` is accepted; unnecessary here, since every
   handle pings its own transaction.
+
+Handing one to another process (`detach` / `attach_transaction`, #13):
+
+- **`@timeout` is in milliseconds and comes back `Int64`.** `get
+  #<id>/@timeout` on a 30 s transaction answers `{"value"=30000;}` in text
+  YSON — no `u`, so not `Uint64`. `Transaction::attach` reads both anyway: a
+  duration in milliseconds is exactly the field a master could spell unsigned,
+  and this crate has been surprised by that class of thing before.
+- **The attribute says nothing about how much life is left.** It is the
+  configured timeout, not the remaining one, and the id carries no last-ping
+  time. That is why `attach` pings before it returns: without it, a handoff
+  taking longer than `timeout × 2/3` produces a handle whose own first ping —
+  one interval away — lands after the cluster has already expired the
+  transaction.
+- **Three different absences, three different errors**, all observed on a local
+  cluster:
+  - a garbage id (`1-2-3-4`): `cluster error 1: Unknown cell tag 0` — names
+    neither the id nor a transaction, which is what `attach_failed` rebrands;
+  - an expired or aborted id, addressed as an object: `Error resolving path
+    #<id>/@timeout` wrapping `No such object <id>` — **not** `No such
+    transaction`;
+  - the same id *pinged*: `No such transaction`, code 11000. Both spellings are
+    why `transaction_is_gone` looks for each, in the whole document.
+- **A detached transaction is indistinguishable from a held one**, so the only
+  evidence a test can read is which requests stop arriving — which is what
+  `crates/ytsaurus-client/tests/transaction_lifecycle.rs` does, against a stub
+  cluster in-process, plus wall-clock timing for the join `detach` promises.
 
 ### Picking a verb, and what is a command at all
 

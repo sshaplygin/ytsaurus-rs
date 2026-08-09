@@ -6,23 +6,46 @@
 
 - **Added** `Transaction::detach` (#13): stops the keep-alive thread and
   leaves the transaction running, returning the id — what C++ spells
-  `ITransaction::Detach()`. Nothing is sent, so from there the transaction
-  lives on the cluster's terms: it expires its timeout after its last ping,
-  30 s by default, unless whoever received the id keeps it alive. The thread
-  is joined before `detach` returns, so no ping is in flight afterwards — a
-  detach racing its own ping neither panics nor extends anything.
+  `ITransaction::Detach()`. Nothing is committed, aborted or otherwise
+  decided, so from there the transaction lives on the cluster's terms: it
+  expires its timeout after its last ping, 30 s by default, unless whoever
+  received the id keeps it alive. The thread is waited for before `detach`
+  returns, so no ping is in flight afterwards — a detach racing its own ping
+  neither panics nor leaves a request behind to restart the expiry clock after
+  the caller has finished reasoning about it. The keep-alive may still get one
+  last ping away before it sees the stop, and that ping is waited for too. The
+  wait itself is bounded at five seconds rather than by the ping's own request
+  budget, which is `min(interval / 2, 120 s)` — two minutes for an hour-long
+  transaction against a proxy that has stopped answering, and `detach` reads
+  as instant at every call site.
 
 - **Added** `Client::attach_transaction(id)`: the receiving half. Turns an id
   into a real `Transaction` — bound client, ping thread, working
   `commit`/`abort`/`ping` — where `with_transaction` only binds commands. The
   ping interval is read from `#<id>/@timeout`, because the id alone does not
-  carry it; that one round trip is also what makes attaching to a transaction
-  that is gone fail immediately, with the cluster's resolve error naming the
-  id. **Dropping an attached handle detaches rather than aborts**, following
-  the C++ destructor's line: an attacher's `?` must not destroy work the
-  process that started the transaction still holds a handle to. The handle
-  always pings — Go's `AttachTx(id, {AutoPingable: false})` maps onto
+  carry it; that round trip is also what makes attaching to a transaction that
+  is gone fail immediately, with the cluster's resolve error naming the id.
+  **Dropping an attached handle detaches rather than aborts**, following the
+  C++ destructor's line: an attacher's `?` must not destroy work the process
+  that started the transaction still holds a handle to. The handle always
+  pings — Go's `AttachTx(id, {AutoPingable: false})` maps onto
   `with_transaction` plus the by-id commands below.
+
+  It also **pings once before returning**, a second round trip, because
+  `@timeout` is the *configured* lifetime and says nothing about how much of
+  it a handoff has already spent: an attach at t=21 s of a 30 s transaction
+  last pinged at t=0 would otherwise schedule its first ping for t=31 s, one
+  second after the cluster had expired it — and the reply, `No such
+  transaction`, would stop the keep-alive thread silently. Any handoff slower
+  than `timeout × 2/3` lost the transaction that way. The ping restarts the
+  clock at the attach and doubles as the probe, so a transaction that died in
+  the handoff is this call's error rather than a later command's.
+
+- **Added** `Transaction::is_lost`: whether the keep-alive has given up. It
+  stops on its own for exactly one reason — a ping answered "no such
+  transaction", which is final — and that exit used to be invisible, leaving a
+  handle that pings nothing looking exactly like a healthy one. Go reports the
+  same thing by pushing on `Tx.Finished()`; this is polled.
 
 - **Added** `Client::ping_transaction`, `Client::commit_transaction` and
   `Client::abort_transaction`, taking the bare id, so a process that holds
@@ -39,6 +62,15 @@
   wire level, stub-served in-process. The new `detach` example runs the
   handoff against a cluster: start, detach, drop, attach from a second
   client, hold past the transaction's own timeout, commit.
+
+- **Note for the paranoid**: `mem::forget` on a `Transaction` is not a way to
+  hand it on. It leaks the keep-alive thread, which goes on pinging for the
+  life of the process and holds the transaction and its locks open
+  indefinitely. `detach` is the sanctioned form, and it says so now. Nothing
+  stops two attaches to the same id either: each gets a handle and a thread of
+  its own, they ping the same transaction twice as often, and whichever
+  finishes it first decides it — deliberate, since a second process attaching
+  is the whole point, and documented on `attach_transaction`.
 
 ### Heavy proxies: a pool, picked at random, refreshed — never one host for life
 

@@ -37,11 +37,14 @@
 //! destroy what the process that started the transaction is still counting on.
 //! The C++ client's destructor draws the same line.
 
+use std::convert::Infallible;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use ytsaurus_yson::YsonNode;
+use ytsaurus_yson::{YsonNode, YsonValue};
 
 use crate::error::{ClientError, Result};
 use crate::http::{Method, Payload};
@@ -61,6 +64,17 @@ pub(crate) const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30)
 /// the full retry budget against an unreachable cluster. If the abort is
 /// lost, the transaction expires on its own once nothing pings it.
 const DROP_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`Transaction::detach`] waits for the keep-alive thread.
+///
+/// An unbounded join would be bounded in practice by the ping's own request
+/// budget — [`ping_request_timeout`] — and that is up to
+/// [`crate::DEFAULT_TIMEOUT`], two minutes, for a transaction whose timeout is
+/// an hour. `detach` reads as instant at every call site, so the wait has its
+/// own bound instead: past this, a ping that is still stalled is left to land
+/// on its own, which costs one interval of extra life on a transaction the
+/// caller was handing on anyway.
+const DETACH_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A transaction, alive for as long as this handle is.
 ///
@@ -154,11 +168,21 @@ impl Transaction {
         let value = client
             .get(&format!("#{id}/@timeout"))
             .map_err(|error| attach_failed(&id, error))?;
-        let millis = value.as_i64().ok_or_else(|| ClientError::Decode {
-            command: "attach_transaction".to_owned(),
-            reason: format!("#{id}/@timeout is not an integer: {:?}", value.node),
-        })?;
-        let timeout = Duration::from_millis(u64::try_from(millis).unwrap_or(0));
+        let timeout = attached_timeout(&id, &value)?;
+
+        // Then one ping, before the handle exists. `@timeout` is the
+        // *configured* lifetime, not the remaining one: the id says nothing
+        // about how long ago somebody last pinged, and the keep-alive thread's
+        // first ping is a whole interval away. A handoff that took longer than
+        // two thirds of the timeout would hand back a handle whose first ping
+        // lands after the cluster has already expired the transaction — the
+        // ping would then be answered `No such transaction`, the thread would
+        // give up, and the loss would surface later on an unrelated command.
+        // Pinging here restarts the clock at the attach and turns a
+        // transaction that is already gone into this call's error, which has a
+        // caller to report it to. A *started* handle needs none of this: its
+        // clock starts at the reply it was born from.
+        ping(client, &id).map_err(|error| attach_failed(&id, error))?;
 
         Ok(Self::held(client, id, timeout, Origin::Attached))
     }
@@ -247,22 +271,57 @@ impl Transaction {
         ping(&self.client, &self.id)
     }
 
+    /// Whether the keep-alive has given up on this transaction.
+    ///
+    /// The pinging thread stops on its own for exactly one reason: the cluster
+    /// answered a ping with "no such transaction", which is final — the
+    /// transaction expired, or somebody else aborted or committed it. Without
+    /// this the thread's exit is invisible, and a handle that has quietly
+    /// stopped pinging looks exactly like a healthy one until the next command
+    /// fails.
+    ///
+    /// So this is for a holder that keeps a transaction across something long:
+    /// a false answer means only that no ping has been *answered* that way
+    /// yet, which is the strongest thing a handle can say without asking, and
+    /// [`Transaction::ping`] is how to ask. A handle whose thread never
+    /// started — the spawn failed — answers false: nothing has been lost, and
+    /// nothing is pinging either.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.keep_alive.as_ref().is_some_and(KeepAlive::lost)
+    }
+
     /// Stops keeping the transaction alive and leaves it running.
     ///
     /// The deliberate exception to what `Drop` promises: the transaction
-    /// survives the handle. Nothing at all is sent — to the cluster a detached
-    /// transaction looks exactly like a held one — so from here it lives on
-    /// the cluster's terms: it expires its timeout after its last ping, 30
-    /// seconds by default, unless something else keeps it alive. That
-    /// something is the point: hand the returned id to another process, which
-    /// re-holds it with [`Client::attach_transaction`] or finishes it outright
-    /// with [`Client::commit_transaction`] or [`Client::abort_transaction`].
+    /// survives the handle. Nothing is committed, aborted or otherwise decided
+    /// — to the cluster a detached transaction looks exactly like a held one —
+    /// so from here it lives on the cluster's terms: it expires its timeout
+    /// after its last ping, 30 seconds by default, unless something else keeps
+    /// it alive. That something is the point: hand the returned id to another
+    /// process, which re-holds it with [`Client::attach_transaction`] or
+    /// finishes it outright with [`Client::commit_transaction`] or
+    /// [`Client::abort_transaction`].
     ///
-    /// No ping is in flight when this returns. The keep-alive thread is asked
-    /// to stop and then waited for, so a caller can kill the process the
-    /// moment this returns without a stray request behind it; the wait is
-    /// bounded by one ping's own budget, half the ping interval. What C++
-    /// spells `ITransaction::Detach()`.
+    /// **No ping is in flight when this returns**, which is what lets a caller
+    /// kill the process the moment it does without a stray request behind it.
+    /// The keep-alive thread is asked to stop and then waited for. Two things
+    /// that promise is careful about:
+    ///
+    /// - The keep-alive may get *one last ping* away — it can be past its own
+    ///   stop check and about to send when `detach` raises the flag — so the
+    ///   transaction's clock may restart once more, at up to one ping after
+    ///   this was called. That ping is waited for; it is not left in flight.
+    /// - The wait is bounded by `DETACH_JOIN_TIMEOUT`, five seconds. It is
+    ///   normally over in the time one ping takes, but a ping stalled on a
+    ///   hung proxy has a budget of its own — `min(interval / 2, 120 s)`,
+    ///   which is two minutes for an hour-long transaction — and `detach` will
+    ///   not hold its caller's thread for that.
+    ///
+    /// What C++ spells `ITransaction::Detach()`. It is also the honest way to
+    /// let a transaction outlive its handle: `mem::forget` on a [`Transaction`]
+    /// leaks the keep-alive thread, which goes on pinging for the life of the
+    /// process and holds the transaction and its locks open indefinitely.
     #[must_use = "the id is the only way left to reach the transaction"]
     pub fn detach(mut self) -> String {
         // `Drop` still runs when this consumes the handle; `done` is what
@@ -396,6 +455,36 @@ pub(crate) fn commit_by_id(client: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `#<id>/@timeout`, as a duration.
+///
+/// **Both integer spellings.** The local cluster answers `{"value"=30000;}` —
+/// text YSON, no `u`, so `Int64` — but a duration in milliseconds is exactly
+/// the kind of field a master could send as `Uint64`, and a `Decode` error on
+/// an attribute the crate can plainly read would be a poor way to find that
+/// out.
+///
+/// Anything else — a negative, a zero, a string — is the attach failing and
+/// naming the attribute. Silently reading it as zero would floor
+/// [`ping_interval`] to one second and leave a 1 Hz pinger running for the
+/// handle's whole life.
+fn attached_timeout(id: &str, value: &YsonValue) -> Result<Duration> {
+    let millis = match value.node {
+        YsonNode::Int64(millis) if millis > 0 => u64::try_from(millis).ok(),
+        YsonNode::Uint64(millis) if millis > 0 => Some(millis),
+        _ => None,
+    };
+
+    millis
+        .map(Duration::from_millis)
+        .ok_or_else(|| ClientError::Decode {
+            command: "attach_transaction".to_owned(),
+            reason: format!(
+                "#{id}/@timeout is not a positive number of milliseconds: {:?}",
+                value.node
+            ),
+        })
+}
+
 /// The timeout read failing is the attach failing, and the error should say
 /// so.
 ///
@@ -479,8 +568,18 @@ fn transaction_is_gone(error: &ClientError) -> bool {
 struct KeepAlive {
     /// Raised to ask the thread to stop; the condvar wakes it out of its wait.
     stop: Arc<(Mutex<bool>, Condvar)>,
-    /// The thread itself, kept for the one caller that must wait for it:
-    /// [`Transaction::detach`] promises no ping in flight when it returns.
+    /// Raised by the thread itself when a ping was answered "no such
+    /// transaction" and it gave up. Read through [`Transaction::is_lost`]:
+    /// otherwise the thread's exit is invisible to the handle's owner.
+    lost: Arc<AtomicBool>,
+    /// Disconnects when the thread's body ends, on every path out of it.
+    ///
+    /// Nothing is ever sent on it. It exists because [`Transaction::detach`]
+    /// needs a join with a bound and `std` has no timed one — a
+    /// `recv_timeout` on this is that join.
+    exited: Receiver<Infallible>,
+    /// The thread itself, kept only to reap it once `exited` says its body has
+    /// ended. Joining it directly is what has no bound.
     thread: std::thread::JoinHandle<()>,
 }
 
@@ -493,10 +592,17 @@ impl KeepAlive {
     fn spawn(client: Client, id: String, interval: Duration) -> Option<Self> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = Arc::clone(&stop);
+        let lost = Arc::new(AtomicBool::new(false));
+        let give_up = Arc::clone(&lost);
+        let (alive, exited) = std::sync::mpsc::channel::<Infallible>();
 
         std::thread::Builder::new()
             .name("yt-transaction-ping".to_owned())
             .spawn(move || {
+                // Held for the body's whole life and never sent on: dropping it
+                // — however this thread leaves — is what wakes the waiter in
+                // `stop_and_join`. Bound to a name so it is captured at all.
+                let _alive = alive;
                 let (lock, wake) = &*signal;
                 loop {
                     {
@@ -523,15 +629,27 @@ impl KeepAlive {
                     // transaction" has said something final: pinging on would
                     // spend a request every interval, for as long as the
                     // handle lives, on a transaction that cannot come back.
+                    // The flag is what keeps that exit from being silent.
                     if let Err(error) = ping(&client, &id)
                         && transaction_is_gone(&error)
                     {
+                        give_up.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
             })
             .ok()
-            .map(|thread| Self { stop, thread })
+            .map(|thread| Self {
+                stop,
+                lost,
+                exited,
+                thread,
+            })
+    }
+
+    /// Whether the thread gave up because the transaction is gone.
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
     }
 
     /// Asks the thread to stop, without waiting for it.
@@ -551,15 +669,27 @@ impl KeepAlive {
     /// the destructor above — and which promises that no ping lands after it
     /// returns: a stray ping is harmless on a committed transaction but not on
     /// a detached one, where it would quietly extend a lifetime the caller has
-    /// just finished reasoning about. The wait is bounded: the ping client
-    /// makes one attempt with a request timeout of half the interval, so the
-    /// worst case is the tail of one ping already in flight.
+    /// just finished reasoning about.
+    ///
+    /// **Bounded by [`DETACH_JOIN_TIMEOUT`], not by the ping.** A plain
+    /// `join()` would wait out the ping's own request budget, and that is
+    /// `min(interval / 2, 120 s)` — two minutes for an hour-long transaction,
+    /// against a proxy that has stopped answering. So the wait is a
+    /// `recv_timeout` on a channel the thread's own `Sender` closes when its
+    /// body ends, which is the timed join `std` does not have.
     fn stop_and_join(self) {
         self.raise();
-        // An `Err` here is the thread having panicked; the ping loop has
-        // nothing in it that panics, and a destructor-adjacent path must not
-        // turn someone else's panic into its own.
-        let _ = self.thread.join();
+        if matches!(
+            self.exited.recv_timeout(DETACH_JOIN_TIMEOUT),
+            Err(RecvTimeoutError::Disconnected)
+        ) {
+            // The body has already ended, so this only reaps the thread and
+            // cannot block. An `Err` from it is the thread having panicked;
+            // the ping loop has nothing in it that panics, and a
+            // destructor-adjacent path must not turn someone else's panic into
+            // its own.
+            let _ = self.thread.join();
+        }
     }
 
     fn raise(&self) {
@@ -598,16 +728,63 @@ mod tests {
         );
     }
 
-    /// A transaction whose commit is going nowhere: nothing listens on port 1.
-    fn doomed() -> Transaction {
-        let client = Client::new("http://127.0.0.1:1").with_retries(crate::RetryPolicy::none());
+    /// A handle around `1-2-3-4` on `proxy`, unfinished and not pinging.
+    fn handle_at(proxy: &str, origin: Origin) -> Transaction {
+        let client = Client::new(proxy).with_retries(crate::RetryPolicy::none());
         Transaction {
             client: client.with_transaction("1-2-3-4"),
             id: "1-2-3-4".to_owned(),
             done: false,
             keep_alive: None,
-            origin: Origin::Started,
+            origin,
         }
+    }
+
+    /// A transaction whose commit is going nowhere: nothing listens on port 1.
+    fn doomed() -> Transaction {
+        handle_at("http://127.0.0.1:1", Origin::Started)
+    }
+
+    /// A socket that answers nothing and counts what reaches it.
+    ///
+    /// The point of a *bound* listener rather than a port nothing listens on:
+    /// "nothing was sent" and "something was sent to a closed port" look the
+    /// same to a caller who drops the error, which is every destructor here.
+    /// A connection arriving is the evidence. Nothing is written back, so the
+    /// sender sees the connection close and fails — quickly, which is all
+    /// these tests need of it.
+    fn watched_proxy() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = format!("http://{}", listener.local_addr().expect("has an address"));
+        let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let counted = Arc::clone(&arrived);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    return;
+                }
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        (proxy, arrived)
+    }
+
+    /// Whether `arrived` reaches `wanted` within `budget`.
+    fn connections_reach(
+        arrived: &Arc<std::sync::atomic::AtomicUsize>,
+        wanted: usize,
+        budget: Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if arrived.load(Ordering::Relaxed) >= wanted {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        arrived.load(Ordering::Relaxed) >= wanted
     }
 
     #[test]
@@ -698,26 +875,71 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_join_outlives_the_thread_it_stops() {
-        // The join is what lets `detach` promise "no ping after this returns".
-        // Every ping here fails instantly (port 1), so the only way this test
-        // hangs is the thread not honouring the stop — and a hang is the
-        // failure mode, caught by the harness timeout rather than an assert.
-        let client = Client::new("http://127.0.0.1:1").with_retries(crate::RetryPolicy::none());
-        let keep_alive = KeepAlive::spawn(client, "1-2-3-4".to_owned(), Duration::from_millis(1))
+    fn stop_and_join_waits_for_a_ping_it_caught_in_flight() {
+        // What `detach` buys with the join, measured: a ping already on the
+        // wire is finished before this returns. The proxy accepts and holds
+        // the connection, so the ping is reliably in flight when the stop is
+        // raised, and `stop_and_join` must not come back before it is over.
+        // Plain `stop()` returns in ~0 ms here; that difference is the assert.
+        //
+        // (A thread ignoring the stop would hang instead of failing. libtest
+        // has no per-test timeout, so that would stall the whole run — hence
+        // the bound in `stop_and_join` itself, which caps the damage at
+        // `DETACH_JOIN_TIMEOUT` even then.)
+        const HELD: Duration = Duration::from_millis(400);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = format!("http://{}", listener.local_addr().expect("has an address"));
+        let (accepted, an_accept) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                accepted.send(()).ok();
+                // Held, unanswered, then closed: the ping fails at HELD rather
+                // than waiting out its own one-second request budget.
+                std::thread::sleep(HELD);
+                drop(stream);
+            }
+        });
+
+        let client = Client::new(&proxy).with_retries(crate::RetryPolicy::none());
+        let interval = Duration::from_millis(1);
+        let mut ping_client = client.clone();
+        ping_client
+            .transport
+            .set_timeout(ping_request_timeout(interval));
+        let keep_alive = KeepAlive::spawn(ping_client, "1-2-3-4".to_owned(), interval)
             .expect("the thread starts");
 
+        an_accept
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a ping reached the proxy");
+
+        let waited = std::time::Instant::now();
         keep_alive.stop_and_join();
+        let waited = waited.elapsed();
+
+        assert!(
+            waited >= HELD / 2,
+            "stop_and_join returned in {waited:?}, so it did not wait out the ping it caught"
+        );
     }
 
     #[test]
     fn detach_hands_back_the_id_and_disarms_drop() {
-        // `detach` consumes the handle, so `Drop` still runs inside it — with
-        // `done` set, on a client that could only fail loudly if it sent
-        // anything. Returning at all is half the assertion; the wire-level
-        // proof that nothing was sent is in tests/transaction_lifecycle.rs.
-        let tx = doomed();
+        // `detach` consumes the handle, so `Drop` still runs inside it, and
+        // `done` is the only thing keeping it from aborting. Asserted against
+        // a socket that counts connections rather than a dead port, where an
+        // abort that was sent and one that was not look identical.
+        let (proxy, arrived) = watched_proxy();
+        let tx = handle_at(&proxy, Origin::Started);
+
         assert_eq!(tx.detach(), "1-2-3-4");
+
+        assert!(
+            !connections_reach(&arrived, 1, Duration::from_millis(300)),
+            "detach sent something: a detached transaction must look untouched"
+        );
     }
 
     #[test]
@@ -754,13 +976,71 @@ mod tests {
     }
 
     #[test]
-    fn an_attached_handle_dropped_mid_work_sends_nothing() {
-        // Same shape as above: an attached handle that is *not* finished. A
-        // started one in this state reaches for the cluster to abort; an
-        // attached one must not reach for anything. Nothing observable here
-        // beyond "no panic" — the wire test pins the absence of the abort.
-        let mut tx = doomed();
-        tx.origin = Origin::Attached;
-        drop(tx);
+    fn only_a_started_handles_drop_reaches_for_the_cluster() {
+        // The whole of `Drop`'s distinction, in one pair. Both handles are
+        // unfinished; both drop; the *started* one must abort and the
+        // *attached* one must send nothing at all. Asserting the second alone
+        // would pass on a `Drop` that had stopped sending anything, which is
+        // why the first is here beside it.
+        let (started_proxy, reached_by_started) = watched_proxy();
+        drop(handle_at(&started_proxy, Origin::Started));
+        assert!(
+            connections_reach(&reached_by_started, 1, Duration::from_secs(5)),
+            "a dropped started handle sent nothing: `?` inside a transaction \
+             no longer leaves the cluster as it was"
+        );
+
+        let (attached_proxy, reached_by_attached) = watched_proxy();
+        drop(handle_at(&attached_proxy, Origin::Attached));
+        assert!(
+            !connections_reach(&reached_by_attached, 1, Duration::from_millis(300)),
+            "a dropped attached handle reached for the cluster: an attacher's \
+             `?` must not destroy the owner's work"
+        );
+    }
+
+    #[test]
+    fn a_timeout_attribute_is_read_in_either_integer() {
+        // Int64 is what the local cluster answers — `{"value"=30000;}`, no `u`
+        // — but a millisecond count is exactly the sort of field a master
+        // could spell unsigned, and failing an attach over that would be a bad
+        // way to find out.
+        for node in [YsonNode::Int64(30_000), YsonNode::Uint64(30_000)] {
+            let value = YsonValue {
+                attributes: None,
+                node,
+            };
+            assert_eq!(
+                attached_timeout("1-2-3-4", &value).expect("reads"),
+                Duration::from_secs(30)
+            );
+        }
+    }
+
+    #[test]
+    fn a_nonsense_timeout_attribute_is_an_error_that_names_it() {
+        // Read as zero, each of these would floor `ping_interval` to a second
+        // and leave a 1 Hz pinger running for the handle's whole life, on a
+        // transaction whose real interval nobody knows.
+        for node in [
+            YsonNode::Int64(-1),
+            YsonNode::Int64(0),
+            YsonNode::Uint64(0),
+            YsonNode::String(b"30s".to_vec()),
+            YsonNode::Entity,
+        ] {
+            let value = YsonValue {
+                attributes: None,
+                node: node.clone(),
+            };
+            let error = attached_timeout("1-2-3-4", &value)
+                .expect_err(&format!("{node:?} is not a transaction timeout"));
+
+            let ClientError::Decode { command, reason } = &error else {
+                panic!("wrong variant for {node:?}: {error:?}");
+            };
+            assert_eq!(command, "attach_transaction");
+            assert!(reason.contains("1-2-3-4/@timeout"), "{reason}");
+        }
     }
 }

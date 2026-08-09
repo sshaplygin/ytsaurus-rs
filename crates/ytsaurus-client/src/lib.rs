@@ -818,6 +818,21 @@ impl Client {
     ///   what makes attaching to a transaction that is gone fail *here*,
     ///   rather than on the first command sent through the handle.
     ///
+    /// **It pings before it returns**, one more round trip. `@timeout` is the
+    /// *configured* lifetime and says nothing about how much of it is left:
+    /// the id carries no hint of when its last holder pinged, so a handoff
+    /// that took longer than two thirds of the timeout would otherwise hand
+    /// back a handle whose first ping is already too late. That ping restarts
+    /// the cluster's clock at the attach, and doubles as the liveness probe
+    /// this call reports on.
+    ///
+    /// **Nothing stops two attaches to the same id.** Each is a real handle
+    /// with a thread of its own, and they simply ping the same transaction
+    /// twice as often; whichever commits or aborts first decides it, and the
+    /// other's next command fails with `No such transaction`. There is no
+    /// registry, on purpose — a second process attaching is the whole point,
+    /// and this process is not in a position to know about it.
+    ///
     /// The handle always pings. One that did not would be
     /// [`Client::with_transaction`] — the plain binding, which already exists —
     /// plus [`Client::ping_transaction`], [`Client::commit_transaction`] and
@@ -847,9 +862,10 @@ impl Client {
     /// `Error resolving path #<id>/@timeout` around `No such object <id>` —
     /// object, not transaction, since the id is addressed as one — while an
     /// id that never named anything is refused as `Unknown cell tag 0`, with
-    /// no id in it at all.
-    pub fn attach_transaction(&self, id: impl Into<String>) -> Result<Transaction> {
-        Transaction::attach(self, id.into())
+    /// no id in it at all. A transaction that expires between the two round
+    /// trips fails the same way, on the ping: `No such transaction`.
+    pub fn attach_transaction(&self, id: &str) -> Result<Transaction> {
+        Transaction::attach(self, id.to_owned())
     }
 
     /// Tells the cluster a transaction is still wanted, by bare id.

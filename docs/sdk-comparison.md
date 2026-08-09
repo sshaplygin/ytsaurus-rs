@@ -200,7 +200,7 @@ from the fact that all four are "mutating and light".
 | Handle doubles as a client | `ITransaction : IClientBase` | `Tx` embeds the interfaces | `Deref<Target = Client>` |
 | Attach to one started elsewhere | yes, fully | yes | yes — `attach_transaction`, pinging included |
 | `Detach` — stop pinging, leave it alive | **yes** | partial | yes — and dropping an *attached* handle detaches too |
-| Learn it was lost without a command | no | **`Tx.Finished()` channel** | manual `ping()` |
+| Learn it was lost without a command | no | **`Tx.Finished()` channel** | `is_lost()`, polled — or `ping()` |
 | Prerequisite transaction ids | yes | yes | no |
 | Wait for a waitable lock | `GetAcquiredFuture()` | **no helper** | **yes, with a mandatory deadline** |
 | Unlock | yes | yes | no |
@@ -217,7 +217,15 @@ What `Drop` does follows the C++ destructor's line: a handle this process
 transaction — where an *attached* one detaches. Go's
 `AttachTx(id, {AutoPingable: false})` maps onto `with_transaction` plus the
 by-id commands; the Rust `attach_transaction` always pings, because a
-non-pinging handle would duplicate exactly that pair.
+non-pinging handle would duplicate exactly that pair. It also pings *before*
+returning, which neither of the others does: `@timeout` is the configured
+lifetime and the id says nothing about how much of it a handoff has already
+spent.
+
+The remaining Go advantage in that table is `Tx.Finished()`, which is pushed
+rather than polled. `Transaction::is_lost` answers the same question — the
+keep-alive stops for exactly one reason, and this is that verdict made
+visible — but a holder has to ask.
 
 ## Dynamic tables, administration, the rest
 
