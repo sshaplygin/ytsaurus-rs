@@ -16,6 +16,8 @@ use std::process::Command;
 use serde::Serialize;
 use ytsaurus_yson::{YsonFormat, to_vec};
 
+mod common;
+
 /// A scratch directory that cleans up after itself.
 struct TempDir(PathBuf);
 
@@ -83,7 +85,7 @@ fn run(dir: &TempDir, input_path: &Path) -> (Vec<u8>, String) {
 
     let script = format!(
         "{:?} <{:?} 1>{:?} 5>{:?}",
-        env!("CARGO_BIN_EXE_counted"),
+        common::example("counted").display(),
         input_path.display().to_string(),
         output.display().to_string(),
         statistics.display().to_string(),

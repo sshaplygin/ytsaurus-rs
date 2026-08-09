@@ -277,7 +277,7 @@ minutes later. The default launcher built with `cargo run` is Mach-O on macOS
 or normally dynamically linked on Linux, so it cannot be the uploaded file.
 Build the worker with `scripts/build-worker.sh` and upload that with
 `upload_worker`. The source is still one file — see
-[`examples/src/bin/selfrun.rs`](../../examples/src/bin/selfrun.rs).
+[`crates/ytsaurus-job/examples/selfrun.rs`](../../crates/ytsaurus-job/examples/selfrun.rs).
 
 ## Talking to a real installation
 
@@ -432,7 +432,7 @@ what they printed, so the error carries the job's own words:
 operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
   job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
   stderr:
-    thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+    thread 'main' panicked at crates/ytsaurus-job/examples/boom.rs:37:17:
     boom: this job fails on purpose (row 1, 23 bytes)
 ```
 

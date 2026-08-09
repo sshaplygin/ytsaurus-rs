@@ -22,7 +22,7 @@
 //! export YT_PROXY=http://localhost:8000
 //! scripts/build-worker.sh selfrun     # the binary the cluster will run
 //! YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \\
-//!     cargo run -p ytsaurus-examples --bin selfrun
+//!     cargo run -p ytsaurus-job --example selfrun
 //! ```
 //!
 //! ## Running the static build directly

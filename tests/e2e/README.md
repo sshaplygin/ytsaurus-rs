@@ -5,7 +5,7 @@ runs in CI.
 
 | | Runs in CI | Needs a cluster | What it proves |
 | --- | --- | --- | --- |
-| [`examples/tests/cat_e2e.rs`](../../examples/tests/cat_e2e.rs) | yes | no | the compiled worker handles the real byte stream correctly |
+| [`crates/ytsaurus-job/tests/cat_e2e.rs`](../../crates/ytsaurus-job/tests/cat_e2e.rs) | yes | no | the compiled worker handles the real byte stream correctly |
 | [`run_e2e.sh`](run_e2e.sh) | no | yes | the above, plus the scheduler, operation spec and re-encoding |
 
 The important point: the offline test's fixtures are **captured from a real
@@ -15,7 +15,7 @@ handed on fd 0.
 ## Offline test (runs automatically)
 
 ```sh
-cargo test -p ytsaurus-examples --test cat_e2e
+cargo test -p ytsaurus-job --test cat_e2e
 ```
 
 Runs the real `cat` binary the way the cluster runs it — input on fd 0, output
@@ -68,7 +68,7 @@ Python.
 ### Dynamic Skiff map
 
 The Skiff path is exercised offline by
-[`examples/tests/skiff_cat_e2e.rs`](../../examples/tests/skiff_cat_e2e.rs): it
+[`crates/ytsaurus-job/tests/skiff_cat_e2e.rs`](../../crates/ytsaurus-job/tests/skiff_cat_e2e.rs): it
 runs the real `skiff_cat` worker with non-UTF-8 `string32` data. With the local
 cluster running, the equivalent client-driven cluster check is:
 
@@ -140,17 +140,17 @@ cargo run --release -p ytsaurus-client --example profile     # what the pilot sp
 # One source, two build outputs: `cargo run` makes a host launcher on every
 # platform, so point it at the static musl worker built above.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
-    cargo run -p ytsaurus-examples --bin selfrun
+    cargo run -p ytsaurus-job --example selfrun
 
 # An https cluster needs the launcher to have TLS, which `examples/` leaves off
 # by default:
 #   selfrun: https://… needs TLS, and this build has none: the `tls` feature of
 #   ytsaurus-client is off. Enable it, or use an http:// proxy.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
-    cargo run -p ytsaurus-examples --bin selfrun --features tls
+    cargo run -p ytsaurus-job --example selfrun --features example-tls
 ```
 
-`--features tls` changes only the **launcher**. The musl worker built by
+`--features example-tls` changes only the **launcher**. The musl worker built by
 `scripts/build-worker.sh` still carries no TLS — that is the invariant the
 `musl` CI job asserts by listing the worker's dependency graph — and the client
 examples above need no flag at all, because `ytsaurus-client`'s `tls` feature is
@@ -184,7 +184,7 @@ operation 1ba94195-3142e068-103e8-ffe93efc finished as failed: Failed jobs limit
   stderr:
     boom: started, reading input
     ytsaurus-job: the job panicked and will fail.
-    thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+    thread 'main' panicked at crates/ytsaurus-job/examples/boom.rs:37:17:
     boom: this job fails on purpose (row 1, 23 bytes)
    ok a failed job was reported
    ok the job's stderr came back
@@ -734,7 +734,7 @@ export YT_HEAVY_PROXY_DOMAINS=proxy-zone.net
 
 # 4. https, which the worker-shaped build has no TLS for. The launcher role
 #    needs the feature; the musl worker still must not have it.
-cargo run -p ytsaurus-examples --bin selfrun --features tls
+cargo run -p ytsaurus-job --example selfrun --features example-tls
 ```
 
 Three more things about that run, because they were checked and are not obvious:

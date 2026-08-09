@@ -94,7 +94,7 @@ PY
 ok "cat_expected_table_0.bin, cat_expected_table_1.bin, cat_expected_single.bin"
 
 say "Verifying the offline test against the fresh fixtures"
-(cd "$ROOT" && cargo test -p ytsaurus-examples --test cat_e2e 2>&1 | tail -12)
+(cd "$ROOT" && cargo test -p ytsaurus-job --test cat_e2e 2>&1 | tail -12)
 
 yt remove "$BASE" --recursive --force
 say "Done"

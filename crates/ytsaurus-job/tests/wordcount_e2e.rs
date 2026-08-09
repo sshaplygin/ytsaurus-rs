@@ -12,6 +12,8 @@ use std::process::{Command, Stdio};
 
 use ytsaurus_yson::{Scan, YsonFormat, YsonNode, YsonValue, from_slice, scan::scan_value, to_vec};
 
+mod common;
+
 // ------------------------------------------------------------ YSON helpers
 
 fn uvarint(mut v: u64, out: &mut Vec<u8>) {
@@ -81,7 +83,7 @@ fn split_records(mut data: &[u8]) -> Vec<Vec<u8>> {
 
 /// Runs one phase of the worker, feeding `input` on stdin and returning fd 1.
 fn run_phase(mode: &str, input: &[u8]) -> Vec<u8> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wordcount"))
+    let mut child = Command::new(common::example("wordcount"))
         .arg(mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

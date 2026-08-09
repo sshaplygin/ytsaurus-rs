@@ -105,7 +105,7 @@ never mandatory. See `ytsaurus-client`'s `VanillaSpec` for the other side.
 ## 0.2.0
 
 Everything here came from writing a production-shaped pilot
-([`sessionize`](../../examples/src/bin/sessionize.rs)) and a launcher
+([`sessionize`](../../crates/ytsaurus-job/examples/sessionize.rs)) and a launcher
 ([`ytsaurus-client`](../ytsaurus-client/)) against the API, then filing what got
 in the way. Each change closes a numbered issue.
 

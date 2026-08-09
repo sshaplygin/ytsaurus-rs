@@ -86,9 +86,15 @@ jobs:
       # `tls` and `tracing` are both off in a worker build, and both would
       # break or bloat it: `rustls` reaches `ring`, which wants a C
       # cross-compiler, and a worker should carry only what it runs on. Neither
-      # is off by accident — `examples/` takes the client with
-      # `default-features = false` — so this asserts the invariant rather than
-      # trusting it. `rustls-platform-verifier` is the third name for the same
+      # is off by accident — `ytsaurus-job` takes the client as a
+      # `default-features = false` dev-dependency, for the `selfrun` example —
+      # so this asserts the invariant rather than trusting it.
+      #
+      # Read **with** dev-dependencies, which is the whole point: cargo compiles
+      # a package's dev-dependencies whenever it builds that package's examples,
+      # and the workers are examples. That is also why criterion is pinned
+      # below 0.8: 0.8 reaches `alloca`, whose build script wants the C
+      # cross-compiler this build is meant not to need. `rustls-platform-verifier` is the third name for the same
       # reason: the `platform-verifier` feature is gated on `tls`, and this is
       # what says so out loud.
       #
@@ -104,7 +110,7 @@ jobs:
       - name: Assert the worker graph has no tracing and no TLS
         run: |
           set -euo pipefail
-          graph=$(cargo tree -p ytsaurus-examples \
+          graph=$(cargo tree -p ytsaurus-job \
                     --target x86_64-unknown-linux-musl \
                     --prefix none --no-dedupe | awk 'NF {print $1}' | sort -u)
 
@@ -117,18 +123,20 @@ jobs:
           for crate in tracing rustls ring rustls-platform-verifier; do
             if echo "$graph" | grep -qx "$crate"; then
               echo "ERROR: $crate reached the worker build"
-              cargo tree -p ytsaurus-examples \
+              cargo tree -p ytsaurus-job \
                 --target x86_64-unknown-linux-musl -i "$crate"
               exit 1
             fi
             echo "OK: no $crate in the worker graph"
           done
 
+      # Through the script rather than a bare cargo call: the script is what
+      # stages each example from `<profile>/examples/<name>` into
+      # `<profile>/<name>`, which is the layout the assertion below and every
+      # document in the repository expect. Running it here also means the thing
+      # contributors run is the thing CI exercises.
       - name: Build worker binaries
-        run: |
-          cargo build -p ytsaurus-examples \
-            --profile release-worker \
-            --target x86_64-unknown-linux-musl
+        run: ./scripts/build-worker.sh
 
       - name: Assert binaries are statically linked
         run: |

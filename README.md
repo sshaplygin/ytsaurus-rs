@@ -37,10 +37,9 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-yson/](crates/ytsaurus-yson/) | YSON serializer/deserializer (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | [crates/ytsaurus-skiff/](crates/ytsaurus-skiff/) | Schema model and compatibility suite for YTsaurus Skiff. **Pre-release**: published so the crates above can be, with [gates still open](docs/skiff-compatibility.md). |
 | [crates/ytsaurus-format/](crates/ytsaurus-format/) | Shared `DataFormat` selection used by client specs/table I/O and worker I/O. |
-| [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. |
+| [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. Its [examples/](crates/ytsaurus-job/examples/) are the nine runnable worker binaries. |
 | [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
 | [crates/ytsaurus-helpers/](crates/ytsaurus-helpers/) | Derive macros: a table schema read off the struct the rows have. |
-| [examples/](examples/) | Worker binaries built on `ytsaurus-job`. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, and how this compares to the official C++ and Go clients. |
 | [tests/e2e/](tests/e2e/) | End-to-end scripts against a local YTsaurus cluster. |
 
@@ -92,22 +91,25 @@ fn main() {
 If the launcher comes from `cargo run`, build a static worker separately and
 set `YT_WORKER_BINARY` so it uploads that artifact; rebuild the worker whenever
 its source changes. If it fails, the error carries the job's own stderr rather
-than a state string. See [examples/src/bin/selfrun.rs](examples/src/bin/selfrun.rs);
+than a state string. See [crates/ytsaurus-job/examples/selfrun.rs](crates/ytsaurus-job/examples/selfrun.rs);
 the full walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 
 ```sh
 # a local cluster is plain HTTP
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
-    cargo run -p ytsaurus-examples --bin selfrun
+    cargo run -p ytsaurus-job --example selfrun
 
 # an https cluster needs the launcher to have TLS
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
-    cargo run -p ytsaurus-examples --bin selfrun --features tls
+    cargo run -p ytsaurus-job --example selfrun --features example-tls
 ```
 
-The flag changes the **launcher** only: `examples/` turns `ytsaurus-client`'s
-`tls` feature off so `build-worker.sh` can cross-compile to musl with nothing
-but the Rust toolchain, and the musl worker still carries no TLS either way.
+The flag changes the **launcher** only. `ytsaurus-job` takes `ytsaurus-client`
+as a `default-features = false` dev-dependency, for this one example, which is
+what lets `build-worker.sh` cross-compile to musl with nothing but the Rust
+toolchain; the musl worker carries no TLS either way. It is spelled
+`example-tls` rather than `tls` because it changes nothing about the library —
+`ytsaurus-job` has no HTTP in it at all.
 
 **Against a cluster that is not a local one** — a private CA, heavy proxies in
 another domain, a shared file cache — see [the runbook in

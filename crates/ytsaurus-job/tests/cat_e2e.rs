@@ -16,12 +16,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/e2e/fixtures");
+mod common;
 
-const INPUT: &[u8] = include_bytes!("../../tests/e2e/fixtures/cat_input.bin");
-const EXPECTED_TABLE_0: &[u8] = include_bytes!("../../tests/e2e/fixtures/cat_expected_table_0.bin");
-const EXPECTED_TABLE_1: &[u8] = include_bytes!("../../tests/e2e/fixtures/cat_expected_table_1.bin");
-const EXPECTED_SINGLE: &[u8] = include_bytes!("../../tests/e2e/fixtures/cat_expected_single.bin");
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/e2e/fixtures");
+
+const INPUT: &[u8] = include_bytes!("../../../tests/e2e/fixtures/cat_input.bin");
+const EXPECTED_TABLE_0: &[u8] =
+    include_bytes!("../../../tests/e2e/fixtures/cat_expected_table_0.bin");
+const EXPECTED_TABLE_1: &[u8] =
+    include_bytes!("../../../tests/e2e/fixtures/cat_expected_table_1.bin");
+const EXPECTED_SINGLE: &[u8] =
+    include_bytes!("../../../tests/e2e/fixtures/cat_expected_single.bin");
 
 /// A scratch directory that cleans up after itself.
 struct TempDir(PathBuf);
@@ -63,7 +68,7 @@ fn run_cat(input: &Path, outputs: &[PathBuf], extra_args: &str) -> std::process:
 
     let script = format!(
         "{:?} {extra_args} <{:?}{redirects}",
-        env!("CARGO_BIN_EXE_cat"),
+        common::example("cat").display(),
         input.display().to_string()
     );
 

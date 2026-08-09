@@ -166,3 +166,43 @@ impl io::Write for SharedBuffer {
         Ok(())
     }
 }
+
+/// Where cargo put a compiled example, so a test can run one.
+///
+/// The workers under `examples/` are the thing these end-to-end tests exist to
+/// run: they exec the binary the way a cluster does — rows in on fd 0, tables
+/// out on fds 1 and 4 — rather than calling into the library, because what the
+/// cluster runs is a process and not a function.
+///
+/// **Derived from the test binary's own path, because cargo names no variable
+/// for it.** `CARGO_BIN_EXE_<name>` exists for `[[bin]]` targets and has no
+/// counterpart for examples, so the only thing to go on is that both land in
+/// the same profile directory: the test at `<profile>/deps/<name>-<hash>` and
+/// the example at `<profile>/examples/<name>`. That holds for `--release` and
+/// for a `--target` cross-build too, since the whole tree moves together.
+///
+/// # Panics
+///
+/// If the example is not there, which means it was not built. `cargo test` and
+/// `cargo test --all-targets` build examples; `cargo test --test wordcount_e2e`
+/// on its own does not, and the message says so rather than leaving a reader
+/// with `No such file or directory` about a path they never wrote.
+pub fn example(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::current_exe().expect("a test knows its own path");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.push("examples");
+    path.push(name);
+
+    assert!(
+        path.is_file(),
+        "the `{name}` example is not built at {}.\n\
+         Run `cargo test -p ytsaurus-job` or `cargo build -p ytsaurus-job \
+         --examples` first: cargo builds examples for a whole-package test run \
+         and not for `--test <name>` on its own.",
+        path.display()
+    );
+    path
+}

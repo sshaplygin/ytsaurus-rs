@@ -68,7 +68,7 @@
 //! operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
 //!   job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
 //!   stderr:
-//!     thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+//!     thread 'main' panicked at crates/ytsaurus-job/examples/boom.rs:37:17:
 //!     boom: this job fails on purpose (row 1, 23 bytes)
 //! ```
 //!

@@ -12,6 +12,8 @@ use std::process::Command;
 
 use ytsaurus_yson::{Scan, YsonFormat, YsonNode, YsonValue, from_slice, scan::scan_value};
 
+mod common;
+
 const MINUTE_US: i64 = 60 * 1_000_000;
 
 /// Epoch microseconds for 2026-01-01T00:00:00Z.
@@ -174,7 +176,7 @@ fn run_phase(mode: &str, input: &[u8], tag: &str) -> (Vec<u8>, Vec<u8>) {
 
     let script = format!(
         "{:?} {mode} <{:?} 1>{:?} 4>{:?}",
-        env!("CARGO_BIN_EXE_sessionize"),
+        common::example("sessionize").display(),
         stdin_path.display().to_string(),
         t0.display().to_string(),
         t1.display().to_string(),

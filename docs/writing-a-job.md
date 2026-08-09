@@ -219,7 +219,7 @@ and point the host launcher at it:
 scripts/build-worker.sh my_job
 # Rebuild this worker whenever its source changes.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/my_job \
-    cargo run -p ytsaurus-examples --bin my_job
+    cargo run -p my-workers --bin my_job
 ```
 
 where the launcher chooses:
@@ -232,7 +232,7 @@ match std::env::var("YT_WORKER_BINARY") {
 ```
 
 On Linux x86-64, you can instead run the musl build itself, and
-`upload_current_exe` needs no help. [`examples/src/bin/selfrun.rs`](../examples/src/bin/selfrun.rs)
+`upload_current_exe` needs no help. [`crates/ytsaurus-job/examples/selfrun.rs`](../crates/ytsaurus-job/examples/selfrun.rs)
 is the runnable version of both forms.
 
 ### Uploading it only when it changed
@@ -303,7 +303,7 @@ With the `main` from §3, that is just the binary:
 
 ```sh
 export YT_PROXY=http://localhost:8000
-cargo run -p ytsaurus-examples --bin my_job
+cargo run -p my-workers --bin my_job
 ```
 
 ### Typed output tables
@@ -504,7 +504,7 @@ yt map-reduce \
     --spec '{reduce_job_io={control_attributes={enable_key_switch=%true}}}'
 ```
 
-See [`examples/src/bin/wordcount.rs`](../examples/src/bin/wordcount.rs).
+See [`crates/ytsaurus-job/examples/wordcount.rs`](../crates/ytsaurus-job/examples/wordcount.rs).
 
 ## 9. Jobs with no input
 
@@ -546,7 +546,7 @@ that in the command (`"./my_job 3"` above) as the spec's own parameter. A task
 may declare output tables or none at all; `gang_options` and the rest go through
 `VanillaTask::with_raw`.
 
-See [`examples/src/bin/shards.rs`](../examples/src/bin/shards.rs) and
+See [`crates/ytsaurus-job/examples/shards.rs`](../crates/ytsaurus-job/examples/shards.rs) and
 `cargo run -p ytsaurus-client --example vanilla`.
 
 ## 10. Reporting your own numbers
@@ -598,7 +598,7 @@ than nesting it — and the total is over `completed` jobs, since an aborted job
 work is redone by its replacement. `Client::custom_statistics` returns the whole
 tree if you want the per-job-type breakdown.
 
-See [`examples/src/bin/counted.rs`](../examples/src/bin/counted.rs) and
+See [`crates/ytsaurus-job/examples/counted.rs`](../crates/ytsaurus-job/examples/counted.rs) and
 `cargo run -p ytsaurus-client --example statistics`.
 
 ## 11. Test without a cluster
@@ -609,9 +609,9 @@ A job is a program that reads a pipe, so you can run it as one:
 ./my_job < input.bin > table0.bin 4> table1.bin
 ```
 
-That is exactly how [`examples/tests/cat_e2e.rs`](../examples/tests/cat_e2e.rs)
+That is exactly how [`crates/ytsaurus-job/tests/cat_e2e.rs`](../crates/ytsaurus-job/tests/cat_e2e.rs)
 works, and it catches most protocol mistakes without a cluster. For the reduce
-path, [`examples/tests/wordcount_e2e.rs`](../examples/tests/wordcount_e2e.rs)
+path, [`crates/ytsaurus-job/tests/wordcount_e2e.rs`](../crates/ytsaurus-job/tests/wordcount_e2e.rs)
 simulates the shuffle by sorting the mapper output and inserting key switches.
 
 For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
@@ -655,7 +655,7 @@ operation 1ba94195-3142e068-103e8-ffe93efc finished as failed: Failed jobs limit
   stderr:
     boom: started, reading input
     ytsaurus-job: the job panicked and will fail.
-    thread 'main' panicked at examples/src/bin/boom.rs:37:17:
+    thread 'main' panicked at crates/ytsaurus-job/examples/boom.rs:37:17:
     boom: this job fails on purpose (row 1, 23 bytes)
 ```
 

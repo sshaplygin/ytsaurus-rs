@@ -3,7 +3,7 @@
 //! Build it the way a real worker is built:
 //!
 //! ```sh
-//! cargo build -p ytsaurus-examples --bin hello \
+//! cargo build -p ytsaurus-job --example hello \
 //!     --profile release-worker --target x86_64-unknown-linux-musl
 //! file target/x86_64-unknown-linux-musl/release-worker/hello
 //! ```

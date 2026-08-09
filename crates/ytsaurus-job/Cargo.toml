@@ -11,6 +11,13 @@ description = "Runtime for writing YTsaurus MapReduce jobs in Rust: streaming YS
 readme = "README.md"
 keywords = ["ytsaurus", "mapreduce", "yson", "job"]
 categories = ["encoding"]
+# `examples/selfrun.rs` is the one example that needs `ytsaurus-client`, which
+# is a **version-less** dev-dependency here so that two published crates do not
+# become cyclic. Cargo drops such a dependency from the published manifest — so
+# a `selfrun.rs` that shipped would be an example nobody could build from the
+# registry, failing on an import of a crate the manifest no longer names. The
+# other eight need only this crate's own dependencies and ship as they are.
+exclude = ["examples/selfrun.rs"]
 
 [dependencies]
 ytsaurus-yson.workspace = true
@@ -19,9 +26,58 @@ ytsaurus-format.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[features]
+# Gives the `selfrun` example TLS, for a cluster reached over https. Off by
+# default, and it affects **nothing but that example**: this crate's library has
+# no HTTP in it at all. It exists because `selfrun` is the one worker that is
+# also a launcher, so it needs `ytsaurus-client` — and a musl worker build must
+# not drag in `rustls`, which reaches `ring`, which wants a C cross-compiler.
+#
+#   cargo run -p ytsaurus-job --example selfrun --features example-tls
+example-tls = ["ytsaurus-client/tls"]
+
 [dev-dependencies]
 serde_bytes.workspace = true
+serde.workspace = true
 criterion.workspace = true
+# For the `selfrun` example only, which is launcher and job in one binary.
+#
+# **Path and no version, deliberately.** `ytsaurus-client` dev-depends on this
+# crate in turn, so a version here would make two published crates cyclic and
+# deadlock every release after it — 0.2.6 of either would need 0.2.6 of the
+# other already on crates.io. Cargo drops a version-less dev-dependency from the
+# published manifest, which is what makes the cycle a local build detail rather
+# than something a consumer of either crate can see.
+#
+# `default-features = false` is what keeps TLS out of the worker build; see the
+# `example-tls` feature above.
+ytsaurus-client = { path = "../ytsaurus-client", default-features = false }
+
+# Four of the workers carry unit tests of their own — the counting in
+# `wordcount`, the sessionising in `sessionize`, the shard arithmetic in
+# `shards`, the statistics in `counted` — sixteen in all, testing functions that
+# are private to a worker and have no business being public API.
+#
+# **`test = true` is what keeps them running.** Cargo runs the unit tests inside
+# a `[[bin]]`, which is what these were, and does *not* run the ones inside an
+# example unless the target says so: the default is `test = false`. Moving them
+# here without this line dropped all sixteen and left the suite green, which is
+# the only kind of regression worth writing eight lines about.
+[[example]]
+name = "counted"
+test = true
+
+[[example]]
+name = "sessionize"
+test = true
+
+[[example]]
+name = "shards"
+test = true
+
+[[example]]
+name = "wordcount"
+test = true
 
 [[bench]]
 name = "job_throughput"

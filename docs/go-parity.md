@@ -16,7 +16,7 @@ client could not do.
 
 | Go example | Here | What it is about |
 | --- | --- | --- |
-| `compute-email-example` | [`examples/src/bin/selfrun.rs`](../examples/src/bin/selfrun.rs) | one binary that is both launcher and job |
+| `compute-email-example` | [`crates/ytsaurus-job/examples/selfrun.rs`](../crates/ytsaurus-job/examples/selfrun.rs) | one binary that is both launcher and job |
 | `count-names-example` | [`sort_reduce.rs`](../crates/ytsaurus-client/examples/sort_reduce.rs) | sort a table, then reduce over its key groups |
 | `cypress-example` | [`cluster_info.rs`](../crates/ytsaurus-client/examples/cluster_info.rs) | connect, and read a node into a Rust type |
 | `schema` | [`schema.rs`](../crates/ytsaurus-client/examples/schema.rs) | infer a schema from a struct, create, read back, alter |
@@ -197,7 +197,7 @@ cargo run -p ytsaurus-client --example sort_reduce
 cargo run -p ytsaurus-client --example vanilla
 # `cargo run` is the host launcher; upload the static worker built above.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
-    cargo run -p ytsaurus-examples --bin selfrun
+    cargo run -p ytsaurus-job --example selfrun
 ```
 
 [`tests/e2e/README.md`](../tests/e2e/README.md) holds the output of each, from

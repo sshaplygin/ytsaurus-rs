@@ -3,8 +3,21 @@ use std::{
     process::{Command, Stdio},
 };
 
-use ytsaurus_examples::skiff_passthrough_format;
-use ytsaurus_skiff::{Decoder, Encoder, Value};
+use ytsaurus_skiff::{Decoder, Encoder, Format, Schema, SchemaRef, Value, WireType};
+
+mod common;
+
+/// The same one-column `string32` format the worker uses, spelled out here on
+/// purpose: see the note on the example's own copy. Two independent spellings
+/// that have to agree are worth more than one shared constant that cannot
+/// disagree.
+fn skiff_passthrough_format() -> Format {
+    Format::new(vec![SchemaRef::Inline(Schema::tuple([Schema::named(
+        "value",
+        WireType::String32,
+    )]))])
+    .expect("the fixed skiff_cat table schema is valid")
+}
 
 #[test]
 fn dynamic_skiff_worker_round_trips_non_utf8_rows() {
@@ -19,7 +32,7 @@ fn dynamic_skiff_worker_round_trips_non_utf8_rows() {
     }
     let input = encoder.into_inner().unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_skiff_cat"))
+    let mut child = Command::new(common::example("skiff_cat"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

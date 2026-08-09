@@ -21,7 +21,6 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, and published from 0.2.5 with `ytsaurus-skiff`, whose status it inherits. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
-| `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`, `skiff_cat`) plus their e2e tests. |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
@@ -100,23 +99,35 @@ cross-toolchain or Docker needed.
 crate. It lives in the workspace `release-worker` profile so library crates never
 inherit it.
 
-`ytsaurus-client`'s **`tls` feature is on by default and off in `examples/`**.
-TLS means `rustls`, which means `ring`, which needs a C cross-compiler to reach
-musl — and `examples/` is what `build-worker.sh` cross-compiles. Turning it off
-there is what keeps that script working with nothing but the Rust toolchain,
-even for a worker that contains the whole client. The dependency is spelled out
-in `examples/Cargo.toml` rather than inherited, because cargo does not let an
-inherited dependency disable default features.
+`ytsaurus-client`'s **`tls` feature is on by default and off where the workers
+are built**. TLS means `rustls`, which means `ring`, which needs a C
+cross-compiler to reach musl — and the workers are what `build-worker.sh`
+cross-compiles. Turning it off is what keeps that script working with nothing
+but the Rust toolchain, even for `selfrun`, which contains the whole client. The
+dependency is spelled out in `crates/ytsaurus-job/Cargo.toml` rather than
+inherited, because cargo does not let an inherited dependency disable default
+features.
+
+**A dev-dependency is a worker's dependency.** Cargo compiles a package's
+dev-dependencies whenever it builds that package's *examples*, and the workers
+are examples of `ytsaurus-job`. So anything added to that crate's
+`[dev-dependencies]` lands in the musl build: that is why `ytsaurus-client` is
+there with `default-features = false`, why it carries a **path and no version**
+(a version would make it cyclic with the client, which dev-depends on this crate
+in turn, and deadlock both releases), and why the throughput bench lives in
+**criterion pinned below 0.8** — 0.8 added a dependency on `alloca`, whose
+build script wants exactly the C cross-compiler this build is meant not to
+need, and `cargo bench` is not where that would have been noticed.
 
 Its **`tracing` and `platform-verifier` features are off by default** and must
 stay that way, for the second half of the same reason: a worker binary should
 carry only what it runs on, and `default-features = false` in
-`examples/Cargo.toml` is what keeps them out of the musl build.
+`crates/ytsaurus-job/Cargo.toml` is what keeps them out of the musl build.
 `platform-verifier` is gated on `tls` and so cannot reach a worker even if
 something asked for it; `YT_CA_BUNDLE`, which answers the same need with no
 dependency at all, sits behind `tls` for the same reason. CI asserts all of
 this rather than trusting it — the musl job lists the worker's dependency graph
-with `cargo tree -p ytsaurus-examples --target x86_64-unknown-linux-musl
+with `cargo tree -p ytsaurus-job --target x86_64-unknown-linux-musl
 --prefix none` and fails if `tracing`, `rustls`, `ring` or
 `rustls-platform-verifier` is in it. Listed and searched rather than probed with
 `-i <crate>`: `-i` exits non-zero both when the crate is absent (the pass) and
