@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.6 - 2026-08-10
+
+### The worker examples live here now
+
+- **Added** eight runnable workers under `examples/` — `cat`, `wordcount`,
+  `hello`, `sessionize`, `boom`, `counted`, `shards` and `skiff_cat` — which
+  were a separate package in the repository before and are now published with
+  this crate. `cargo run -p ytsaurus-job --example wordcount`, and on docs.rs
+  they sit beside the API they demonstrate.
+
+  A ninth, `selfrun`, stays in the repository and is **excluded from the
+  package**. It is launcher and job in one binary, so it needs
+  `ytsaurus-client` — which dev-depends on this crate in turn, so the
+  dependency here carries a path and no version to keep two published crates
+  from becoming cyclic. Cargo drops a version-less dev-dependency on publish,
+  and an example importing a crate the manifest no longer names is an example
+  nobody could build.
+
+- **Added** the `example-tls` feature, which gives that same `selfrun` example
+  TLS for a cluster reached over https. It affects nothing else: this crate's
+  library has no HTTP in it. Off by default, because the workers cross-compile
+  to musl and `rustls` reaches `ring`, which wants a C cross-compiler.
+
+- **Changed** the criterion dev-dependency to `0.7`. Cargo compiles a package's
+  dev-dependencies whenever it builds that package's examples, and criterion
+  0.8 reaches `alloca`, whose build script wants the same cross-compiler.
+  Nothing in the bench used a 0.8 feature.
+
 ## 0.2.5 - 2026-08-10
 
 No changes to this crate beyond the version, which tracks the workspace.

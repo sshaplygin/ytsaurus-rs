@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.6 - 2026-08-10
+
+No changes to this crate beyond the version, which tracks the workspace.
+
 ## 0.2.5 - 2026-08-10
 
 First release, and the first version of this crate. Version tracks the

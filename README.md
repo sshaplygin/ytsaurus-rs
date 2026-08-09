@@ -5,7 +5,7 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
 
-All six crates are on crates.io at **0.2.5**, released together — the version is
+All six crates are on crates.io at **0.2.6**, released together — the version is
 the workspace's, so they move as one.
 
 | Crate | Version | Docs | What it is |
@@ -241,7 +241,7 @@ across both YSON formats without a crash.
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).
 
-All six crates are on crates.io at 0.2.5, and **no further release happens
+All six crates are on crates.io at 0.2.6, and **no further release happens
 without explicit human approval** — versions, yanks and new crates alike. In
 particular the `yson-rs` name belongs to its upstream author and will never be
 claimed here.

@@ -1326,8 +1326,8 @@ iterations without a crash.
 ### Shipped
 
 - **GitHub**: [sshaplygin/ytsaurus-rs](https://github.com/sshaplygin/ytsaurus-rs),
-  public, CI green, tagged `v0.2.5`.
-- **crates.io**: all six crates at **0.2.5**, released together —
+  public, CI green, tagged `v0.2.6`.
+- **crates.io**: all six crates at **0.2.6**, released together —
   [`ytsaurus-yson`](https://crates.io/crates/ytsaurus-yson),
   [`ytsaurus-skiff`](https://crates.io/crates/ytsaurus-skiff),
   [`ytsaurus-format`](https://crates.io/crates/ytsaurus-format),
