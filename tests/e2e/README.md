@@ -304,7 +304,7 @@ so that the day a cluster enables it, the run says so instead of going stale.
 == Aborting it, with a reason
    ok the scheduler took the request in 399 ms
    ok and it was already `aborted` — 0.0s of waiting
-   ok and no job is still running (0 left in the list)
+   ok and its job stopped 0.0s after the operation did
 == Reading back why it stopped
    Operation aborted by user request: stopped by the abort example
    ok and kept the reason given: "stopped by the abort example"
