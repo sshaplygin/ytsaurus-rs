@@ -13,10 +13,21 @@
 //!
 //! Prints the time each call took, which is the whole point of the feature.
 //!
-//! On an installation whose cache is operator-managed there is no second call
-//! to time: the client warns, uploads outside the cache and carries on — a
-//! launch that works, and nothing to demonstrate. The example stops there and
-//! says so, rather than failing later at a check whose cause has scrolled off.
+//! The demonstration needs a cache it may **clear** — the first call has to be
+//! a real miss — so it brings one of its own rather than using the
+//! installation's. The shared default (`//tmp/yt_wrapper/file_storage/new_cache`,
+//! the path the Python wrapper uses) is read-only for an ordinary user on a
+//! managed installation, and the example's setup step died there with
+//! `Access denied for user "…": "remove" permission … is not allowed by any
+//! matching ACE` — a refusal about the example's own housekeeping, not about
+//! anything the client cannot do.
+//!
+//! `YT_FILE_CACHE` points it back at a shared cache, and then one of two things
+//! happens, both of which the example stops on rather than failing three checks
+//! later where the cause has scrolled off: the cache refuses the *upload*, and
+//! the client warns, uploads outside the cache and carries on — a launch that
+//! works with nothing to demonstrate — or it refuses the *clearing*, and the
+//! first call is bound to be a hit, so there is no cold upload to time.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -26,6 +37,19 @@ use ytsaurus_client::{CachedFile, Client, ClientError, MapSpec};
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_cached";
+
+/// The cache this example brings with it.
+///
+/// It has to *clear* an entry to make the first upload a real miss, and a
+/// shared cache is the one thing an ordinary user will never be allowed to
+/// remove from. Bringing its own makes the demonstration self-contained.
+///
+/// **Beside `BASE` and not inside it.** `run` starts by removing `BASE` whole,
+/// so a cache under there would be wiped before the clearing step could find
+/// anything in it — the step would print "nothing cached" for ever and the
+/// `remove` it exists to exercise would never run. A cache is a thing that
+/// survives runs; that is the entire feature.
+const CACHE: &str = "//tmp/ytsaurus_rs_cached_cache";
 
 /// The worker this launches, as produced by `scripts/build-worker.sh cat`.
 const WORKER: &str = "target/x86_64-unknown-linux-musl/release-worker/cat";
@@ -44,7 +68,15 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), ClientError> {
-    let client = Client::from_env()?;
+    // `YT_FILE_CACHE` is somebody asking for a particular cache on purpose, and
+    // `from_env` has already applied it; naming it here as well is what lets
+    // the example print which cache the numbers below came from.
+    let cache = std::env::var("YT_FILE_CACHE")
+        .map(|named| named.trim().to_owned())
+        .ok()
+        .filter(|named| !named.is_empty())
+        .unwrap_or_else(|| CACHE.to_owned());
+    let client = Client::from_env()?.with_file_cache(&cache);
 
     if !std::path::Path::new(WORKER).exists() {
         eprintln!("worker not found at {WORKER}");
@@ -62,14 +94,22 @@ fn run() -> Result<(), ClientError> {
     client.write_table_rows(format!("{BASE}/input"), SAMPLE)?;
     let size = std::fs::metadata(WORKER).map(|m| m.len()).unwrap_or(0);
     done(&format!("{BASE}, worker is {} KiB", size / 1024));
+    done(&format!("caching into {cache}"));
 
-    // The cache is shared and persistent, so a previous run of this example
-    // would leave nothing to miss on. Clearing it makes the first call a real
-    // upload every time.
+    // A cache is persistent, so a previous run would leave nothing to miss on.
+    // Clearing this one entry makes the first call a real upload every time —
+    // and this is the step a shared cache refuses, which is why the example
+    // brings its own unless told otherwise.
     step("Clearing this binary out of the cache, so the first call is a miss");
     let digest = md5_of(WORKER)?;
     if let Some(cached) = client.file_from_cache(&digest)? {
-        client.remove(&cached)?;
+        // A managed cache is read-only to an ordinary user, `remove` included,
+        // and this is the one thing the client cannot degrade around: an entry
+        // that stays makes the first call a hit, so there is no cold upload to
+        // time and every check below would be comparing two warm ones.
+        if let Err(refused) = client.remove(&cached) {
+            return Err(nothing_to_clear(&cache, &cached, &refused));
+        }
         done(&format!("removed {cached}"));
     } else {
         done("nothing cached");
@@ -126,7 +166,7 @@ fn run() -> Result<(), ClientError> {
         before == after && !after.is_empty(),
     )?;
 
-    println!("\nOne upload, any number of launches. Tables left at {BASE}");
+    println!("\nOne upload, any number of launches. Tables left at {BASE}, cache at {cache}");
     Ok(())
 }
 
@@ -166,12 +206,34 @@ fn nothing_to_demonstrate(first: &CachedFile) -> ClientError {
     eprintln!("        the worker went to {} instead", first.path);
     eprintln!("        every launch will send the whole binary again until that changes");
     eprintln!("        the warning printed above names the cache that refused it and quotes");
-    eprintln!("        the cluster; Client::with_file_cache points this at a path you can");
-    eprintln!("        write to, and then the example has something to show");
+    eprintln!("        the cluster; unset YT_FILE_CACHE to let the example use the one it");
+    eprintln!("        brings ({CACHE}), or point it at a path you can write");
+    eprintln!("        to, and then the example has something to show");
     ClientError::Config(
         "the file cache would not take the worker, so there is no cache hit to demonstrate"
             .to_owned(),
     )
+}
+
+/// Why this example stops when the cache holds the worker and will not let go.
+///
+/// Reached only when `YT_FILE_CACHE` points at a cache somebody else owns: the
+/// entry is there, `remove` is refused — `Access denied … "remove" permission …
+/// is not allowed by any matching ACE`, code 901 — and so the first call is
+/// bound to be a cache hit. Everything after this measures a warm upload against
+/// a warm one, and the "and was quicker" check then passes or fails on which of
+/// two identical operations the cluster felt like doing faster. Stopping here
+/// says what happened; carrying on would report a coin toss.
+fn nothing_to_clear(cache: &str, entry: &str, refused: &ClientError) -> ClientError {
+    eprintln!("   FAIL {entry} is in the cache and this installation will not remove it");
+    eprintln!("        {refused}");
+    eprintln!("        so the first upload would be a hit, and there is no cold call to time");
+    eprintln!("        unset YT_FILE_CACHE to use the cache this example brings ({CACHE}),");
+    eprintln!("        or point it at one you can write to — {cache} is not that");
+    ClientError::Config(format!(
+        "the worker is already in {cache} and this caller may not clear it, \
+         so there is no cold upload to measure"
+    ))
 }
 
 /// The same digest the client computes, so the example can clear the entry.

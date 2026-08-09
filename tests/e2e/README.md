@@ -78,9 +78,28 @@ YT_PROXY=http://localhost:8000 cargo run -p ytsaurus-client --example skiff_laun
 ```
 
 It writes and reads raw Skiff streams through the HTTP client, launches a map
-whose mapper format is Skiff, and verifies decoded output rows. This is not yet
-a CI or captured-cluster fixture; run it against a real cluster before treating
-the dynamic Skiff layer as release-ready.
+whose mapper format is Skiff, and verifies decoded output rows. This is not a CI
+or captured-cluster fixture.
+
+**Run against a managed multi-node installation on 2026-08-09**, which is the
+first real cluster it has seen:
+
+```text
+operation f532b7b6-7f7d2064-3f403e8-66d783be: completed (15s)
+Skiff map succeeded: 2 rows
+```
+
+It wrote a Skiff stream through `write_table_with_format`, ran a map whose
+mapper format is Skiff, read the output back through `read_table_with_format`,
+decoded it and compared both rows element by element — including the non-UTF-8
+`[0, 0xff, b'x']` — and checked no extra rows arrived.
+
+**That verifies the dynamic Skiff *map path*, and not the fixtures gate.** One
+table, one output descriptor, no table indexes, no range or row indexes, no key
+switch: required test 4 of
+[`docs/skiff-compatibility.md`](../../docs/skiff-compatibility.md) asks for all
+of those and none of them is covered here. Treat the dynamic Skiff map as
+cluster-verified and the rest of the contract as it stands there.
 
 The comparison is input-table read-back against output-table read-back, not
 against the uploaded file. **The cluster re-encodes rows on ingest** — 309 676
@@ -122,7 +141,20 @@ cargo run --release -p ytsaurus-client --example profile     # what the pilot sp
 # platform, so point it at the static musl worker built above.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
     cargo run -p ytsaurus-examples --bin selfrun
+
+# An https cluster needs the launcher to have TLS, which `examples/` leaves off
+# by default:
+#   selfrun: https://… needs TLS, and this build has none: the `tls` feature of
+#   ytsaurus-client is off. Enable it, or use an http:// proxy.
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun --features tls
 ```
+
+`--features tls` changes only the **launcher**. The musl worker built by
+`scripts/build-worker.sh` still carries no TLS — that is the invariant the
+`musl` CI job asserts by listing the worker's dependency graph — and the client
+examples above need no flag at all, because `ytsaurus-client`'s `tls` feature is
+on by default and only `examples/` turns it off.
 
 `diagnose` runs the `boom` worker, which panics on its first row, and checks
 that the failed job's stderr came back in the error rather than only in the web
@@ -434,12 +466,34 @@ table, stopped at three depths, timed by the scheduler:
 ```
 
 Decoding is ~10 % of a job that does something with its rows, against 66 % for
-the microbenchmark's job that does nothing with them. That is the answer the
-backlog wanted from this: the Skiff question loses urgency.
+the microbenchmark's job that does nothing with them.
 [`docs/benchmarking.md`](../../docs/benchmarking.md) records it with the three
 reasons it is a reading rather than a verdict — chief among them that rounds of
 the same mode scattered by a second, which is more than the quantity being
 measured.
+
+**The same example on a production cluster, 2026-08-09, says 36.2 %.** At the
+then-default three rounds it refused to answer at all — a shallower mode
+measured slower than a deeper one (1507, 1107, 2752 ms), which is the guard
+working rather than a failure — and at `YT_PROFILE_ROUNDS=7`:
+
+```text
+   being handed the rows         474 ms    34.0%
+   decoding them                 505 ms    36.2%
+   validating and writing        415 ms    29.8%
+   ————————————————————————————————————————
+   the pilot's map              1394 ms   100.0%
+
+Decoding is 36.2% of this job — above the 30% the Skiff question turns on.
+```
+
+Same job, different machine: the fixed costs are a fifth of what they are on an
+emulated local cluster — 474 ms against 2225 ms — and decoding is the part that
+did not shrink with them.
+The rounds still scatter (3331 ms against 1395 ms), so this is not a verdict
+either — but two readings 3.4× apart mean **the Skiff question is open**, and
+the local one is the reading least like production. The default is five rounds
+now because three produced no answer here.
 
 `streaming`, same cluster — the same 64 MiB table written from a generator and
 then read back both ways, with peak RSS watched throughout:
@@ -647,3 +701,63 @@ Things that cost time here, recorded so they do not cost it again:
 - YTsaurus publishes x86_64 images only. On Apple Silicon the cluster runs under
   emulation, which the YTsaurus docs say is not guaranteed to work — it did work
   here, but a Linux x86_64 host is the reliable option.
+
+### Against a cluster that is not the local one
+
+A managed installation differs from `ghcr.io/ytsaurus/local:stable` in four ways,
+and each of them **stops** the suite rather than degrading it. Verified on a
+managed multi-node installation on 2026-08-09, where all 24 examples passed once
+the environment said what it needed. The names below are placeholders; the
+shapes are not.
+
+```sh
+export YT_PROXY=cluster.example.net
+
+# 1. A private CA. Without this, every request — the very first one, before any
+#    YTsaurus logic runs — is `invalid peer certificate: UnknownIssuer`, because
+#    this client trusts the Mozilla bundle compiled in and not what the machine
+#    trusts. `curl` on the same box works, which is what makes it confusing.
+#    The `yt` CLI reads the same variable; the Go SDK takes the system store.
+export YT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# 2. Heavy proxies in another domain. `/hosts` names 79 of them under
+#    *.proxy-zone.net, which is not the domain of the configured address, so
+#    the default rule refuses all 79 and every upload dies at the control proxy
+#    with `Control proxy may not serve heavy requests with input data`.
+export YT_HEAVY_PROXY_DOMAINS=proxy-zone.net
+
+# 3. A shared file cache nobody but its owner may write to. Only `cached_upload`
+#    cares — it clears an entry to make the first upload a real miss — and it now
+#    brings a cache of its own at //tmp/ytsaurus_rs_cached_cache. Set this only
+#    to point it somewhere else.
+# export YT_FILE_CACHE=//tmp/ytsaurus_rs_cache
+
+# 4. https, which the worker-shaped build has no TLS for. The launcher role
+#    needs the feature; the musl worker still must not have it.
+cargo run -p ytsaurus-examples --bin selfrun --features tls
+```
+
+Three more things about that run, because they were checked and are not obvious:
+
+- **Nothing about pools had to be configured.** The default `physical` tree and
+  the ephemeral pool the scheduler gives a user carried all 24 examples, and
+  `//tmp` was writable.
+- **A short cluster name still needs completing.** `YT_PROXY=hume` is the
+  ordinary spelling wherever an installation's clusters share one domain; here
+  it becomes `https://hume`, which resolves nowhere unless the machine's own
+  resolver search list completes it. `YT_PROXY_SUFFIX=.yt.example.net` completes
+  a dotless name the way the Go SDK does — no suffix is compiled in, because
+  this client is not one installation's.
+- **A production cluster is much faster than the local one**, enough to change
+  what some of the numbers in this document mean. `streaming` moved its full
+  64 MiB in 8 s, and the RSS baseline differed (50.0 MiB against 2.9 MiB — the
+  release build and the host allocator, not a regression) while the invariant
+  the test exists for held exactly: streaming cost **0.0 MiB** of growth against
+  25.7 MiB buffered. The `profile` numbers moved further; see above.
+
+`YT_HEAVY_PROXY_DOMAINS`, `YT_FILE_CACHE` and `YT_PROXY_SUFFIX` are read by
+`Client::from_env`, which is what every example here builds its client with —
+`Client::with_heavy_proxies_under`, `Client::with_file_cache` and a spelled-out
+address are the same three settings in Rust. `YT_HEAVY_PROXIES_ANYWHERE=1`
+removes the domain rule altogether, which is what the official Go SDK does with
+`/hosts` and what to reach for if naming a domain is not enough.

@@ -43,7 +43,19 @@
 //! file must be an X.509 certificate: one that is not, a `.p7b` re-armoured
 //! under a `BEGIN CERTIFICATE` label being the usual case, refuses the whole
 //! file rather than becoming a root store quietly shorter than the caller
-//! wrote down.
+//! wrote down. Without it, and without that feature, a cluster behind a private
+//! CA fails its very first request with `invalid peer certificate:
+//! UnknownIssuer` — the refusal names both ways out, because on a machine where
+//! `curl` reaches the same cluster nothing else about it suggests whose roots
+//! were consulted.
+//!
+//! **An installation differs from a local cluster in ways a caller of
+//! [`Client::from_env`] cannot otherwise reach**, so it reads four more:
+//! `YT_PROXY_SUFFIX` completes a bare cluster name, `YT_HEAVY_PROXY_DOMAINS`
+//! names another domain its heavy proxies live in, `YT_HEAVY_PROXIES_ANYWHERE`
+//! removes that rule outright, and `YT_FILE_CACHE` moves the worker cache. Each
+//! is inert when unset, and each but the first has a builder method beside it —
+//! see [`Client::from_env`] for the table.
 //!
 //! # When an operation fails
 //!
@@ -167,11 +179,11 @@
 //! it is coarse: sharing a parent domain on a hosting platform means sharing it
 //! with every other tenant of that platform.
 //! [`Client::with_heavy_proxies_in`] is the version that is a boundary — a list
-//! written out on purpose — and [`Client::with_heavy_proxies_anywhere`] is the
-//! opt-out for an installation whose `/hosts` genuinely names another domain.
-//! When a whole answer is declined the client says so once, naming what it
-//! refused and why, rather than leaving it to be deduced from a cluster error
-//! later on.
+//! written out on purpose — [`Client::with_heavy_proxies_under`] names one more
+//! domain for an installation that publishes its heavy proxies in a second zone,
+//! and [`Client::with_heavy_proxies_anywhere`] removes the rule. When a whole
+//! answer is declined the client says so once, naming what it refused and why,
+//! rather than leaving it to be deduced from a cluster error later on.
 //!
 //! Getting this wrong does not look like a routing problem, which is why it is
 //! worth spelling out what it does look like. The refusal arrives as a
@@ -388,22 +400,99 @@ impl Client {
     /// rather than as an error, because that is what it means on a cluster that
     /// wants none.
     ///
+    /// # What else it reads
+    ///
+    /// Everything a cluster can differ in that a *caller* cannot reach from
+    /// here. Every example in this repository builds its client with this one
+    /// method, so a policy settable only in Rust is a policy an example cannot
+    /// be run under — which is how an installation that publishes its heavy
+    /// proxies in another domain came to be unrunnable by any configuration at
+    /// all, and had to be answered with a patch. Each of these is inert when
+    /// unset, so a client built on a machine that sets none behaves exactly as
+    /// [`Client::new`] does.
+    ///
+    /// | Variable | Effect |
+    /// | --- | --- |
+    /// | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Off unless set, and applied only to a name with no dot, no colon and no `localhost` in it — the gate the Go SDK uses. There is no builder for this one: in Rust, spell the address out. |
+    /// | `YT_CA_BUNDLE` | A PEM file of roots, for a cluster behind a private CA. Read by the transport rather than here, and by [`Client::new`] too. |
+    /// | `YT_HEAVY_PROXY_DOMAINS` | One more domain — or several, comma- or space-separated — that `/hosts` may name a heavy proxy under. [`Client::with_heavy_proxies_under`]. |
+    /// | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes` removes the domain rule outright. [`Client::with_heavy_proxies_anywhere`]. |
+    /// | `YT_FILE_CACHE` | Where [`Client::upload_worker_cached`] keeps its files, for an installation whose shared cache is read-only. [`Client::with_file_cache`]. |
+    ///
+    /// `YT_HEAVY_PROXIES_ANYWHERE` is applied after `YT_HEAVY_PROXY_DOMAINS`, so
+    /// a machine that sets both is one where the rule is off — the wider of the
+    /// two wins, rather than the order they happen to be exported in.
+    ///
+    /// **The environment can widen the heavy-proxy rule and cannot narrow it**,
+    /// which is deliberate: [`Client::with_heavy_proxies_in`] is the one mode
+    /// that is a boundary rather than a heuristic, and a boundary that a
+    /// variable could set is a boundary that a variable could move. Write that
+    /// one in Rust.
+    ///
+    /// A variable **set to nothing counts as unset**, all of them alike:
+    /// `export YT_FILE_CACHE=` in a shell profile is how a knob gets turned back
+    /// off, and reading it literally would point the cache at `""`. `YT_PROXY`
+    /// included — an empty one earns the same message as a missing one, which is
+    /// the message that says what to export.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if `YT_PROXY` is not set.
+    /// Returns [`ClientError::Config`] if `YT_PROXY` is not set, or set to
+    /// nothing.
     pub fn from_env() -> Result<Self> {
-        let proxy = std::env::var("YT_PROXY").map_err(|_| {
+        Self::from_lookup(environment_value)
+    }
+
+    /// [`Client::from_env`], with the environment handed in.
+    ///
+    /// Everything that method does except reading the process environment, so a
+    /// test can pin **which variable does what** — that a typo in one of the
+    /// five names, or the two heavy-proxy knobs applied in the other order, is
+    /// caught by something other than review. Writing the process environment is
+    /// global, and unsafe in edition 2024; the same split is why
+    /// `http::roots_for` exists beside `http::configured_bundle`.
+    ///
+    /// **Except the token**, which finds its own way in through
+    /// [`token_from_environment`] — `YT_TOKEN`, then `YT_TOKEN_PATH`, then
+    /// `~/.yt/token`, the last of which is a file and not a variable at all. A
+    /// caller of this seam is configuring the five above and nothing else.
+    ///
+    /// The trimming and the empty-is-unset rule live **here** rather than in the
+    /// lookup, so they are on the path every caller takes: a test that
+    /// reimplemented them in its own fake would be pinning the fake, and
+    /// deleting them from [`environment_value`] would leave everything green.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let value = |name: &str| {
+            lookup(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+
+        let proxy = value("YT_PROXY").ok_or_else(|| {
             ClientError::Config(
                 "YT_PROXY is not set; export it (for a local cluster: \
                  YT_PROXY=http://localhost:8000) or use Client::new"
                     .to_owned(),
             )
         })?;
+        let proxy = expanded_proxy(&proxy, value("YT_PROXY_SUFFIX").as_deref());
 
-        Ok(match token_from_environment() {
+        let mut client = match token_from_environment() {
             Some(token) => Self::with_token(&proxy, token),
             None => Self::new(&proxy),
-        })
+        };
+
+        if let Some(domains) = value("YT_HEAVY_PROXY_DOMAINS") {
+            client = client.with_heavy_proxies_under(split_domains(&domains));
+        }
+        if value("YT_HEAVY_PROXIES_ANYWHERE").is_some_and(|value| truthy(&value)) {
+            client = client.with_heavy_proxies_anywhere(true);
+        }
+        if let Some(cache) = value("YT_FILE_CACHE") {
+            client = client.with_file_cache(cache);
+        }
+
+        Ok(client)
     }
 
     /// Overrides how often [`Client::wait_for_operation`] polls.
@@ -453,6 +542,12 @@ impl Client {
     /// Defaults to the path the Python wrapper uses, so the cache is shared
     /// with whatever else the installation runs — and whatever expiry its
     /// administrators have set applies here too.
+    ///
+    /// That default is **read-only for an ordinary user** on a managed
+    /// installation, which the client itself handles — a refused cache degrades
+    /// to a plain upload and says so — but which anything that needs to *clear*
+    /// an entry cannot. `YT_FILE_CACHE` sets the same thing for a client built
+    /// by [`Client::from_env`].
     #[must_use]
     pub fn with_file_cache(mut self, path: impl Into<String>) -> Self {
         self.file_cache = path.into();
@@ -491,7 +586,7 @@ impl Client {
     /// `https://cluster.example.net` will follow `n0132-sas.example.net` and
     /// will not follow `n0132-sas.somewhere-else.net`. A configured name with
     /// no dots in it, which is how `YT_PROXY` is usually written, is matched as
-    /// a label instead: `hume` follows `n0008-sas.hume.yt.yandex.net`. A name
+    /// a label instead: `hume` follows `n0008-sas.hume.yt.example.net`. A name
     /// that is refused is passed over; a `/hosts` answer that is refused
     /// entirely leaves the upload going to the configured address, which is
     /// where it went before this client routed anything, and the client says so
@@ -531,9 +626,11 @@ impl Client {
     /// ```
     ///
     /// **This is all or nothing**, which is why
-    /// [`Client::with_heavy_proxies_in`] exists beside it: a domain rule that
-    /// misses by one label should not have to be answered by removing the rule.
-    /// The last of the two called is the one that decides.
+    /// [`Client::with_heavy_proxies_under`] and
+    /// [`Client::with_heavy_proxies_in`] exist beside it: a domain rule that
+    /// misses by one label should not have to be answered by removing the rule
+    /// — name the other domain, or the proxies themselves. The last of the
+    /// three called is the one that decides.
     ///
     /// This does not disturb what a client it was cloned from has already
     /// resolved.
@@ -581,6 +678,68 @@ impl Client {
     {
         self.transport
             .set_heavy_proxies_in(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Lets `/hosts` name a heavy proxy under a domain given here, as well as
+    /// under the configured address's own.
+    ///
+    /// The middle setting, and on a large installation the only one that fits.
+    /// A cluster addressed as `cluster.example.net` may publish its heavy
+    /// proxies as `n0132-sas.rack7.proxy-zone.net` — a different domain, so the
+    /// default rule refuses every one of them and no upload can leave the
+    /// control proxy: `Control proxy may not serve heavy requests with input
+    /// data`. The two answers that existed for that were writing all
+    /// seventy-nine names out by hand, which goes stale the moment a proxy
+    /// rotates, and [`Client::with_heavy_proxies_anywhere`], which removes the
+    /// rule. What such an installation actually has is one more domain.
+    ///
+    /// ```
+    /// use ytsaurus_client::Client;
+    ///
+    /// let client = Client::new("https://cluster.example.net")
+    ///     .with_heavy_proxies_under(["proxy-zone.net"]);
+    /// ```
+    ///
+    /// A domain is matched as a suffix and as itself, without case: the entry
+    /// above admits `proxy-zone.net` and anything under it, and nothing else.
+    /// Every way a person writes one is accepted — surrounding space, a leading
+    /// or trailing dot, a leading `*`, a scheme, a port — so a value read out of
+    /// a configuration file works as written. An entry left with **no dot in
+    /// it** is dropped rather than honoured: `net` would admit every `.net` host
+    /// the cluster could name, which is
+    /// [`Client::with_heavy_proxies_anywhere`] by accident.
+    ///
+    /// The configured address's own domain still applies — this widens the
+    /// rule, it does not replace it — and an empty list therefore means exactly
+    /// the default. A **second call replaces the first**, like every other
+    /// setter here; it does not accumulate. And note the shape of the family
+    /// rather than the reading of one word:
+    /// `with_heavy_proxies_anywhere(false)` after this means *the default rule*
+    /// and so discards these domains, which is not "stop widening".
+    ///
+    /// **It is still a suffix rule**, so it is worth what the domain rule is
+    /// worth: a guard against a typo and against an obviously foreign name, not
+    /// a boundary that holds a credential — see
+    /// [`Client::with_heavy_proxies_anywhere`] for why that is, and
+    /// [`Client::with_heavy_proxies_in`] for the version that is a boundary.
+    /// A domain somebody wrote on purpose is a narrower statement than removing
+    /// the rule, and it survives proxy rotation, which is the whole of what it
+    /// claims.
+    ///
+    /// The last of this,
+    /// [`Client::with_heavy_proxies_anywhere`] and
+    /// [`Client::with_heavy_proxies_in`] to be called is the one that decides,
+    /// and none of them disturbs what a client this was cloned from has already
+    /// resolved.
+    #[must_use]
+    pub fn with_heavy_proxies_under<I, S>(mut self, domains: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.transport
+            .set_heavy_proxies_under(domains.into_iter().map(Into::into).collect());
         self
     }
 
@@ -4380,6 +4539,85 @@ fn refuse_body_on_get(method: Method, command: &str, has_body: bool) -> Result<(
     Ok(())
 }
 
+/// One variable, as the process has it.
+///
+/// The whole of what [`Client::from_env`] adds to [`Client::from_lookup`], and
+/// deliberately nothing else: trimming and the empty-is-unset rule live in
+/// `from_lookup`, on the path every caller and every test takes.
+fn environment_value(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// A bare cluster name completed by the suffix this machine was given.
+///
+/// A bare cluster name — `hume` — is the ordinary spelling at an installation
+/// whose clusters all sit under one domain, and it is the one thing this client
+/// could not take: `Transport::new` puts `https://` in front of whatever it is
+/// handed, and `https://hume` resolves nowhere unless a resolver search list
+/// happens to complete it. The Go SDK completes it in `yt/go/config.go` — no
+/// colon, no dot, not `localhost`, then a suffix — and the same gate is used
+/// here.
+///
+/// **The suffix is not compiled in.** Go's is, because that SDK ships with one
+/// installation in mind; this client does not, so the suffix comes from
+/// `YT_PROXY_SUFFIX` and there is no expansion at all without it. Leading and
+/// trailing dots come off: `.yt.example.net`, `yt.example.net` and
+/// `yt.example.net.` are all how a person writes one, and a trailing dot left
+/// on would make a name that connects and then fails every domain comparison
+/// in [`crate::Client::with_heavy_proxies_under`]'s neighbourhood.
+///
+/// The gate is what keeps it from touching anything else. A colon means a scheme
+/// or a port — `http://localhost:8000` has both — a dot means a name that
+/// already resolves or is meant to, and anything *carrying* `localhost` is this
+/// machine whatever else is set. That last test is `contains`, exactly as Go
+/// writes it, so a cluster genuinely named `mylocalhostcluster` is left alone;
+/// spelling it out is the price of matching the gate this was ported from.
+///
+/// This also makes the label rule in `http::same_domain` reachable **without a
+/// resolver search list**: the rule matches a dotless `YT_PROXY` as a label of
+/// the discovered name, and until now the only way to have a dotless `YT_PROXY`
+/// that connected at all was for the machine's DNS configuration to complete it.
+fn expanded_proxy(proxy: &str, suffix: Option<&str>) -> String {
+    let proxy = proxy.trim();
+    let Some(suffix) = suffix else {
+        return proxy.to_owned();
+    };
+
+    if proxy.contains(':') || proxy.contains('.') || proxy.contains("localhost") {
+        return proxy.to_owned();
+    }
+    format!("{proxy}.{}", suffix.trim_matches('.'))
+}
+
+/// The domains out of `YT_HEAVY_PROXY_DOMAINS`.
+///
+/// Comma **or** whitespace: a list in a shell profile is written one way by
+/// whoever thinks of it as a list and the other by whoever thinks of it as
+/// arguments, and neither is worth an error message. Empty entries fall out
+/// here, and [`Client::with_heavy_proxies_under`] drops anything left over.
+fn split_domains(value: &str) -> Vec<String> {
+    value
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether a variable spells yes.
+///
+/// The three spellings a shell profile uses, without case. Anything else is
+/// **not** a yes, including `0` and `false` — a flag this client cannot read is
+/// a flag it has not been given, and guessing at `on`, `y` or `enabled` would
+/// mean guessing at what `off`, `n` and `disabled` should do to a knob that is
+/// already off.
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 /// Finds a token the way the `yt` CLI finds one.
 ///
 /// `YT_TOKEN`, then `YT_TOKEN_PATH`, then `~/.yt/token` — first one that has
@@ -5503,5 +5741,207 @@ mod tests {
         // Not asserting on process env, only that the message is actionable.
         let err = ClientError::Config("YT_PROXY is not set".to_owned());
         assert!(err.to_string().contains("YT_PROXY"));
+    }
+
+    /// `Client::from_env` against a fixed environment, with nothing global
+    /// touched. A plain lookup and nothing more: trimming and empty-is-unset
+    /// belong to `from_lookup`, and a helper that repeated them here would be
+    /// the thing the tests below were pinning.
+    fn from_environment(vars: &[(&str, &str)]) -> Result<Client> {
+        Client::from_lookup(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn each_variable_reaches_the_setting_it_names() {
+        // The mapping itself, which review is the only other thing that checks:
+        // swap two of these names and every other test in the crate still
+        // passes.
+        let client = from_environment(&[
+            ("YT_PROXY", "hume"),
+            ("YT_PROXY_SUFFIX", ".yt.example.net"),
+            ("YT_HEAVY_PROXY_DOMAINS", "proxy-zone.net, other-zone.net"),
+            ("YT_FILE_CACHE", "//tmp/mine/cache"),
+        ])
+        .expect("YT_PROXY is set");
+
+        assert_eq!(
+            client.transport.configured_address(),
+            "https://hume.yt.example.net"
+        );
+        assert_eq!(client.file_cache, "//tmp/mine/cache");
+        // The whole rendering, not a substring of it: `Only([…])` holds the
+        // same two names as `Under { … }`, so wiring the variable to
+        // `with_heavy_proxies_in` would pass a `contains` check — which is
+        // exactly the swap this test is here to catch. Brittle on purpose.
+        assert_eq!(
+            client.transport.heavy_hosts_debug(),
+            r#"Under { domains: ["proxy-zone.net", "other-zone.net"], ignored: [] }"#
+        );
+    }
+
+    #[test]
+    fn a_machine_that_sets_nothing_gets_the_defaults() {
+        // The invariant the whole feature rests on: four new variables, and a
+        // client built where none of them is set is the client this crate
+        // shipped before they existed.
+        let bare = from_environment(&[("YT_PROXY", "http://localhost:8000")])
+            .expect("YT_PROXY is set")
+            .transport;
+        let new = Client::new("http://localhost:8000").transport;
+
+        assert_eq!(bare.configured_address(), new.configured_address());
+        assert_eq!(bare.heavy_hosts_debug(), new.heavy_hosts_debug());
+        assert_eq!(
+            from_environment(&[("YT_PROXY", "http://localhost:8000")])
+                .expect("YT_PROXY is set")
+                .file_cache,
+            Client::new("http://localhost:8000").file_cache
+        );
+    }
+
+    #[test]
+    fn the_wider_heavy_proxy_setting_wins_however_it_was_exported() {
+        // Both set is a machine where somebody tried the domain and then gave
+        // up on the rule. Reading them in export order would make that machine
+        // behave differently depending on which line of the profile came last.
+        let hosts = from_environment(&[
+            ("YT_PROXY", "https://cluster.example.net"),
+            ("YT_HEAVY_PROXY_DOMAINS", "proxy-zone.net"),
+            ("YT_HEAVY_PROXIES_ANYWHERE", "1"),
+        ])
+        .expect("YT_PROXY is set")
+        .transport
+        .heavy_hosts_debug();
+
+        assert!(hosts.contains("Anywhere"), "{hosts}");
+
+        // And anything that is not one of the three spellings of yes leaves the
+        // rule where the domains put it.
+        let hosts = from_environment(&[
+            ("YT_PROXY", "https://cluster.example.net"),
+            ("YT_HEAVY_PROXY_DOMAINS", "proxy-zone.net"),
+            ("YT_HEAVY_PROXIES_ANYWHERE", "0"),
+        ])
+        .expect("YT_PROXY is set")
+        .transport
+        .heavy_hosts_debug();
+
+        assert_eq!(
+            hosts,
+            r#"Under { domains: ["proxy-zone.net"], ignored: [] }"#
+        );
+    }
+
+    #[test]
+    fn a_variable_set_to_nothing_is_a_variable_that_is_not_set() {
+        // `export YT_FILE_CACHE=` in a profile is how a knob gets turned back
+        // off, and taking it literally would point the cache at `""`. The rule
+        // lives in `from_lookup` rather than in the lookup, so this exercises
+        // the same code `from_env` runs.
+        let client = from_environment(&[
+            ("YT_PROXY", "  https://cluster.example.net  "),
+            ("YT_FILE_CACHE", "   "),
+            ("YT_HEAVY_PROXY_DOMAINS", ""),
+            ("YT_PROXY_SUFFIX", ""),
+        ])
+        .expect("YT_PROXY is set");
+
+        assert_eq!(
+            client.transport.configured_address(),
+            "https://cluster.example.net",
+            "and a value that is set is trimmed"
+        );
+        assert_eq!(client.file_cache, Client::new("x").file_cache);
+        assert_eq!(client.transport.heavy_hosts_debug(), "SameDomain");
+    }
+
+    #[test]
+    fn a_proxy_set_to_nothing_is_a_proxy_that_is_not_set() {
+        // `export YT_PROXY=` is how a profile turns one off, and the message
+        // that says what to export is the right answer to it. Taken literally
+        // — and with a suffix set — it would instead address
+        // `https://.yt.example.net`, which looks like a name and resolves
+        // nowhere.
+        let err = from_environment(&[("YT_PROXY", "   "), ("YT_PROXY_SUFFIX", ".yt.example.net")])
+            .expect_err("an empty proxy is not a proxy");
+
+        assert!(err.to_string().contains("YT_PROXY is not set"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_cluster_name_is_completed_only_when_a_suffix_says_so() {
+        // The ordinary spelling wherever an installation's clusters share one
+        // domain, and the one this client turned into `https://hume`.
+        assert_eq!(
+            expanded_proxy("hume", Some(".yt.example.net")),
+            "hume.yt.example.net"
+        );
+        // Written without the leading dot by whoever thinks of it as a domain,
+        // and with a trailing one by whoever thinks of it as an FQDN. A
+        // trailing dot left on connects and then fails every domain
+        // comparison, which is worse than not connecting.
+        for suffix in ["yt.example.net", "yt.example.net.", " .yt.example.net "] {
+            assert_eq!(
+                expanded_proxy("hume", Some(suffix.trim())),
+                "hume.yt.example.net",
+                "{suffix:?}"
+            );
+        }
+        // No suffix, no expansion: the suffix is not compiled in, because this
+        // client is not one installation's.
+        assert_eq!(expanded_proxy("hume", None), "hume");
+    }
+
+    #[test]
+    fn a_name_that_needs_no_completing_is_left_alone() {
+        // Go's gate, kept: a colon is a scheme or a port, a dot is a name that
+        // already means something, and `localhost` is this machine whatever
+        // else is set.
+        for proxy in [
+            "http://localhost:8000",
+            "localhost",
+            "hume.yt.example.net",
+            "cluster.example.net",
+            "10.0.0.7",
+            "hume:80",
+            // The surprising half of Go's gate, spelled out because it is
+            // `contains` and not equality: a cluster whose own name carries
+            // `localhost` is never completed.
+            "mylocalhostcluster",
+        ] {
+            assert_eq!(expanded_proxy(proxy, Some(".yt.example.net")), proxy);
+        }
+    }
+
+    #[test]
+    fn domains_are_read_as_a_list_however_they_were_written() {
+        assert_eq!(
+            split_domains("proxy-zone.net, sas.proxy-zone.net"),
+            ["proxy-zone.net", "sas.proxy-zone.net"]
+        );
+        assert_eq!(
+            split_domains("proxy-zone.net sas.proxy-zone.net"),
+            ["proxy-zone.net", "sas.proxy-zone.net"]
+        );
+        // A trailing comma is how a list gets edited, not a domain called "".
+        assert_eq!(split_domains("proxy-zone.net,,"), ["proxy-zone.net"]);
+        assert!(split_domains("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn only_the_three_spellings_of_yes_are_yes() {
+        for value in ["1", "true", "TRUE", "yes", " Yes "] {
+            assert!(truthy(value), "{value}");
+        }
+        // A knob that is already off has nothing to gain from guessing, and
+        // reading `0` as a yes is the way a variable meant to disable something
+        // enables it.
+        for value in ["0", "false", "no", "on", "enabled", ""] {
+            assert!(!truthy(value), "{value}");
+        }
     }
 }

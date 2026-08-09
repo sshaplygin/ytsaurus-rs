@@ -90,10 +90,73 @@ its source changes. If it fails, the error carries the job's own stderr rather
 than a state string. See [examples/src/bin/selfrun.rs](examples/src/bin/selfrun.rs);
 the full walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 
+```sh
+# a local cluster is plain HTTP
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun
+
+# an https cluster needs the launcher to have TLS
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun --features tls
+```
+
+The flag changes the **launcher** only: `examples/` turns `ytsaurus-client`'s
+`tls` feature off so `build-worker.sh` can cross-compile to musl with nothing
+but the Rust toolchain, and the musl worker still carries no TLS either way.
+
+**Against a cluster that is not a local one** — a private CA, heavy proxies in
+another domain, a shared file cache — see [the runbook in
+tests/e2e/README.md](tests/e2e/README.md#against-a-cluster-that-is-not-the-local-one).
+
+## Environment
+
+Everything this workspace reads. Three groups, because they are set by three
+different people: you, the cluster, and whoever is running an example.
+
+**The client** — [`Client::from_env`](https://docs.rs/ytsaurus-client) reads
+these. `YT_PROXY` is the only one that is required; every other is inert when
+unset, so a machine that sets none behaves exactly as `Client::new` does. One
+**set to nothing counts as unset** throughout — `export YT_FILE_CACHE=` is how a
+knob gets turned back off — and all but `YT_CA_BUNDLE` are trimmed. That one is
+read as a path rather than as text, so it keeps whatever spelling it was given.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `YT_PROXY` | — | The cluster address. A bare host means `https://`; a local cluster is `http://localhost:8000`. **Required.** |
+| `YT_TOKEN` | — | The token. Looked for the way the `yt` CLI looks for it, stopping at the first that has one. |
+| `YT_TOKEN_PATH` | `~/.yt/token` | A file holding the token instead, tried after `YT_TOKEN` and before the default path. Trimmed, so a trailing newline from `echo` does not fail authentication. |
+| `YT_CA_BUNDLE` | Mozilla roots | A PEM file of root certificates, for a cluster whose chain ends in a private CA. Without it such a cluster fails its first request with `invalid peer certificate: UnknownIssuer`. |
+| `YT_PROXY_SUFFIX` | off | Completes a bare cluster name: `YT_PROXY=hume` plus `.yt.example.net` addresses `hume.yt.example.net`. Applied only to a name with no dot, no colon and no `localhost` in it. No suffix is compiled in. |
+| `YT_HEAVY_PROXY_DOMAINS` | — | One more domain, or several comma- or space-separated, that `/hosts` may name a heavy proxy under — for an installation that publishes them in a zone of its own. `Client::with_heavy_proxies_under`. |
+| `YT_HEAVY_PROXIES_ANYWHERE` | off | `1`, `true` or `yes` removes the domain rule altogether, which is what the official Go SDK does with `/hosts`. Applied after the domains, so the wider of the two wins. |
+| `YT_FILE_CACHE` | `//tmp/yt_wrapper/file_storage/new_cache` | Where `upload_worker_cached` keeps its files, for an installation whose shared cache is read-only to you. |
+
+The heavy-proxy rule can be **widened** from the environment and deliberately not
+narrowed: `Client::with_heavy_proxies_in` is the one mode that is a boundary
+rather than a heuristic, and it is written in Rust. See [the client
+README](crates/ytsaurus-client/README.md#where-a-heavy-command-goes).
+
+**The cluster, inside a job** — set by YTsaurus when it execs the worker, read by
+`ytsaurus-job`. `YT_JOB_ID` is what `is_inside_job` tests, and is why one binary
+can be both launcher and job. The full table, with what each is worth, is in
+[docs/writing-a-job.md](docs/writing-a-job.md#what-the-cluster-puts-in-a-jobs-environment).
+
+**The examples and scripts** — knobs for the things that measure something, so a
+run can be made bigger without editing code:
+
+| Variable | Default | Used by |
+| --- | --- | --- |
+| `YT_WORKER_BINARY` | the running executable | `selfrun` — the static musl worker to upload when the launcher itself came from `cargo run` |
+| `YT_PROFILE_MIB` / `YT_PROFILE_ROUNDS` | 48 / 5 | `profile`. Raise the rounds on a busy cluster; at 3 it could not separate the phases at all |
+| `YT_STREAM_MIB` | 64 | `streaming` |
+| `YT_APPEND_ROWS` / `YT_APPEND_CHUNKS` | 60000 / 12 | `append` |
+| `YT_LOCAL_DIR` | `~/yt-local` | `tests/e2e/run_local_cluster.sh` |
+| `YT_PILOT_BASE` | `//tmp/ytsaurus_rs_pilot` | `tests/e2e/run_pilot.sh` |
+
 ## Build and test
 
 ```sh
-cargo test --workspace          # 343 tests
+cargo test --workspace          # 759 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```
@@ -161,10 +224,12 @@ RSS at all** — 46.6 MiB before and after on Linux CI, 1.9 → 2.0 MiB on macOS
 (the absolute figure is the test binary's own footprint, which differs by
 platform; the invariant is that it does not grow). Streaming a 67.7 MiB table
 out of a cluster costs **1.0 MiB** of peak RSS against 70.9 MiB to read it into
-memory. Decoding YSON is **~10 %** of the pilot job's time on a cluster, against
-66 % for a job that does nothing but decode — which is the measurement Skiff has
-to beat to be worth switching to. Fuzzing ran 6.5 M iterations across both YSON
-formats without a crash.
+memory. Decoding YSON is **~10 %** of the pilot job's time on the local Docker
+cluster and **36 %** of the same job on a production one, against 66 % for a job
+that does nothing but decode — two readings 3.4× apart, which is why the Skiff
+question is recorded as **open** rather than answered; see
+[docs/benchmarking.md](docs/benchmarking.md). Fuzzing ran 6.5 M iterations
+across both YSON formats without a crash.
 
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).

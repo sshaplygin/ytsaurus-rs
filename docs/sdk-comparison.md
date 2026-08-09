@@ -117,8 +117,22 @@ promise about the token, which is a promise a suffix rule cannot make — steeri
 the `/hosts` body means controlling the proxy or the wire, and either already
 has the token. `Client::with_heavy_proxies_anywhere(true)` restores the other
 clients' behaviour; `Client::with_heavy_proxies_in([…])` goes the other way and
-is the only one of the three that is a boundary, because it is a list somebody
+is the only one of the four that is a boundary, because it is a list somebody
 wrote on purpose.
+
+**A large installation showed what that constraint costs**, and it is not
+hypothetical: a managed installation answered `/hosts` with 79 heavy proxies in
+a zone of its own, under a domain the configured address does not share, so the
+rule refused every one of them and no heavy command could be sent at all. The
+Go SDK sends the token to whatever `/hosts` names — `listHeavyProxies` returns
+the list verbatim and `proxy_set.go` adds every entry without a filter — so on
+that cluster the stricter client is the one that does not work.
+`Client::with_heavy_proxies_under([…])` is the answer this client grew for it:
+the domain rule plus the domains an operator names, which is narrower than the
+official clients' behaviour and survives a proxy rotation, which a written-out
+list does not. The deviation from both official
+clients stands — it is a guard the others do not have — but it is now a guard
+with a setting between "as shipped" and "off".
 
 Logging is a smaller row than it was and still the softer of the two: this
 client has one span per attempt and one event per retry, where the official
