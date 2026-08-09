@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 652 tests
+cargo test --workspace            # 741 tests: 668 unit and integration, 73 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -355,10 +355,12 @@ Handing one to another process (`detach` / `attach_transaction`, #13):
   not to `/api/v4/`. `get_supported_features` is the real "no parameters,
   small answer" command — `Null` in, `Structured` out, non-volatile,
   non-heavy — and is what the doctest and the `raw` example use.
-- `check_permission`, `read_file` and `get_supported_features` are all
-  registered and none is modelled here; they are the natural first users of the
-  raw door. *(`list_operations` was on this list until the operation lifecycle
-  landed; it has a method now.)*
+- `check_permission` and `get_supported_features` are registered and not
+  modelled here; they are the natural first users of the raw door.
+  *(`list_operations` and `read_file` were both on this list and both came off
+  it — the first with the operation lifecycle, the second as `Client::read_file`
+  and `Client::read_file_streaming`. The `raw` example still reads a file, now
+  because that wire shape is verified rather than because nothing else could.)*
 - **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
   envelope is keyed by what the command returns, the same trap that made
   `exists` read the wrong key for two releases. Captured from a local cluster:
@@ -369,7 +371,48 @@ Handing one to another process (`detach` / `attach_transaction`, #13):
   `user_tokens_metadata`.
 - **`read_file` streams and `write_file` takes a chunked body**, verified with
   a 4 MB round trip through `Client::raw_command_streaming` and
-  `raw_command_upload` — neither direction holds the file.
+  `raw_command_upload` — neither direction holds the file. `Client::read_file`
+  and `Client::read_file_streaming` are that round trip written down, and the
+  buffered half needs a check the streaming half cannot have: a file's bytes
+  carry no framing, so a body cut short by a mid-stream failure looks exactly
+  like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot
+  read. It compares the body against the node's `@uncompressed_data_size` —
+  the *logical* size, measured against `compression_codec=zlib_6` nodes of
+  1 000 000 bytes each: `@compressed_data_size` is 4 214 for the cycling
+  `i % 256` bytes the tests write, 999 for all zeros and 1 000 324 for
+  `os.urandom` — none of them the logical size, and the read passes against
+  all three. There is no `@file_size`: asked for one, the cluster answers
+  `Attribute "file_size" is not found`.
+- **`ureq`'s `limit()` does not bound memory.** `BodyWithConfig::do_build`
+  wraps the raw source in a `LimitReader` and builds the gzip decoder on top,
+  so the number bounds *transferred* bytes — and every request this crate
+  sends carries `Accept-Encoding: gzip`. Measured: a `read_file` of 600 MiB of
+  zeros arrives in 611 522 wire bytes, and `.limit(536870912)` on it returned
+  all 629 145 600. A ceiling that counts memory has to sit above the decoder,
+  which is what `http::CapReader` is for. **A wire limit is still needed
+  underneath it** — a chunked stream of empty deflate stored blocks
+  (`00 00 00 ff ff`) decodes to nothing, so a cap on decoded bytes never spends
+  a byte against it and `flate2` loops inside a single `read`; with the wire
+  limit taken away, that read does not return. **And the wire limit cannot be
+  the memory cap**: deflate expands what it cannot compress, so the largest
+  permitted body can arrive larger than the cap — 4 096 incompressible bytes
+  gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip
+  wrapper, for that reason.
+- **A memory cap is not a process budget.** `read_to_end` grows a `Vec` by
+  doubling and copies as it grows, so both buffers are resident for the length
+  of a copy — about 1.5× where the allocator cannot extend in place. Measured
+  in a release build against a local listener: a read handing back
+  536 870 911 bytes peaks at 544 178 176 of resident set, and a 600 MiB read
+  *refused* by the 512 MiB cap peaks at 611 385 344. Quote the cap as what is
+  held, never as what to size a container for.
+- **A rich path does nothing to a file read**, measured on a 1000-byte file:
+  `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads back all
+  1000 bytes and says nothing — a file is sliced by the command's `offset` and
+  `length` parameters, never by limits on the path — and `//tmp/f[#0:#10]`
+  likewise returns all 1000, then fails `read_file`'s size check, because
+  `//tmp/f[#0:#10]/@uncompressed_data_size` is not a path the cluster parses
+  (`Error reading parameter /path: Unexpected token "/" of type "slash"`).
+  So `read_file` documents a plain node path; #12 is where selection goes.
 
 ### Authentication and compression
 
@@ -601,6 +644,99 @@ Handing one to another process (`detach` / `attach_transaction`, #13):
 - A reader never sees a partial append — `@row_count` holds its old value until
   the upload transaction commits.
 
+### Selecting columns and rows on a path
+
+The read-side half of the same mechanism, and the sibling-parameter trap
+generalised: `columns` and `ranges` are attributes **on the path** too, and the
+cluster's answer to one in the wrong place is again a 200.
+
+- **A read selection on a *write* is ignored and the whole table is replaced,
+  with a 200.** Measured in both spellings: `write_table_rows("//tmp/t[#0:#2]",
+  rows)` replaced everything and reported success, and a `write_table` whose
+  path carried `ranges` as a typed *attribute* did exactly the same — 200, three
+  rows replaced by one. Same shape as the append trap: an attribute in the wrong
+  place costs a table and says nothing. Hence `TablePath::write_refusal`.
+- **An unknown name in `columns` is not an error**: 200, with the key simply
+  absent from every row. A typo reads clean and decodes short — loudly into a
+  struct, silently into a map.
+- **`columns=[]` is answered 200 with one empty map per row**, and it composes
+  with a range: `<columns=[];ranges=[{lower_limit={row_index=0};
+  upper_limit={row_index=2}}]>` came back as two empty maps, and the same range
+  spelled with `key` bounds as three. That counts the rows of a *range* with no
+  column bytes on the wire — something `@row_count` cannot do, speaking as it
+  does for a whole static table — so the client **sends** it. The first round
+  refused it by analogy with `update_operation_parameters({})`; the analogy was
+  false, because that one is a mutation silently no-op'd and reported as
+  success while this is a read that returns one correct record per row.
+- **A negative `row_index` is clamped to 0, not rejected** — the correction that
+  cost the most here, because the first measurement did not isolate the
+  variable. `{lower_limit={row_index=-5}}` returned **all five rows** of a
+  five-row table and `-5..2` returned rows 0 and 1: a negative lower limit reads
+  exactly as `0` would. Only a negative *upper* limit comes back empty
+  (`{upper_limit={row_index=-2}}` → 200, no rows), and that is the clamp too.
+  The earlier "`-5..0` is answered 200 and no rows" was true of `upper_limit=0`,
+  not of the negative bound. The client still refuses it — a bound arriving only
+  from arithmetic that went wrong, silently replaced by one that reads the whole
+  table, is worth an error — but for that reason, not the false one.
+- **A backwards range is answered 200 with no rows, in either selector**:
+  `{lower_limit={row_index=5};upper_limit={row_index=3}}` and
+  `{lower_limit={key=[3]};upper_limit={key=[1]}}` both came back empty. The
+  client refuses both, which it did not at first — it checked only row indices.
+- **Measure the shape the client actually sends, not the flat text.** This one
+  cost two wrong rounds. The client sends `path` as a **YSON string node with
+  its attributes hung outside** — `<columns=[n]>"//tmp/t{k}"` — while a `curl`
+  with JSON parameters sends the *flat text* `<columns=[n]>//tmp/t{k}` as one
+  string. **They parse differently and give opposite answers.** In flat text
+  the string's `{k}` wins; in the YSON shape the attribute wins. Reproduce the
+  real one with `-H 'X-YT-Header-Format: <format=text>yson'` and parameters
+  `{path=<columns=["n"]>"//tmp/t{k}";output_format=json}`. A JSON-parameter
+  `curl` is not evidence about this client's behaviour.
+- **The attribute beats the string when both spell the same kind of selection,
+  silently, at 200.** Measured in the YSON shape, on a table `k,n`:
+  `<columns=["n"]>"//tmp/t{k}"` → column `n` (the `{k}` discarded);
+  `<ranges=[…0:2]>"//tmp/t[#3:#5]"` → rows 0–1 (the `[#3:#5]` discarded);
+  `<columns=["k"]>"<columns=["n"]>//tmp/t"` → column `k`. **Different kinds
+  compose**: `<columns=["n"]>"//tmp/t[#3:#5]"` → rows 3–4 carrying only `n`,
+  and `<ranges=[…0:2]>"//tmp/t{k}"` → rows 0–1 carrying only `k`. So the client
+  refuses the doubled *kind* and sends the pairing. Nothing here is corrupted —
+  the read is exactly what the attribute asked for — the loss is that the
+  caller's own half is thrown away with no mention, which is what the refusal
+  is for.
+- **There is no 400 in any of this.** Every combination above answers 200,
+  including a string that opens with `<…>`: `"<columns=["n"]>//tmp/t"` alone
+  → column `n`, and `<ranges=[…0:2]>"<columns=["n"]>//tmp/t"` → rows 0–1
+  carrying only `n`, composing like any other different kinds. A leading `<…>`
+  is still refused, but for the honest reason: **the client cannot parse the
+  block to know which attribute it names**, and if it names the one being added
+  the caller's is discarded silently. (The earlier "two blocks → 400, *does not
+  start with a valid root-designator*" was the flat-text artefact — two `<…>`
+  concatenated into one string — not anything this client can send.)
+- **A `uint64` key column does not insist on the `u` suffix**: on a
+  `uint64`-keyed table `{exact={key=[42]}}` and `{exact={key=[42u]}}` both
+  returned the row. `yson_build::uint` earns its place on *range* instead —
+  `Key::from(i64)` stops at `i64::MAX`, and the row keyed
+  `18446744073709551615u` came back only for the uint spelling.
+- **`key` and `key_bound` compare a short key by opposite rules**, which is the
+  finding worth the most here. Under `key` the row's whole key is compared
+  component-wise, the shorter tuple being smaller when equal so far. Under
+  `key_bound` the row's key is **truncated** to the bound's length first, so
+  every row sharing the prefix compares *equal* to it. On a table keyed
+  `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
+
+  | sent | rows back |
+  | --- | --- |
+  | `{key=[a]}` … `{key=[b]}` | `(a,/x) (a,/y)` |
+  | `{key=[a]}` … `{key_bound=["<=";[b]]}` | `(a,/x) (a,/y) (b,/x) (b,/y)` |
+  | `{key_bound=[">";[a]]}` | `(b,/x) (b,/y) (c,/x)` |
+  | `{exact={key=[a]}}` | `(a,/x) (a,/y)` |
+
+  So `a..b` and `a..=b` differ by a whole prefix group, and `>` on a prefix
+  drops every row of that prefix — there is no "the row just after `a`".
+- **A range entry mixing `key` on one side with `key_bound` on the other is
+  accepted**, which is what `keys(a..=b)` sends. The reference documents the two
+  selectors separately and never together; the cluster takes the mixture.
+- All of the above is checked by `examples/rich_path.rs`.
+
 ### Tracing
 
 Read out of the cluster's source — the HTTP reference does not mention the
@@ -781,8 +917,9 @@ and the documentation disagreed and the source is what settles it.
 - The proxy **accepts a chunked request body** for `write_table`, so a table can
   be written from a `Read` that never has all of it.
 - `ureq` 3.3 caps `read_to_vec` at 10 MB unless told otherwise but leaves a
-  **reader uncapped**, which is the right way round: the buffered path passes an
-  explicit limit, the streaming path passes none.
+  **reader uncapped**, which is the right way round: the buffered path enforces
+  a limit of its own, the streaming path none. `ureq`'s number is not that
+  limit and cannot be — see the API-shape note above on where `limit()` sits.
 - **`ureq` 3.3 still exposes no trailers** — rechecked in its source, where the
   word does not appear. So the `X-YT-Error` trailer a proxy uses to report a
   mid-stream failure remains unreadable, and the completeness check on
@@ -819,6 +956,128 @@ and the documentation disagreed and the source is what settles it.
   of that request queues forever instead. Hence the deadline on `lock_waiting`.
 - `unlock` exists and is not modelled: its rules about a transaction that has
   already modified the node were not verified here.
+
+### Batched commands
+
+`execute_batch` sends several light commands in one request — `BatchRequest` +
+`Client::execute_batch`, exercised by
+`cargo run -p ytsaurus-client --example batch`. All of the following was watched
+on the local cluster, not read:
+
+- **The saving is real and it is the whole point.** Twelve `create`s went as
+  **one** request in **9.16 ms**, against **140.77 ms** for the same twelve sent
+  one at a time — measured through a counting TCP relay in front of the proxy,
+  because a client has no way to count its own round trips. `tests/batch.rs`
+  pins the count against an in-process socket; a program on a cluster cannot,
+  which is why the example does not claim it.
+- **An envelope `transaction_id` is silently dropped.** `TExecuteBatchOptions :
+  TMutatingOptions` has no transactional half, so a batch stamped with one
+  created its node **outside** the transaction — visible at once, untouched by
+  the abort. The silent escape a transaction exists to prevent. The client
+  stamps each **part** instead, which the cluster honours, and `execute_batch`
+  is on the `NO_TRANSACTION` list so the blanket stamp cannot dress the envelope
+  up in a parameter known to mean nothing.
+- **A part naming an unknown command fails the whole batch** — HTTP 400,
+  `Unknown command "frobnicate"`, and **no per-part results at all**, because
+  the driver resolves each command's descriptor before per-part error handling
+  begins (`TRequestExecutor::Run` throws first).
+- **…and that refused batch ran every part. It is not a race.** The failure
+  destroys the *answers*, not the work. `TExecuteBatchCommand` collects the
+  sub-requests into callbacks, runs them all through
+  `CancelableRunWithBoundedConcurrency`, and only then calls `.ValueOrThrow()`
+  on the collected list, which discards every result together as soon as one is
+  the unknown-name throw — **dispatch is never aborted**. Probed five ways, and
+  none of the obvious mitigations mitigate:
+
+  | batch | HTTP | applied |
+  | --- | --- | --- |
+  | `[create a1, frobnicate]` | 400, no results | `a1` exists |
+  | `[frobnicate, create b1]` — bad part **first** | 400 | `b1` exists |
+  | `[create c1, frobnicate, create c2]` | 400 | **both** exist |
+  | `concurrency=1`, `[frobnicate, create d1, create d2]` | 400 | **both** exist |
+  | `concurrency=1`, 8 creates then `frobnicate` | 400 | **all 8** exist |
+
+  Putting the bad part first does not limit the damage and neither does
+  `concurrency=1`. So a wholesale failure says nothing about what was applied,
+  and there are no per-part results to ask — which is why
+  `Client::execute_batch` reports the prefix it was *answered* for and does not
+  claim to know what landed, and why `ClientError::BatchInterrupted`'s own
+  one-liner refuses to call that prefix "applied".
+- **The one bound that does hold: parameter parsing versus execution.** A batch
+  refused while its parameters are being read runs **nothing**; a batch that
+  reaches execution runs **all of it**. Measured with a `create` sitting in each
+  refused request:
+
+  | probe | message | applied |
+  | --- | --- | --- |
+  | `concurrency=0` + create | `Validation failed at /concurrency` | **nothing** |
+  | part missing `command` | `Error loading parameter /requests` | **nothing** |
+  | part `parameters` not a dict | `Error loading parameter /requests` | **nothing** |
+  | `requests` not a list | `Error loading parameter /requests` | **nothing** |
+  | `requests` missing | `Missing required parameter /requests` | n/a |
+
+  This is the only fact that lets a caller reason about a 400 at all: the
+  message tells you which side of the line you are on.
+- **Parts run in parallel, and the documentation means it.** A batch that
+  created a node and asked `exists` about it in the same breath was answered
+  `%false`: both parts succeeded, and the read simply ran first. A part and its
+  consequence belong in two batches.
+- **A batch replayed under one mutation id is deduplicated per part.** The
+  driver hands part *k* the batch's id plus *k*
+  (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`) and stamps the
+  batch's `retry` flag into every volatile part. Measured with parts that carry
+  **no `ignore_existing`** — `BatchRequest::create_table`, not
+  `BatchRequest::create` — because that is the only spelling where the result
+  means anything:
+
+  ```text
+  first  (id)          : ["2-2e82-10191-d4fdeff4", "2-2e83-10191-b0f0b0cd"]
+  replay (id, retry)   : ["2-2e82-10191-d4fdeff4", "2-2e83-10191-b0f0b0cd"]   IDENTICAL
+  fresh  (new id)      : [501 "already exists", 501 "already exists"]
+  ```
+
+  **Do not run this check with `BatchRequest::create`.** It sends
+  `ignore_existing`, so a second send answers with the *old* node's id whether
+  or not a replay was recognised — measured, a two-`create` batch under a
+  **fresh** id returned ids identical to the first send's, which looks exactly
+  like a deduplicated replay and is not one. One id covers **one** request,
+  though: because the per-part ids are derived by incrementing, a second request
+  under anything derived from the same id would collide with the first request's
+  parts, so a split batch carrying a caller's id is refused.
+- **`isHeavy` is not what decides whether a command can be a part — the data
+  types are.** The driver throws `Command %Qv cannot be part of a batch since it
+  has inappropriate output type %Qlv` before any part runs, so one such name
+  fails the whole request. Measured against the registry the cluster serves at
+  `GET /api/v4` (190 commands) and confirmed name by name: a part is refused
+  when its **output type** is `tabular` or `binary`, or its **input type** is
+  `binary` — 21 names, against the 7 on the crate's `HEAVY` list. The two lists
+  differ in *both* directions: `get_job_spec` is `is_heavy: true` and was
+  **accepted** as a part (ordinary per-part error), while `alter_query` and
+  `push_queue_producer` are `is_heavy: false` and are refused. And `write_table`
+  — `is_heavy: true`, input `tabular`, output `structured` — was **accepted and
+  applied**: a `write_table` part with its rows in the part's `input` wrote
+  them, so the crate's refusal of it is the crate's own policy (bulk data does
+  not belong inline in a batch body headed for a light proxy) and not the
+  cluster's. `select_rows` and `lookup_rows` are the names a caller would
+  plausibly try; both are refused, and `[create x1, select_rows]` was answered
+  400 `inappropriate output type "tabular"` **with `x1` created anyway**. Two
+  more whole-batch refusals no name list can catch: a part whose command takes
+  input and is given none (`Command %Qv requires input`, measured for
+  `insert_rows`, `write_table` and seven others), and an unknown name.
+- **No modelled command answers a bare `{}` under API v4.** Measured one part
+  apiece: `create` → `{"output":{"node_id":…}}`, `set` → `{"output":{}}`,
+  `remove` → `{"output":{}}`, `exists` → `{"output":{"value":false}}`. The bare
+  `{}` the command reference's example shows for a `set` belongs to **v3**: the
+  registry the cluster serves at `GET /api/v4` lists `remove` and `set` as
+  `output_type: structured`, and only `/api/v3` lists them `null`. So the
+  registry's output-type bit does not separate `set` from `create` on the
+  version this crate speaks, and a guard built on it — refusing only a bare `{}`
+  — is dead against its own motivating scenario, because the shape a v4 cluster
+  would really produce is `{"output":{}}`, and that is a legitimate `set`
+  success the parser cannot tell from a broken `create`. The parser therefore
+  checks **the key the answer carries** (`node_id` for `create`, `value` for
+  `exists`/`get`/`list`), which catches a `create` with no `node_id` however it
+  is wrapped.
 
 ### Control records
 

@@ -70,6 +70,11 @@ ytsaurus-helpers.workspace = true
 # compiled rather than asserted.
 ytsaurus-job.workspace = true
 criterion.workspace = true
+# Compresses a test response, which is the only way to show that a buffered
+# read's cap counts *decoded* bytes: a body small enough on the wire to pass
+# any limit put there, and large enough once inflated to fail the real one.
+# Already in the tree — `ureq`'s `gzip` feature is what inflates it again.
+flate2 = "1"
 
 [[bench]]
 name = "rows"

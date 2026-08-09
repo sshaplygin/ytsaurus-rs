@@ -1435,6 +1435,7 @@ name = "ytsaurus-client"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "flate2",
  "md5",
  "serde",
  "serde_bytes",

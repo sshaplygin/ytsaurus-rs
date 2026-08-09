@@ -144,8 +144,15 @@ an example, which is exactly why they had not been noticed.
 2. ~~**No append.**~~ **Built.** `TablePath::new(p).append()` carries the
    `<append=%true>` attribute a path can have, and the three write methods take
    `impl Into<TablePath>` so a `&str` still means what it always did. Go's
-   `ypath.Rich` also carries `Columns` and `Ranges`; those are read-side and are
-   not modelled, which is why the type exists rather than a second write method.
+   `ypath.Rich` also carries `Columns` and `Ranges`; those are read-side and
+   are **now modelled too** — `TablePath::columns` / `::range`, with the read
+   methods taking `impl Into<TablePath>` — which is what the type existed to
+   make room for. A *write* with a read selection is refused locally, because
+   the cluster ignores the selection and replaces the table with a 200.
+   `examples/rich_path.rs` checks the whole of it against a cluster, including
+   the one thing no wire test can say: `key` and `key_bound` compare a short
+   key by opposite rules, so `keys(a..b)` and `keys(a..=b)` differ by a whole
+   prefix group rather than by one row.
 3. ~~**No escape hatch.**~~ **Built.** `Client::raw_command(method, command,
    params, payload)` sends a command this crate does not model, with
    `raw_command_streaming` and `raw_command_upload` for the two heavy shapes,

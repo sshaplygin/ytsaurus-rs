@@ -55,7 +55,7 @@ And the surprise runs the other way too: **`TrimRows`, `GetTabletInfos`,
 | Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic — a pool picked at random, refreshed lazily every minute, a failed host dropped until a refresh restores it; constrained to the configured domain, or to a list you write |
 | Compression | configurable, off by default | zstd both ways | gzip **inbound only** |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | **one, 120 s, not settable** |
-| Batching several commands | `CreateBatchRequest` | `NewBatchRequest` | **none** |
+| Batching several commands | `CreateBatchRequest` → futures | `NewBatchRequest` → `BatchResponse[T]` | `BatchRequest` → `Vec<Result<…>>`, per-part; **no per-part retry**, where C++ re-queues a retriable part; a split batch that stops reports the prefix it applied, where C++ throws with it lost |
 | Retries | three policies by request class | interceptor chain | one policy × `Repeatable` |
 | Client logging | global `ILogger` | `Config.Logger`, structured | optional `tracing` feature, off by default |
 | Distributed tracing | `EnableClientTracing` | `TraceFn` + Jaeger and OTel adapters | `TraceContext` → `traceparent`, no dependency |
@@ -139,7 +139,7 @@ launcher-and-worker pattern depends on it.
 | `MultisetAttributes` | yes | yes | no |
 | `CreateObject` (accounts, users) | yes | yes | no |
 | Path: `append` | yes | yes | **yes** — `TablePath::new(p).append()` |
-| Path: columns, ranges, key bounds | `TRichYPath` | `ypath.Rich` | **no** |
+| Path: columns, ranges, key bounds | `TRichYPath` | `ypath.Rich` | **yes** — `TablePath::columns` / `::range`, `RowRange`, `Key`; a *write* with a read selection is refused locally, because the cluster silently ignores it there |
 | Dynamic value | `TNode` | `yson.RawValue` | `YsonValue` |
 | Read a node into a native type | protobuf/`TNode` | `GetNode(&out)` | **`get_as::<T>()`** |
 
@@ -152,7 +152,7 @@ launcher-and-worker pattern depends on it.
 | Schema validated before sending | no | no | **`TableSchema::validate()`** |
 | Whole table as typed rows in one call | no, loop a reader | no, loop a reader | **`read_table_rows` / `write_table_rows`** |
 | Streaming row cursor | `TTableReader<T>` | `TableReader.Next/Scan` | in `ytsaurus-job`, not the client |
-| Read a file back | `CreateFileReader` | `ReadFile` | **no — `write_file` has no counterpart** |
+| Read a file back | `CreateFileReader` | `ReadFile` | **yes — `read_file`, and `read_file_streaming` for one that does not fit** |
 | Partitioned reads | `GetTablePartitions` | `PartitionTables` | no |
 | Parallel reader | `library/parallel_io` | **no** | no |
 | Blob tables | `CreateBlobTableReader` | **no** | no |
@@ -260,21 +260,28 @@ Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
-two on that list are **now built**: logging and tracing — a `traceparent` the
-cluster joins, and an optional `tracing` feature — and the operation object and
-its lifecycle, which is what the table above came to; so is transaction
-`Detach`, with attach and the by-id commands beside it. What is left is
-`read_file`, batch requests, and read-side column and range selection.
+all six on that list are **now built**: logging and tracing — a `traceparent`
+the cluster joins, and an optional `tracing` feature — the operation object and
+its lifecycle, which is what the table above came to, read-side column and
+range selection (`TablePath::columns` / `::range`), `read_file` with its
+streaming half (#10), batch requests (`BatchRequest` and
+`Client::execute_batch`, per-part `Result`s with the C++ client's
+`Concurrency` and `BatchPartMaxSize` options, plus one thing neither official
+client offers — a split batch that stops names the prefix it already applied),
+and transaction `Detach`, with attach and the by-id commands beside it.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,
 and every entry above was unreachable even as a workaround. **That is now
 `Client::raw_command`** — with `raw_command_streaming` and
 `raw_command_upload` for the heavy shapes — so each remaining entry is a
-question of ergonomics rather than of capability. `read_file` is the clearest
-case: still not modelled, and reachable today as
-`raw_command_streaming(Method::Get, "read_file", …)`, which never holds more of
-the file than a buffer. See `cargo run -p ytsaurus-client --example raw`.
+question of ergonomics rather than of capability. `read_file` was the clearest
+case, reachable for a release only as
+`raw_command_streaming(Method::Get, "read_file", …)`: that is the door its
+methods grew out of — the wire shape was verified through it before it was
+modelled — and the `raw` example still reads a file that way, to show the door
+working on a command whose shape is known. See
+`cargo run -p ytsaurus-client --example raw`.
 
 Whether either official client offers the same door was not checked for this
 document, and it matters less to them: both model far more of the API, so the
