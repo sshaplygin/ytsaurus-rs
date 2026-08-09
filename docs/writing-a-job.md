@@ -4,9 +4,11 @@ From an empty file to a running operation. Assumes you can reach a cluster —
 `export YT_PROXY=http://localhost:8000` for the local one in
 [`tests/e2e/README.md`](../tests/e2e/README.md).
 
-The shape this guide builds towards is **one binary that is both the launcher
-and the job**: it uploads itself, starts the operation, and is what the cluster
-runs. The `yt` CLI can do the launching instead, and §5 covers that too.
+The direct-static shape this guide builds towards is **one binary that is both
+the launcher and the job**: it uploads itself, starts the operation, and is
+what the cluster runs. A `cargo run` launcher uploads a separately built static
+worker from the same source; the `yt` CLI can do the launching instead, and §5
+covers that too.
 
 ## 0. What a job actually is
 
@@ -181,8 +183,8 @@ fn main() {
 fn launch() -> Result<(), ytsaurus_client::ClientError> {
     let client = ytsaurus_client::Client::from_env()?;
 
-    // Uploads *this very binary*, so what runs on the cluster is what you
-    // just built.
+    // Uploads this static binary, so what runs on the cluster is what you just
+    // built.
     client.upload_current_exe("//tmp/my_job")?;
 
     let spec = ytsaurus_client::MapSpec::new("./my_job", ["//tmp/input"], ["//tmp/output"])
@@ -194,9 +196,9 @@ fn launch() -> Result<(), ytsaurus_client::ClientError> {
 }
 ```
 
-That is the whole pattern, and it removes a whole class of bug: there is no
-second artifact to forget to rebuild, so "the cluster is running last week's
-worker" cannot happen.
+For a static launcher, that is the whole pattern, and it removes a whole class
+of bug: there is no second artifact to forget to rebuild, so "the cluster is
+running last week's worker" cannot happen.
 
 `upload_current_exe` checks the running executable's ELF header before
 uploading — Linux, x86-64, statically linked — because everything it rejects
@@ -208,13 +210,14 @@ cause:
 so a Linux node cannot exec it. Build the worker with scripts/build-worker.sh …
 ```
 
-**On macOS the launcher cannot be the uploaded file.** A Mach-O binary is not
-something a node can exec, and a Linux binary is not something macOS can run.
-The source stays one file; you build it twice and point the launcher at the musl
-build:
+**The default launcher built with `cargo run` cannot be the uploaded file.** On
+macOS it is Mach-O; on a typical Linux host it is dynamically linked. A cluster
+node can run neither. The source stays one file; build the static musl worker
+and point the host launcher at it:
 
 ```sh
 scripts/build-worker.sh my_job
+# Rebuild this worker whenever its source changes.
 YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/my_job \
     cargo run -p ytsaurus-examples --bin my_job
 ```
@@ -228,9 +231,9 @@ match std::env::var("YT_WORKER_BINARY") {
 }
 ```
 
-On Linux x86-64, run the musl build itself and `upload_current_exe` needs no
-help. [`examples/src/bin/selfrun.rs`](../examples/src/bin/selfrun.rs) is the
-runnable version of all of this.
+On Linux x86-64, you can instead run the musl build itself, and
+`upload_current_exe` needs no help. [`examples/src/bin/selfrun.rs`](../examples/src/bin/selfrun.rs)
+is the runnable version of both forms.
 
 ### Uploading it only when it changed
 

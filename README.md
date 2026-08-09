@@ -68,11 +68,11 @@ yt map './my_job' --src //tmp/in --dst //tmp/out \
     --local-file target/x86_64-unknown-linux-musl/release-worker/my_job
 ```
 
-## Or let the binary launch itself
+## Or let a static binary launch itself
 
-The cluster starts a job with `YT_JOB_ID` in its environment, so one binary can
-be both the launcher and the job — and upload *itself*, which means the cluster
-can never be running a stale worker:
+The cluster starts a job with `YT_JOB_ID` in its environment, so a static Linux
+x86-64 binary can be both the launcher and the job — and upload *itself*, which
+means the cluster can never be running a stale worker:
 
 ```rust
 fn main() {
@@ -84,9 +84,11 @@ fn main() {
 }
 ```
 
-If it fails, the error carries the job's own stderr rather than a state string.
-See [examples/src/bin/selfrun.rs](examples/src/bin/selfrun.rs); the full
-walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
+If the launcher comes from `cargo run`, build a static worker separately and
+set `YT_WORKER_BINARY` so it uploads that artifact; rebuild the worker whenever
+its source changes. If it fails, the error carries the job's own stderr rather
+than a state string. See [examples/src/bin/selfrun.rs](examples/src/bin/selfrun.rs);
+the full walkthrough is [docs/writing-a-job.md](docs/writing-a-job.md).
 
 ## Build and test
 

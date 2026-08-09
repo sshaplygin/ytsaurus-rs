@@ -195,7 +195,9 @@ cargo run -p ytsaurus-client --example table_usage
 cargo run -p ytsaurus-client --example schema
 cargo run -p ytsaurus-client --example sort_reduce
 cargo run -p ytsaurus-client --example vanilla
-cargo run -p ytsaurus-examples --bin selfrun     # on Linux; see the README on macOS
+# `cargo run` is the host launcher; upload the static worker built above.
+YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
+    cargo run -p ytsaurus-examples --bin selfrun
 ```
 
 [`tests/e2e/README.md`](../tests/e2e/README.md) holds the output of each, from

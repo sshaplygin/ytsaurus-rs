@@ -1,4 +1,4 @@
-//! `selfrun` — one binary that is both the launcher and the job.
+//! `selfrun` — one Rust source, two roles.
 //!
 //! The cluster starts a job by exec'ing an uploaded binary with `YT_JOB_ID` in
 //! its environment. So a program can ask which role it is playing, and be both:
@@ -8,28 +8,30 @@
 //! ────────────                          ──────────────
 //! selfrun                               ./selfrun
 //!   is_inside_job() -> false              is_inside_job() -> true
-//!   uploads *itself*  ──────────────────► maps rows
+//!   uploads the worker ─────────────────► maps rows
 //!   starts the operation                  writes the output table
 //!   waits, reads the result back
 //! ```
 //!
-//! The binary that runs on the cluster is the one you just built, because it is
-//! the same file. There is no second artifact to forget to rebuild.
+//! A static Linux x86-64 build can be both the launcher and the job. When
+//! `cargo run` is the launcher, it instead builds a host executable (normally a
+//! dynamically linked debug binary). Build the static worker separately and
+//! tell the launcher to upload it; both artifacts still come from this source.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
 //! scripts/build-worker.sh selfrun     # the binary the cluster will run
-//! cargo run -p ytsaurus-examples --bin selfrun
+//! YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \\
+//!     cargo run -p ytsaurus-examples --bin selfrun
 //! ```
 //!
-//! ## Two builds on macOS
+//! ## Running the static build directly
 //!
-//! `upload_current_exe` uploads the running executable, which works when the
-//! launcher is itself a Linux x86-64 static binary — build it with
-//! `scripts/build-worker.sh` and run *that*. On macOS the running executable is
-//! Mach-O, which no node can exec, and the client refuses it by inspecting the
-//! ELF header rather than letting the job fail later. Set `YT_WORKER_BINARY` to
-//! the musl build in that case; the source is still one file.
+//! `upload_current_exe` also works when the launcher is itself the Linux x86-64
+//! static binary produced by `scripts/build-worker.sh`. That is an option on a
+//! Linux x86-64 host; macOS cannot run the Linux binary, and a normal Linux
+//! `cargo run` build is dynamically linked. In either case the client checks
+//! the ELF header before uploading instead of letting the job fail later.
 //!
 //! The mapper counts hosts: `{url, size}` in, `{host, size}` out.
 
@@ -41,8 +43,8 @@ use ytsaurus_yson::{YsonFormat, to_vec};
 /// Where the demo keeps its tables, and the worker.
 const BASE: &str = "//tmp/ytsaurus_rs_selfrun";
 
-/// Points at a cross-compiled build of this same source, for hosts that cannot
-/// run a Linux binary themselves.
+/// Points at the static worker built from this source when the running launcher
+/// is not itself a Linux x86-64 static binary.
 const WORKER_OVERRIDE: &str = "YT_WORKER_BINARY";
 
 #[derive(Deserialize)]
@@ -109,11 +111,11 @@ fn launch() -> Result<(), ClientError> {
         client.row_count(&format!("{BASE}/input"))?
     ));
 
-    step("Uploading this very binary");
+    step("Uploading the worker");
     let remote = format!("{BASE}/selfrun");
     match std::env::var(WORKER_OVERRIDE) {
-        // A cross-compiled build of this same source, for a host whose own
-        // binaries a cluster node cannot run.
+        // A static build of this same source, for a launcher a cluster node
+        // cannot run (including a normal `cargo run` build on Linux).
         Ok(path) if !path.trim().is_empty() => {
             client.upload_worker(&path, &remote)?;
             done(&format!("{path} -> {remote}"));
@@ -146,7 +148,7 @@ fn launch() -> Result<(), ClientError> {
     let output = client.read_table(format!("{BASE}/output"))?;
     done(&format!("{rows} rows, {} bytes", output.len()));
 
-    println!("\nOne binary, two roles. Output at {BASE}/output");
+    println!("\nOne source, two roles. Output at {BASE}/output");
     Ok(())
 }
 
