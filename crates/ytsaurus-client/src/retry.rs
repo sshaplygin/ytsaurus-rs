@@ -89,8 +89,8 @@ pub enum Repeatable {
     /// the configured address's own domain — see
     /// [`Client::with_heavy_proxies_anywhere`](crate::Client::with_heavy_proxies_anywhere).
     ///
-    /// `write_table`, `read_table`, `write_file`, `get_job_input` and
-    /// `get_job_stderr` are the modelled ones — every one of them declared
+    /// `write_table`, `read_table`, `write_file`, `read_file`, `get_job_input`
+    /// and `get_job_stderr` are the modelled ones — every one of them declared
     /// `isHeavy = true` in `REGISTER_ALL`/`REGISTER` in the cluster's
     /// [driver registry](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp),
     /// whose argument order is `(command, name, inDataType, outDataType,

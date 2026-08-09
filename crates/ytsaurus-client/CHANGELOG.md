@@ -2,6 +2,215 @@
 
 ## Unreleased
 
+### A file can be read back
+
+- **Added** `Client::read_file` and `Client::read_file_streaming` — the mirror
+  `write_file` shipped without, and the sharpest asymmetry in the crate until
+  now: a worker binary could be uploaded and never fetched back (#10). The
+  pair takes the shape of `read_table`'s: buffered for a result a launcher
+  inspects, streaming for a file that does not fit — which a file is exactly
+  the thing to be. `read_file` is a heavy command without input data, so both
+  go to the proxy the cluster names, as the table reads do, and an
+  installation whose control proxy answers heavy reads with a cross-host 307
+  is handled by the same routing rather than by following the redirect with
+  the token stripped. Verified against a local cluster: 4 MB of non-UTF-8
+  bytes round-trip byte-for-byte through both halves, and an empty file reads
+  back empty. The buffered half holds the whole file in memory, and the cap on
+  that is the bullet below.
+
+- **Added** the completeness check the buffered read needs where a table read
+  already had one. The proxy reports a mid-stream failure in a trailer `ureq`
+  cannot see, and a file's bytes carry no framing — where a truncated table
+  leaves a record that does not parse, a truncated file just ends, looking
+  exactly like a shorter file. So `read_file` compares the body against the
+  node's `@uncompressed_data_size`, one light `get` after the heavy read, and
+  a body of any other length is an error naming both numbers. The attribute is
+  the *logical* size — verified with `compression_codec=zlib_6`, 1 000 000
+  bytes reading back whole off 4 214 on disk — and there is no `@file_size`,
+  whatever the name suggests: asked, the cluster answers `Attribute
+  "file_size" is not found`. An answer that is not an integer fails the read
+  too, because a check that quietly stopped checking would be worse than none.
+  The streaming path cannot check — the point is not to have the whole thing —
+  and `FileReader` says what to compare instead: `bytes_read` against the same
+  attribute.
+
+- **Added** `FileReader`, the streaming read's return type — `ResponseReader`
+  under the name the file path uses, exactly as `TableReader` is for tables.
+
+### The 512 MiB cap on a buffered response, which was not one
+
+- **Fixed** the cap itself, which counted the wrong bytes and so bounded
+  nothing worth bounding. `ureq`'s `limit()` wraps the *raw* body source and
+  builds the gzip decoder on top of it, so the number it takes is a limit on
+  what arrives on the wire — and every request this crate sends carries
+  `Accept-Encoding: gzip`. Measured against a cluster: a 600 MiB file of zeros
+  read back through `read_file` crosses the wire in 611 522 bytes, and the code
+  as it stood — `.limit(536870912).read_to_vec()` — handed back all
+  629 145 600 without an error. At that ratio a 512 MiB wire cap admits
+  hundreds of gigabytes into memory. The cap now sits **above** the decoder and
+  counts the bytes that land in the `Vec`, so the promise the documentation
+  made is the one the code keeps: the same read is now refused, and
+  `read_file_streaming` still moves all 600 MiB of it. A body of *exactly* the
+  cap also passes now, where the old guard failed it — `ureq`'s reader errors
+  on the read that finds the end, so "larger than the limit" was a byte off,
+  and deflate expands what it cannot compress, so the wire backstop underneath
+  has to allow the largest permitted body room to arrive *bigger*: 4 096
+  incompressible bytes gzip to 4 119. The backstop is `deflateBound`'s worth of
+  slack, which still bounds the case it exists for — an endless stream of empty
+  deflate blocks, which decodes to nothing and so is invisible to a cap on
+  decoded bytes — at about 584 MiB of transfer.
+
+  **Observable:** a buffered response that decodes to more than 512 MiB used
+  to succeed, allocating however much it decoded to. It now fails.
+  `read_table_streaming`, `read_file_streaming` and `write_table` are
+  unaffected — none of them buffers.
+
+  **The cap is on what is held, not on what a process needs.** The bytes land
+  in a `Vec` that grows by doubling and copies as it grows, so peak residency
+  runs above the ceiling: measured, a 600 MiB read refused by the cap peaks at
+  611 385 344 bytes of resident set and one that holds 512 MiB peaks at
+  544 178 176, with about 1.5× the worst case the growth implies. And it is
+  the buffered commands and uploads that are capped, not the crate: two error
+  paths — the non-2xx branch of a streaming open, and the `/hosts` lookup —
+  still take `ureq`'s wire-only default.
+
+- **Changed** the error class for a buffered response over the cap, from
+  `ClientError::Transport` to a new `ClientError::ResponseTooLarge { command,
+  limit }`. It reaches `read_table`, `read_table_with_format`,
+  `read_skiff_table`, `read_table_rows`, a buffered `raw_command`, and any
+  light command with an answer that large. A caller matching
+  `ClientError::Transport { .. }` to back off and retry will stop matching —
+  which is the point. `Transport` means *the request never got its answer*, and
+  every predicate that narrows it by looking inside (`is_retriable`, and
+  through it `worth_asking_again` and `attributable_to_the_host`) answered
+  `true` here, because `BodyExceedsLimit` is not an `Io` error. So an over-cap
+  heavy read was retried, and it **dropped a healthy data proxy from the pool**
+  — enough of them empty it, and the fallback window then answers unrelated
+  writes with the control-proxy refusal #30 exists to prevent. The new variant
+  is retried by nothing and blamed on nobody, and its message names the cap and
+  the streaming half of the same command. `ClientError` is `#[non_exhaustive]`,
+  so a new variant cannot break an exhaustive match.
+### The read half of a rich path
+
+- **Added** column and row selection to `TablePath`: `columns(…)` and
+  `range(…)`, with `RowRange` and `Key` behind the latter. Three columns of a
+  hundred rows now cost three columns of a hundred rows on the wire, not the
+  whole table. The selections travel as the `columns` and `ranges` attributes
+  *on the path* — the same mechanism as `<append=%true>`, and for the same
+  reason: a sibling parameter is silently dropped. Spellings are the
+  [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath),
+  and `ypath.Rich` in the Go SDK renders the identical shapes.
+
+- **Added** row ranges as plain Rust ranges — `path.range(0..100)`,
+  `range(100..)`, `range(..)` — because Rust's `..` and the cluster's
+  `row_index` limits mean the same thing: inclusive below, exclusive above.
+  Key ranges on sorted tables take the same shape,
+  `RowRange::keys(Key::from("a")..Key::from("b"))`, and the inclusivity
+  travels with the range: the two bounds the `key` selector says natively are
+  sent as `key`, the other two (`..=`, `Bound::Excluded` below) as the
+  cluster's `key_bound=[relation;prefix]` form, whose relation is the only one
+  the reference allows on that side. `RowRange::exact_key` is the `exact`
+  selector. A range never mixes `exact` with a limit because no constructor
+  can write that.
+
+  **The two selectors compare a short key by opposite rules, and the difference
+  is a group of rows.** Measured on a local cluster, table keyed
+  `(host, path)`, rows `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`: `keys(a..b)`
+  returned the two `a` rows, `keys(a..=b)` returned four — all of host `b` —
+  and `keys((Excluded(a), Unbounded))` returned three, having dropped every row
+  of host `a` rather than one row. `key` compares component-wise with the
+  shorter tuple smaller; `key_bound` truncates the row's key to the bound's
+  length first, so every row sharing the prefix compares equal to it. The same
+  run settled the other open question: a range entry carrying `key` on one side
+  and `key_bound` on the other — what `keys(a..=b)` sends — is accepted, though
+  the reference documents the two selectors only separately.
+  `examples/rich_path.rs` is that run, and it checks itself.
+
+- **Added** `yson_build::uint`, without which the top half of a `uint64` key
+  column had no spelling: the `From` shortcuts on `Key` give int64 for an
+  integer, so every key above `i64::MAX` was unnameable. Measured, the type
+  itself is not the obstacle — on a `uint64`-keyed table `{exact={key=[42]}}`
+  and `{exact={key=[42u]}}` both returned the row — but the row keyed
+  `18446744073709551615u` came back only for the uint spelling.
+
+- **Changed** `read_table`, `read_table_with_format`, `read_skiff_table`,
+  `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`,
+  as the write methods already did. Call sites that pass `&str`, `String`,
+  `&String`, `&&str` or `Cow<str>` compile unchanged; a call that leaned on
+  inference (`path.as_ref()`) may need to say `&str` once.
+
+- **Breaking** a *write* to a path carrying a read selection is refused
+  locally, as `ClientError::Config`, before anything is sent. The cluster
+  ignores a selection on a write and replaces the whole table with a 200 —
+  measured in both spellings: `write_table_rows("//tmp/t[#0:#2]", rows)`
+  replaced everything and reported success, and a `write_table` whose path
+  carried `ranges` as a typed *attribute* did exactly the same, 200 and three
+  rows replaced by one — so the only honest write is no write.
+  The same refusal covers selection syntax spelled into the path *string* on a
+  write: a leading `<…>` block, or an unescaped `[` / `{` (a literal bracket
+  in a node name is escaped, `\[`, and still writable). Reads keep taking
+  string-spelled paths verbatim, because the cluster honours them there and
+  always has — except where the typed API would spell **the same kind** of
+  selection a second time, or where the string opens with `<…>`. Measured in
+  the shape this client sends (attributes hung outside a YSON string node), a
+  doubled kind is not a draw: the **attribute wins and the caller's
+  string-spelled half is discarded**, at 200, with nothing said.
+  `<ranges=[…0:2]>"//tmp/t[#3:#5]"` returned rows 0–1, not 3–4, and
+  `<columns=[n]>"//tmp/t{k}"` returned column `n`, not `k`. Rows against
+  columns *compose* and are sent — `<columns=[n]>"//tmp/t[#3:#5]"` gave rows
+  3–4 carrying only `n`. A leading `<…>` is refused whatever it holds, not
+  because the cluster objects — it composes there too — but because this
+  client cannot parse the block to see which attribute it names, and if it
+  names the one being added the caller's is discarded in silence.
+
+  **In plain terms, one working spelling stops working:
+  `write_table("<append=%true>//tmp/t", rows)` used to append and now returns
+  `ClientError::Config`.** The cluster did parse and honour that string, so
+  nothing was being silently ignored there — but this client does not parse a
+  path string at all, and the one syntax covers both `<append=%true>`, which
+  the cluster honours on a write, and `<ranges=…>`, which it drops while
+  replacing the table. Telling them apart would mean parsing rich YPath;
+  refusing is the only answer that is right for both. `TablePath::append()` is
+  the replacement, and `Client::raw_command` takes any other write attribute.
+  Nothing in this repository used the string spelling, so the break is
+  external-only.
+
+- **Breaking** `TablePath` no longer derives `Eq` (a key bound may hold a
+  double, which has no `Eq`); `PartialEq` remains. Neither `TablePath` nor
+  `RowRange` derives `Default`: `TablePath::default()` is the empty path,
+  which names no table and no caller wanted. `read_skiff_table` refuses a path
+  whose **columns** are selected twice — `TablePath::columns`, and now also
+  `{…}` in the path *string*, since the Skiff format's fields become a
+  `columns` attribute whether the caller named one or not. Measured, the
+  synthesised attribute wins (`<columns=[n]>"//tmp/t{k}"` came back as column
+  `n`), so the Skiff tuple stays aligned with its schema and nothing decodes
+  wrong — what is lost is the caller's own `{…}`, discarded at 200 without a
+  word, and refusing is how they hear about it. **A row range joins a Skiff
+  read freely, typed or string-spelled** — `<columns=[n]>"//tmp/t[#3:#5]"`
+  answered 200 with rows 3–4 carrying only `n`, since ranges pick rows and the
+  schema picks columns.
+
+- **Breaking** a row range asking for rows no table has is refused rather than
+  sent, in both selectors: one that runs backwards (`rows(5..3)`,
+  `keys(b..a)`) and one with a negative row index (`rows(-5..2)`). Measured,
+  the two fail differently. A backwards range is answered 200 with no rows —
+  `{lower_limit={row_index=5};upper_limit={row_index=3}}` and
+  `{lower_limit={key=[3]};upper_limit={key=[1]}}` both came back empty. **A
+  negative row index is clamped to 0 and the read succeeds**:
+  `{lower_limit={row_index=-5}}` returned all five rows of a five-row table and
+  `-5..2` returned rows 0 and 1, so a negative lower limit reads exactly as `0`
+  would, and only a negative *upper* limit comes back empty. A bound that
+  arrives only from arithmetic that went wrong, and is then silently replaced
+  by one that reads from the start of the table, is worth an error. An *empty*
+  range is still fine: `rows(5..5)` is legal on a slice and honestly asks for
+  no rows, and `keys(a..a)` likewise.
+
+  **`columns([])` is not in that set and is sent.** Measured, `<columns=[]>`
+  answers 200 with one empty map per row and composes with a range, so it
+  counts the rows of a range — or probes whether a key range holds any — with
+  no column bytes on the wire, which `Client::row_count` cannot do, reading as
+  it does the whole-table `@row_count` attribute.
+
 ### Heavy proxies: a pool, picked at random, refreshed — never one host for life
 
 - **Changed** how heavy commands choose their proxy, to parity with the C++

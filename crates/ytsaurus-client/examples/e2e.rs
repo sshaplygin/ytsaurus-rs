@@ -165,8 +165,8 @@ fn identity(client: &Client, rows: &[u8]) -> Result<(), ClientError> {
     // against the *uploaded file* instead would fail for a reason that has
     // nothing to do with the job: the cluster re-encodes rows on ingest, and
     // 309 676 bytes came back as 309 688.
-    let before = client.read_table(&format!("{BASE}/input"))?;
-    let after = client.read_table(&format!("{BASE}/output"))?;
+    let before = client.read_table(format!("{BASE}/input"))?;
+    let after = client.read_table(format!("{BASE}/output"))?;
 
     check(
         &format!("identical ({} bytes)", before.len()),
@@ -204,8 +204,8 @@ fn table_switching(client: &Client, rows0: &[u8], rows1: &[u8]) -> Result<(), Cl
     client.wait_for_operation(&id)?;
 
     for i in 0..2 {
-        let input = client.read_table(&format!("{BASE}/in{i}"))?;
-        let output = client.read_table(&format!("{BASE}/out{i}"))?;
+        let input = client.read_table(format!("{BASE}/in{i}"))?;
+        let output = client.read_table(format!("{BASE}/out{i}"))?;
         check(
             &format!("table {i} identical ({} bytes)", input.len()),
             input == output,
@@ -253,7 +253,7 @@ fn wordcount(client: &Client) -> Result<(), ClientError> {
     // written above; a YTsaurus string column holds arbitrary bytes, which is
     // why the worker itself reads it as `&[u8]`.
     let counted: BTreeMap<String, i64> = client
-        .read_table_rows::<Total>(&format!("{BASE}/counts"))?
+        .read_table_rows::<Total>(format!("{BASE}/counts"))?
         .into_iter()
         .map(|row| (row.word, row.count))
         .collect();

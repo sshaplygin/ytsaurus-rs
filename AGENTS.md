@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 661 tests: 594 unit and integration, 67 doc
+cargo test --workspace            # 721 tests: 649 unit and integration, 72 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -314,10 +314,12 @@ per command. Cluster facts:
   not to `/api/v4/`. `get_supported_features` is the real "no parameters,
   small answer" command — `Null` in, `Structured` out, non-volatile,
   non-heavy — and is what the doctest and the `raw` example use.
-- `check_permission`, `read_file` and `get_supported_features` are all
-  registered and none is modelled here; they are the natural first users of the
-  raw door. *(`list_operations` was on this list until the operation lifecycle
-  landed; it has a method now.)*
+- `check_permission` and `get_supported_features` are registered and not
+  modelled here; they are the natural first users of the raw door.
+  *(`list_operations` and `read_file` were both on this list and both came off
+  it — the first with the operation lifecycle, the second as `Client::read_file`
+  and `Client::read_file_streaming`. The `raw` example still reads a file, now
+  because that wire shape is verified rather than because nothing else could.)*
 - **`get_supported_features` answers `{features=…}`**, not `{value=…}` — the
   envelope is keyed by what the command returns, the same trap that made
   `exists` read the wrong key for two releases. Captured from a local cluster:
@@ -328,7 +330,48 @@ per command. Cluster facts:
   `user_tokens_metadata`.
 - **`read_file` streams and `write_file` takes a chunked body**, verified with
   a 4 MB round trip through `Client::raw_command_streaming` and
-  `raw_command_upload` — neither direction holds the file.
+  `raw_command_upload` — neither direction holds the file. `Client::read_file`
+  and `Client::read_file_streaming` are that round trip written down, and the
+  buffered half needs a check the streaming half cannot have: a file's bytes
+  carry no framing, so a body cut short by a mid-stream failure looks exactly
+  like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot
+  read. It compares the body against the node's `@uncompressed_data_size` —
+  the *logical* size, measured against `compression_codec=zlib_6` nodes of
+  1 000 000 bytes each: `@compressed_data_size` is 4 214 for the cycling
+  `i % 256` bytes the tests write, 999 for all zeros and 1 000 324 for
+  `os.urandom` — none of them the logical size, and the read passes against
+  all three. There is no `@file_size`: asked for one, the cluster answers
+  `Attribute "file_size" is not found`.
+- **`ureq`'s `limit()` does not bound memory.** `BodyWithConfig::do_build`
+  wraps the raw source in a `LimitReader` and builds the gzip decoder on top,
+  so the number bounds *transferred* bytes — and every request this crate
+  sends carries `Accept-Encoding: gzip`. Measured: a `read_file` of 600 MiB of
+  zeros arrives in 611 522 wire bytes, and `.limit(536870912)` on it returned
+  all 629 145 600. A ceiling that counts memory has to sit above the decoder,
+  which is what `http::CapReader` is for. **A wire limit is still needed
+  underneath it** — a chunked stream of empty deflate stored blocks
+  (`00 00 00 ff ff`) decodes to nothing, so a cap on decoded bytes never spends
+  a byte against it and `flate2` loops inside a single `read`; with the wire
+  limit taken away, that read does not return. **And the wire limit cannot be
+  the memory cap**: deflate expands what it cannot compress, so the largest
+  permitted body can arrive larger than the cap — 4 096 incompressible bytes
+  gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip
+  wrapper, for that reason.
+- **A memory cap is not a process budget.** `read_to_end` grows a `Vec` by
+  doubling and copies as it grows, so both buffers are resident for the length
+  of a copy — about 1.5× where the allocator cannot extend in place. Measured
+  in a release build against a local listener: a read handing back
+  536 870 911 bytes peaks at 544 178 176 of resident set, and a 600 MiB read
+  *refused* by the 512 MiB cap peaks at 611 385 344. Quote the cap as what is
+  held, never as what to size a container for.
+- **A rich path does nothing to a file read**, measured on a 1000-byte file:
+  `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads back all
+  1000 bytes and says nothing — a file is sliced by the command's `offset` and
+  `length` parameters, never by limits on the path — and `//tmp/f[#0:#10]`
+  likewise returns all 1000, then fails `read_file`'s size check, because
+  `//tmp/f[#0:#10]/@uncompressed_data_size` is not a path the cluster parses
+  (`Error reading parameter /path: Unexpected token "/" of type "slash"`).
+  So `read_file` documents a plain node path; #12 is where selection goes.
 
 ### Authentication and compression
 
@@ -560,6 +603,99 @@ per command. Cluster facts:
 - A reader never sees a partial append — `@row_count` holds its old value until
   the upload transaction commits.
 
+### Selecting columns and rows on a path
+
+The read-side half of the same mechanism, and the sibling-parameter trap
+generalised: `columns` and `ranges` are attributes **on the path** too, and the
+cluster's answer to one in the wrong place is again a 200.
+
+- **A read selection on a *write* is ignored and the whole table is replaced,
+  with a 200.** Measured in both spellings: `write_table_rows("//tmp/t[#0:#2]",
+  rows)` replaced everything and reported success, and a `write_table` whose
+  path carried `ranges` as a typed *attribute* did exactly the same — 200, three
+  rows replaced by one. Same shape as the append trap: an attribute in the wrong
+  place costs a table and says nothing. Hence `TablePath::write_refusal`.
+- **An unknown name in `columns` is not an error**: 200, with the key simply
+  absent from every row. A typo reads clean and decodes short — loudly into a
+  struct, silently into a map.
+- **`columns=[]` is answered 200 with one empty map per row**, and it composes
+  with a range: `<columns=[];ranges=[{lower_limit={row_index=0};
+  upper_limit={row_index=2}}]>` came back as two empty maps, and the same range
+  spelled with `key` bounds as three. That counts the rows of a *range* with no
+  column bytes on the wire — something `@row_count` cannot do, speaking as it
+  does for a whole static table — so the client **sends** it. The first round
+  refused it by analogy with `update_operation_parameters({})`; the analogy was
+  false, because that one is a mutation silently no-op'd and reported as
+  success while this is a read that returns one correct record per row.
+- **A negative `row_index` is clamped to 0, not rejected** — the correction that
+  cost the most here, because the first measurement did not isolate the
+  variable. `{lower_limit={row_index=-5}}` returned **all five rows** of a
+  five-row table and `-5..2` returned rows 0 and 1: a negative lower limit reads
+  exactly as `0` would. Only a negative *upper* limit comes back empty
+  (`{upper_limit={row_index=-2}}` → 200, no rows), and that is the clamp too.
+  The earlier "`-5..0` is answered 200 and no rows" was true of `upper_limit=0`,
+  not of the negative bound. The client still refuses it — a bound arriving only
+  from arithmetic that went wrong, silently replaced by one that reads the whole
+  table, is worth an error — but for that reason, not the false one.
+- **A backwards range is answered 200 with no rows, in either selector**:
+  `{lower_limit={row_index=5};upper_limit={row_index=3}}` and
+  `{lower_limit={key=[3]};upper_limit={key=[1]}}` both came back empty. The
+  client refuses both, which it did not at first — it checked only row indices.
+- **Measure the shape the client actually sends, not the flat text.** This one
+  cost two wrong rounds. The client sends `path` as a **YSON string node with
+  its attributes hung outside** — `<columns=[n]>"//tmp/t{k}"` — while a `curl`
+  with JSON parameters sends the *flat text* `<columns=[n]>//tmp/t{k}` as one
+  string. **They parse differently and give opposite answers.** In flat text
+  the string's `{k}` wins; in the YSON shape the attribute wins. Reproduce the
+  real one with `-H 'X-YT-Header-Format: <format=text>yson'` and parameters
+  `{path=<columns=["n"]>"//tmp/t{k}";output_format=json}`. A JSON-parameter
+  `curl` is not evidence about this client's behaviour.
+- **The attribute beats the string when both spell the same kind of selection,
+  silently, at 200.** Measured in the YSON shape, on a table `k,n`:
+  `<columns=["n"]>"//tmp/t{k}"` → column `n` (the `{k}` discarded);
+  `<ranges=[…0:2]>"//tmp/t[#3:#5]"` → rows 0–1 (the `[#3:#5]` discarded);
+  `<columns=["k"]>"<columns=["n"]>//tmp/t"` → column `k`. **Different kinds
+  compose**: `<columns=["n"]>"//tmp/t[#3:#5]"` → rows 3–4 carrying only `n`,
+  and `<ranges=[…0:2]>"//tmp/t{k}"` → rows 0–1 carrying only `k`. So the client
+  refuses the doubled *kind* and sends the pairing. Nothing here is corrupted —
+  the read is exactly what the attribute asked for — the loss is that the
+  caller's own half is thrown away with no mention, which is what the refusal
+  is for.
+- **There is no 400 in any of this.** Every combination above answers 200,
+  including a string that opens with `<…>`: `"<columns=["n"]>//tmp/t"` alone
+  → column `n`, and `<ranges=[…0:2]>"<columns=["n"]>//tmp/t"` → rows 0–1
+  carrying only `n`, composing like any other different kinds. A leading `<…>`
+  is still refused, but for the honest reason: **the client cannot parse the
+  block to know which attribute it names**, and if it names the one being added
+  the caller's is discarded silently. (The earlier "two blocks → 400, *does not
+  start with a valid root-designator*" was the flat-text artefact — two `<…>`
+  concatenated into one string — not anything this client can send.)
+- **A `uint64` key column does not insist on the `u` suffix**: on a
+  `uint64`-keyed table `{exact={key=[42]}}` and `{exact={key=[42u]}}` both
+  returned the row. `yson_build::uint` earns its place on *range* instead —
+  `Key::from(i64)` stops at `i64::MAX`, and the row keyed
+  `18446744073709551615u` came back only for the uint spelling.
+- **`key` and `key_bound` compare a short key by opposite rules**, which is the
+  finding worth the most here. Under `key` the row's whole key is compared
+  component-wise, the shorter tuple being smaller when equal so far. Under
+  `key_bound` the row's key is **truncated** to the bound's length first, so
+  every row sharing the prefix compares *equal* to it. On a table keyed
+  `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
+
+  | sent | rows back |
+  | --- | --- |
+  | `{key=[a]}` … `{key=[b]}` | `(a,/x) (a,/y)` |
+  | `{key=[a]}` … `{key_bound=["<=";[b]]}` | `(a,/x) (a,/y) (b,/x) (b,/y)` |
+  | `{key_bound=[">";[a]]}` | `(b,/x) (b,/y) (c,/x)` |
+  | `{exact={key=[a]}}` | `(a,/x) (a,/y)` |
+
+  So `a..b` and `a..=b` differ by a whole prefix group, and `>` on a prefix
+  drops every row of that prefix — there is no "the row just after `a`".
+- **A range entry mixing `key` on one side with `key_bound` on the other is
+  accepted**, which is what `keys(a..=b)` sends. The reference documents the two
+  selectors separately and never together; the cluster takes the mixture.
+- All of the above is checked by `examples/rich_path.rs`.
+
 ### Tracing
 
 Read out of the cluster's source — the HTTP reference does not mention the
@@ -740,8 +876,9 @@ and the documentation disagreed and the source is what settles it.
 - The proxy **accepts a chunked request body** for `write_table`, so a table can
   be written from a `Read` that never has all of it.
 - `ureq` 3.3 caps `read_to_vec` at 10 MB unless told otherwise but leaves a
-  **reader uncapped**, which is the right way round: the buffered path passes an
-  explicit limit, the streaming path passes none.
+  **reader uncapped**, which is the right way round: the buffered path enforces
+  a limit of its own, the streaming path none. `ureq`'s number is not that
+  limit and cannot be — see the API-shape note above on where `limit()` sits.
 - **`ureq` 3.3 still exposes no trailers** — rechecked in its source, where the
   word does not appear. So the `X-YT-Error` trailer a proxy uses to report a
   mid-stream failure remains unreadable, and the completeness check on

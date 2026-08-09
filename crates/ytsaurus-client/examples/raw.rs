@@ -7,14 +7,18 @@
 //! `pub(crate)`, so a command with no method on `Client` could not be sent at
 //! all, however well the transport underneath it would have carried it.
 //!
-//! Four commands are used here and **none of them is modelled**:
+//! Four commands are used here:
 //!
 //! - `get_supported_features` — what this cluster's build can do. No
 //!   parameters, a small structured answer, a GET.
-//! - `write_file` and `read_file` streaming — `read_file` in particular is a
-//!   real gap: files can be written by this crate and not read back. The raw
-//!   door is how one is read today, and it never holds more of the file than a
-//!   buffer.
+//! - `write_file` and `read_file` streaming — `read_file` was the crate's
+//!   sharpest gap when this example was written: files could be written and
+//!   not read back, and this call was the whole of how one was read. It has
+//!   methods now — `Client::read_file` and `Client::read_file_streaming` (#10)
+//!   grew out of exactly this — and the round trip stays because it shows the
+//!   door carrying data in both directions, on commands whose wire shape this
+//!   example itself verified. Neither direction ever holds more of the file
+//!   than a buffer.
 //! - `list_operations` — a read that is safe to repeat, which is what
 //!   `Repeatable` is for, and one of the commands issue #9 lists as missing.
 //!
@@ -121,8 +125,9 @@ fn supported_features(client: &Client) -> Result<(), ClientError> {
     )
 }
 
-/// A file written and read back, both through commands this crate does not
-/// model — and the read never holding the whole file.
+/// A file written and read back through the raw door — the read never holding
+/// the whole file. `Client::read_file_streaming` is this call grown into a
+/// method; the door sends the same request.
 fn a_file_through_the_raw_door(client: &Client) -> Result<(), ClientError> {
     step("A file, uploaded and streamed back");
 

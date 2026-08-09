@@ -85,6 +85,54 @@ const LOCATION: &str = "Location";
 /// changed the policy and not the numbers.
 const MAX_REDIRECTS: usize = 10;
 
+/// How much of a response a buffered command will hold in memory — 512 MiB,
+/// counted **after** decompression.
+///
+/// Buffered responses are small (a table or file read is the exception, and a
+/// launcher reads results, not bulk data), and `ureq`'s own default is
+/// conservative enough to truncate a modest table silently, which is the
+/// failure this number exists to avoid. It is not a promise that half a
+/// gigabyte in a `Vec` is a good idea: the two commands that reach it in
+/// practice — [`Client::read_table`](crate::Client::read_table) and
+/// [`Client::read_file`](crate::Client::read_file) — each have a streaming
+/// half that holds nothing, and the error names it (see [`body_failure`]).
+///
+/// **`ureq`'s own `limit()` cannot enforce this**, which is why [`CapReader`]
+/// exists. `BodyWithConfig::do_build` wraps the raw body source in a
+/// `LimitReader` and then builds the gzip decoder *on top of it*, so the
+/// number it is given bounds what arrives **on the wire** — not what lands in
+/// the `Vec`. This client always asks for compression (`ureq`'s `gzip` feature
+/// is on, and `tests/request_shape.rs` pins the header), so those are not the
+/// same quantity and are not close to it. Measured against a local cluster: a
+/// `read_file` of a 5 000 000-byte file of zeros answers `Content-Encoding:
+/// gzip` in **4 892 wire bytes**, and `ureq` 3.3 asked for `.limit(100_000)`
+/// on that same read hands back all 5 000 000 without an error — fifty times
+/// its limit. At that ratio a 512 MiB *wire* cap would admit hundreds of
+/// gigabytes into memory, which is the OOM the documentation used to promise
+/// could not happen.
+///
+/// So the cap is applied where the bytes accumulate: [`CapReader`] sits above
+/// the decoder and counts what comes out of it.
+///
+/// **It bounds what is held, not what a process needs.** The bytes land in a
+/// `Vec` that grows by doubling and copies as it grows, so the old buffer and
+/// the new one are both resident for the length of a copy — about 1.5× the cap
+/// where the allocator cannot extend in place. Measured here, in a release
+/// build, against a listener serving gzipped zeros: a read of 536 870 911 bytes
+/// peaks at **544 178 176** of resident set for the 512 MiB it hands back, and
+/// a 600 MiB read *refused* by this cap peaks at **611 385 344** — 1.14× the
+/// number the error quotes. So `512 MiB` is what this client will hold, not
+/// what to size a container for.
+///
+/// **It covers the two buffered reads and not the crate.** [`Transport::send`]
+/// and [`Transport::upload`] read through [`read_capped`]; two other places
+/// still take `ureq`'s wire-only default — the non-2xx branch of
+/// [`Transport::open`] and the `/hosts` lookup in [`Transport::fetch`] — and a
+/// gzipped body there is bounded on the wire, which is the ratio above all over
+/// again. Both read an answer this client is about to fail on, so neither is
+/// reached in the ordinary case; neither is bounded in memory either.
+const RESPONSE_LIMIT: u64 = 512 * 1024 * 1024;
+
 /// The commands that carry a data stream, and so belong on a heavy proxy.
 ///
 /// The
@@ -99,26 +147,27 @@ const MAX_REDIRECTS: usize = 10;
 /// text.
 ///
 /// The list is what the **cluster** declares heavy, not what this crate
-/// happens to model: `read_file` and `read_blob_table` have no method here and
-/// are reachable through
-/// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming) —
-/// which is how the documentation on that method reads a file — so leaving
-/// them out would take the advice away from exactly the caller who went to the
-/// trouble of streaming.
+/// happens to model: `read_blob_table` has no method here and is reachable
+/// through
+/// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming), so
+/// leaving it out would take the advice away from exactly the caller who went
+/// to the trouble of streaming. (`read_file` sat beside it until it grew
+/// [`Client::read_file`](crate::Client::read_file); its entry below predates
+/// the method and is unchanged by it.)
 ///
 /// Used for one thing only — whether a refused redirect is told to go to a
 /// heavy proxy. A command sent through
 /// [`Client::raw_command`](crate::Client::raw_command) that is heavy and not
 /// listed here loses the advice, not the refusal.
 ///
-/// **Merge marker.** `Repeatable` grows a `Heavy` variant on
-/// `feature/heavy-proxy-routing` (#38), which encodes the cluster's `isHeavy`
-/// bit for routing. The two lists say the same thing about the same commands
-/// and are written down twice, so **whoever merges that branch must check this
-/// list against every `Repeatable::Heavy` call site** and reconcile the two —
-/// a command routed to a heavy proxy but missing here is refused a redirect
-/// with `heavy: false`, and told nothing it can act on. There is no test to
-/// catch it from this side: `Repeatable::Heavy` does not exist on this branch.
+/// **The same fact is written down twice.** [`Repeatable::Heavy`] encodes the
+/// cluster's `isHeavy` bit for *routing* (#38, since merged), and this list
+/// encodes it for the redirect advice; they say the same thing about the same
+/// commands. A command routed to a heavy proxy but missing here is refused a
+/// redirect with `heavy: false` and told nothing it can act on, so a new
+/// `Repeatable::Heavy` call site must be checked against this list. The one
+/// entry that has no call site to check against is `read_blob_table`, and
+/// that is the point of the paragraph above.
 const HEAVY: &[&str] = &[
     "read_table",
     "write_table",
@@ -639,6 +688,17 @@ pub(crate) struct Transport {
     /// out between the redirect hops that attempt makes. Per-phase limit for
     /// streaming ones. See [`Transport::dispatch`].
     timeout: Duration,
+    /// How much of a buffered response this client will hold in memory:
+    /// [`RESPONSE_LIMIT`], counted after decompression.
+    ///
+    /// A field rather than the constant read at each of the places that need
+    /// it — [`Transport::send`] and [`Transport::upload`] — because a cap only
+    /// reachable by producing half a gigabyte is a cap no test reaches, and a
+    /// guard no test reaches can be deleted at any of them without anything
+    /// going red. It has one production value; the only thing that changes it
+    /// is `Transport::set_response_limit`, which does not exist outside
+    /// `cfg(test)` — and so does not exist in a rendered doc either.
+    response_limit: u64,
     /// Stamped onto every command, when the client is bound to a transaction.
     transaction: Option<String>,
     /// The `traceparent` header, when the client was given a trace to belong
@@ -703,6 +763,7 @@ impl Transport {
             token,
             retries,
             timeout,
+            response_limit: RESPONSE_LIMIT,
             transaction: None,
             trace: None,
             tracestate: None,
@@ -752,6 +813,21 @@ impl Transport {
     /// Overrides how old a `/hosts` answer may grow before it is refreshed.
     pub(crate) fn set_host_list_refresh_interval(&mut self, interval: Duration) {
         self.host_list_refresh = interval;
+    }
+
+    /// Lowers the buffered-response cap, so a test can reach it.
+    ///
+    /// [`RESPONSE_LIMIT`] is half a gigabyte: a test that had to produce one to
+    /// watch the guard work is a test that would not be written, and the guard
+    /// would go unpinned at every site that applies it — which is how
+    /// [`Transport::upload`]'s came to swallow the failure unnoticed.
+    ///
+    /// `#[cfg(test)]` rather than `pub(crate)`: the cap is not a knob, and
+    /// nothing outside a test may widen it. See [`RESPONSE_LIMIT`] for why the
+    /// number is the number.
+    #[cfg(test)]
+    pub(crate) fn set_response_limit(&mut self, limit: u64) {
+        self.response_limit = limit;
     }
 
     /// Drops what discovery resolved, because the rules it resolved under have
@@ -1204,6 +1280,9 @@ impl Transport {
     }
 
     /// One attempt, read into memory.
+    ///
+    /// The cap on what is held is [`Transport::response_limit`] — the whole of
+    /// why that is a field and not the constant read here.
     fn send(
         &self,
         base: &str,
@@ -1223,22 +1302,7 @@ impl Transport {
         let mut response = self.dispatch(base, method, command, parameters, body, false)?;
 
         let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .with_config()
-            // Responses are small (a table read is the exception, and a
-            // launcher reads results, not bulk data). The default cap is
-            // conservative enough to truncate a modest table silently.
-            .limit(512 * 1024 * 1024)
-            .read_to_vec()
-            // A `Transport` error, not `Decode`: a connection cut while the
-            // body streams in is the same network failure as one cut a packet
-            // earlier, and `Decode` is the one thing the retry policy never
-            // repeats.
-            .map_err(|e| ClientError::Transport {
-                command: command.to_owned(),
-                source: Box::new(e),
-            })?;
+        let body = read_capped(command, response.body_mut(), self.response_limit)?;
 
         if !(200..300).contains(&status) {
             return Err(ClientError::Http {
@@ -1350,12 +1414,22 @@ impl Transport {
             // small structured document today, but a raw command sends whatever
             // it was given, and lossily decoding a binary answer would be a
             // silent corruption rather than a refusal.
-            let body = response
-                .body_mut()
-                .with_config()
-                .limit(512 * 1024 * 1024)
-                .read_to_vec()
-                .unwrap_or_default();
+            let body = match read_capped(command, response.body_mut(), self.response_limit) {
+                Ok(body) => body,
+                // An answer this client will not hold is the one failure worth
+                // failing the write over. `raw_command_upload` hands this
+                // `Vec` back as *the answer*, so an empty one would be the
+                // same silent corruption reading it as a string would: a
+                // command that returned half a gigabyte reported as one that
+                // returned nothing.
+                Err(error @ ClientError::ResponseTooLarge { .. }) => return Err(error),
+                // Anything else is a cut or unreadable answer to a write whose
+                // status line already said it was done. A heavy command is
+                // sent once, so failing here fails a write that succeeded; the
+                // body is read for the connection's sake, and what it said is
+                // not worth that.
+                Err(_) => Vec::new(),
+            };
 
             if !(200..300).contains(&status) {
                 return Err(ClientError::Http {
@@ -2147,6 +2221,162 @@ fn refusal_hint(error: ClientError, why: &str) -> ClientError {
     }
 }
 
+/// The response cap, applied where the bytes actually accumulate.
+///
+/// `ureq`'s own `limit()` counts what arrives on the wire; this counts what
+/// comes out of the decoder, which is what is held. [`RESPONSE_LIMIT`] has the
+/// measurement that makes the difference a factor of a thousand rather than a
+/// technicality.
+///
+/// It reads one byte past what is left, so an overrun is *visible* without
+/// being kept, and fails with the same `ureq::Error::BodyExceedsLimit` the
+/// wire limit raises — so both arrive at [`body_failure`] as one case with one
+/// message.
+///
+/// **A body of exactly `limit` decoded bytes passes**, which is the other half
+/// of what this fixes. `ureq`'s `LimitReader` errors on the next `read` once
+/// its budget reaches zero, and `read_to_end` always makes that read to find
+/// the end, so the cap it enforced was "at least the limit" while the error
+/// said "larger than" it. The wire backstop has to leave room for that same
+/// body compressed, which is not the same number — see [`wire_budget`].
+struct CapReader<R> {
+    reader: R,
+    /// The cap, kept for the error; `left` is what is spent against it.
+    limit: u64,
+    left: u64,
+}
+
+impl<R> CapReader<R> {
+    fn new(reader: R, limit: u64) -> Self {
+        CapReader {
+            reader,
+            limit,
+            left: limit,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CapReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // One byte more than may be kept: enough to tell "ended exactly at the
+        // cap" from "ran past it" without a probe read of its own, and the
+        // byte itself is never returned to the caller.
+        let room = self.left.saturating_add(1).min(buf.len() as u64) as usize;
+        let read = self.reader.read(&mut buf[..room])?;
+
+        if read as u64 > self.left {
+            return Err(ureq::Error::BodyExceedsLimit(self.limit).into_io());
+        }
+
+        self.left -= read as u64;
+        Ok(read)
+    }
+}
+
+/// How many bytes `ureq` may transfer for a memory cap of `limit`.
+///
+/// The backstop, and it is not optional: [`CapReader`] counts what comes *out*
+/// of the decoder, so a stream that decodes to nothing never spends against it.
+/// An endless chunked body of empty deflate stored blocks — `00 00 00 ff ff`,
+/// repeated — makes `flate2` loop inside a single `read` producing no output,
+/// so `CapReader::read` is never re-entered and `left` never moves. With the
+/// wire limit removed, that read does not come back;
+/// `an_endless_body_that_decodes_to_nothing_is_still_bounded` is it with a
+/// deadline on it. `ureq`'s own limit sits underneath the decoder and counts
+/// transferred bytes, which is exactly the quantity such a stream does spend.
+///
+/// It cannot be `limit`, or even `limit + 1`. Deflate **expands** what it
+/// cannot compress: a body of exactly `limit` decoded bytes is the largest this
+/// client is documented to hand back, and gzipped it crosses the wire *larger*
+/// than that. Measured with `flate2` at 4 096 incompressible bytes: **4 119**
+/// on the wire, which a budget of 4 097 refuses — a response inside the
+/// documented ceiling turned away by a guard that exists to catch responses
+/// outside it.
+///
+/// So the budget is zlib's own `deflateBound` — `n + n/8 + n/64 + 5`, its bound
+/// for a deflate stream that compresses nothing — with 64 bytes covering the
+/// gzip wrapper's header and trailer (18) and the two bytes of rounding this
+/// gives up by shifting rather than dividing. At [`RESPONSE_LIMIT`] that is
+/// 612 368 448 wire bytes for 536 870 912 held, so the backstop still bounds
+/// the pathological stream at about 584 MiB of transfer.
+///
+/// It bounds a *conformant* encoder. One that expands past `deflateBound` — a
+/// dynamic Huffman block per byte, which nothing writes by accident — is
+/// refused, and refusing is the safe direction to be wrong in.
+fn wire_budget(limit: u64) -> u64 {
+    limit
+        .saturating_add(limit >> 3)
+        .saturating_add(limit >> 6)
+        .saturating_add(64)
+}
+
+/// Reads a buffered response body, capped at [`RESPONSE_LIMIT`]'s worth of
+/// *decoded* bytes.
+///
+/// Two guards, counting two different things. [`CapReader`] is the cap the
+/// caller is promised, and it sits above the decoder; the limit `ureq` is given
+/// is the backstop underneath it, and [`wire_budget`] is why the second is not
+/// simply the first.
+fn read_capped(command: &str, body: &mut ureq::Body, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let transferred = wire_budget(limit);
+    let mut reader = CapReader::new(body.with_config().limit(transferred).reader(), limit);
+
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| body_failure(command, limit, e.into()))?;
+
+    Ok(bytes)
+}
+
+/// Which error a buffered response body failed with, and whose fault it is.
+///
+/// Two failures arrive down the same road and mean opposite things.
+///
+/// A connection cut while the body streams in is the same network failure as
+/// one cut a packet earlier, so it stays a [`ClientError::Transport`]: worth
+/// waiting and repeating where the command allows it, and — for a heavy
+/// command — a fair reason to drop the host it went to.
+///
+/// A body that ran past the cap is neither, and left as a `Transport` it would
+/// be read as both. `ureq` reports it as `Error::BodyExceedsLimit`, which is
+/// not an `Io` error, so every predicate that narrows `Transport` by looking
+/// inside — [`crate::retry::is_retriable`], and through it
+/// [`crate::retry::worth_asking_again`] and
+/// [`crate::retry::attributable_to_the_host`] — answers `true` for it. The
+/// consequences are not this caller's alone: an over-cap
+/// [`Client::read_file`](crate::Client::read_file) would fail and take a
+/// **healthy** data proxy out of the pool for it; enough of them empty the
+/// pool, and the fallback window then answers unrelated *writes* with the
+/// control-proxy refusal [#30] exists to prevent. Nothing about that is the
+/// host's doing — it served the request perfectly — and no amount of waiting
+/// shrinks the file.
+///
+/// So it becomes a [`ClientError::ResponseTooLarge`]: settled, and about the
+/// request rather than the addressee. Never retried, never blamed on a host.
+///
+/// `limit` rather than the number `ureq` carries in `BodyExceedsLimit`,
+/// because the two are not the same: what `ureq` is asked to enforce is a
+/// transferred-byte backstop above the memory cap (see [`wire_budget`]), and
+/// the cap the caller needs told is this one.
+///
+/// [#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
+fn body_failure(command: &str, limit: u64, error: ureq::Error) -> ClientError {
+    if matches!(error, ureq::Error::BodyExceedsLimit(_)) {
+        return ClientError::ResponseTooLarge {
+            command: command.to_owned(),
+            limit,
+        };
+    }
+
+    ClientError::Transport {
+        command: command.to_owned(),
+        source: Box::new(error),
+    }
+}
+
 /// Names the proxy a routed command actually went to.
 ///
 /// `write_table: transport error: io: Connection refused` is a true report
@@ -2189,8 +2419,19 @@ fn routed_to(error: ClientError, base: &str) -> ClientError {
             command: command + &at,
             reason,
         },
-        // Nothing else carries a command to qualify: an `Io` names a local
-        // path, a `Config` names the build, and an `OperationFailed` is the
+        // `ResponseTooLarge` carries a command too, and is deliberately *not*
+        // qualified — which is why it is written out here rather than left to
+        // fall through. Its message offers the streaming half of the same
+        // command, and `error::streaming_advice` finds that half by matching
+        // the command name **exactly**: `read_file at n0132-sas.example.net`
+        // matches nothing, and the sentence saying what to do instead
+        // disappears. The host is not worth naming in any case — this failure
+        // is about the size of the answer, and the answer is exactly as large
+        // at the next proxy along. `a_response_too_large_keeps_the_way_past_it`
+        // fails if this arm is deleted.
+        error @ ClientError::ResponseTooLarge { .. } => error,
+        // Nothing else carries a command at all: an `Io` names a local path, a
+        // `Config` names the build, and an `OperationFailed` is the
         // scheduler's verdict rather than one proxy's.
         other => other,
     }
@@ -3985,6 +4226,114 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
     }
 
     #[test]
+    fn a_response_too_large_leaves_the_host_that_served_it_in_the_pool() {
+        // The predicate assertions in `the_cap_counts_…` say this one layer
+        // up; this is the consequence they stand for, watched happening. A
+        // pool of two, a `read_file` past the cap, and the question of whose
+        // fault it was.
+        let mut transport =
+            Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
+        transport.set_proxy_discovery(true);
+        let both = [
+            "https://n0132-sas.example.net".to_owned(),
+            "https://n0133-sas.example.net".to_owned(),
+        ];
+        let seed = |transport: &Transport| {
+            pooled(
+                transport,
+                &[
+                    "https://n0132-sas.example.net",
+                    "https://n0133-sas.example.net",
+                ],
+            );
+        };
+
+        // What this error was before it was classified: `ureq`'s
+        // `BodyExceedsLimit` inside a `Transport`. It is not an `Io` error, so
+        // `rejected_the_certificate` cannot narrow it, and the predicate says
+        // yes to a host that did nothing wrong.
+        seed(&transport);
+        let as_it_was: Result<()> = Err(ClientError::Transport {
+            command: "read_file".to_owned(),
+            source: Box::new(ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT)),
+        });
+        let _ = transport.after_heavy(
+            Repeatable::Heavy,
+            &discovered("https://n0132-sas.example.net"),
+            as_it_was,
+        );
+        assert_eq!(
+            pool_of(&transport).as_deref(),
+            Some(&["https://n0133-sas.example.net".to_owned()][..]),
+            "the old shape was supposed to evict the host — if it no longer \
+             does, the half of this test that follows has stopped proving \
+             anything"
+        );
+
+        // And what it is now. The host served the request perfectly, and the
+        // response will be exactly as large at the next proxy along.
+        seed(&transport);
+        let now: Result<()> = Err(body_failure(
+            "read_file",
+            RESPONSE_LIMIT,
+            ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT),
+        ));
+        let reported = transport.after_heavy(
+            Repeatable::Heavy,
+            &discovered("https://n0132-sas.example.net"),
+            now,
+        );
+
+        assert!(reported.is_err());
+        assert_eq!(
+            pool_of(&transport).as_deref(),
+            Some(&both[..]),
+            "a response too large to hold cost the pool a healthy data proxy"
+        );
+    }
+
+    #[test]
+    fn a_response_too_large_keeps_the_way_past_it() {
+        // `routed_to` names the proxy a routed command actually went to, by
+        // appending " at <host>" to the command. `ResponseTooLarge` is the one
+        // command-carrying error it leaves alone, and the coupling is easy to
+        // miss: the message offers the streaming half of the same command, and
+        // `error::streaming_advice` finds that half by matching the command
+        // name exactly — so decorating the name deletes the advice.
+        //
+        // Adding a `ResponseTooLarge` arm beside the others is what fails
+        // here, which is the point: an edit that decorates it uniformly should
+        // have to read this, rather than have a caller discover it after being
+        // told a file was too large and not told what to do instead.
+        let reported = routed_to(
+            body_failure(
+                "read_file",
+                RESPONSE_LIMIT,
+                ureq::Error::BodyExceedsLimit(0),
+            ),
+            "https://n0132-sas.example.net",
+        );
+
+        let message = reported.to_string();
+        assert!(message.contains("read_file_streaming"), "{message}");
+        assert!(!message.contains(" at n0132-sas"), "{message}");
+
+        // The neighbours it sits between are still decorated, so this is a
+        // deliberate exception rather than a `routed_to` that stopped working.
+        let neighbour = routed_to(
+            ClientError::Decode {
+                command: "read_file".to_owned(),
+                reason: "cut short".to_owned(),
+            },
+            "https://n0132-sas.example.net",
+        );
+        assert!(
+            neighbour.to_string().contains(" at n0132-sas"),
+            "{neighbour}"
+        );
+    }
+
+    #[test]
     fn a_pool_with_nobody_left_falls_back() {
         // The last host dropped is not a pool of zero to divide by — it is
         // the fallback state. That the fallback *ends* — the next heavy
@@ -4209,26 +4558,458 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         // Every command this crate itself sends heavily is here. `get_job_stderr`
         // was the one that was not, and it is the one a launcher reaches for
         // while it is already diagnosing a failure — the worst moment to be
-        // handed a refusal with no advice in it. See the merge marker on
-        // [`HEAVY`]: #38 writes the same fact down a second time.
+        // handed a refusal with no advice in it. See [`HEAVY`]:
+        // `Repeatable::Heavy` writes the same fact down a second time, and the
+        // two have to agree.
         for command in [
             "read_table",
             "write_table",
+            "read_file",
             "write_file",
             "get_job_input",
             "get_job_stderr",
         ] {
             assert!(HEAVY.contains(&command), "{command}");
         }
-        // And the ones reachable only through the raw door, which is the point
+        // And the one reachable only through the raw door, which is the point
         // of listing what the cluster calls heavy rather than what this crate
-        // models: the documentation on `raw_command_streaming` reads a file.
-        for command in ["read_file", "read_blob_table"] {
-            assert!(HEAVY.contains(&command), "{command}");
-        }
+        // models.
+        assert!(HEAVY.contains(&"read_blob_table"));
         for command in ["create", "exists", "start_operation", "get_job", "hosts"] {
             assert!(!HEAVY.contains(&command), "{command}");
         }
+    }
+
+    /// Serves one response carrying `payload`, and hands back the address to
+    /// send to.
+    ///
+    /// `gzip` chooses whether the bytes go out compressed, which is the whole
+    /// question these tests are about: compressed, the wire and the `Vec` are
+    /// different quantities, and it matters which one the cap counts.
+    ///
+    /// The listener is on its own thread and is dropped with it; nothing here
+    /// retries, so one accepted connection is the whole of its life.
+    fn serving(payload: &[u8], gzip: bool) -> String {
+        use std::io::Write;
+
+        let (encoding, body) = if gzip {
+            use flate2::{Compression, write::GzEncoder};
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(payload).expect("compresses");
+            (
+                "Content-Encoding: gzip\r\n",
+                encoder.finish().expect("finishes"),
+            )
+        } else {
+            ("", payload.to_vec())
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("has an address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
+            drain_request(&mut reader);
+
+            let mut reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 {encoding}Content-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            reply.extend_from_slice(&body);
+            stream.write_all(&reply).ok();
+            stream.flush().ok();
+        });
+
+        format!("http://{address}")
+    }
+
+    /// Serves a gzip body that never ends and decodes to nothing.
+    ///
+    /// The case the wire backstop is the only guard against, and the reason
+    /// [`wire_budget`] is not simply dropped now that the cap counts decoded
+    /// bytes. An empty deflate *stored* block is five bytes — `00 00 00 ff ff`
+    /// — and a stream of them makes `flate2` loop **inside a single `read`**,
+    /// consuming input and producing no output: [`CapReader`] is never
+    /// re-entered, so `left` never moves and a cap on decoded bytes is never
+    /// spent.
+    ///
+    /// Chunked, so there is no length to disagree with, and the thread writes
+    /// until the client stops listening.
+    fn serving_endless_empty_deflate() -> String {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("has an address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
+            drain_request(&mut reader);
+
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                      Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .is_err()
+            {
+                return;
+            }
+
+            // A well-formed gzip header, and then a member that is all framing
+            // and no content, for as long as anyone is reading.
+            let mut empty_blocks = Vec::new();
+            for _ in 0..256 {
+                empty_blocks.extend_from_slice(&[0x00, 0x00, 0x00, 0xff, 0xff]);
+            }
+            let mut payload = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+            payload.extend_from_slice(&empty_blocks);
+
+            loop {
+                let framed = format!("{:x}\r\n", payload.len());
+                if stream.write_all(framed.as_bytes()).is_err()
+                    || stream.write_all(&payload).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                    || stream.flush().is_err()
+                {
+                    return;
+                }
+                payload.clone_from(&empty_blocks);
+            }
+        });
+
+        format!("http://{address}")
+    }
+
+    /// Reads one whole request off `reader` — the head, and the body if it has
+    /// one.
+    ///
+    /// Not a parser, just enough of one to know when a request has ended.
+    /// `upload` is why the body half exists: its request *is* a stream, `ureq`
+    /// sends it chunked, and a listener that answered before reading it would
+    /// leave the client writing into a socket nobody is draining.
+    fn drain_request(reader: &mut impl std::io::BufRead) {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if line == "\r\n" => break,
+                Ok(_) => head.push_str(&line),
+            }
+        }
+
+        let header = |name: &str| {
+            head.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+        };
+
+        if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
+            // `<hex length>\r\n`, the bytes, `\r\n`; a length of zero ends it.
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let Ok(size) = usize::from_str_radix(line.trim(), 16) else {
+                    return;
+                };
+                let mut chunk = vec![0; size + 2];
+                if reader.read_exact(&mut chunk).is_err() || size == 0 {
+                    return;
+                }
+            }
+        }
+
+        if let Some(length) = header("content-length").and_then(|value| value.parse().ok()) {
+            let mut body = vec![0_u8; length];
+            let _ = reader.read_exact(&mut body);
+        }
+    }
+
+    /// `n` bytes gzip cannot shrink, the same `n` bytes every run.
+    ///
+    /// A xorshift rather than a constant, and that is the whole point:
+    /// `vec![7; 4096]` compresses to nothing, so a boundary test written on it
+    /// cannot see the case where the *wire* is larger than the `Vec` — which is
+    /// the case the wire backstop has to make room for.
+    fn incompressible(n: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// A transport that will hold `limit` decoded bytes and no more.
+    fn capped(base: &str, limit: u64) -> Transport {
+        let mut transport = Transport::new(base, None, Duration::from_secs(10));
+        transport.set_response_limit(limit);
+        transport
+    }
+
+    /// A `read_file` through the real `send`, capped at `limit` decoded bytes.
+    fn read_file_capped(base: &str, limit: u64) -> Result<Vec<u8>> {
+        capped(base, limit).send(
+            base,
+            Method::Get,
+            "read_file",
+            &map([("path", string("//tmp/f"))]),
+            &Payload::None,
+        )
+    }
+
+    /// A `write_table` through the real `upload`, capped the same way.
+    fn upload_capped(base: &str, limit: u64) -> Result<Vec<u8>> {
+        capped(base, limit).upload(
+            Method::Put,
+            "write_table",
+            &map([("path", string("//tmp/t"))]),
+            &mut std::io::empty(),
+        )
+    }
+
+    #[test]
+    fn the_cap_counts_the_bytes_held_and_not_the_bytes_transferred() {
+        // The claim the documentation makes, and the one it could not keep
+        // while `ureq`'s own `limit()` was the whole of the guard: that sits
+        // *under* the gzip decoder, so it bounds the wire and not the `Vec`.
+        // This body is 40 000 bytes of zeros — comfortably past a 4 096-byte
+        // cap, and small enough compressed that a cap on the wire would never
+        // notice it. Measured on a cluster the same way: a 5 000 000-byte file
+        // of zeros arrives in 4 892 bytes, and `ureq` asked to stop at 100 000
+        // hands back all five million.
+        let error = read_file_capped(&serving(&vec![0_u8; 40_000], true), 4_096)
+            .expect_err("the cap is reached");
+
+        assert!(
+            matches!(error, ClientError::ResponseTooLarge { limit: 4_096, .. }),
+            "{error:?}"
+        );
+
+        // Two mutations this fails. Reverting the call site to an inline
+        // `Transport { .. }` — the shape that was here — is the first, and it
+        // is not only a worse message: `BodyExceedsLimit` is not an `Io`
+        // error, so all three predicates that narrow a `Transport` by looking
+        // inside it wave it through. The read would be *retried*, and a heavy
+        // one would drop the host from the pool for serving the request
+        // perfectly. Enough of those empty the pool and the fallback window
+        // answers unrelated writes with the control proxy's refusal, which is
+        // #30 arriving from a caller who only asked for a large file.
+        assert!(!crate::retry::is_retriable(&error), "{error}");
+        assert!(!crate::retry::worth_asking_again(&error), "{error}");
+        assert!(!crate::retry::attributable_to_the_host(&error), "{error}");
+
+        // And it says both things the caller needs: how big is too big, and
+        // what to call instead. `transport error: the response body is larger
+        // than request limit: 536870912` said neither.
+        let message = error.to_string();
+        assert!(message.contains("4096"), "{message}");
+        assert!(message.contains("read_file_streaming"), "{message}");
+    }
+
+    #[test]
+    fn a_body_of_exactly_the_cap_is_not_over_it() {
+        // `ureq`'s `LimitReader` errors on the next `read` once its budget
+        // reaches zero, and `read_to_end` always makes that read to find the
+        // end — so the cap it enforces is one byte tighter than the error it
+        // raises says. A body of exactly the limit is not larger than it.
+        //
+        // This is `CapReader`'s half of the boundary and only its half: the
+        // payload compresses to nothing, so the wire guard is nowhere near
+        // deciding anything, and tightening `read` to `read as u64 >=
+        // self.left` is what fails here. The wire guard's own half — a body
+        // *larger* on the wire than in the `Vec` — is
+        // `the_wire_backstop_leaves_room_for_a_body_it_must_not_refuse`, two
+        // tests rather than one so that deleting either cannot quietly unpin
+        // both boundaries at once.
+        let held = read_file_capped(&serving(&vec![7_u8; 4_096], true), 4_096)
+            .unwrap_or_else(|e| panic!("fits exactly, but {e}"));
+        assert_eq!(held, vec![7_u8; 4_096]);
+
+        // And one byte more does not — either encoding, because either guard
+        // may be the one that notices.
+        for gzip in [true, false] {
+            let error = read_file_capped(&serving(&vec![7_u8; 4_097], gzip), 4_096)
+                .expect_err("one byte past the cap");
+            assert!(
+                matches!(error, ClientError::ResponseTooLarge { limit: 4_096, .. }),
+                "gzip={gzip}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wire_backstop_leaves_room_for_a_body_it_must_not_refuse() {
+        // The cap counts decoded bytes, so the backstop beneath the decoder
+        // has to admit whatever the largest permitted body weighs
+        // *compressed* — and compressed is not always smaller. Deflate expands
+        // what it cannot shrink, so a body of exactly the cap can cross the
+        // wire larger than the cap. Measured here with `flate2`: 4 096
+        // incompressible bytes gzip to 4 119, which a budget of `limit + 1`
+        // refuses — a response inside the documented ceiling turned away by
+        // the guard for responses outside it. See `wire_budget`.
+        let awkward = incompressible(4_096);
+        let compressed = {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&awkward).expect("compresses");
+            encoder.finish().expect("finishes").len()
+        };
+        assert!(
+            compressed > 4_096,
+            "this needs a body gzip makes bigger, and {compressed} is not one"
+        );
+
+        let held = read_file_capped(&serving(&awkward, true), 4_096)
+            .unwrap_or_else(|e| panic!("{compressed} wire bytes for 4096 held, and {e}"));
+        assert_eq!(held, awkward);
+
+        // And the plainer case the slack was first there for: with no encoding
+        // the two guards count the same bytes, and `ureq`'s errors on the read
+        // that finds the end. A budget of `limit` fails both halves of this.
+        let held = read_file_capped(&serving(&vec![7_u8; 4_096], false), 4_096)
+            .unwrap_or_else(|e| panic!("uncompressed and exactly the cap, but {e}"));
+        assert_eq!(held, vec![7_u8; 4_096]);
+    }
+
+    #[test]
+    fn an_endless_body_that_decodes_to_nothing_is_still_bounded() {
+        // Why the wire backstop stays now that the cap counts decoded bytes. A
+        // chunked stream of empty deflate stored blocks decodes to nothing at
+        // all, so `CapReader` never spends a byte of its budget — and `flate2`
+        // loops *inside* one `read`, so it is not even re-entered to notice.
+        // Only the limit under the decoder ends this.
+        //
+        // On its own thread with a deadline, because what this pins is not a
+        // wrong answer but no answer: without the backstop the read does not
+        // return, and a test that hangs is a test that says nothing.
+        let (done, answer) = std::sync::mpsc::channel();
+        let base = serving_endless_empty_deflate();
+        std::thread::spawn(move || {
+            let _ = done.send(read_file_capped(&base, 4_096));
+        });
+
+        let outcome = answer
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a body that never ends must still be refused, and was not");
+        let error = outcome.expect_err("nothing decoded, so there is nothing to hand back");
+        assert!(
+            matches!(error, ClientError::ResponseTooLarge { limit: 4_096, .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_cap_a_transport_is_built_with_is_the_documented_one() {
+        // `set_response_limit` is what lets every test around this one cost
+        // 4 KiB instead of half a gigabyte — and it is also what would let the
+        // cap quietly become something else, because a default of `u64::MAX`
+        // disables the guard crate-wide and leaves all of them passing. This
+        // is the one assertion that reads the number itself.
+        let transport = Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
+        assert_eq!(transport.response_limit, RESPONSE_LIMIT);
+        assert_eq!(RESPONSE_LIMIT, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_response_this_client_will_not_hold_fails_the_upload_that_got_it() {
+        // An upload reads its answer whatever the caller wants with it — a
+        // body left unread keeps the connection out of the pool — and every
+        // other way that read can fail is swallowed on purpose: the status
+        // line already said the write was done, a heavy command is sent once,
+        // and failing there would fail a write that succeeded.
+        //
+        // This one is not that. `raw_command_upload` hands the `Vec` back as
+        // *the answer*, so an answer too large to hold, swallowed, becomes a
+        // command that returned nothing — the silent corruption the cap exists
+        // to turn into a refusal. Making the arm `=> Vec::new()` is what fails
+        // here, and nothing else in the suite notices it.
+        let error = upload_capped(&serving(&vec![0_u8; 40_000], true), 4_096)
+            .expect_err("the answer is past the cap");
+
+        assert!(
+            matches!(error, ClientError::ResponseTooLarge { limit: 4_096, .. }),
+            "{error:?}"
+        );
+
+        // And an answer that fits is still handed back, so the refusal above
+        // is about the size of it and not about uploads.
+        let body = upload_capped(&serving(b"{\"value\"={}}", true), 4_096).expect("fits");
+        assert_eq!(body, b"{\"value\"={}}");
+    }
+
+    #[test]
+    fn a_body_over_the_cap_blames_the_request_and_not_the_proxy_that_served_it() {
+        // The message, per command, without a socket. Each buffered read
+        // points at its own streaming half, and a command that has none
+        // promises nothing.
+        let file = body_failure(
+            "read_file",
+            RESPONSE_LIMIT,
+            ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT),
+        )
+        .to_string();
+        assert!(file.contains("536870912"), "{file}");
+        assert!(file.contains("read_file_streaming"), "{file}");
+
+        let table = body_failure(
+            "read_table",
+            RESPONSE_LIMIT,
+            ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT),
+        )
+        .to_string();
+        assert!(table.contains("read_table_streaming"), "{table}");
+
+        let get = body_failure(
+            "get",
+            RESPONSE_LIMIT,
+            ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT),
+        )
+        .to_string();
+        assert!(!get.contains("streaming"), "{get}");
+
+        // The cap the caller is told is the one they can plan around, not the
+        // one `ureq` was handed — `read_capped` gives it a byte more so that a
+        // body of exactly the cap survives the wire guard too.
+        let quoted = body_failure(
+            "read_file",
+            RESPONSE_LIMIT,
+            ureq::Error::BodyExceedsLimit(RESPONSE_LIMIT + 1),
+        )
+        .to_string();
+        assert!(quoted.contains("536870912"), "{quoted}");
+    }
+
+    #[test]
+    fn a_body_cut_short_is_still_the_network_failure_it_always_was() {
+        // The other half, and the reason the split is a `match` rather than a
+        // blanket reclassification: a connection cut while the body streams in
+        // is the same failure as one cut a packet earlier, worth waiting for
+        // and — for a heavy command — worth trying another host for.
+        let error = body_failure(
+            "read_file",
+            RESPONSE_LIMIT,
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        );
+
+        assert!(matches!(error, ClientError::Transport { .. }), "{error:?}");
+        assert!(crate::retry::is_retriable(&error), "{error}");
+        assert!(crate::retry::attributable_to_the_host(&error), "{error}");
     }
 
     #[test]

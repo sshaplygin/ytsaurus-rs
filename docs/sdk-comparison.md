@@ -139,7 +139,7 @@ launcher-and-worker pattern depends on it.
 | `MultisetAttributes` | yes | yes | no |
 | `CreateObject` (accounts, users) | yes | yes | no |
 | Path: `append` | yes | yes | **yes** — `TablePath::new(p).append()` |
-| Path: columns, ranges, key bounds | `TRichYPath` | `ypath.Rich` | **no** |
+| Path: columns, ranges, key bounds | `TRichYPath` | `ypath.Rich` | **yes** — `TablePath::columns` / `::range`, `RowRange`, `Key`; a *write* with a read selection is refused locally, because the cluster silently ignores it there |
 | Dynamic value | `TNode` | `yson.RawValue` | `YsonValue` |
 | Read a node into a native type | protobuf/`TNode` | `GetNode(&out)` | **`get_as::<T>()`** |
 
@@ -152,7 +152,7 @@ launcher-and-worker pattern depends on it.
 | Schema validated before sending | no | no | **`TableSchema::validate()`** |
 | Whole table as typed rows in one call | no, loop a reader | no, loop a reader | **`read_table_rows` / `write_table_rows`** |
 | Streaming row cursor | `TTableReader<T>` | `TableReader.Next/Scan` | in `ytsaurus-job`, not the client |
-| Read a file back | `CreateFileReader` | `ReadFile` | **no — `write_file` has no counterpart** |
+| Read a file back | `CreateFileReader` | `ReadFile` | **yes — `read_file`, and `read_file_streaming` for one that does not fit** |
 | Partitioned reads | `GetTablePartitions` | `PartitionTables` | no |
 | Parallel reader | `library/parallel_io` | **no** | no |
 | Blob tables | `CreateBlobTableReader` | **no** | no |
@@ -242,24 +242,28 @@ Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
-two on that list are **now built**: logging and tracing — a `traceparent` the
-cluster joins, and an optional `tracing` feature — and the operation object and
-its lifecycle, which is what the table above came to. So are batch requests:
-`BatchRequest` and `Client::execute_batch`, per-part `Result`s with the C++
-client's `Concurrency` and `BatchPartMaxSize` options, plus one thing neither
-official client offers — a split batch that stops names the prefix it already
-applied, rather than reporting only the failure. What is left is `read_file`,
-read-side column and range selection, and transaction `Detach`.
+five on that list are **now built**: logging and tracing — a `traceparent` the
+cluster joins, and an optional `tracing` feature — the operation object and
+its lifecycle, which is what the table above came to, read-side column and
+range selection (`TablePath::columns` / `::range`), `read_file` with its
+streaming half (#10), and batch requests: `BatchRequest` and
+`Client::execute_batch`, per-part `Result`s with the C++ client's
+`Concurrency` and `BatchPartMaxSize` options, plus one thing neither official
+client offers — a split batch that stops names the prefix it already applied,
+rather than reporting only the failure. What is left is transaction `Detach`.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,
 and every entry above was unreachable even as a workaround. **That is now
 `Client::raw_command`** — with `raw_command_streaming` and
 `raw_command_upload` for the heavy shapes — so each remaining entry is a
-question of ergonomics rather than of capability. `read_file` is the clearest
-case: still not modelled, and reachable today as
-`raw_command_streaming(Method::Get, "read_file", …)`, which never holds more of
-the file than a buffer. See `cargo run -p ytsaurus-client --example raw`.
+question of ergonomics rather than of capability. `read_file` was the clearest
+case, reachable for a release only as
+`raw_command_streaming(Method::Get, "read_file", …)`: that is the door its
+methods grew out of — the wire shape was verified through it before it was
+modelled — and the `raw` example still reads a file that way, to show the door
+working on a command whose shape is known. See
+`cargo run -p ytsaurus-client --example raw`.
 
 Whether either official client offers the same door was not checked for this
 document, and it matters less to them: both model far more of the API, so the
