@@ -76,19 +76,67 @@
   namesakes send, plus a `raw` escape hatch. A builder is what lets the retry
   class be decided instead of guessed — see below — and what keeps a part
   from being a shape the cluster refuses: only light commands with `null` or
-  `structured` input and output can be parts at all.
+  `structured` input and output can be parts at all, and a `raw` part naming
+  one the cluster declares **heavy** — `write_table`, `read_file` and the rest
+  of that list — is refused where it is written rather than costing a round
+  trip and taking the *whole* batch down with it.
 
 - **Added** the two options both official clients expose:
   `with_concurrency`, the command's own server-side cap (“to avoid exhausting
   your request rate limit”, default 50 in the cluster's registration), and
   `with_max_part_size`, the C++ client's `BatchPartMaxSize` — a bigger batch
   is split into consecutive requests, `concurrency × 5` per request unless
-  told otherwise, results stitched back in part order. A request that fails
-  wholesale fails the call wholesale with the earlier requests already
-  applied, which is what the C++ client's `ExecuteBatch` does too; the C++
-  client also re-queues a *retriable part* client-side, and this one
+  told otherwise, results stitched back in part order. There is no rollback
+  across the requests, which is what the C++ client's `ExecuteBatch` does too;
+  the C++ client also re-queues a *retriable part* client-side, and this one
   deliberately does not — per-part errors are handed back for the caller to
   judge, and `docs/sdk-comparison.md` discloses the difference.
+
+- **Added** `ClientError::BatchInterrupted`, so a split batch that stops part
+  of the way through does not throw away the parts that already applied. The
+  loop used to return the failure and nothing else: five creates at two per
+  request, second request out of retries, and the caller got
+  `Http { status: 503 }` with no word of the two tables now on the cluster —
+  and no way to recover, because re-running the same `BatchRequest` mints
+  fresh mutation ids and applies the first two a second time. The error now
+  carries `answered` — one entry per part of every request that completed, in
+  part order, with the same per-part `Ok`/`Err` split the success path hands
+  back — beside `parts` and the `cause`. A batch that fits one request is
+  unchanged: there is no prefix, so the underlying error is returned as it
+  always was.
+
+  `answered` is what came **back**, which is deliberately not a claim about
+  what was *applied*. Measured on a local cluster: a request refused wholesale
+  can still have applied some of its parts — a `create` beside a part naming
+  an unknown command created its node even though the batch was answered
+  `Unknown command …` with no per-part results at all. The parts before
+  `answered.len()` are settled; the request that failed is unknown territory,
+  which is what a transaction is for.
+
+- **Added** `Client::execute_batch_with`, taking a caller-supplied
+  `MutationId` — the same guarantee `Client::raw_command_with` offers and the
+  one a single process cannot give itself: persist the id, and a batch
+  replayed after a crash is deduplicated against the send that may already
+  have happened. It was the one thing the feature's own headline safety claim
+  rested on and the API could not express. **Reproduced through this method**
+  on a local cluster: a two-`create` batch sent under an explicit id and again
+  under `id.as_retry()` answered the same two node ids, where a fresh id got
+  two `501 already exists`.
+
+  An id covers **one** request and a split batch with one is refused with
+  `ClientError::Config`: the cluster derives each part's id by incrementing
+  the batch's, so a second request under anything derived from the same id
+  would collide with the first request's parts and be answered with their
+  results.
+
+- **Added** `BatchRequest::raw_with`, taking the `Repeatable` its `Client`
+  namesake takes. `raw` hard-codes `Repeatable::Never`, and because a batch
+  retries as the most cautious of its parts, one raw **read** —
+  `check_permission`, `get_supported_features`, `parse_ypath` — demoted an
+  otherwise all-read batch to send-once. A caller who knows the command's
+  registry bits says so and keeps the retry. `Repeatable::Heavy` is refused:
+  it is not a class a part can have, since a heavy command cannot be a part
+  and a batch does not go to a heavy proxy.
 
 - **A mutating batch is retried under one mutation id, and that is safe
   because the cluster spreads it over the parts.** The driver hands part *k*
@@ -123,9 +171,10 @@
   created a node and asked `exists` about it in the same breath was answered
   `%false` — both parts succeeded, and the read simply ran first. A part and
   its consequence belong in two batches. Also measured: a part naming an
-  unknown command fails the **whole batch** (`Unknown command "frobnicate"`,
-  no per-part results), because the driver resolves the command before
-  per-part error handling begins.
+  unknown command fails the **whole batch** (HTTP 400, `Unknown command
+  "frobnicate"`, no per-part results), because the driver resolves the command
+  before per-part error handling begins — and the *other* parts of that
+  request had already reached the master, so the refusal is not a rollback.
 
 - The parser refuses what it does not recognise — a `results` count that
   does not match the parts, an item that is neither `{output=…}` nor
@@ -134,13 +183,37 @@
   were learned from `exists` answering under `value`; the paranoia is paid
   for.
 
+  **And the empty map is only for the commands that can answer with one.**
+  `{}` means the driver wrote no `output` key, which it does only where the
+  command's registered output type is `Null` — `set` and `remove` here. It
+  used to be accepted for every command, so a cluster or proxy answering `{}`
+  to a `create` passed the parser as a success with nothing in it, and
+  `answer["node_id"]` — the access this crate teaches, in the rustdoc, in the
+  example and in the tests — then **panicked** in caller code one frame away.
+  A structured-output part is now held to an `output`, and only a `raw` part,
+  whose registry bits only its caller knows, is still taken as it comes.
+
+- **A batch is the crate's first light command with a body**, so a
+  cross-origin redirect on one is refused with `RedirectRefusal::Payload`
+  where the same creates sent individually are bodiless POSTs the rule
+  deliberately lets through. Narrow — a client with a token is refused a
+  cross-origin hop anyway — but a tokenless client behind a balancer that
+  canonicalises to another origin finds batching breaks what individual calls
+  did. Documented on `execute_batch`, where a caller meets it.
+
   Verified end to end on a local cluster by
-  `cargo run -p ytsaurus-client --example batch`: twelve creates in one
-  round trip and every node there afterwards, the one-fails-rest-succeed
-  batch, a split batch with a failure kept at its own index, and a batch
-  inside a transaction invisible until the commit. The wire shape — verb,
-  body, mutation id repeated across a retry and absent from a read-only
-  batch — is pinned by `tests/batch.rs` against an in-process stub.
+  `cargo run -p ytsaurus-client --example batch`: twelve creates in one batch
+  and every node there afterwards, the one-fails-rest-succeed batch, a split
+  batch with a failure kept at its own index, a split batch stopped
+  mid-sequence reporting the two parts that had applied, one mutation id
+  replayed for the same two node ids, and a batch inside a transaction
+  invisible until the commit. The **round trip** itself is not something a
+  program on a cluster can see, so the example no longer claims it: it is
+  pinned by `tests/batch.rs` against an in-process socket that counts, and
+  measured once through a counting TCP relay at **1** request and 9.16 ms
+  against 140.77 ms for twelve individual calls. The wire shape — verb, body,
+  the mutation id repeated across a retry, absent from a read-only batch and
+  the caller's own when there is one — is pinned by the same file.
 
 ### A cache that refuses you, and the upload that goes anyway
 

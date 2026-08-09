@@ -128,6 +128,19 @@ const HEAVY: &[&str] = &[
     "get_job_input",
     "get_job_stderr",
 ];
+
+/// Whether `command` is one the cluster declares heavy.
+///
+/// Read by [`BatchRequest::raw`](crate::BatchRequest::raw) as well as by the
+/// redirect advice: *"only light commands"* may be batch parts, so a heavy
+/// name is refused where the batch is built rather than costing a round trip
+/// and taking the **whole** batch down with it. The list is the same list, for
+/// the same reason the transaction one is read from two places — two copies
+/// would drift.
+pub(crate) fn is_heavy(command: &str) -> bool {
+    HEAVY.contains(&command)
+}
+
 /// The W3C trace context, in the spelling the proxy parses. See
 /// [`TraceContext`](crate::TraceContext).
 const TRACEPARENT: &str = "traceparent";
@@ -1705,7 +1718,7 @@ impl Transport {
                 status: status.as_u16(),
                 location: target.clone(),
                 refusal,
-                heavy: HEAVY.contains(&command),
+                heavy: is_heavy(command),
             })
         };
 

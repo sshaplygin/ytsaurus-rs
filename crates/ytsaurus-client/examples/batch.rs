@@ -8,10 +8,21 @@
 //! export YT_PROXY=http://localhost:8000
 //! cargo run -p ytsaurus-client --example batch
 //! ```
+//!
+//! **The round trip itself is not something this program can see.** It checks
+//! what the cluster did — every table there, every answer at its own index,
+//! the transaction invisible until the commit — but "one request" is a fact
+//! about the wire, and a client on a cluster has no way to count what it sent.
+//! `a_dozen_creates_are_one_request` in `tests/batch.rs` is where that claim is
+//! checked, against a socket in-process that counts. Measured there and once by
+//! hand through a counting TCP relay: **1** request, 9.16 ms, against 140.77 ms
+//! for the same twelve creates sent one at a time.
 
 use std::process::ExitCode;
 
-use ytsaurus_client::{BatchRequest, Client, ClientError, Column, ColumnType, TableSchema};
+use ytsaurus_client::{
+    BatchRequest, Client, ClientError, Column, ColumnType, MutationId, TableSchema,
+};
 
 /// Where the demo keeps its tree.
 const BASE: &str = "//tmp/ytsaurus_rs_batch";
@@ -33,7 +44,7 @@ fn run() -> Result<(), ClientError> {
     let client = Client::from_env()?;
     client.remove_tree(BASE)?;
 
-    step("A dozen tables in one round trip");
+    step("A dozen tables in one batch");
     let mut creates = BatchRequest::new();
     for index in 0..TABLES {
         creates.create("table", &table(index));
@@ -123,6 +134,92 @@ fn run() -> Result<(), ClientError> {
             }),
     )?;
 
+    step("A split batch that stops says which parts already applied");
+    // A part naming a command the cluster has never heard of fails the *whole*
+    // request — so putting one in the second chunk of a split batch is a
+    // mid-sequence failure with the first chunk already committed. There is no
+    // rollback, and the error carries the prefix rather than losing it.
+    let mut stopping = BatchRequest::new().with_max_part_size(2);
+    stopping
+        .create("table", &format!("{BASE}/applied0"))
+        .create("table", &format!("{BASE}/applied1"))
+        .create("table", &format!("{BASE}/never"));
+    stopping
+        .raw("frobnicate", ytsaurus_client::yson_build::empty_map(), None)
+        .expect("a fine command name, and no command at all");
+
+    let stopped = client
+        .execute_batch(&stopping)
+        .expect_err("the second request named a command the cluster refuses");
+    let ClientError::BatchInterrupted {
+        answered,
+        parts,
+        cause,
+    } = &stopped
+    else {
+        return Err(ClientError::Config(format!(
+            "a stopped split batch must carry its prefix, not just: {stopped}"
+        )));
+    };
+    check(
+        &format!(
+            "the batch stopped after {} of {parts} parts: {cause}",
+            answered.len()
+        ),
+        *parts == 4 && answered.len() == 2 && answered.iter().all(|part| part.is_ok()),
+    )?;
+    check(
+        "the parts it did answer for are on the cluster — nothing rolled back",
+        client.exists(&format!("{BASE}/applied0"))?
+            && client.exists(&format!("{BASE}/applied1"))?,
+    )?;
+    // And the sharper half, which is why `answered` reports what came *back*
+    // rather than claiming what was applied: the request that failed is not a
+    // no-op either. The parts of it the driver could resolve ran before the
+    // unknown name threw, so a create sitting beside `frobnicate` lands even
+    // though the batch is refused with no per-part results at all. Reported,
+    // not asserted: it is the cluster's behaviour today, and a version that
+    // stopped doing it would be a fix rather than a regression.
+    done(&format!(
+        "the create beside the unknown command {} — a refused request is not a no-op",
+        if client.exists(&format!("{BASE}/never"))? {
+            "landed anyway"
+        } else {
+            "did not land on this cluster"
+        }
+    ));
+
+    step("One mutation id, replayed, is answered with the first result");
+    // The guarantee a single process cannot give itself: persist the id, and
+    // after a crash the same batch is deduplicated rather than applied twice.
+    // `create_table` deliberately omits `ignore_existing`, so a second send
+    // that was *not* recognised as a replay fails — which is what makes the
+    // identical node ids below mean something.
+    let replayed: Vec<String> = ["replay0", "replay1"]
+        .iter()
+        .map(|name| format!("{BASE}/{name}"))
+        .collect();
+    let mut once_and_again = BatchRequest::new();
+    for path in &replayed {
+        once_and_again.create_table(path, &schema)?;
+    }
+
+    let id = MutationId::new();
+    let first = node_ids(client.execute_batch_with(&once_and_again, Some(&id))?)?;
+    let again = node_ids(client.execute_batch_with(&once_and_again, Some(&id.as_retry()))?)?;
+    check(
+        &format!("the replay answered with the same node ids: {first:?}"),
+        first == again,
+    )?;
+
+    let fresh = client.execute_batch_with(&once_and_again, Some(&MutationId::new()))?;
+    check(
+        "and the same batch under a fresh id is refused, as a second create is",
+        fresh
+            .iter()
+            .all(|part| matches!(part, Err(ClientError::Cluster { code: 501, .. }))),
+    )?;
+
     step("A batch inside a transaction is invisible until the commit");
     let tx = client.start_transaction()?;
     let mut staged = BatchRequest::new();
@@ -150,6 +247,27 @@ fn run() -> Result<(), ClientError> {
 /// The `index`-th table of the demo.
 fn table(index: usize) -> String {
     format!("{BASE}/t{index}")
+}
+
+/// The node ids of a batch of creates, in part order — every part an `Ok`
+/// answering under `node_id`, or the whole thing is a failure worth reporting.
+fn node_ids(
+    parts: Vec<Result<ytsaurus_yson::YsonValue, ClientError>>,
+) -> Result<Vec<String>, ClientError> {
+    parts
+        .iter()
+        .map(|part| {
+            let answer = part
+                .as_ref()
+                .map_err(|e| ClientError::Config(format!("a create in the replay failed: {e}")))?;
+            answer["node_id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    ClientError::Config(format!("a create answered without a node id: {answer:?}"))
+                })
+        })
+        .collect()
 }
 
 fn step(what: &str) {

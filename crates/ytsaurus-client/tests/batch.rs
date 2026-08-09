@@ -14,12 +14,12 @@
 //! bare or quoted depending on its first hex digit, so every assertion here
 //! decodes the YSON and compares values.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ytsaurus_client::{BatchRequest, Client, ClientError, RetryPolicy, yson_build};
+use ytsaurus_client::{BatchRequest, Client, ClientError, MutationId, RetryPolicy, yson_build};
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
 /// One captured request: the head as text, the body as bytes.
@@ -100,13 +100,9 @@ fn serve(
         }
 
         // The whole body first — see the type-level comment.
-        let mut body = Vec::new();
-        if let Some(length) = content_length(&head) {
-            body = vec![0_u8; length];
-            if reader.read_exact(&mut body).is_err() {
-                return;
-            }
-        }
+        let Some(body) = read_body(&head, &mut reader) else {
+            return;
+        };
 
         seen.lock()
             .expect("nothing panicked holding it")
@@ -130,28 +126,59 @@ fn serve(
     }
 }
 
+/// Reads a request body to its end, however the head said it was framed.
+///
+/// `None` means the connection died mid-body and there is nothing to answer.
+///
+/// Both framings, though `execute_batch` only ever sends the first: it renders
+/// the whole batch before sending, so the body is always `Payload::Bytes` and
+/// always declares a `Content-Length`. Reading only that one would make a
+/// chunked body silently arrive empty and be answered early — the failure the
+/// type-level comment says closes the connection under `ureq` and reports a
+/// broken pipe instead of the request under test. The proxy takes a chunked
+/// body (see the streaming rule in AGENTS.md), so this is the shape a future
+/// batch could grow, and a stub that could not read it would fail confusingly
+/// rather than usefully.
+fn read_body(head: &str, reader: &mut impl BufRead) -> Option<Vec<u8>> {
+    if header(head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        let mut body = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            let size = usize::from_str_radix(line.trim().split(';').next()?, 16).ok()?;
+            let mut chunk = vec![0_u8; size + 2]; // the chunk, then CRLF
+            reader.read_exact(&mut chunk).ok()?;
+            if size == 0 {
+                return Some(body);
+            }
+            body.extend_from_slice(&chunk[..size]);
+        }
+    }
+
+    let mut body = vec![0_u8; content_length(head).unwrap_or(0)];
+    reader.read_exact(&mut body).ok()?;
+    Some(body)
+}
+
+/// One header of a captured request head, lowercased for matching.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
 /// The declared body length of a request, if it declared one.
 fn content_length(head: &str) -> Option<usize> {
-    head.lines()
-        .find(|line| line.to_lowercase().starts_with("content-length:"))
-        .and_then(|line| line.split(':').nth(1))
-        .and_then(|value| value.trim().parse().ok())
+    header(head, "content-length").and_then(|value| value.parse().ok())
 }
 
 /// The `X-YT-Parameters` header of a captured request, decoded.
 fn header_parameters(head: &str) -> YsonValue {
-    let line = head
-        .lines()
-        .find(|line| {
-            line.split_once(':')
-                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("x-yt-parameters"))
-        })
+    let value = header(head, "x-yt-parameters")
         .unwrap_or_else(|| panic!("no X-YT-Parameters header in:\n{head}"));
-    let value = line
-        .split_once(':')
-        .expect("the header has a value")
-        .1
-        .trim();
     from_slice(value.as_bytes(), YsonFormat::Text)
         .unwrap_or_else(|e| panic!("parameters are not text YSON ({e}): {value}"))
 }
@@ -194,6 +221,31 @@ fn results(items: &[&str]) -> (u16, Vec<u8>) {
 /// doing and not the policy's.
 fn once(stub: &Stub) -> Client {
     Client::new(&stub.url()).with_retries(RetryPolicy::none())
+}
+
+#[test]
+fn the_stub_reads_a_body_however_it_is_framed() {
+    // The stub answers only once the whole request is in, and until now
+    // "whole" meant whatever `Content-Length` said. `execute_batch` always
+    // sends that shape, so a chunked body would have arrived empty and been
+    // answered early — a broken pipe in place of the request under test.
+    // Neither framing is guessed at now, and this is what proves it.
+    let head = "POST /api/v4/execute_batch HTTP/1.1\r\nContent-Length: 5\r\n";
+    assert_eq!(
+        read_body(head, &mut &b"hello and then some"[..]),
+        Some(b"hello".to_vec())
+    );
+
+    let head = "POST /api/v4/execute_batch HTTP/1.1\r\nTransfer-Encoding: chunked\r\n";
+    assert_eq!(
+        read_body(head, &mut &b"5\r\nhello\r\n3\r\n th\r\n0\r\n\r\n"[..]),
+        Some(b"hello th".to_vec()),
+        "the terminating zero chunk ends the body, and no more is read"
+    );
+
+    // No framing at all is a bodiless request, not a read that blocks.
+    let head = "GET /api/v4/get HTTP/1.1\r\n";
+    assert_eq!(read_body(head, &mut &b""[..]), Some(Vec::new()));
 }
 
 #[test]
@@ -549,6 +601,10 @@ fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
         .collect();
     assert_ne!(ids[0], ids[1]);
     assert_ne!(ids[1], ids[2]);
+    // Pairwise-adjacent is not distinct: three ids of A, B, A would pass the
+    // two above and still deduplicate the third request into the first's
+    // answer.
+    assert_ne!(ids[0], ids[2]);
 
     // Stitched back in part order, failure and all.
     assert_eq!(parts.len(), 5);
@@ -562,6 +618,195 @@ fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
             );
         }
     }
+}
+
+#[test]
+fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
+    // The failure the split makes possible and no rollback undoes: chunk one
+    // commits, chunk two exhausts itself on a 503. Reporting only the 503
+    // would tell the caller nothing about the two tables that now exist —
+    // and re-running the batch is not a recovery, because a second execution
+    // mints fresh mutation ids and the parts land a second time.
+    let stub = Stub::serving(vec![
+        results(&[
+            r#"{"output"={"node_id"="0-0-0-0"}}"#,
+            r#"{"output"={"node_id"="0-0-0-1"}}"#,
+        ]),
+        (503, Vec::new()),
+    ]);
+
+    let mut batch = BatchRequest::new().with_max_part_size(2);
+    for index in 0..5 {
+        batch.create("table", &format!("//tmp/t{index}"));
+    }
+
+    let error = once(&stub)
+        .execute_batch(&batch)
+        .expect_err("the second request failed");
+
+    let ClientError::BatchInterrupted {
+        answered,
+        parts,
+        cause,
+    } = &error
+    else {
+        panic!("a stopped split batch must carry its prefix: {error:?}");
+    };
+
+    assert_eq!(*parts, 5, "the batch held five parts");
+    assert_eq!(answered.len(), 2, "one request's worth had been answered");
+    for (index, part) in answered.iter().enumerate() {
+        assert_eq!(
+            part.as_ref().expect("created")["node_id"].as_str(),
+            Some(format!("0-0-0-{index}").as_str()),
+            "the prefix keeps the parts' own answers"
+        );
+    }
+    assert!(
+        matches!(**cause, ClientError::Http { status: 503, .. }),
+        "{cause:?}"
+    );
+    // The message says both halves: where it stopped, and why.
+    let said = error.to_string();
+    assert!(said.contains("2 of 5"), "{said}");
+    assert!(said.contains("503"), "{said}");
+
+    // The third request was never sent — this is a stop, not a skip.
+    assert_eq!(stub.seen().len(), 2);
+
+    // And a batch that fits one request keeps the plain error: there is no
+    // prefix to report, so there is nothing to wrap.
+    let stub = Stub::serving(vec![(503, Vec::new())]);
+    let mut single = BatchRequest::new();
+    single.create("table", "//tmp/t");
+    let error = once(&stub)
+        .execute_batch(&single)
+        .expect_err("the only request failed");
+    assert!(
+        matches!(error, ClientError::Http { status: 503, .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_dozen_creates_are_one_request() {
+    // The example's headline claim — "a dozen tables in one round trip" — is
+    // a wire fact, and a program on a cluster cannot see it. This can: the
+    // default part size is the C++ client's concurrency × 5, so a dozen parts
+    // are nowhere near a split, and the stub counts what arrived.
+    let answers = vec![r#"{"output"={"node_id"="0-0-0-0"}}"#; 12];
+    let stub = Stub::serving(vec![results(&answers)]);
+
+    let mut batch = BatchRequest::new();
+    for index in 0..12 {
+        batch.create("table", &format!("//tmp/ytsaurus_rs_batch/t{index}"));
+    }
+
+    let made = once(&stub).execute_batch(&batch).expect("executes");
+    assert_eq!(made.len(), 12, "twelve parts, twelve answers");
+
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 1, "twelve commands, one round trip");
+    assert_eq!(requests_of(&body_document(&seen[0].1)).len(), 12);
+}
+
+#[test]
+fn a_caller_supplied_mutation_id_is_the_one_that_goes_out() {
+    // The crash-replay guarantee, expressible through the batch API rather
+    // than only through `raw_command_with`: persist the id, and the replay is
+    // deduplicated against the send that may already have landed.
+    let stub = Stub::serving(vec![results(&[r#"{"output"={"node_id"="1-2-3-4"}}"#])]);
+
+    let mut batch = BatchRequest::new();
+    batch.create("table", "//tmp/t");
+
+    let id = MutationId::new();
+    let client = once(&stub);
+    client
+        .execute_batch_with(&batch, Some(&id))
+        .expect("executes");
+    client
+        .execute_batch_with(&batch, Some(&id.as_retry()))
+        .expect("executes");
+
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 2);
+    for (head, _) in &seen {
+        assert_eq!(
+            field(&header_parameters(head), "mutation_id").and_then(YsonValue::as_str),
+            Some(id.as_str()),
+            "the caller's id is what went on the wire:\n{head}"
+        );
+    }
+    // The first send is not a replay and the second says that it is — an
+    // unmarked duplicate is refused rather than deduplicated.
+    assert_eq!(
+        field(&header_parameters(&seen[0].0), "retry").map(|v| &v.node),
+        Some(&YsonNode::Boolean(false))
+    );
+    assert_eq!(
+        field(&header_parameters(&seen[1].0), "retry").map(|v| &v.node),
+        Some(&YsonNode::Boolean(true))
+    );
+
+    // An id would be a lie across a split: the cluster derives each part's id
+    // by incrementing the batch's, so a second request under the same id
+    // collides with the first request's parts. Refused before anything is
+    // sent — nothing listens on this address.
+    let mut split = BatchRequest::new().with_max_part_size(1);
+    split.create("table", "//tmp/a").create("table", "//tmp/b");
+    let error = Client::new("http://127.0.0.1:1")
+        .with_retries(RetryPolicy::none())
+        .execute_batch_with(&split, Some(&MutationId::new()))
+        .expect_err("one id cannot cover two requests");
+    assert!(matches!(error, ClientError::Config(_)), "{error:?}");
+    assert!(error.to_string().contains("with_max_part_size"), "{error}");
+}
+
+#[test]
+fn a_raw_read_a_caller_vouches_for_leaves_the_batch_retriable() {
+    // `raw` alone means send-once, and one raw part decides the whole batch —
+    // so an all-read batch with a `check_permission` in it was demoted to a
+    // single attempt. A caller who knows the command's registry bits says so,
+    // and the batch is retried like the reads it is made of. The 503 here is
+    // retriable, so a send-once batch shows up as one request and a `Freely`
+    // one as two.
+    let stub = Stub::serving(vec![
+        (503, Vec::new()),
+        results(&[
+            r#"{"output"={"value"=%true}}"#,
+            r#"{"output"={"action"="allow"}}"#,
+        ]),
+    ]);
+
+    let mut batch = BatchRequest::new();
+    batch.exists("//tmp/t");
+    batch
+        .raw_with(
+            "check_permission",
+            yson_build::map([
+                ("user", yson_build::string("root")),
+                ("path", yson_build::string("//tmp/t")),
+                ("permission", yson_build::string("read")),
+            ]),
+            None,
+            ytsaurus_client::Repeatable::Freely,
+        )
+        .expect("a fine command name");
+
+    let parts = Client::new(&stub.url())
+        .with_retries(RetryPolicy::new(2, Duration::ZERO, Duration::ZERO))
+        .execute_batch(&batch)
+        .expect("the second attempt succeeded");
+    assert_eq!(parts.len(), 2);
+    assert!(parts.iter().all(Result::is_ok), "{parts:?}");
+
+    assert_eq!(stub.seen().len(), 2, "the batch is a read and was retried");
+
+    // Still no mutation id: nothing here mutates, so there is nothing for one
+    // to deduplicate.
+    let sent = header_parameters(&stub.seen()[0].0);
+    assert!(field(&sent, "mutation_id").is_none());
 }
 
 #[test]

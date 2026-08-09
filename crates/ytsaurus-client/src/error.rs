@@ -110,6 +110,46 @@ pub enum ClientError {
         reason: String,
     },
 
+    /// A split batch stopped part of the way through, and the requests before
+    /// the failure are **already applied on the cluster**.
+    ///
+    /// [`Client::execute_batch`](crate::Client::execute_batch) sends a batch
+    /// larger than [`BatchRequest::with_max_part_size`](crate::BatchRequest::with_max_part_size)
+    /// as several `execute_batch` requests. There is no rollback: when a later
+    /// request fails wholesale, the earlier ones have run and their parts have
+    /// taken effect. Reporting only the failure would hide that, and re-running
+    /// the same [`BatchRequest`](crate::BatchRequest) is not a recovery either
+    /// — a second execution mints fresh mutation ids, so the parts that already
+    /// landed are applied a second time rather than deduplicated.
+    ///
+    /// So the prefix comes back with the failure: `answered` holds one entry
+    /// per part of every request that completed, in part order, with exactly
+    /// the per-part `Ok`/`Err` split [`Client::execute_batch`](crate::Client::execute_batch)
+    /// would have handed back. `answered.len()` is where the batch stopped, and
+    /// `parts` is how many there were, so the parts never attempted are
+    /// `batch[answered.len()..]`.
+    ///
+    /// Only for a batch that **was** split: a batch that fits in one request
+    /// fails with the underlying error itself, since there is no prefix to
+    /// report. Put the sequence in a transaction, or keep it inside one
+    /// request, if a partial application is not something the caller can act
+    /// on.
+    #[error(
+        "execute_batch: the batch stopped after {} of {parts} parts, which are already \
+         applied on the cluster: {cause}",
+        .answered.len()
+    )]
+    BatchInterrupted {
+        /// The parts already answered, in part order — every part of every
+        /// request that completed, `Ok` and `Err` alike.
+        answered: Vec<Result<ytsaurus_yson::YsonValue>>,
+        /// How many parts the batch held in all.
+        parts: usize,
+        /// Why the rest never went.
+        #[source]
+        cause: Box<ClientError>,
+    },
+
     /// Reading a local file failed.
     #[error("reading {path}: {source}")]
     Io {

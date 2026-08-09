@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 618 tests
+cargo test --workspace            # 661 tests: 594 unit and integration, 67 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -778,6 +778,57 @@ and the documentation disagreed and the source is what settles it.
   of that request queues forever instead. Hence the deadline on `lock_waiting`.
 - `unlock` exists and is not modelled: its rules about a transaction that has
   already modified the node were not verified here.
+
+### Batched commands
+
+`execute_batch` sends several light commands in one request — `BatchRequest` +
+`Client::execute_batch`, exercised by
+`cargo run -p ytsaurus-client --example batch`. All of the following was watched
+on the local cluster, not read:
+
+- **The saving is real and it is the whole point.** Twelve `create`s went as
+  **one** request in **9.16 ms**, against **140.77 ms** for the same twelve sent
+  one at a time — measured through a counting TCP relay in front of the proxy,
+  because a client has no way to count its own round trips. `tests/batch.rs`
+  pins the count against an in-process socket; a program on a cluster cannot,
+  which is why the example does not claim it.
+- **An envelope `transaction_id` is silently dropped.** `TExecuteBatchOptions :
+  TMutatingOptions` has no transactional half, so a batch stamped with one
+  created its node **outside** the transaction — visible at once, untouched by
+  the abort. The silent escape a transaction exists to prevent. The client
+  stamps each **part** instead, which the cluster honours, and `execute_batch`
+  is on the `NO_TRANSACTION` list so the blanket stamp cannot dress the envelope
+  up in a parameter known to mean nothing.
+- **A part naming an unknown command fails the whole batch** — HTTP 400,
+  `Unknown command "frobnicate"`, and **no per-part results at all**, because
+  the driver resolves each command's descriptor before per-part error handling
+  begins (`TRequestExecutor::Run` throws first).
+- **…and that refused batch is not a batch that did nothing.** A `create`
+  sitting beside the `frobnicate` in the *same* request **still created its
+  node**. The parts run in parallel, and the ones the driver could resolve had
+  already reached the master when the unknown name threw. So a wholesale failure
+  says nothing about what was applied, and there are no per-part results to ask
+  — which is why `Client::execute_batch` reports the prefix it was *answered*
+  for and does not claim to know what landed.
+- **Parts run in parallel, and the documentation means it.** A batch that
+  created a node and asked `exists` about it in the same breath was answered
+  `%false`: both parts succeeded, and the read simply ran first. A part and its
+  consequence belong in two batches.
+- **A batch replayed under one mutation id is deduplicated per part.** The
+  driver hands part *k* the batch's id plus *k*
+  (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`) and stamps the
+  batch's `retry` flag into every volatile part. A two-`create` batch sent under
+  an explicit id and then again under `id.as_retry()` answered the **same two
+  node ids**; the same batch under a fresh id got two `501 already exists`.
+  Reproduced through `Client::execute_batch_with`. One id covers **one**
+  request, though: because the per-part ids are derived by incrementing, a
+  second request under anything derived from the same id would collide with the
+  first request's parts, so a split batch carrying a caller's id is refused.
+- **A `set` part answers `{output={}}` under API v4**, not the bare `{}` the
+  command reference's example shows. Both are accepted, but only for the
+  commands whose registered output type is `Null` — a `create` answering `{}` is
+  refused, because reading it as an empty success hands the caller a map with no
+  `node_id` in it and `YsonValue`'s `Index` panics on the next line.
 
 ### Control records
 

@@ -54,11 +54,42 @@ enum PartKind {
     /// own, and the master answers a marked replay with the first response.
     /// See [`Client::execute_batch`](crate::Client::execute_batch).
     MasterMutation,
-    /// A command this crate does not model. It may be mutating somewhere no
+    /// A command nobody has classified. It may be mutating somewhere no
     /// mutation cache covers — the scheduler, say — so a batch carrying one is
     /// sent once, exactly as [`Client::raw_command`](crate::Client::raw_command)
     /// is and for the same reason.
+    ///
+    /// Where a [`BatchRequest::raw`] part lands by default. A caller who knows
+    /// the command's registry bits says so with [`BatchRequest::raw_with`],
+    /// and the part is then one of the two above — the *retry* class is the
+    /// cluster's fact about the command, not a property of how this crate
+    /// happened to spell the call.
     Raw,
+}
+
+/// What a part's success looks like, which decides what an **empty** answer
+/// may mean.
+///
+/// The cluster's own registry carries this bit — `REGISTER_ALL(command, name,
+/// inDataType, **outDataType**, isVolatile, isHeavy)` in
+/// [`driver.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp)
+/// — and the driver reads it to decide whether to write an `output` key at all
+/// (`DoIf(error.IsOK() && … == EDataType::Structured)` in
+/// `TExecuteBatchCommand::TRequestExecutor::OnResponse`). Written down per part
+/// here so [`parse_results`] can hold the answer to the same standard: see
+/// [`part_result`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Output {
+    /// `create`, `exists`, `get`, `list` — the answer is a value, under the
+    /// key that command returns. An empty answer from one of these is a shape
+    /// this client refuses rather than reads as a success with nothing in it.
+    Structured,
+    /// `set`, `remove` — `EDataType::Null`, so there is nothing to wrap and
+    /// the bare `{}` the reference's own example shows is the honest answer.
+    Null,
+    /// A [`BatchRequest::raw`] part: the caller knows the command's registry
+    /// bits and this crate does not, so both shapes are taken as they come.
+    Unclassified,
 }
 
 /// One command inside a batch, in the shape the cluster takes it.
@@ -78,6 +109,7 @@ pub(crate) struct BatchPart {
     parameters: YsonValue,
     input: Option<YsonValue>,
     kind: PartKind,
+    output: Output,
 }
 
 /// Commands batched to be sent in one round trip.
@@ -141,6 +173,36 @@ pub(crate) struct BatchPart {
 /// [`BatchRequest::with_max_part_size`] is a client-side split into several
 /// requests — the same pair the C++ client exposes as
 /// `TExecuteBatchOptions{Concurrency, BatchPartMaxSize}`.
+///
+/// **The two option setters take `self`, and the part adders take `&mut self`.**
+/// They are different jobs and the shapes say so: the options are the request's
+/// settings, chosen once and up front, so they chain off the constructor and
+/// are gone by the time the batch has a name; the adders are the contents,
+/// added in a loop, so they hand the borrow straight back. Set the options
+/// first and the mix never shows:
+///
+/// ```
+/// # use ytsaurus_client::BatchRequest;
+/// let mut batch = BatchRequest::new().with_concurrency(8).with_max_part_size(64);
+/// for index in 0..3 {
+///     batch.create("table", &format!("//tmp/pipeline/t{index}"));
+/// }
+/// assert_eq!(batch.len(), 3);
+/// ```
+///
+/// # Executing one twice sends everything twice
+///
+/// [`Client::execute_batch`](crate::Client::execute_batch) borrows the batch,
+/// so it is still there afterwards and can be sent again — and doing so is
+/// **new work, not a replay**. The parts are unchanged, but each execution
+/// mints its own mutation ids, so the cluster has nothing to deduplicate
+/// against and applies every part a second time: a batch of `create`s run twice
+/// answers `501 already exists` throughout the second run, and a batch of
+/// `remove`s answers `500`. The reuse worth having is a batch of reads, or one
+/// rebuilt from [`BatchRequest::new`] for the second pass. A *replay* — the
+/// same mutation deduplicated against the first send — is
+/// [`Client::execute_batch_with`](crate::Client::execute_batch_with) with the
+/// id you kept.
 #[derive(Debug, Clone, Default)]
 pub struct BatchRequest {
     parts: Vec<BatchPart>,
@@ -216,6 +278,7 @@ impl BatchRequest {
             ]),
             None,
             PartKind::MasterMutation,
+            Output::Structured,
         )
     }
 
@@ -253,6 +316,7 @@ impl BatchRequest {
             ]),
             None,
             PartKind::MasterMutation,
+            Output::Structured,
         ))
     }
 
@@ -266,6 +330,7 @@ impl BatchRequest {
             yson_build::map([("path", yson_build::string(path))]),
             None,
             PartKind::Read,
+            Output::Structured,
         )
     }
 
@@ -277,6 +342,7 @@ impl BatchRequest {
             yson_build::map([("path", yson_build::string(path))]),
             None,
             PartKind::Read,
+            Output::Structured,
         )
     }
 
@@ -291,6 +357,7 @@ impl BatchRequest {
             yson_build::map([("path", yson_build::string(path))]),
             None,
             PartKind::Read,
+            Output::Structured,
         )
     }
 
@@ -306,6 +373,7 @@ impl BatchRequest {
             ]),
             None,
             PartKind::MasterMutation,
+            Output::Null,
         )
     }
 
@@ -321,6 +389,7 @@ impl BatchRequest {
             ]),
             None,
             PartKind::MasterMutation,
+            Output::Null,
         )
     }
 
@@ -340,18 +409,22 @@ impl BatchRequest {
             yson_build::map([("path", yson_build::string(format!("{path}/@{name}")))]),
             Some(value),
             PartKind::MasterMutation,
+            Output::Null,
         )
     }
 
     /// Adds a command this crate does not model.
     ///
     /// The escape hatch, as [`Client::raw_command`](crate::Client::raw_command)
-    /// is outside a batch — and with the same consequence: **a batch carrying
-    /// a raw part is sent once**, whatever the retry policy says, because a
-    /// command this crate cannot classify may be mutating somewhere no
-    /// mutation cache covers, and a replayed batch would apply it twice.
-    /// [`Client::execute_batch`](crate::Client::execute_batch) documents the
-    /// retry rule this feeds.
+    /// is outside a batch — and with the same default and the same
+    /// consequence: **a batch carrying a raw part is sent once**, whatever the
+    /// retry policy says, because a command this crate cannot classify may be
+    /// mutating somewhere no mutation cache covers, and a replayed batch would
+    /// apply it twice. [`BatchRequest::raw_with`] is where a caller who knows
+    /// the command's registry bits says otherwise, exactly as
+    /// [`Client::raw_command_with`](crate::Client::raw_command_with) is
+    /// outside a batch; [`Client::execute_batch`](crate::Client::execute_batch)
+    /// documents the retry rule this feeds.
     ///
     /// `input` is for a structured-input command (the rule
     /// [`BatchRequest::set_attribute`] describes); commands with no input
@@ -359,25 +432,100 @@ impl BatchRequest {
     /// input and output can be parts at all — and know that a part naming a
     /// command the cluster has never heard of fails the **whole batch**, not
     /// the part: watched on a local cluster, where `{command=frobnicate}` was
-    /// answered `Unknown command "frobnicate"` with no per-part results at
-    /// all. (The driver decides per-part errors only after it has resolved
-    /// the command's descriptor — `TRequestExecutor::Run` throws before that
-    /// on an unknown name.)
+    /// answered HTTP 400 and `Unknown command "frobnicate"` with no per-part
+    /// results at all. (The driver decides per-part errors only after it has
+    /// resolved the command's descriptor — `TRequestExecutor::Run` throws
+    /// before that on an unknown name.)
+    ///
+    /// **A refused batch is not a batch that did nothing.** Measured on the
+    /// same cluster: a `create` sitting beside that `frobnicate` in one
+    /// request **still created its node**, because the parts run in parallel
+    /// and the ones the driver could resolve had already gone to the master by
+    /// the time the unknown name threw. So the whole-batch failure says
+    /// nothing about what was applied, and there are no per-part results to
+    /// ask. A name worth typing here is one you have checked.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if `command` is not a bare command
     /// name, or if `params` is not a YSON dict — the same refusals, for the
-    /// same reasons, as [`Client::raw_command`](crate::Client::raw_command).
+    /// same reasons, as [`Client::raw_command`](crate::Client::raw_command) —
+    /// or if `command` is one the cluster declares **heavy**, which cannot be
+    /// a part at all: see [`BatchRequest::raw_with`].
     pub fn raw(
         &mut self,
         command: &str,
         params: YsonValue,
         input: Option<YsonValue>,
     ) -> Result<&mut Self> {
+        self.raw_with(command, params, input, Repeatable::Never)
+    }
+
+    /// As [`BatchRequest::raw`], saying how the part may be repeated.
+    ///
+    /// The asymmetry this removes: `raw` hard-codes [`Repeatable::Never`], and
+    /// because the batch retries as the most cautious of its parts, **one**
+    /// raw part demotes an otherwise all-read batch to send-once. A raw read —
+    /// `check_permission`, `get_supported_features`, `parse_ypath` — is
+    /// [`Repeatable::Freely`], and saying so leaves the batch as retriable as
+    /// it was. The judgement is the cluster's, from the same `REGISTER_ALL`
+    /// row [`Client::raw_command_with`](crate::Client::raw_command_with) reads
+    /// it from, and the same caution applies: *light and mutating* is not
+    /// enough for [`Repeatable::WithMutationId`], because the mutation cache
+    /// is the **master's** and a scheduler command is not in it. Prefer
+    /// [`Repeatable::Never`] when in doubt — that is why it is what `raw`
+    /// gives you.
+    ///
+    /// A part's class is combined with the others, never applied alone: the
+    /// batch is one HTTP request, so it goes out as the most cautious answer
+    /// among its parts.
+    ///
+    /// # Errors
+    ///
+    /// As [`BatchRequest::raw`], and additionally [`ClientError::Config`] for
+    /// [`Repeatable::Heavy`], which is not a class a part can have: the
+    /// [command reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)
+    /// admits only light commands as parts. A heavy name — `write_table`,
+    /// `read_file` and the rest of the cluster's own list — is refused here for
+    /// the same reason whichever class is claimed for it, because the cluster
+    /// answers a batch holding one by failing the **whole** batch, and paying a
+    /// round trip to be told so costs the other parts their answers.
+    pub fn raw_with(
+        &mut self,
+        command: &str,
+        params: YsonValue,
+        input: Option<YsonValue>,
+        repeatable: Repeatable,
+    ) -> Result<&mut Self> {
         crate::check_command_name(command)?;
         crate::refuse_non_dict_parameters(command, &params)?;
-        Ok(self.push(command, params, input, PartKind::Raw))
+
+        if crate::http::is_heavy(command) {
+            return Err(ClientError::Config(format!(
+                "{command} moves table or file data, and only light commands \
+                 can be parts of a batch — the cluster fails the whole batch \
+                 over one, so the other parts would lose their answers too. \
+                 Send it with Client::raw_command_streaming or \
+                 Client::raw_command_upload, outside the batch."
+            )));
+        }
+        if repeatable == Repeatable::Heavy {
+            return Err(ClientError::Config(format!(
+                "{command} was declared Repeatable::Heavy, which is not a class \
+                 a batch part can have: a heavy command is refused as a part, \
+                 and Repeatable::Heavy also asks for a heavy proxy, which is \
+                 not where a batch goes. Send it outside the batch."
+            )));
+        }
+
+        let kind = match repeatable {
+            Repeatable::Freely => PartKind::Read,
+            Repeatable::WithMutationId => PartKind::MasterMutation,
+            // `Never`, and any class a later release names: the batch is sent
+            // once, which is the answer that is safe for all of them.
+            _ => PartKind::Raw,
+        };
+        Ok(self.push(command, params, input, kind, Output::Unclassified))
     }
 
     /// How many parts the batch holds.
@@ -400,12 +548,14 @@ impl BatchRequest {
         parameters: YsonValue,
         input: Option<YsonValue>,
         kind: PartKind,
+        output: Output,
     ) -> &mut Self {
         self.parts.push(BatchPart {
             command: command.to_owned(),
             parameters,
             input,
             kind,
+            output,
         });
         self
     }
@@ -530,7 +680,9 @@ fn names_transaction(parameters: &YsonValue) -> bool {
 ///   there was nothing to wrap. The reference's own example answers a `set`
 ///   this way; under API v4 a local cluster answers `set` as `{output={}}`
 ///   instead, so this arm has only the documentation and the driver source
-///   (`DoIf(error.IsOK() && … == EDataType::Structured)`) to stand on.
+///   (`DoIf(error.IsOK() && … == EDataType::Structured)`) to stand on — and it
+///   is therefore allowed **only for the commands that source names**, the
+///   `null`-output ones. See [`part_result`].
 ///
 /// Anything else is refused as [`ClientError::Decode`] rather than read as
 /// one of the three: this crate's envelope rules were learned from `exists`
@@ -577,15 +729,24 @@ pub(crate) fn parse_results(body: &[u8], parts: &[BatchPart]) -> Result<Vec<Resu
         )));
     }
 
-    items
-        .iter()
-        .zip(parts)
-        .map(|(item, part)| part_result(item, &part.command))
-        .collect()
+    items.iter().zip(parts).map(part_result).collect()
 }
 
 /// One item of the `results` list, read by the rules above.
-fn part_result(item: &YsonValue, command: &str) -> Result<Result<YsonValue>> {
+///
+/// The empty arm is **not** open to every command. `{}` means "no `output`
+/// key", which the driver writes only for a command whose output type is
+/// `EDataType::Null` — [`Output::Null`]. A `create` answering `{}` would be a
+/// shape nothing accounts for, and taking it as a success with nothing in it
+/// hands the caller an empty map: the access this crate teaches for a create is
+/// `answer["node_id"]`, [`YsonValue`]'s `Index` panics on a missing key, and
+/// the parser would have turned a strange answer into a panic in caller code
+/// one frame away. So a [`Output::Structured`] part is held to an `output`, and
+/// only [`Output::Null`] and the unclassifiable [`Output::Unclassified`] of a
+/// [`BatchRequest::raw`] part may answer bare.
+fn part_result((item, part): (&YsonValue, &BatchPart)) -> Result<Result<YsonValue>> {
+    let command = &part.command;
+
     let YsonNode::Map(fields) = &item.node else {
         return Err(refused(format!(
             "{command}: a part's result is not a dict: {:?}",
@@ -600,7 +761,14 @@ fn part_result(item: &YsonValue, command: &str) -> Result<Result<YsonValue>> {
         (Some(error), None, 1) => Ok(Err(part_error(command, error))),
         (None, Some(output), 1) => Ok(Ok(output.clone())),
         // Success with nothing to say: a part whose command outputs `null`.
-        (None, None, 0) => Ok(Ok(yson_build::empty_map())),
+        (None, None, 0) if part.output != Output::Structured => Ok(Ok(yson_build::empty_map())),
+        (None, None, 0) => Err(refused(format!(
+            "{command}: a part answered with an empty result, which means \"no \
+             output\" — but {command} returns a structured answer, so its \
+             success has a value in it and this is a shape from nowhere. \
+             Reading it as an empty success would hand back a map with no \
+             node_id or value in it, and indexing that panics."
+        ))),
         _ => Err(refused(format!(
             "{command}: a part's result carries keys this client does not \
              recognise: {:?}",
@@ -796,6 +964,93 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_result_is_refused_for_a_part_whose_success_has_a_value() {
+        // `{}` means the driver wrote no `output` key, which it does only for
+        // a command whose output type is Null. A `create` answering that way
+        // is a shape from nowhere, and reading it as an empty success hands
+        // the caller a map with no `node_id` in it — which the access this
+        // crate teaches, `answer["node_id"]`, then panics on.
+        for build in [
+            (|batch: &mut BatchRequest| {
+                batch.create("table", "//tmp/t");
+            }) as fn(&mut BatchRequest),
+            |batch| {
+                batch.exists("//tmp/t");
+            },
+            |batch| {
+                batch.get("//tmp/t");
+            },
+            |batch| {
+                batch.list("//tmp/t");
+            },
+        ] {
+            let mut batch = BatchRequest::new();
+            build(&mut batch);
+            let command = batch.parts()[0].command.clone();
+
+            let error = parse_results(br#"{"results"=[{}]}"#, batch.parts())
+                .expect_err(&format!("{command} does not succeed with nothing to say"));
+            assert!(matches!(error, ClientError::Decode { .. }), "{error:?}");
+            assert!(error.to_string().contains("structured"), "{error}");
+        }
+
+        // The commands the driver source names — `EDataType::Null` — still
+        // answer bare, and so does a raw part, whose bits only its caller
+        // knows.
+        let mut nulls = BatchRequest::new();
+        nulls
+            .set_attribute("//tmp/t", "note", yson_build::string("x"))
+            .remove("//tmp/t");
+        nulls
+            .raw(
+                "parse_ypath",
+                yson_build::map([("path", yson_build::string("//tmp"))]),
+                None,
+            )
+            .expect("a fine command name");
+
+        let results =
+            parse_results(br#"{"results"=[{};{};{}]}"#, nulls.parts()).expect("all three parse");
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+
+    #[test]
+    fn a_heavy_command_cannot_be_a_part_however_it_is_classified() {
+        // Only light commands may be parts, and the cluster fails the *whole*
+        // batch over one that is not — so the other parts would lose their
+        // answers to a mistake this list can catch before the socket.
+        for heavy in ["write_table", "read_table", "write_file", "get_job_input"] {
+            let mut batch = BatchRequest::new();
+            let error = batch
+                .raw(heavy, yson_build::empty_map(), None)
+                .expect_err(&format!("{heavy} is heavy and cannot be a part"));
+            assert!(matches!(error, ClientError::Config(_)), "{heavy}: {error}");
+            assert!(batch.is_empty(), "a refused part must not be half-added");
+
+            // And claiming a class for it does not make it lighter.
+            assert!(
+                batch
+                    .raw_with(heavy, yson_build::empty_map(), None, Repeatable::Freely)
+                    .is_err(),
+                "{heavy} was accepted once it claimed to be a read"
+            );
+        }
+
+        // `Heavy` is not a class a part can have at all, whatever it names.
+        let mut batch = BatchRequest::new();
+        let error = batch
+            .raw_with(
+                "check_permission",
+                yson_build::empty_map(),
+                None,
+                Repeatable::Heavy,
+            )
+            .expect_err("a part is never heavy");
+        assert!(matches!(error, ClientError::Config(_)), "{error}");
+        assert!(batch.is_empty());
+    }
+
+    #[test]
     fn the_retry_class_is_the_most_cautious_part() {
         let mut reads = BatchRequest::new();
         reads.exists("//tmp/a").get("//tmp/b").list("//tmp/c");
@@ -814,6 +1069,32 @@ mod tests {
         )
         .expect("a fine command name");
         assert_eq!(raw.repeatable(), Repeatable::Never);
+
+        // A caller who knows the command's registry bits says so, and one raw
+        // *read* no longer costs an all-read batch its retry.
+        let mut vouched = BatchRequest::new();
+        vouched.exists("//tmp/a");
+        vouched
+            .raw_with(
+                "check_permission",
+                yson_build::map([("path", yson_build::string("//tmp"))]),
+                None,
+                Repeatable::Freely,
+            )
+            .expect("a fine command name");
+        assert_eq!(vouched.repeatable(), Repeatable::Freely);
+
+        // And a raw light mutation the master's cache covers keeps the batch
+        // replayable rather than demoting it to send-once.
+        vouched
+            .raw_with(
+                "concatenate",
+                yson_build::map([("destination_path", yson_build::string("//tmp/c"))]),
+                None,
+                Repeatable::WithMutationId,
+            )
+            .expect("a fine command name");
+        assert_eq!(vouched.repeatable(), Repeatable::WithMutationId);
     }
 
     #[test]
