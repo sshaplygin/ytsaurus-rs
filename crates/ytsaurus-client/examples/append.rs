@@ -242,14 +242,20 @@ fn run() -> Result<(), ClientError> {
         raced(&client, &exclusive, false)? == 100,
     )?;
 
-    step("What a reader sees while an append is in flight");
+    step("What a reader sees before an append commits");
     // Nothing, which is the answer that lets a reader poll `@row_count` without
     // a lock: the rows arrive with the upload transaction's commit, all at once.
     let inflight = format!("{BASE}/inflight");
     client.create("table", &inflight)?;
     client.write_table_rows(&inflight, entries(0..10))?;
     let body = encoded(entries(10..40));
-    let (path, writing) = (inflight.clone(), client.clone());
+    // This outer transaction is the cluster-held boundary for the samples.
+    // The writer may finish while its thread is winding down, but the rows
+    // cannot become visible until `commit` below. `is_finished` therefore only
+    // decides when there are no more useful samples to take; it cannot let the
+    // final one race the commit.
+    let tx = client.start_transaction()?;
+    let (path, writing) = (inflight.clone(), tx.client().clone());
     let upload = std::thread::spawn(move || {
         writing.write_table_streaming(TablePath::new(&path).append(), Trickle::new(body))
     });
@@ -260,12 +266,10 @@ fn run() -> Result<(), ClientError> {
     }
     upload.join().expect("the upload thread finished")?;
     check(
-        &format!(
-            "{} readings during the upload, every one of them 10",
-            seen.len()
-        ),
+        &readings_report(&seen),
         !seen.is_empty() && seen.iter().all(|&n| n == 10),
     )?;
+    tx.commit()?;
     check("and 40 once it commits", client.row_count(&inflight)? == 40)?;
 
     benchmark(&client)?;
@@ -447,6 +451,11 @@ fn first_line(message: &str) -> &str {
     message.lines().next().unwrap_or(message)
 }
 
+/// What the in-flight check actually observed, including the values on failure.
+fn readings_report(readings: &[i64]) -> String {
+    format!("readings before the transaction commits: {readings:?}")
+}
+
 fn step(what: &str) {
     println!("\n== {what}");
 }
@@ -462,4 +471,17 @@ fn check(what: &str, passed: bool) -> Result<(), ClientError> {
     }
     eprintln!("   FAIL {what}");
     Err(ClientError::Config(format!("check failed: {what}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readings_report;
+
+    #[test]
+    fn readings_report_keeps_every_observation() {
+        assert_eq!(
+            readings_report(&[10, 10, 40]),
+            "readings before the transaction commits: [10, 10, 40]"
+        );
+    }
 }
