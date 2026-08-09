@@ -355,12 +355,38 @@ fn a_skiff_read_merges_a_row_range_with_its_schema_columns() {
         let _ = client.read_skiff_table(TablePath::new("//tmp/t").range(0..2), &one_column());
     });
 
-    let sent = parameters(&head);
+    // The whole rendering rather than two independent substrings: the claim
+    // is that both attributes sit on the *path*, and a pair of `contains`
+    // would still pass if `columns` moved off it to a sibling parameter —
+    // which is precisely the trap `<append=%true>` taught. Attribute order is
+    // the encoder's BTreeMap, so `columns` before `ranges` is byte order, not
+    // insertion luck.
     assert!(
-        sent.contains("columns=[n]")
-            && sent.contains(r#"ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]"#),
-        "the Skiff read lost half the selection:\n{head}"
+        parameters(&head).contains(
+            r#"path=<columns=[n];ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>"//tmp/t""#
+        ),
+        "the Skiff read lost half the selection, or moved it off the path:\n{head}"
     );
+}
+
+#[test]
+fn a_skiff_read_refuses_a_column_selection_spelled_into_the_string() {
+    // The "one spelling of a selection" rule, in the one place it can be
+    // broken with nothing typed at all: a Skiff read synthesises a `columns`
+    // attribute out of the format's fields, so `//tmp/t{n}` arrives as two
+    // column selections on one path. Skiff is positional, so the two
+    // disagreeing is a misaligned tuple — a wrong value, not a missing one.
+    let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
+
+    for path in ["//tmp/t{n}", "<columns=[n]>//tmp/t", "//tmp/t[#0:#2]"] {
+        let error = client
+            .read_skiff_table(path, &one_column())
+            .expect_err("refused");
+        assert!(
+            matches!(&error, ClientError::Config(_)),
+            "{path} was not refused locally: {error}"
+        );
+    }
 }
 
 #[test]
@@ -488,15 +514,90 @@ fn a_read_refuses_a_selection_spelled_twice() {
     // A string that already carries `[…]` plus a typed range is two spellings
     // of a selection on one path; whichever the cluster preferred, the caller
     // would silently read the wrong rows.
+    //
+    // Every reader has to refuse it, not just the buffered one: each builds
+    // its parameter block separately, and the streaming reader is where a
+    // doubled selection costs the most — it exists because the table is too
+    // big to hold, so reading the wrong slice of it is the expensive mistake.
+    // The address answers nothing, so a request that *was* attempted would
+    // come back Transport rather than Config.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
-    let error = client
-        .read_table(TablePath::new("//tmp/t[#0:#2]").range(0..2))
-        .expect_err("refused");
+    let doubled = || TablePath::new("//tmp/t[#0:#2]").range(0..2);
 
-    assert!(
-        matches!(&error, ClientError::Config(_)),
-        "not the local refusal: {error}"
-    );
+    let refusals: Vec<(&str, ClientError)> = vec![
+        (
+            "read_table",
+            client.read_table(doubled()).expect_err("refused"),
+        ),
+        (
+            "read_table_rows",
+            client
+                .read_table_rows::<std::collections::BTreeMap<String, i64>>(doubled())
+                .expect_err("refused"),
+        ),
+        (
+            "read_table_streaming",
+            // `expect_err` needs a `Debug` success value and a `TableReader`
+            // has none, so the success case is spelled out.
+            match client.read_table_streaming(doubled()) {
+                Ok(_) => panic!("read_table_streaming did not refuse a doubled selection"),
+                Err(error) => error,
+            },
+        ),
+        (
+            "read_skiff_table",
+            client
+                .read_skiff_table(TablePath::new("//tmp/t[#0:#2]").range(0..2), &one_column())
+                .expect_err("refused"),
+        ),
+    ];
+
+    for (reader, error) in refusals {
+        assert!(
+            matches!(&error, ClientError::Config(_)),
+            "{reader} did not refuse locally: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_read_refuses_a_selection_that_asks_for_nothing() {
+    // Measured on a local cluster: `columns=[]` is answered 200 with one
+    // empty map per row, and a backwards or negative `row_index` range with
+    // no rows at all. None of the three can succeed, so none of them is sent.
+    let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
+    // From variables because clippy will not compile the literal `5..3` —
+    // which is also how a caller reaches it: computed, from an offset that
+    // came out wrong, where a silently empty read is hardest to notice.
+    let (from, to) = (5_i64, 3_i64);
+
+    let refusals: Vec<(&str, ClientError)> = vec![
+        (
+            "columns([])",
+            client
+                .read_table(TablePath::new("//tmp/t").columns(Vec::<String>::new()))
+                .expect_err("refused"),
+        ),
+        (
+            "rows(5..3)",
+            client
+                .read_table(TablePath::new("//tmp/t").range(from..to))
+                .expect_err("refused"),
+        ),
+        (
+            "rows(-5..0)",
+            client
+                .read_table(TablePath::new("//tmp/t").range(-5..0))
+                .expect_err("refused"),
+        ),
+    ];
+
+    for (selection, error) in refusals {
+        assert!(
+            matches!(&error, ClientError::Config(_)),
+            "{selection} did not refuse locally: {error}"
+        );
+    }
 }
 
 #[test]

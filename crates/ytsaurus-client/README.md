@@ -451,6 +451,45 @@ Worth it because the alternative is quadratic: writing a table in twelve pieces
 by rewriting it each time sends 6.5× the rows.
 [`examples/append.rs`](examples/append.rs) measures exactly that.
 
+## Reading part of a table
+
+The same type, the read side: `columns` and `ranges` are attributes on the path
+too, so three columns of a hundred rows cost three columns of a hundred rows on
+the wire rather than the whole table.
+
+```rust
+let head = client.read_table_rows::<Visit>(
+    TablePath::new("//tmp/log").columns(["host", "status"]).range(0..100),
+)?;
+```
+
+Row ranges are plain Rust ranges — `0..100`, `100..`, `..` — because Rust's `..`
+and the cluster's `row_index` limits agree: inclusive below, exclusive above.
+Key ranges on a sorted table take the same shape,
+`RowRange::keys(Key::from("a")..Key::from("b"))`, and `RowRange::exact_key` is
+the cluster's `exact` selector.
+
+Four things worth knowing, all measured on a cluster by
+[`examples/rich_path.rs`](examples/rich_path.rs):
+
+- **A *write* to a path carrying a selection is refused**, as
+  `ClientError::Config`, before anything is sent. The cluster ignores a
+  selection on a write and replaces the whole table with a 200 — silent data
+  loss in both spellings, `write_table_rows("//tmp/t[#0:#2]", rows)` and a typed
+  `ranges` attribute alike.
+- **On a key *prefix*, `<=` takes a whole group and `>` drops one.** `keys(a..b)`
+  and `keys(a..=b)` differ by every row of `b`, not by one row: the second sends
+  `key_bound`, and `key_bound` truncates the row's key to the bound's length
+  before comparing. An exclusive lower bound on a prefix likewise excludes the
+  whole prefix — there is no "the row just after `a`".
+- **A column the table does not have is not an error.** The key is simply absent
+  from every row, so a typo reads clean; a struct fails on the missing field,
+  a map does not.
+- **A selection is said once.** A path whose *string* already spells one
+  (`//tmp/t[#0:#2]`, `//tmp/t{a}`) still reads verbatim, as it always did, but
+  adding a typed selection on top is refused — including on a Skiff read, whose
+  columns are its format's fields.
+
 ## Stopping an operation
 
 ```rust

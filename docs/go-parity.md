@@ -149,6 +149,10 @@ an example, which is exactly why they had not been noticed.
    methods taking `impl Into<TablePath>` — which is what the type existed to
    make room for. A *write* with a read selection is refused locally, because
    the cluster ignores the selection and replaces the table with a 200.
+   `examples/rich_path.rs` checks the whole of it against a cluster, including
+   the one thing no wire test can say: `key` and `key_bound` compare a short
+   key by opposite rules, so `keys(a..b)` and `keys(a..=b)` differ by a whole
+   prefix group rather than by one row.
 3. ~~**No escape hatch.**~~ **Built.** `Client::raw_command(method, command,
    params, payload)` sends a command this crate does not model, with
    `raw_command_streaming` and `raw_command_upload` for the two heavy shapes,

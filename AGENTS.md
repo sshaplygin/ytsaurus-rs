@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 618 tests
+cargo test --workspace            # 668 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -559,6 +559,45 @@ per command. Cluster facts:
   nothing truncates the table.
 - A reader never sees a partial append — `@row_count` holds its old value until
   the upload transaction commits.
+
+### Selecting columns and rows on a path
+
+The read-side half of the same mechanism, and the sibling-parameter trap
+generalised: `columns` and `ranges` are attributes **on the path** too, and the
+cluster's answer to one in the wrong place is again a 200.
+
+- **A read selection on a *write* is ignored and the whole table is replaced,
+  with a 200.** Measured in both spellings: `write_table_rows("//tmp/t[#0:#2]",
+  rows)` replaced everything and reported success, and a `write_table` whose
+  path carried `ranges` as a typed *attribute* did exactly the same — 200, three
+  rows replaced by one. Same shape as the append trap: an attribute in the wrong
+  place costs a table and says nothing. Hence `TablePath::write_refusal`.
+- **An unknown name in `columns` is not an error**: 200, with the key simply
+  absent from every row. A typo reads clean and decodes short — loudly into a
+  struct, silently into a map.
+- **`columns=[]` is answered 200 with one empty map per row**, and a `row_index`
+  range that runs backwards (`5..3`) or below zero (`-5..0`) is answered 200 and
+  no rows. The cluster validates none of the three, so the client refuses them.
+- **`key` and `key_bound` compare a short key by opposite rules**, which is the
+  finding worth the most here. Under `key` the row's whole key is compared
+  component-wise, the shorter tuple being smaller when equal so far. Under
+  `key_bound` the row's key is **truncated** to the bound's length first, so
+  every row sharing the prefix compares *equal* to it. On a table keyed
+  `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
+
+  | sent | rows back |
+  | --- | --- |
+  | `{key=[a]}` … `{key=[b]}` | `(a,/x) (a,/y)` |
+  | `{key=[a]}` … `{key_bound=["<=";[b]]}` | `(a,/x) (a,/y) (b,/x) (b,/y)` |
+  | `{key_bound=[">";[a]]}` | `(b,/x) (b,/y) (c,/x)` |
+  | `{exact={key=[a]}}` | `(a,/x) (a,/y)` |
+
+  So `a..b` and `a..=b` differ by a whole prefix group, and `>` on a prefix
+  drops every row of that prefix — there is no "the row just after `a`".
+- **A range entry mixing `key` on one side with `key_bound` on the other is
+  accepted**, which is what `keys(a..=b)` sends. The reference documents the two
+  selectors separately and never together; the cluster takes the mixture.
+- All of the above is checked by `examples/rich_path.rs`.
 
 ### Tracing
 

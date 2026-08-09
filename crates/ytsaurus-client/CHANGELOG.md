@@ -25,6 +25,23 @@
   selector. A range never mixes `exact` with a limit because no constructor
   can write that.
 
+  **The two selectors compare a short key by opposite rules, and the difference
+  is a group of rows.** Measured on a local cluster, table keyed
+  `(host, path)`, rows `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`: `keys(a..b)`
+  returned the two `a` rows, `keys(a..=b)` returned four — all of host `b` —
+  and `keys((Excluded(a), Unbounded))` returned three, having dropped every row
+  of host `a` rather than one row. `key` compares component-wise with the
+  shorter tuple smaller; `key_bound` truncates the row's key to the bound's
+  length first, so every row sharing the prefix compares equal to it. The same
+  run settled the other open question: a range entry carrying `key` on one side
+  and `key_bound` on the other — what `keys(a..=b)` sends — is accepted, though
+  the reference documents the two selectors only separately.
+  `examples/rich_path.rs` is that run, and it checks itself.
+
+- **Added** `yson_build::uint`, without which a `uint64` key column had no
+  spelling: the `From` shortcuts on `Key` give int64 for an integer, and a
+  `uint64` is a different YSON type, not a wider one.
+
 - **Changed** `read_table`, `read_table_with_format`, `read_skiff_table`,
   `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`,
   as the write methods already did. Call sites that pass `&str`, `String`,
@@ -45,10 +62,36 @@
   always has — except a string-spelled selection *combined with* a typed one,
   which is two spellings of a selection on one path and is refused too.
 
+  **In plain terms, one working spelling stops working:
+  `write_table("<append=%true>//tmp/t", rows)` used to append and now returns
+  `ClientError::Config`.** The cluster did parse and honour that string, so
+  nothing was being silently ignored there — but this client does not parse a
+  path string at all, and the one syntax covers both `<append=%true>`, which
+  the cluster honours on a write, and `<ranges=…>`, which it drops while
+  replacing the table. Telling them apart would mean parsing rich YPath;
+  refusing is the only answer that is right for both. `TablePath::append()` is
+  the replacement, and `Client::raw_command` takes any other write attribute.
+  Nothing in this repository used the string spelling, so the break is
+  external-only.
+
 - **Breaking** `TablePath` no longer derives `Eq` (a key bound may hold a
-  double, which has no `Eq`); `PartialEq` remains. `read_skiff_table` refuses
-  a path with `TablePath::columns` set — the Skiff format's fields already are
-  the column selection — while a `TablePath::range` joins it freely.
+  double, which has no `Eq`); `PartialEq` remains. Neither `TablePath` nor
+  `RowRange` derives `Default`: `TablePath::default()` is the empty path,
+  which names no table and no caller wanted. `read_skiff_table` refuses a path
+  whose columns are selected twice — `TablePath::columns`, and now also a
+  selection spelled into the path *string*, since the Skiff format's fields
+  become a `columns` attribute whether the caller named one or not, and Skiff
+  being positional the two disagreeing is a misaligned tuple rather than a
+  missing map key. A `TablePath::range` joins a Skiff read freely.
+
+- **Breaking** a read selection that asks for nothing is refused rather than
+  sent: `columns([])`, and a row range that runs backwards (`rows(5..3)`) or
+  below zero (`rows(-5..0)`). The cluster validates none of the three —
+  measured: `columns=[]` answers 200 with one empty map per row, and both bad
+  ranges answer 200 with no rows — so each costs a round trip to learn
+  nothing. The same call this crate already makes for an empty
+  `parameters={}` on `update_operation_parameters`. An *empty* range is still
+  fine: `rows(5..5)` is legal on a slice and honestly asks for no rows.
 
 ### Heavy proxies: a pool, picked at random, refreshed — never one host for life
 

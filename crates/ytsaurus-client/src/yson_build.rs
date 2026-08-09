@@ -30,6 +30,20 @@ pub fn int(value: i64) -> YsonValue {
     }
 }
 
+/// A YSON uint64.
+///
+/// A different YSON type from [`int`], not a wider one, and the difference
+/// shows on a `uint64` key column: [`Key::from`](crate::Key)`(42_i64)` sends an
+/// int64 at it, so such a component is spelled
+/// `Key::new([yson_build::uint(42)])`.
+#[must_use]
+pub fn uint(value: u64) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node: YsonNode::Uint64(value),
+    }
+}
+
 /// A YSON double.
 ///
 /// The type a scheduler weight has: `update_operation_parameters` takes
@@ -173,5 +187,18 @@ mod tests {
     fn booleans_use_the_yson_spelling() {
         let encoded = to_string(&map([("enable", boolean(true))]), YsonFormat::Text).unwrap();
         assert_eq!(encoded, "{enable=%true}");
+    }
+
+    #[test]
+    fn an_unsigned_integer_is_not_the_same_value_as_a_signed_one() {
+        // YSON writes a uint64 with a `u` suffix, and that is the whole point
+        // of the helper: a `uint64` key column compares against `42u`, and
+        // `42` sent at it is a different value of a different type.
+        let encoded = to_string(&map([("n", uint(42))]), YsonFormat::Text).unwrap();
+        assert_eq!(encoded, "{n=42u}");
+        assert_ne!(uint(42), int(42));
+        // The half of u64 an i64 cannot hold is reachable only this way.
+        let encoded = to_string(&map([("n", uint(u64::MAX))]), YsonFormat::Text).unwrap();
+        assert_eq!(encoded, "{n=18446744073709551615u}");
     }
 }
