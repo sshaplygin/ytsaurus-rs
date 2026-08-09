@@ -485,10 +485,19 @@ Four things worth knowing, all measured on a cluster by
 - **A column the table does not have is not an error.** The key is simply absent
   from every row, so a typo reads clean; a struct fails on the missing field,
   a map does not.
-- **A selection is said once.** A path whose *string* already spells one
-  (`//tmp/t[#0:#2]`, `//tmp/t{a}`) still reads verbatim, as it always did, but
-  adding a typed selection on top is refused — including on a Skiff read, whose
-  columns are its format's fields.
+- **A selection is said once *per kind*.** A path whose *string* already spells
+  one (`//tmp/t[#0:#2]`, `//tmp/t{a}`) still reads verbatim, as it always did,
+  and the other kind on top of it composes and is sent:
+  `TablePath::new("//tmp/t[#0:#2]").columns(["n"])` reads the two rows the
+  string names carrying the one column the attribute names, and
+  `read_skiff_table("//tmp/t[#0:#2]", fmt)` takes its rows from the string and
+  its columns from the format's fields. What is refused is the *same* kind
+  twice: measured, the attribute this client adds wins and the string's half is
+  discarded at 200 with nothing said. So a Skiff read of `//tmp/t{a}` is
+  refused — the format's fields are already a column selection — where the same
+  read of `//tmp/t[#0:#2]` goes through. A string that *opens* with `<…>` is
+  refused whatever it holds: this client does not parse the block to see which
+  attribute it names.
 
 ## Stopping an operation
 

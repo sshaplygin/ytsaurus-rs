@@ -23,7 +23,7 @@
 
 use std::ops::{Bound, RangeBounds};
 
-use ytsaurus_yson::{YsonFormat, YsonValue};
+use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue};
 
 use crate::yson_build;
 
@@ -109,6 +109,19 @@ impl TablePath {
     /// named column, so a typo here reads clean and decodes short. A struct
     /// decoded from such a read fails loudly on the missing field, which is
     /// where the typo surfaces; a map decodes to fewer keys and does not.
+    ///
+    /// **The empty selection is that same shape taken to its end, and it is
+    /// sent.** Measured: `<columns=[]>` answers 200 with one empty map per
+    /// row, and it composes with a range —
+    /// `<columns=[];ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>`
+    /// came back as two empty maps, and the same range spelled with `key`
+    /// bounds came back as three. That is how many rows a range holds, or
+    /// whether a key range holds any, with no column bytes on the wire —
+    /// a question [`Client::row_count`](crate::Client::row_count) cannot
+    /// answer, since it reads the `@row_count` attribute and so speaks only
+    /// for a whole static table. It decodes to a map with no keys and to a
+    /// struct missing every field, so name the columns when the *rows* are
+    /// what is wanted.
     ///
     /// Calling this again replaces the selection rather than adding to it.
     #[must_use]
@@ -252,55 +265,114 @@ impl TablePath {
     ///
     /// A read passes the string through verbatim, selection syntax and all —
     /// the cluster honours it there, and code that read `//tmp/t[#0:#2]`
-    /// before this type existed keeps working. Two shapes are refused: a
-    /// selection that asks for nothing at all, and string-spelled syntax
-    /// **combined with** a typed selection — that puts two spellings of a
-    /// selection on one path, and whichever the cluster preferred, the caller
-    /// would silently read the wrong rows.
+    /// before this type existed keeps working. Two shapes are refused: a range
+    /// asking for rows no table has, and a typed selection landing on a string
+    /// that already spells **the same kind** of selection, where the typed one
+    /// silently wins and the caller's string half is discarded — see
+    /// [`TablePath::selection_conflict`] for the measurements and for why the
+    /// other pairings go through.
     pub(crate) fn read_refusal(&self) -> Option<String> {
-        if let Some(columns) = &self.columns
-            && columns.is_empty()
-        {
-            return Some(format!(
-                "{}: TablePath::columns([]) asks the cluster for no columns — measured \
-                 on a local cluster, it answers 200 with one empty map per row, which \
-                 decodes to a struct missing every field or to a map with no keys. \
-                 Name the columns to read, or leave the selection off to read them all",
-                self.path
-            ));
-        }
         for range in &self.ranges {
             if let Some(reason) = range.refusal() {
                 return Some(format!("{}: {reason}", self.path));
             }
         }
-        if self.columns.is_none() && self.ranges.is_empty() {
-            return None;
-        }
-        self.doubled_selection_refusal("adding TablePath::columns or TablePath::range on top")
+        self.selection_conflict(
+            self.columns.is_some(),
+            !self.ranges.is_empty(),
+            "TablePath::columns",
+            "TablePath::range",
+        )
     }
 
-    /// The refusal owed to a path whose *string* already spells a selection
-    /// when a second selection is going onto it regardless — `second` names
-    /// where that second one comes from, and the sentence continues "…would
-    /// send two spellings of a selection".
+    /// Why the attributes this client is about to add cannot ride on this
+    /// path string, if they cannot.
     ///
-    /// [`TablePath::read_refusal`] is this with a typed selection the caller
-    /// asked for. A Skiff read needs it separately, because it **synthesises**
-    /// a `columns` attribute out of the format's fields whether the caller
-    /// named columns or not — and Skiff being positional, a disagreement
-    /// there is a misaligned tuple rather than a missing map key.
-    pub(crate) fn doubled_selection_refusal(&self, second: &str) -> Option<String> {
-        if !self.path.starts_with('<') && first_unescaped_selector(&self.path).is_none() {
+    /// The client never parses a path string. It sends the string as a YSON
+    /// string node and hangs its own attributes *outside* it —
+    /// `<columns=[n]>"//tmp/t{k}"`, not the flat text
+    /// `<columns=[n]>//tmp/t{k}` — and the cluster reads both halves. Measured
+    /// on a local cluster, in that wire shape, every combination answers 200
+    /// and one rule covers all of them: **the outer attribute wins, and the
+    /// selector spelled in the string is silently discarded.**
+    ///
+    /// - **The same kind spelled twice: the caller's string half is dropped
+    ///   without a word.** `<columns=[n]>"//tmp/t{k}"` answered with column
+    ///   `n` — the `{k}` the caller wrote had no effect;
+    ///   `<ranges=[…0:2]>"//tmp/t[#3:#5]"` answered with rows 0–1, not 3–4.
+    ///   Inside a leading block it is the same:
+    ///   `<columns=[k]>"<columns=[n]>//tmp/t"` answered with column `k`.
+    ///   Nothing is corrupted — the read is exactly what the *attribute*
+    ///   asked for — but the caller is told nothing about the half that was
+    ///   thrown away, which is the whole trap this type exists to close.
+    /// - **Different kinds compose, so they are allowed.** Rows and columns
+    ///   answer different questions: `<columns=[n]>"//tmp/t[#3:#5]"` gave rows
+    ///   3–4 carrying only `n`, and `<ranges=[…0:2]>"//tmp/t{k}"` gave rows
+    ///   0–1 carrying only `k`. Both are the read that was asked for.
+    /// - **A leading `<…>` is honoured, and is refused only because this
+    ///   client cannot read it.** With nothing added, `"<columns=[n]>//tmp/t"`
+    ///   answered with column `n`, so the string's own block works; adding a
+    ///   *different* kind composes, as `<ranges=[…0:2]>"<columns=[n]>//tmp/t"`
+    ///   (rows 0–1, column `n`) showed. But telling those apart means parsing
+    ///   the block to see which attribute it names, which this client does
+    ///   not do — and if it names the one being added, the caller's is
+    ///   discarded silently. Refusing the whole shape is the conservative
+    ///   answer to a block that cannot be read; there is no cluster error
+    ///   here to point at.
+    ///
+    /// `adding_columns` / `adding_rows` say which attributes are going on;
+    /// `columns_source` / `rows_source` name what is putting them there, since
+    /// a Skiff read **synthesises** `columns` from its format's fields whether
+    /// the caller named columns or not.
+    pub(crate) fn selection_conflict(
+        &self,
+        adding_columns: bool,
+        adding_rows: bool,
+        columns_source: &str,
+        rows_source: &str,
+    ) -> Option<String> {
+        if !adding_columns && !adding_rows {
             return None;
         }
-        Some(format!(
-            "{}: the path string already spells a selection (`<…>`, `[…]` or \
-             `{{…}}`), and this client does not parse it; {second} would send two \
-             spellings of a selection and read something other than what was \
-             asked — give the command a bare path, and say the selection once",
-            self.path
-        ))
+        if self.path.starts_with('<') {
+            return Some(format!(
+                "{}: the path string opens with an attribute block, and this client \
+                 does not parse it, so it cannot tell whether that block names the \
+                 same attribute this command is about to add. If it does, the added \
+                 one wins and the block's is discarded silently, at 200 — measured, \
+                 `<columns=[k]>\"<columns=[n]>//tmp/t\"` read column `k` and said \
+                 nothing about `n`. Give the command a bare path and say the \
+                 attributes once, with TablePath",
+                self.path
+            ));
+        }
+        // Both selectors can appear on one string — `//tmp/t{a}[#0:#2]` is the
+        // documented spelling — so each is asked about separately rather than
+        // through whichever came first.
+        let spelled = unescaped_selectors(&self.path);
+        if adding_columns && spelled.columns {
+            return Some(format!(
+                "{}: the path string already selects columns with `{{…}}`, and this \
+                 client does not parse it; the `columns` attribute {columns_source} \
+                 adds would be the second column selection on one path, and the \
+                 added attribute wins — measured, `<columns=[n]>\"//tmp/t{{k}}\"` read \
+                 column `n` and discarded the `{{k}}` without a word, at 200. Say the \
+                 column selection once",
+                self.path
+            ));
+        }
+        if adding_rows && spelled.rows {
+            return Some(format!(
+                "{}: the path string already selects rows with `[…]`, and this client \
+                 does not parse it; the `ranges` attribute {rows_source} adds would be \
+                 the second row selection on one path, and the added attribute wins — \
+                 measured, `<ranges=[…0:2]>\"//tmp/t[#3:#5]\"` read rows 0-1 and \
+                 discarded the `[#3:#5]` without a word, at 200. Say the row \
+                 selection once",
+                self.path
+            ));
+        }
+        None
     }
 }
 
@@ -322,6 +394,39 @@ fn first_unescaped_selector(path: &str) -> Option<char> {
         }
     }
     None
+}
+
+/// Which selections a path string spells, by the same escaping rule.
+///
+/// Separate from [`first_unescaped_selector`] because one string can carry
+/// both — `//tmp/t{host}[#0:#2]` selects columns *and* rows — and the two are
+/// answered differently: only the kind the client is about to add a second
+/// time is a conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selectors {
+    /// An unescaped `[`: a row range.
+    rows: bool,
+    /// An unescaped `{`: a column selection.
+    columns: bool,
+}
+
+fn unescaped_selectors(path: &str) -> Selectors {
+    let mut found = Selectors {
+        rows: false,
+        columns: false,
+    };
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' => {
+                bytes.next();
+            }
+            b'[' => found.rows = true,
+            b'{' => found.columns = true,
+            _ => {}
+        }
+    }
+    found
 }
 
 /// One entry of a path's `ranges` attribute: which rows to read.
@@ -484,17 +589,32 @@ impl RowRange {
 
     /// Why this range asks for rows no table has, if it does.
     ///
-    /// The cluster validates neither shape — measured on a local cluster, a
-    /// `row_index` range running backwards and one running below zero are
-    /// both answered 200 with no rows at all, which is a read that succeeds
-    /// and returns nothing. Rust refuses the same mistake on a slice
-    /// (`&rows[5..3]` panics with *"slice index starts at 5 but ends at 3"*)
-    /// and clippy will not even compile the literal, so a range built from
-    /// Rust's own syntax refuses it here rather than spending a round trip to
-    /// learn nothing. Both shapes therefore arrive only *computed*, from a
-    /// page number or an offset that came out wrong, which is exactly when a
-    /// silent empty read is hardest to notice. An *empty* range is fine:
-    /// `5..5` is legal on a slice and asks honestly for no rows.
+    /// The cluster validates neither shape, and the two go wrong differently —
+    /// measured on a local cluster against a five-row table:
+    ///
+    /// - **A negative `row_index` is clamped to 0 and the read succeeds**, so
+    ///   the bound is not so much rejected as quietly replaced.
+    ///   `{lower_limit={row_index=-5}}` returned **all five rows**, and
+    ///   `{lower_limit={row_index=-5};upper_limit={row_index=2}}` returned rows
+    ///   0 and 1 — a lower limit of `-5` reads exactly as `0` would. A negative
+    ///   *upper* limit clamps the same way and therefore selects nothing:
+    ///   `{upper_limit={row_index=-2}}` came back 200 and empty. So a
+    ///   miscomputed offset either reads from the start of the table or reads
+    ///   nothing at all, and both are reported as success.
+    /// - **A backwards range is answered 200 with no rows.**
+    ///   `{lower_limit={row_index=5};upper_limit={row_index=3}}` returned
+    ///   nothing, and so did the key spelling,
+    ///   `{lower_limit={key=[3]};upper_limit={key=[1]}}`.
+    ///
+    /// Rust refuses the same mistake on a slice (`&rows[5..3]` panics with
+    /// *"slice index starts at 5 but ends at 3"*) and clippy will not even
+    /// compile the literal, so a range built from Rust's own syntax refuses it
+    /// here rather than spending a round trip. Neither shape can be written
+    /// deliberately: both arrive *computed*, from a page number or an offset
+    /// that came out wrong, and reading the whole table under a bound that
+    /// asked for something else is worse than an error, not better. An
+    /// *empty* range is fine: `5..5` is legal on a slice and asks honestly for
+    /// no rows, and `keys(a..a)` likewise.
     fn refusal(&self) -> Option<String> {
         for limit in [&self.lower, &self.upper] {
             if let Some(Limit::RowIndex(index)) = limit
@@ -502,8 +622,10 @@ impl RowRange {
             {
                 return Some(format!(
                     "row index {index} is negative, and rows are numbered from 0 — the \
-                     cluster answers a negative limit with 200 and no rows rather than \
-                     with an error"
+                     cluster clamps it to 0 and answers 200, so a negative lower limit \
+                     reads from the start of the table as if it had said 0 and a \
+                     negative upper limit selects nothing; either way a bound that was \
+                     never honoured is reported as success"
                 ));
             }
         }
@@ -517,8 +639,48 @@ impl RowRange {
                  no rows rather than with an error"
             ));
         }
+        if let (Some(lower), Some(upper)) = (self.lower.as_ref(), self.upper.as_ref())
+            && let (Some(lower), Some(upper)) = (lower.key(), upper.key())
+            && key_ordering(lower, upper) == Some(std::cmp::Ordering::Greater)
+        {
+            return Some(
+                "the key range starts after it ends, the same mistake as \
+                 `&rows[5..3]`; the cluster answers it with 200 and no rows rather \
+                 than with an error"
+                    .to_owned(),
+            );
+        }
         None
     }
+}
+
+/// How two key tuples order, when this client can tell.
+///
+/// Component-wise, which is how the cluster compares them, with a shorter
+/// tuple sorting first when the components it has all match — the `key` rule
+/// [`RowRange::keys`] documents. Two components of different YSON types are
+/// **not** compared: the cluster's own answer there is not the obvious one
+/// (measured, it reads an int64 `42` and a uint64 `42u` as the same key), so
+/// a mixed pair returns `None` and no refusal follows. This only ever has to
+/// be right about ranges it refuses.
+fn key_ordering(lower: &Key, upper: &Key) -> Option<std::cmp::Ordering> {
+    for (lower, upper) in lower.0.iter().zip(upper.0.iter()) {
+        if lower.attributes.is_some() || upper.attributes.is_some() {
+            return None;
+        }
+        let ordering = match (&lower.node, &upper.node) {
+            (YsonNode::Boolean(lower), YsonNode::Boolean(upper)) => lower.cmp(upper),
+            (YsonNode::Int64(lower), YsonNode::Int64(upper)) => lower.cmp(upper),
+            (YsonNode::Uint64(lower), YsonNode::Uint64(upper)) => lower.cmp(upper),
+            (YsonNode::String(lower), YsonNode::String(upper)) => lower.cmp(upper),
+            (YsonNode::Double(lower), YsonNode::Double(upper)) => lower.partial_cmp(upper)?,
+            _ => return None,
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return Some(ordering);
+        }
+    }
+    Some(lower.0.len().cmp(&upper.0.len()))
 }
 
 impl From<std::ops::Range<i64>> for RowRange {
@@ -569,6 +731,17 @@ enum Limit {
 }
 
 impl Limit {
+    /// The key this limit compares against, whichever selector spells it.
+    ///
+    /// `keys(a..=b)` puts a `key` on one side and a `key_bound` on the other,
+    /// so a backwards range has to be recognised across both spellings.
+    fn key(&self) -> Option<&Key> {
+        match self {
+            Limit::RowIndex(_) => None,
+            Limit::Key(key) | Limit::KeyBound { key, .. } => Some(key),
+        }
+    }
+
     fn to_yson(&self) -> YsonValue {
         match self {
             Limit::RowIndex(index) => yson_build::map([("row_index", yson_build::int(*index))]),
@@ -595,10 +768,15 @@ impl Limit {
 /// let visit = Key::new([yson_build::uint(1_700_000_000)]);
 /// ```
 ///
-/// The `From` shortcuts cover the types a key column usually has, and
-/// `From<i64>` is an **int64** — a `uint64` column is a different YSON type and
-/// is spelled `Key::new([yson_build::uint(n)])`, which is why that helper
-/// exists.
+/// The `From` shortcuts cover the types a key column usually has. `From<i64>`
+/// sends an **int64**, and on a `uint64` key column that is not a mismatch —
+/// measured on a `uint64`-keyed table, `{exact={key=[42]}}` and
+/// `{exact={key=[42u]}}` both returned the same row, so the cluster reads the
+/// two as one key. What `i64` cannot do is *reach* the top of that column:
+/// every key above `i64::MAX` is unnameable by it, and only
+/// [`yson_build::uint`] gets there —
+/// `{exact={key=[18446744073709551615u]}}` returned its row. That ceiling is
+/// why the helper exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Key(Vec<YsonValue>);
 
@@ -987,45 +1165,108 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_that_asks_for_nothing_is_refused() {
-        // Measured on a local cluster: every one of these is answered 200 and
-        // returns nothing — `columns=[]` gives one empty map per row, and a
-        // backwards or negative `row_index` range gives no rows at all. A
-        // request that cannot succeed is refused here rather than spending a
-        // round trip to come back empty, the same call this crate already
-        // makes for an empty `parameters={}` on update_operation_parameters.
-        let empty = TablePath::new("//tmp/t").columns(Vec::<String>::new());
-        let reason = empty.read_refusal().expect("refused");
-        assert!(reason.contains("no columns"), "{reason}");
-
+    fn a_range_asking_for_rows_no_table_has_is_refused() {
         // Written from variables because clippy's `reversed_empty_ranges`
         // will not compile the literal `5..3` — which is the shape a real
         // caller hits too: a backwards range only ever arrives computed, from
-        // a page number or an offset that came out wrong.
+        // a page number or an offset that came out wrong. Measured, the
+        // cluster answers it 200 with no rows.
         let (from, to) = (5_i64, 3_i64);
         let backwards = TablePath::new("//tmp/t").range(from..to);
         let reason = backwards.read_refusal().expect("refused");
         assert!(reason.contains("starts at 5 and ends at 3"), "{reason}");
 
-        let negative = TablePath::new("//tmp/t").range(-5..0);
-        let reason = negative.read_refusal().expect("refused");
-        assert!(reason.contains("is negative"), "{reason}");
+        // A negative row index is the *other* failure, and not an empty read:
+        // measured, the cluster clamps it to 0 and answers 200, so
+        // `{lower_limit={row_index=-5}}` returned all five rows of a five-row
+        // table and `-5..2` returned rows 0 and 1. The bound is silently
+        // replaced rather than refused, which is what makes it worth catching
+        // here. The assertion names the clamp so the pre-fix wording — "200
+        // and no rows" — could not satisfy it.
+        for range in [-5..2, -5..0] {
+            let negative = TablePath::new("//tmp/t").range(range);
+            let reason = negative.read_refusal().expect("refused");
+            assert!(reason.contains("is negative"), "{reason}");
+            assert!(reason.contains("clamps it to 0"), "{reason}");
+            assert!(
+                reason.contains("reads from the start of the table"),
+                "{reason}"
+            );
+        }
+        // The upper limit is checked too, where the clamp empties the read.
+        let negative_upper = TablePath::new("//tmp/t").range(..-2);
+        assert!(
+            negative_upper
+                .read_refusal()
+                .expect("refused")
+                .contains("is negative")
+        );
+
+        // A backwards *key* range is the same mistake in the other selector,
+        // and the cluster answers it the same way — measured,
+        // `{lower_limit={key=[3]};upper_limit={key=[1]}}` came back 200 with
+        // no rows, exactly as `rows(5..3)` did. Refusing one and sending the
+        // other would be an inconsistency with nothing behind it.
+        let reason = TablePath::new("//tmp/t")
+            .range(RowRange::keys(Key::from("b")..Key::from("a")))
+            .read_refusal()
+            .expect("refused");
+        assert!(reason.contains("starts after it ends"), "{reason}");
+        // Including across the two spellings one range entry can mix: an
+        // inclusive key range puts `key` on the low side and `key_bound` on
+        // the high side, and backwards is still backwards.
+        assert!(
+            TablePath::new("//tmp/t")
+                .range(RowRange::keys(Key::from("b")..=Key::from("a")))
+                .read_refusal()
+                .is_some()
+        );
 
         // An *empty* range is not a broken one: `&rows[5..5]` is legal and
         // means no rows, so a caller computing `start..end` that came out
-        // equal gets an honest empty read rather than an error.
-        assert!(
-            TablePath::new("//tmp/t")
-                .range(5..5)
-                .read_refusal()
-                .is_none()
+        // equal gets an honest empty read rather than an error. The same for
+        // keys, and for a forwards range of either kind.
+        for path in [
+            TablePath::new("//tmp/t").range(5..5),
+            TablePath::new("//tmp/t").range(0..1),
+            TablePath::new("//tmp/t").range(RowRange::keys(Key::from("a")..Key::from("a"))),
+            TablePath::new("//tmp/t").range(RowRange::keys(Key::from("a")..Key::from("b"))),
+            // A prefix sorts before the longer key it starts, which is the
+            // `key` rule, so this is forwards and stays sendable.
+            TablePath::new("//tmp/t").range(RowRange::keys(
+                Key::from("a")..Key::new([yson_build::string("a"), yson_build::int(1)]),
+            )),
+            // Mixed component types are not compared at all: the cluster
+            // reads int64 42 and uint64 42u as one key, so this client does
+            // not claim to know which of two types sorts first.
+            TablePath::new("//tmp/t").range(RowRange::keys(
+                Key::new([yson_build::uint(9)])..Key::new([yson_build::int(2)]),
+            )),
+        ] {
+            assert!(path.read_refusal().is_none(), "{path} was refused");
+        }
+    }
+
+    #[test]
+    fn an_empty_column_selection_is_sent() {
+        // Measured on a local cluster: `<columns=[]>` answers 200 with one
+        // empty map per row, and it composes with a range —
+        // `<columns=[];ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>`
+        // came back as two empty maps. That is a row count over a *range*
+        // with no column bytes on the wire, which `Client::row_count` cannot
+        // give — it reads `@row_count`, a whole-table attribute. A read that
+        // returns one correct record per row is not a request that cannot
+        // succeed, so it goes.
+        let empty = TablePath::new("//tmp/t").columns(Vec::<String>::new());
+        assert!(empty.read_refusal().is_none());
+        assert_eq!(
+            ytsaurus_yson::to_string(&empty.to_yson(), YsonFormat::Text).unwrap(),
+            r#"<columns=[]>"//tmp/t""#
         );
-        assert!(
-            TablePath::new("//tmp/t")
-                .range(0..1)
-                .read_refusal()
-                .is_none()
-        );
+        let counted = TablePath::new("//tmp/t")
+            .columns(Vec::<String>::new())
+            .range(0..2);
+        assert!(counted.read_refusal().is_none());
     }
 
     #[test]
@@ -1043,28 +1284,86 @@ mod tests {
     }
 
     #[test]
-    fn a_read_takes_the_string_verbatim_unless_a_typed_selection_joins_it() {
+    fn a_read_takes_the_string_verbatim_unless_the_same_selection_joins_it() {
         // Reads honoured string-spelled ranges before this type existed, and
-        // still do — the cluster reads them correctly there.
-        assert!(TablePath::new("//tmp/t[#0:#2]").read_refusal().is_none());
+        // still do — the cluster reads them correctly there, and a bare
+        // string is passed through whatever it spells.
+        for path in [
+            "//tmp/t[#0:#2]",
+            "//tmp/t{a}",
+            "<columns=[a]>//tmp/t",
+            "//tmp/t{a}[#0:#2]",
+        ] {
+            assert!(
+                TablePath::new(path).read_refusal().is_none(),
+                "bare {path} was refused"
+            );
+        }
         assert!(
             TablePath::new("//tmp/t")
                 .columns(["a"])
                 .read_refusal()
                 .is_none()
         );
-        // Both spellings on one path is the shape with no right answer.
+
+        // The same *kind* of selection spelled twice is the shape with no
+        // right answer, and measured it is not a draw: in the wire shape this
+        // client sends — attributes hung outside a YSON string node — the
+        // added attribute wins and the caller's string half is discarded
+        // without a word, at 200. `<ranges=[…0:2]>"//tmp/t[#3:#5]"` returned
+        // rows 0-1, and `<columns=[n]>"//tmp/t{k}"` returned column `n`.
+        let reason = TablePath::new("//tmp/t[#0:#2]")
+            .range(0..2)
+            .read_refusal()
+            .expect("refused");
+        assert!(reason.contains("already selects rows"), "{reason}");
+        let reason = TablePath::new("//tmp/t{a}")
+            .columns(["b"])
+            .read_refusal()
+            .expect("refused");
+        assert!(reason.contains("already selects columns"), "{reason}");
+
+        // Different kinds compose, and are sent. Measured:
+        // `<columns=[n]>"//tmp/t[#3:#5]"` gave rows 3-4 carrying only `n`, and
+        // `<ranges=[…0:2]>"//tmp/t{k}"` gave rows 0-1 carrying only `k`. Both
+        // are the read that was asked for, so refusing them would take a
+        // working capability away for a conflict that is not there.
         assert!(
             TablePath::new("//tmp/t[#0:#2]")
+                .columns(["a"])
+                .read_refusal()
+                .is_none()
+        );
+        assert!(
+            TablePath::new("//tmp/t{a}")
+                .range(0..2)
+                .read_refusal()
+                .is_none()
+        );
+        // Unless the string spells both, in which case the doubled half still
+        // bites — `first_unescaped_selector` would only have seen the `{`.
+        assert!(
+            TablePath::new("//tmp/t{a}[#0:#2]")
                 .range(0..2)
                 .read_refusal()
                 .is_some()
         );
-        assert!(
-            TablePath::new("<columns=[a]>//tmp/t")
-                .columns(["b"])
+
+        // A leading attribute block is refused whatever it holds and whatever
+        // is being added — not because the cluster objects (it does not:
+        // `<ranges=[…0:2]>"<columns=[n]>//tmp/t"` answered 200 with rows 0-1
+        // carrying only `n`, the two composing like any other different
+        // kinds) but because this client cannot read the block to know which
+        // attribute it names. If it names the one being added, the added one
+        // wins silently — `<columns=[k]>"<columns=[n]>//tmp/t"` read `k`. The
+        // conservative answer is the only one available without parsing.
+        for path in ["<columns=[a]>//tmp/t", "<primary_medium=default>//tmp/t"] {
+            let reason = TablePath::new(path)
+                .range(0..2)
                 .read_refusal()
-                .is_some()
-        );
+                .expect("refused");
+            assert!(reason.contains("cannot tell whether"), "{reason}");
+            assert!(reason.contains("discarded silently"), "{reason}");
+        }
     }
 }

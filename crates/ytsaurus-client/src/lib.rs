@@ -1955,21 +1955,34 @@ impl Client {
     ///
     /// `format` must have exactly one table schema. Its named fields select
     /// the table columns and determine the bytes returned — which is why a
-    /// path that *also* names columns is refused: two selections, one
-    /// positional wire format, no right answer. That covers both spellings —
-    /// [`TablePath::columns`] and a selection in the path *string*
-    /// (`//tmp/t{a}`, `<columns=[a]>//tmp/t`) — because the format's fields
-    /// become a `columns` attribute here whether the caller named one or not.
-    /// A [`TablePath::range`] combines fine, because a range says which rows
-    /// and the schema says which columns. The response is decoded to its end
-    /// before being returned so a truncated Skiff stream is never reported as
-    /// a successful table read.
+    /// path that *also* names columns is refused. That covers both spellings,
+    /// [`TablePath::columns`] and `{…}` in the path *string*, because the
+    /// format's fields become a `columns` attribute here whether the caller
+    /// named one or not.
+    ///
+    /// **What that costs is a silently ignored filter, not a corrupt decode.**
+    /// Measured, the synthesised attribute wins: `<columns=[n]>"//tmp/t{k}"`
+    /// answered with column `n`. A Skiff read therefore still receives exactly
+    /// the columns its format names, and the tuple stays aligned — but the
+    /// `{…}` the caller wrote is discarded without a word, at 200. Refusing is
+    /// how they get to hear about it. A path string opening with `<…>` is
+    /// refused one step removed: this client cannot parse the block to see
+    /// whether it names `columns` as well.
+    ///
+    /// **Row selections are not column selections and are not refused.** A
+    /// [`TablePath::range`] combines, and so does a range spelled into the
+    /// string — measured, `<columns=[n]>"//tmp/t[#0:#2]"` answered 200 with
+    /// rows 0-1 carrying only `n`. Ranges pick rows, the schema picks columns.
+    ///
+    /// The response is decoded to its end before being returned so a truncated
+    /// Skiff stream is never reported as a successful table read.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the format is not a direct-table format, the
-    /// path also selects columns — typed or string-spelled — the response is
-    /// incomplete, or the request fails.
+    /// path also selects columns — through [`TablePath::columns`] or as `{…}`
+    /// in its string — the path string opens with an attribute block, the
+    /// response is incomplete, or the request fails.
     pub fn read_skiff_table(
         &self,
         path: impl Into<TablePath>,
@@ -3922,9 +3935,12 @@ fn refuse_selection_on_write(path: &TablePath) -> Result<()> {
     }
 }
 
-/// Refuses a read that spells a selection twice — once in the path string,
-/// once through the typed API — since whichever spelling the cluster
-/// preferred, the caller would silently get the other one's answer.
+/// Refuses a read that spells the *same kind* of selection twice — once in
+/// the path string, once through the typed API. Measured, the typed attribute
+/// wins and the caller's string half is discarded at 200, so the filter they
+/// wrote into the path simply never happens and nothing says so. Rows against
+/// columns compose and are sent; a string opening with `<…>` is refused
+/// because this client cannot parse the block to see which attribute it names.
 fn refuse_mixed_selection_on_read(path: &TablePath) -> Result<()> {
     match path.read_refusal() {
         Some(reason) => Err(ClientError::Config(reason)),
@@ -3942,13 +3958,22 @@ fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue>
         )));
     }
     // The same rule for the *string* spelling, which the typed check above
-    // cannot see. This function synthesises a `columns` attribute out of the
-    // format's fields whether the caller asked for one or not, so a path
-    // string spelling `{a}` or `<columns=[a]>` is a doubled selection even
-    // though nothing typed was set — and Skiff is positional, so the two
-    // disagreeing is a misaligned tuple rather than a missing map key.
-    if let Some(reason) = path.doubled_selection_refusal(
-        "the Skiff format's fields, which travel as a `columns` attribute of their own,",
+    // cannot see: this function synthesises a `columns` attribute out of the
+    // format's fields whether the caller asked for one or not, so `//tmp/t{a}`
+    // is a doubled column selection even though nothing typed was set.
+    // Measured, the synthesised attribute wins — `<columns=[n]>"//tmp/t{k}"`
+    // came back as column `n` — so the Skiff tuple stays aligned with its
+    // schema and nothing is decoded wrong; what is lost is the caller's own
+    // `{a}`, discarded at 200 with no mention. Only the *column* half is a
+    // conflict: a string-spelled row range answers a different question and
+    // composes, as `<columns=[n]>"//tmp/t[#0:#2]"` confirmed by returning rows
+    // 0-1 carrying only `n`. A leading `<…>` is refused too, for the reason
+    // `selection_conflict` documents — the block cannot be read from here.
+    if let Some(reason) = path.selection_conflict(
+        true,
+        false,
+        "the Skiff format's fields become",
+        "the Skiff read adds",
     ) {
         return Err(ClientError::Config(reason));
     }
@@ -4198,24 +4223,53 @@ mod tests {
         // The branch's own invariant — one spelling of a selection per path —
         // has a hole here that it has nowhere else: this function
         // *synthesises* a `columns` attribute out of the format's fields, so
-        // there is a second selection whether the caller typed one or not,
-        // and the typed check above cannot see a string-spelled first one.
-        // Skiff being positional, the two disagreeing is a misaligned tuple
-        // rather than a missing map key — a wrong value, not a missing one.
+        // there is a second column selection whether the caller typed one or
+        // not, and the typed check above cannot see a string-spelled first
+        // one. Measured, the synthesised attribute wins —
+        // `<columns=[n]>"//tmp/t{k}"` answered with column `n` — so the tuple
+        // stays aligned with the schema and no value is decoded wrong. What
+        // is lost is the caller's own `{found}`, silently discarded at 200,
+        // which is the trap: the filter they wrote simply never happened.
+        let refused = skiff_table_path(&TablePath::from("//tmp/table{found}"), &skiff_format());
+        assert!(
+            matches!(&refused, Err(ClientError::Config(reason)) if reason.contains("already selects columns")),
+            "a string column selection was not refused: {refused:?}"
+        );
+        // A leading attribute block is refused one step removed: the cluster
+        // takes it happily (`<ranges=[…0:2]>"<columns=[n]>//tmp/t"` composed
+        // at 200), but this client cannot read the block to know whether it
+        // names `columns` too, and if it does the synthesised one wins in
+        // silence.
         for path in [
-            "//tmp/table{found}",
             "<columns=[found]>//tmp/table",
-            "//tmp/table[#0:#2]",
+            "<primary_medium=default>//tmp/table",
         ] {
             let refused = skiff_table_path(&TablePath::from(path), &skiff_format());
             assert!(
-                matches!(&refused, Err(ClientError::Config(reason)) if reason.contains("two spellings")),
+                matches!(&refused, Err(ClientError::Config(reason)) if reason.contains("cannot tell whether")),
                 "{path} was not refused: {refused:?}"
             );
         }
+
+        // A *row* range is not a column selection. Measured on the cluster,
+        // `<columns=[n]>//tmp/t[#0:#2]` answers 200 with rows 0-1 carrying
+        // only `n` — the two attributes answer different questions — so the
+        // string spelling of a range goes through, as it does for read_table.
+        let ranged = skiff_table_path(&TablePath::from("//tmp/table[#0:#2]"), &skiff_format())
+            .expect("a string row range is not a column selection");
+        assert_eq!(
+            ytsaurus_yson::to_string(&ranged, YsonFormat::Text).unwrap(),
+            r#"<columns=[found;rcl]>"//tmp/table[#0:#2]""#
+        );
+        // And so is a typed one, which renders its own `ranges` alongside.
+        assert!(
+            skiff_table_path(&TablePath::from("//tmp/table").range(0..2), &skiff_format()).is_ok()
+        );
+
         // An escaped bracket is part of a node name, and that table is
         // readable as Skiff like any other.
         assert!(skiff_table_path(&TablePath::from(r"//tmp/t\[x\]"), &skiff_format()).is_ok());
+        assert!(skiff_table_path(&TablePath::from(r"//tmp/t\{x\}"), &skiff_format()).is_ok());
     }
 
     #[test]

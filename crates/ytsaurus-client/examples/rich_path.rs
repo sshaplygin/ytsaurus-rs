@@ -23,6 +23,7 @@ use ytsaurus_client::{
     Client, ClientError, Column, ColumnType, Key, RowRange, SkiffFormat, SkiffSchema,
     SkiffSchemaRef, SkiffWireType, TablePath, TableSchema, yson_build,
 };
+use ytsaurus_skiff::Decoder as SkiffDecoder;
 
 /// Where the demo keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_rich_path";
@@ -184,11 +185,14 @@ fn run() -> Result<(), ClientError> {
     )?;
     // A Skiff read's columns are its format's fields; a range says which
     // rows. The cluster gets both attributes on one path — `<columns=[n];
-    // ranges=[…]>` — and this is the check that it takes them together.
+    // ranges=[…]>` — and this is the check that it takes them together. The
+    // rows are counted rather than merely awaited: a range that was accepted
+    // and then dropped would answer with the whole table, which is not empty
+    // either.
     let skiff = client.read_skiff_table(TablePath::new(&visits).range(0..2), &n_only())?;
     check(
-        "a Skiff read merges its schema's columns with a typed row range",
-        !skiff.is_empty(),
+        "a Skiff read merges its schema's columns with a typed row range: 2 rows of the 5",
+        skiff_rows(&skiff)? == 2,
     )?;
 
     step("A read still takes a string-spelled selection verbatim");
@@ -197,6 +201,51 @@ fn run() -> Result<(), ClientError> {
     check(
         "//…[#0:#2] reads the first two rows, as it always did",
         summary(&client.read_table_rows::<Visit>(format!("{visits}[#0:#2]"))?) == "a/x a/y",
+    )?;
+    // Including on a Skiff read, whose refusal is about *columns*: the
+    // synthesised `<columns=[n]>` and a string `[…]` answer different
+    // questions, so the cluster takes both. This is the case the coarse
+    // version of the rule used to refuse while calling it a doubled selection.
+    let ranged_skiff = client.read_skiff_table(format!("{visits}[#0:#2]"), &n_only())?;
+    check(
+        "a Skiff read takes a string-spelled range: 2 rows from the string, columns from the schema",
+        skiff_rows(&ranged_skiff)? == 2,
+    )?;
+    // Rows against columns compose in the typed direction too, and both halves
+    // are asked about: the string's `[#0:#2]` by the row count, the typed
+    // `columns` by what each row carries.
+    let both: Vec<BTreeMap<String, i64>> =
+        client.read_table_rows(TablePath::new(format!("{visits}[#0:#2]")).columns(["n"]))?;
+    check(
+        "a string-spelled range and a typed column selection combine: 2 rows of exactly n",
+        both.len() == 2 && both.iter().all(|row| row.keys().eq(["n"].iter())),
+    )?;
+
+    step("An empty projection counts rows without reading any of them");
+    // `columns([])` is a read that works, and the only cheap way to ask how
+    // many rows a *range* holds: `row_count` reads the whole-table
+    // `@row_count` attribute and cannot answer for a range or a key window.
+    check(
+        "columns([]) over a row range answers one empty record per row",
+        client
+            .read_table_rows::<BTreeMap<String, i64>>(
+                TablePath::new(&visits)
+                    .columns(Vec::<String>::new())
+                    .range(1..3),
+            )?
+            .len()
+            == 2,
+    )?;
+    check(
+        "and over a key range, where @row_count has nothing to say",
+        client
+            .read_table_rows::<BTreeMap<String, i64>>(
+                TablePath::new(&visits)
+                    .columns(Vec::<String>::new())
+                    .range(RowRange::keys(Key::from("a")..Key::from("c"))),
+            )?
+            .len()
+            == 4,
     )?;
 
     step("And the shapes this client refuses to send");
@@ -217,34 +266,73 @@ fn run() -> Result<(), ClientError> {
         client.row_count(&visits)? == 5,
     )?;
 
-    // One selection per path, whichever way it is spelled.
+    // The *same kind* of selection spelled twice. This client sends the path
+    // as a YSON string with its attributes hung outside —
+    // `<ranges=[…]>"//tmp/t[#0:#2]"` — and measured in that shape the
+    // **attribute wins**: the caller's string-spelled half is discarded at
+    // 200 with nothing said. Nothing decodes wrong; the filter the caller
+    // wrote simply never happens. That combination cannot be demonstrated
+    // through the client because it is exactly what is refused, so what the
+    // cluster is asked here is the half that *is* sendable: a string block on
+    // its own really is honoured, which is why discarding it matters.
+    check(
+        "a path string's own `<columns=[n]>` is honoured when nothing is added",
+        client
+            .read_table_rows::<BTreeMap<String, i64>>(format!("<columns=[n]>{visits}"))?
+            .iter()
+            .all(|row| row.len() == 1 && row.contains_key("n")),
+    )?;
     refused(
-        "a read spelling a selection twice, once in the string and once typed",
+        "a read spelling a row selection twice, once in the string and once typed",
         client.read_table_rows::<Visit>(TablePath::new(format!("{visits}[#0:#2]")).range(0..2)),
     )?;
     refused(
         "a Skiff read whose path string names columns — its format already does",
         client.read_skiff_table(format!("{visits}{{n}}"), &n_only()),
     )?;
-
-    // Selections that ask for nothing. Every one of these is answered 200 by
-    // the cluster and comes back empty, so they are refused here instead of
-    // costing a round trip to learn nothing.
+    // And a path string that opens with an attribute block, whatever it
+    // holds. The cluster is happy to take both — a block naming a *different*
+    // attribute composes — but this client cannot read the block to find out
+    // which, and if it names the one being added the caller's is discarded in
+    // silence. Refusing is the conservative answer to text it will not parse.
     refused(
-        "columns([]), which the cluster answers with one empty map per row",
-        client.read_table_rows::<Visit>(TablePath::new(&visits).columns(Vec::<String>::new())),
+        "a typed range on a path whose string already opens with `<…>`",
+        client
+            .read_table_rows::<Visit>(TablePath::new(format!("<columns=[n]>{visits}")).range(0..2)),
     )?;
+
+    // Ranges that ask for rows no table has. A backwards range comes back
+    // empty at 200; a negative row index is *clamped to 0* and comes back
+    // with real rows, which is the more dangerous of the two.
+    //
     // From variables because clippy will not compile the literal `5..3`, and
     // for the same reason a caller only ever reaches it computed: an offset
-    // that came out wrong, where a silently empty read is hardest to spot.
+    // that came out wrong, where a silently wrong read is hardest to spot.
     let (from, to) = (5_i64, 3_i64);
     refused(
         "range(5..3), as `&rows[5..3]` would be",
         client.read_table_rows::<Visit>(TablePath::new(&visits).range(from..to)),
     )?;
     refused(
-        "range(-5..0), since rows are numbered from 0",
-        client.read_table_rows::<Visit>(TablePath::new(&visits).range(-5..0)),
+        "range(-5..2), which the cluster would have read as range(0..2)",
+        client.read_table_rows::<Visit>(TablePath::new(&visits).range(-5..2)),
+    )?;
+    refused(
+        "keys(b..a), the same mistake in the other selector",
+        client.read_table_rows::<Visit>(
+            TablePath::new(&visits).range(RowRange::keys(Key::from("b")..Key::from("a"))),
+        ),
+    )?;
+    // The measurement the refusal above is built on, made here rather than
+    // asserted from memory: a negative lower limit reads from row 0.
+    check(
+        "and the cluster really does clamp: <ranges=[{lower_limit={row_index=-5}}]> is all 5 rows",
+        client
+            .read_table_rows::<Visit>(format!(
+                "<ranges=[{{lower_limit={{row_index=-5}}}}]>{visits}"
+            ))?
+            .len()
+            == 5,
     )?;
 
     println!(
@@ -294,6 +382,27 @@ fn n_only() -> SkiffFormat {
         SkiffSchema::named("n", SkiffWireType::Int64),
     ]))])
     .expect("one named tuple is a valid format")
+}
+
+/// How many rows a Skiff answer holds.
+///
+/// Decoded rather than divided out of the byte count: a row's width is its
+/// schema's business, and the point of the count is what the *cluster*
+/// selected.
+fn skiff_rows(stream: &[u8]) -> Result<usize, ClientError> {
+    let mut decoder = SkiffDecoder::new(stream, n_only());
+    let mut rows = 0;
+    while decoder
+        .skip_row()
+        .map_err(|error| ClientError::Decode {
+            command: "read_skiff_table".to_owned(),
+            reason: error.to_string(),
+        })?
+        .is_some()
+    {
+        rows += 1;
+    }
+    Ok(rows)
 }
 
 /// Checks that a call was refused *locally*, before anything was sent.

@@ -32,10 +32,14 @@ pub fn int(value: i64) -> YsonValue {
 
 /// A YSON uint64.
 ///
-/// A different YSON type from [`int`], not a wider one, and the difference
-/// shows on a `uint64` key column: [`Key::from`](crate::Key)`(42_i64)` sends an
-/// int64 at it, so such a component is spelled
-/// `Key::new([yson_build::uint(42)])`.
+/// A different YSON type from [`int`], but on a `uint64` key column the
+/// cluster does not hold that against a value it can read: measured,
+/// `{exact={key=[42]}}` and `{exact={key=[42u]}}` returned the same row, so
+/// [`Key::from`](crate::Key)`(42_i64)` finds it. The difference that bites is
+/// *range*. `Key::from(i64)` tops out at `i64::MAX`, so every key above that
+/// is one it cannot spell, and such a row is reachable only through this
+/// helper — `Key::new([yson_build::uint(u64::MAX)])` returned the row keyed
+/// `18446744073709551615u`.
 #[must_use]
 pub fn uint(value: u64) -> YsonValue {
     YsonValue {
@@ -191,14 +195,19 @@ mod tests {
 
     #[test]
     fn an_unsigned_integer_is_not_the_same_value_as_a_signed_one() {
-        // YSON writes a uint64 with a `u` suffix, and that is the whole point
-        // of the helper: a `uint64` key column compares against `42u`, and
-        // `42` sent at it is a different value of a different type.
+        // YSON writes a uint64 with a `u` suffix, and these are two distinct
+        // values in this crate's own model.
         let encoded = to_string(&map([("n", uint(42))]), YsonFormat::Text).unwrap();
         assert_eq!(encoded, "{n=42u}");
         assert_ne!(uint(42), int(42));
-        // The half of u64 an i64 cannot hold is reachable only this way.
+        // The cluster, though, does not make the caller pick: measured on a
+        // `uint64`-keyed table, `{exact={key=[42]}}` and `{exact={key=[42u]}}`
+        // both returned the row. What only this helper can do is name a key
+        // above `i64::MAX` at all — that half of `u64` is unreachable from
+        // `Key::from(i64)`, and the row keyed `18446744073709551615u` came
+        // back for exactly this spelling.
         let encoded = to_string(&map([("n", uint(u64::MAX))]), YsonFormat::Text).unwrap();
         assert_eq!(encoded, "{n=18446744073709551615u}");
+        assert!(i64::try_from(u64::MAX).is_err());
     }
 }

@@ -374,11 +374,20 @@ fn a_skiff_read_refuses_a_column_selection_spelled_into_the_string() {
     // The "one spelling of a selection" rule, in the one place it can be
     // broken with nothing typed at all: a Skiff read synthesises a `columns`
     // attribute out of the format's fields, so `//tmp/t{n}` arrives as two
-    // column selections on one path. Skiff is positional, so the two
-    // disagreeing is a misaligned tuple — a wrong value, not a missing one.
+    // column selections on one path. Measured in the wire shape this client
+    // sends — attributes hung outside a YSON string node — the synthesised
+    // attribute wins: `<columns=[n]>"//tmp/t{k}"` came back as column `n`, so
+    // the tuple stays aligned with its schema and nothing decodes wrong. What
+    // is lost is the caller's own `{n}`, discarded at 200 without a word. A
+    // leading `<…>` is refused one step removed: the cluster takes it, but
+    // this client cannot parse the block to know whether it names `columns`.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
 
-    for path in ["//tmp/t{n}", "<columns=[n]>//tmp/t", "//tmp/t[#0:#2]"] {
+    for path in [
+        "//tmp/t{n}",
+        "<columns=[n]>//tmp/t",
+        "<primary_medium=default>//tmp/t",
+    ] {
         let error = client
             .read_skiff_table(path, &one_column())
             .expect_err("refused");
@@ -387,6 +396,25 @@ fn a_skiff_read_refuses_a_column_selection_spelled_into_the_string() {
             "{path} was not refused locally: {error}"
         );
     }
+}
+
+#[test]
+fn a_skiff_read_sends_a_string_spelled_row_range() {
+    // The refusal above exists to stop a columns-versus-columns conflict, and
+    // a row range is not one. Measured, `<columns=["n"]>"//tmp/t[#3:#5]"`
+    // answered 200 with rows 3-4 carrying only `n`: ranges select rows, the
+    // synthesised attribute selects columns, and they compose — neither is
+    // discarded. `read_table` has always taken the string spelling, and a
+    // Skiff read takes it too.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_skiff_table("//tmp/t[#0:#2]", &one_column());
+    });
+
+    assert!(
+        parameters(&head).contains(r#"path=<columns=[n]>"//tmp/t[#0:#2]""#),
+        "the string-spelled range did not reach the cluster intact:\n{head}"
+    );
 }
 
 #[test]
@@ -511,9 +539,12 @@ fn a_read_keeps_passing_a_string_spelled_path_through() {
 
 #[test]
 fn a_read_refuses_a_selection_spelled_twice() {
-    // A string that already carries `[…]` plus a typed range is two spellings
-    // of a selection on one path; whichever the cluster preferred, the caller
-    // would silently read the wrong rows.
+    // A string that already carries `[…]` plus a typed range is the *same
+    // kind* of selection spelled twice on one path. Measured, the attribute
+    // this client hangs on the path wins and the string's half is discarded at
+    // 200 with nothing said — the rows that come back are the ones the typed
+    // range names, and the range the caller wrote into the string simply never
+    // happens.
     //
     // Every reader has to refuse it, not just the buffered one: each builds
     // its parameter block separately, and the streaming reader is where a
@@ -561,23 +592,19 @@ fn a_read_refuses_a_selection_spelled_twice() {
 }
 
 #[test]
-fn a_read_refuses_a_selection_that_asks_for_nothing() {
-    // Measured on a local cluster: `columns=[]` is answered 200 with one
-    // empty map per row, and a backwards or negative `row_index` range with
-    // no rows at all. None of the three can succeed, so none of them is sent.
+fn a_read_refuses_a_range_asking_for_rows_no_table_has() {
+    // Measured on a local cluster: a backwards range is answered 200 with no
+    // rows, in either selector; a negative `row_index` is *clamped to 0* and
+    // answered 200 with real rows — `{lower_limit={row_index=-5}}` returned
+    // all five rows of a five-row table, and `-5..2` returned rows 0 and 1.
+    // Neither bound is honoured as written, and neither is reported.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
     // From variables because clippy will not compile the literal `5..3` —
     // which is also how a caller reaches it: computed, from an offset that
-    // came out wrong, where a silently empty read is hardest to notice.
+    // came out wrong, where a silently wrong read is hardest to notice.
     let (from, to) = (5_i64, 3_i64);
 
     let refusals: Vec<(&str, ClientError)> = vec![
-        (
-            "columns([])",
-            client
-                .read_table(TablePath::new("//tmp/t").columns(Vec::<String>::new()))
-                .expect_err("refused"),
-        ),
         (
             "rows(5..3)",
             client
@@ -585,9 +612,17 @@ fn a_read_refuses_a_selection_that_asks_for_nothing() {
                 .expect_err("refused"),
         ),
         (
-            "rows(-5..0)",
+            "rows(-5..2), which the cluster would have read as rows(0..2)",
             client
-                .read_table(TablePath::new("//tmp/t").range(-5..0))
+                .read_table(TablePath::new("//tmp/t").range(-5..2))
+                .expect_err("refused"),
+        ),
+        (
+            "keys(b..a), the same mistake in the other selector",
+            client
+                .read_table(
+                    TablePath::new("//tmp/t").range(RowRange::keys(Key::from("b")..Key::from("a"))),
+                )
                 .expect_err("refused"),
         ),
     ];
@@ -598,6 +633,32 @@ fn a_read_refuses_a_selection_that_asks_for_nothing() {
             "{selection} did not refuse locally: {error}"
         );
     }
+}
+
+#[test]
+fn a_read_sends_an_empty_column_selection() {
+    // `columns([])` is a read that succeeds, not one that cannot: measured,
+    // `<columns=[]>` answers 200 with one empty map per row, and it composes
+    // with a range — `<columns=[];ranges=[…#0:#2]>` came back as two empty
+    // maps. That counts the rows of a *range*, or probes whether a key range
+    // holds any, with no column bytes on the wire — which `Client::row_count`
+    // cannot do, reading as it does the whole-table `@row_count` attribute.
+    // So it travels, on the path, as the empty list it is.
+    let head = capture(|proxy| {
+        let client = Client::new(proxy).with_retries(RetryPolicy::none());
+        let _ = client.read_table(
+            TablePath::new("//tmp/t")
+                .columns(Vec::<String>::new())
+                .range(0..2),
+        );
+    });
+
+    assert!(
+        parameters(&head).contains(
+            r#"path=<columns=[];ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>"//tmp/t""#
+        ),
+        "the empty projection did not travel as an empty `columns` attribute:\n{head}"
+    );
 }
 
 #[test]
