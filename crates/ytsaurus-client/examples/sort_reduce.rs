@@ -107,7 +107,7 @@ fn run() -> Result<(), ClientError> {
     // Keyed by word, because what is being checked is what each group came to
     // and not the order the reduce emitted its groups in.
     let counts: BTreeMap<String, i64> = client
-        .read_table_rows::<Total>(&format!("{BASE}/counts"))?
+        .read_table_rows::<Total>(format!("{BASE}/counts"))?
         .into_iter()
         .map(|row| (row.word, row.count))
         .collect();

@@ -119,8 +119,8 @@ fn run() -> Result<(), ytsaurus_client::ClientError> {
     // `cat` is the identity, so reading both tables back through the same path
     // must give identical bytes. Comparing against the rows this wrote would
     // fail for an unrelated reason: the cluster re-encodes them on ingest.
-    let before = client.read_table(&format!("{BASE}/input"))?;
-    let after = client.read_table(&format!("{BASE}/output"))?;
+    let before = client.read_table(format!("{BASE}/input"))?;
+    let after = client.read_table(format!("{BASE}/output"))?;
 
     if before != after {
         eprintln!(

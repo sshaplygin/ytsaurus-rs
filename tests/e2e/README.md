@@ -109,6 +109,7 @@ cargo run -p ytsaurus-client --example table_usage  # Rust values in, Rust value
 cargo run -p ytsaurus-client --example abort        # stopping an operation, and what it costs
 cargo run -p ytsaurus-client --example lifecycle    # pause, reprice, finish early, reattach; merge and erase
 cargo run --release -p ytsaurus-client --example append  # adding rows, against rewriting them
+cargo run -p ytsaurus-client --example rich_path    # which columns and rows a path names
 cargo run -p ytsaurus-client --example transaction  # published all at once, or not at all
 cargo run -p ytsaurus-client --example cypress      # list, copy, move, link and lock
 cargo run -p ytsaurus-client --example raw          # commands the crate does not model
@@ -316,6 +317,40 @@ Two of those lines are the ones that would not have been guessed. Appending to a
 out of order, so an append there is a continuation rather than an addition. And
 **aborting is not idempotent**: an operation the scheduler has finished with is
 gone from it, where a transaction would have forgiven the second abort.
+
+`rich_path`, on `ghcr.io/ytsaurus/local:stable` on 2026-08-09 — the read half of
+the same path type, on a table keyed `(host, path)` holding `(a,/x) (a,/y)
+(b,/x) (b,/y) (c,/x)`. The wire shapes are pinned offline; what only a cluster
+can answer is **which rows come back**:
+
+```text
+== Naming rows by key — where the two selectors disagree
+   ok keys(a..b) stops before host b: a/x a/y
+   ok keys(a..=b) takes all of host b, and the mixed key/key_bound entry is accepted
+   ok keys((Excluded(a), Unbounded)) drops every row of host a, not one row
+   ok a..b is 2 rows and a..=b is 4: a group apart, not a row
+== The exact selector
+   ok exact_key(a) is every row of host a
+   ok and says the same as keys(a..=a), which is what its doc claims
+   ok a full key selects the single row it names
+== And the shapes this client refuses to send
+   ok a write that names a row range
+   ok a write whose path string spells a range
+   ok and the table is untouched: still 5 rows
+```
+
+Two findings, and both are about a key *shorter* than the table's key columns —
+which is the ordinary case, since a range over a `(host, path)` table is usually
+a range over hosts. **`key` and `key_bound` compare a prefix by opposite rules**:
+`key` compares the row's whole key component-wise with the shorter tuple
+smaller, while `key_bound` **truncates** the row's key to the bound's length
+first, so every row sharing the prefix compares *equal* to the bound. Hence
+`a..b` and `a..=b` differing by all four rows of host `b` rather than by one row,
+and hence `>` on a prefix dropping the whole group — there is no "the row just
+after `a`" for the cluster to start from. And **a range entry that mixes `key`
+on one side with `key_bound` on the other is accepted**, which is what the most
+natural inclusive spelling sends; the reference documents the two selectors only
+separately, so this had to be asked rather than read.
 
 `table_usage` and `cluster_info`, same cluster — the two examples that mirror
 the Go SDK's `table-usage` and `cypress-example`. Between them they are the

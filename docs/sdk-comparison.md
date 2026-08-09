@@ -139,7 +139,7 @@ launcher-and-worker pattern depends on it.
 | `MultisetAttributes` | yes | yes | no |
 | `CreateObject` (accounts, users) | yes | yes | no |
 | Path: `append` | yes | yes | **yes** — `TablePath::new(p).append()` |
-| Path: columns, ranges, key bounds | `TRichYPath` | `ypath.Rich` | **no** |
+| Path: columns, ranges, key bounds | `TRichYPath` | `ypath.Rich` | **yes** — `TablePath::columns` / `::range`, `RowRange`, `Key`; a *write* with a read selection is refused locally, because the cluster silently ignores it there |
 | Dynamic value | `TNode` | `yson.RawValue` | `YsonValue` |
 | Read a node into a native type | protobuf/`TNode` | `GetNode(&out)` | **`get_as::<T>()`** |
 
@@ -242,11 +242,11 @@ Add typed whole-table I/O in one call, which neither has.
 
 What is missing, in the order it would matter for production use, is tracked in
 the [parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues). The first
-three on that list are **now built**: logging and tracing — a `traceparent` the
+four on that list are **now built**: logging and tracing — a `traceparent` the
 cluster joins, and an optional `tracing` feature — the operation object and
-its lifecycle, which is what the table above came to, and `read_file` with its
-streaming half (#10). What is left is batch requests, read-side column and
-range selection, and transaction `Detach`.
+its lifecycle, which is what the table above came to, read-side column and
+range selection (`TablePath::columns` / `::range`), and `read_file` with its
+streaming half (#10). What is left is batch requests and transaction `Detach`.
 
 Behind all of them used to sit one structural gap: `Transport::call` was
 `pub(crate)`, so a command this crate does not model could not be sent at all,

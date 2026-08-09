@@ -107,7 +107,7 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Checking what the jobs wrote");
-    let rows: Vec<Shard> = client.read_table_rows(&format!("{BASE}/results"))?;
+    let rows: Vec<Shard> = client.read_table_rows(format!("{BASE}/results"))?;
 
     check(
         &format!("{JOBS} rows, one per job"),
