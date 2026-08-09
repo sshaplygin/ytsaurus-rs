@@ -167,41 +167,93 @@ impl io::Write for SharedBuffer {
     }
 }
 
-/// Where cargo put a compiled example, so a test can run one.
+/// A runnable copy of one of the `examples/` workers, built if it is not there.
 ///
-/// The workers under `examples/` are the thing these end-to-end tests exist to
-/// run: they exec the binary the way a cluster does — rows in on fd 0, tables
-/// out on fds 1 and 4 — rather than calling into the library, because what the
-/// cluster runs is a process and not a function.
+/// These end-to-end tests exec the worker the way a cluster does — rows in on
+/// fd 0, tables out on fds 1 and 4 — rather than calling into the library,
+/// because what the cluster runs is a process and not a function.
 ///
-/// **Derived from the test binary's own path, because cargo names no variable
-/// for it.** `CARGO_BIN_EXE_<name>` exists for `[[bin]]` targets and has no
-/// counterpart for examples, so the only thing to go on is that both land in
-/// the same profile directory: the test at `<profile>/deps/<name>-<hash>` and
-/// the example at `<profile>/examples/<name>`. That holds for `--release` and
-/// for a `--target` cross-build too, since the whole tree moves together.
+/// **Cargo names no variable for an example's path.** `CARGO_BIN_EXE_<name>`
+/// exists for `[[bin]]` targets and has no counterpart here, so the path is
+/// derived instead: the test binary sits at `<profile>/deps/<name>-<hash>` and a
+/// runnable example at `<profile>/examples/<name>`, and that relationship holds
+/// under `--release` and under a `--target` cross-build, since the whole tree
+/// moves together.
+///
+/// **And no ordinary test command reliably builds one**, which is why this
+/// builds it rather than asserting:
+///
+/// - `cargo test --all-targets` compiles every example as a *libtest harness*
+///   to `examples/<name>-<hash>`, because there `--examples` means test them.
+///   No runnable binary is produced. Exec'ing the harness would answer
+///   `running 0 tests` and compare nothing, so a hashed sibling is never used
+///   here even when one is sitting right beside the name being looked for.
+/// - a plain `cargo test` does build runnable examples — except the four
+///   declared `test = true` in `Cargo.toml`, which get the harness treatment
+///   for the same reason, and those are `counted`, `sessionize`, `shards` and
+///   `wordcount`: four of the five workers these tests exec.
+/// - `cargo test --test cat_e2e` builds that test and no examples at all.
+///
+/// So the fallback is one `cargo build --example <name>`, run at most once per
+/// name per test binary. By the time a test runs, the cargo that started it has
+/// finished building and released the target-directory lock; a second cargo
+/// blocks on that lock only if something else is building, which is correct
+/// rather than merely tolerable.
 ///
 /// # Panics
 ///
-/// If the example is not there, which means it was not built. `cargo test` and
-/// `cargo test --all-targets` build examples; `cargo test --test wordcount_e2e`
-/// on its own does not, and the message says so rather than leaving a reader
-/// with `No such file or directory` about a path they never wrote.
+/// If the example cannot be built, with cargo's own output.
 pub fn example(name: &str) -> std::path::PathBuf {
-    let mut path = std::env::current_exe().expect("a test knows its own path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
+    use std::sync::{Mutex, OnceLock};
+
+    // One build per name per process: several tests in one binary ask for the
+    // same worker, and they run on their own threads.
+    static BUILT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+    let mut dir = std::env::current_exe().expect("a test knows its own path");
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
     }
-    path.push("examples");
-    path.push(name);
+    // `<profile>` — `debug` for the dev profile, and its own name otherwise.
+    let profile = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("debug")
+        .to_owned();
+    dir.push("examples");
+    let path = dir.join(name);
+
+    let mut built = BUILT
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .expect("the build set is only ever locked here");
+
+    if !path.is_file() && built.insert(name.to_owned()) {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let mut command = std::process::Command::new(cargo);
+        command.args(["build", "-p", "ytsaurus-job", "--example", name]);
+        // `--profile dev` is spelled `debug` in the directory and rejected on
+        // the command line, so the one case that needs no flag is the one that
+        // cannot take it.
+        if profile != "debug" {
+            command.args(["--profile", &profile]);
+        }
+
+        let out = command
+            .output()
+            .unwrap_or_else(|e| panic!("could not run cargo to build the `{name}` example: {e}"));
+        assert!(
+            out.status.success(),
+            "building the `{name}` example failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    drop(built);
 
     assert!(
         path.is_file(),
-        "the `{name}` example is not built at {}.\n\
-         Run `cargo test -p ytsaurus-job` or `cargo build -p ytsaurus-job \
-         --examples` first: cargo builds examples for a whole-package test run \
-         and not for `--test <name>` on its own.",
+        "no runnable `{name}` example at {} even after building it",
         path.display()
     );
     path

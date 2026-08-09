@@ -57,6 +57,17 @@ jobs:
       - name: cargo test (client with every feature)
         run: cargo test -p ytsaurus-client --all-features
 
+      # The workers are examples of `ytsaurus-job`, and the end-to-end tests
+      # below exec them. `--all-targets` does not build a runnable one — there
+      # `--examples` means *test* the examples, so each is compiled as a libtest
+      # harness and no plain binary is produced — and `tests/common::example`
+      # answers that by building what it needs. Doing it here as well is not
+      # redundant: it builds the nine once, before any test runs, instead of
+      # leaving several test binaries to discover the gap at the same moment and
+      # queue behind each other on cargo's lock.
+      - name: Build the worker examples the e2e tests run
+        run: cargo build -p ytsaurus-job --examples
+
       - name: cargo test
         run: cargo test --workspace --all-targets
 
