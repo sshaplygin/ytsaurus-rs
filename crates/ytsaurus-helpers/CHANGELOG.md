@@ -2,9 +2,9 @@
 
 ## 0.2.5 - 2026-08-10
 
-First release on crates.io, and the first version of this crate. Version tracks
-the workspace. Published because `ytsaurus-client`'s `derive` feature depends on
-it: an optional dependency still has to exist on crates.io.
+First release, and the first version of this crate. Version tracks the
+workspace. Published because `ytsaurus-client`'s `derive` feature depends on it:
+an optional dependency still has to exist on crates.io.
 
 `#[derive(TableRow)]` reads a struct's fields and produces the YTsaurus table
 schema they describe — one column per field, in declaration order, with the

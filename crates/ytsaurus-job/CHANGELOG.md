@@ -2,7 +2,7 @@
 
 ## 0.2.5 - 2026-08-10
 
-First release on crates.io.
+No changes to this crate beyond the version, which tracks the workspace.
 
 ### An empty reduce group stays empty
 

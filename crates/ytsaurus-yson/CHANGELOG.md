@@ -8,8 +8,7 @@ list below is that record: everything that differs from upstream `ba2044c`.
 
 ## 0.2.5 - 2026-08-10
 
-First release on crates.io. No changes to this crate beyond the version, which
-tracks the workspace.
+No changes to this crate beyond the version, which tracks the workspace.
 
 ## 0.2.0
 

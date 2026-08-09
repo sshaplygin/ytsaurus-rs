@@ -1,16 +1,21 @@
 # ytsaurus-rs
 
 [![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
-[![ytsaurus-skiff](https://img.shields.io/badge/ytsaurus--skiff-WIP-lightgrey.svg)](docs/skiff-compatibility.md)
+[![release](https://img.shields.io/github/v/tag/sshaplygin/ytsaurus-rs?label=release&sort=semver)](https://github.com/sshaplygin/ytsaurus-rs/releases)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
+
+All six crates are on crates.io at **0.2.5**, released together — the version is
+the workspace's, so they move as one.
 
 | Crate | Version | Docs | What it is |
 | --- | --- | --- | --- |
 | [`ytsaurus-yson`](crates/ytsaurus-yson/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-yson.svg)](https://crates.io/crates/ytsaurus-yson) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-yson)](https://docs.rs/ytsaurus-yson) | YSON codec, text and binary |
 | [`ytsaurus-job`](crates/ytsaurus-job/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-job.svg)](https://crates.io/crates/ytsaurus-job) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-job)](https://docs.rs/ytsaurus-job) | Job runtime |
 | [`ytsaurus-client`](crates/ytsaurus-client/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-client.svg)](https://crates.io/crates/ytsaurus-client) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-client)](https://docs.rs/ytsaurus-client) | HTTP API v4 launcher |
-| [`ytsaurus-helpers`](crates/ytsaurus-helpers/) | unpublished | — | `#[derive(TableRow)]` for schemas |
+| [`ytsaurus-helpers`](crates/ytsaurus-helpers/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-helpers.svg)](https://crates.io/crates/ytsaurus-helpers) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-helpers)](https://docs.rs/ytsaurus-helpers) | `#[derive(TableRow)]` for schemas |
+| [`ytsaurus-skiff`](crates/ytsaurus-skiff/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-skiff.svg)](https://crates.io/crates/ytsaurus-skiff) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-skiff)](https://docs.rs/ytsaurus-skiff) | Skiff schema and codec. **Pre-release** — [gates still open](docs/skiff-compatibility.md) |
+| [`ytsaurus-format`](crates/ytsaurus-format/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-format.svg)](https://crates.io/crates/ytsaurus-format) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-format)](https://docs.rs/ytsaurus-format) | `DataFormat`, shared by launcher and worker. Pre-release with the above |
 
 Write [YTsaurus](https://ytsaurus.tech) MapReduce workers in Rust instead of C++.
 
@@ -30,7 +35,7 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | Path | What it is |
 | --- | --- |
 | [crates/ytsaurus-yson/](crates/ytsaurus-yson/) | YSON serializer/deserializer (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
-| [crates/ytsaurus-skiff/](crates/ytsaurus-skiff/) | Schema model and compatibility suite for YTsaurus Skiff. **Implementation in progress; not published.** |
+| [crates/ytsaurus-skiff/](crates/ytsaurus-skiff/) | Schema model and compatibility suite for YTsaurus Skiff. **Pre-release**: published so the crates above can be, with [gates still open](docs/skiff-compatibility.md). |
 | [crates/ytsaurus-format/](crates/ytsaurus-format/) | Shared `DataFormat` selection used by client specs/table I/O and worker I/O. |
 | [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. |
 | [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
@@ -234,9 +239,10 @@ across both YSON formats without a crash.
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).
 
-All three crates are on crates.io, and **no further release happens without
-explicit human approval** — versions, yanks and new crates alike. In particular
-the `yson-rs` name belongs to its upstream author and will never be claimed here.
+All six crates are on crates.io at 0.2.5, and **no further release happens
+without explicit human approval** — versions, yanks and new crates alike. In
+particular the `yson-rs` name belongs to its upstream author and will never be
+claimed here.
 
 Every protocol fact in this repository is taken from the official YTsaurus
 documentation and cited at the point of use, then checked against a real cluster.

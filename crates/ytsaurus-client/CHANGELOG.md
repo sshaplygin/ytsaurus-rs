@@ -2,8 +2,6 @@
 
 ## 0.2.5 - 2026-08-10
 
-First release on crates.io.
-
 ### A managed installation is configurable from the environment
 
 Everything here comes from one run of the whole example suite against a managed

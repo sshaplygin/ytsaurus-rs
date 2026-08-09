@@ -17,8 +17,8 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | --- | --- |
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
 | `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. Reads and writes YSON or Skiff. |
-| `crates/ytsaurus-skiff/` | Skiff schema, format and bounded streaming codec. Pre-release, `publish = false`; see [docs/skiff-compatibility.md](docs/skiff-compatibility.md). |
-| `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, `publish = false`. |
+| `crates/ytsaurus-skiff/` | Skiff schema, format and bounded streaming codec. **Pre-release, and published from 0.2.5** — the ship gates in [docs/skiff-compatibility.md](docs/skiff-compatibility.md) are still not all green, and the API may change in a patch release. It is on crates.io because `ytsaurus-job` and `ytsaurus-client` depend on it and could not be published otherwise. |
+| `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, and published from 0.2.5 with `ytsaurus-skiff`, whose status it inherits. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
 | `examples/` | Worker binaries (`cat`, `wordcount`, `hello`, `sessionize`, `boom`, `selfrun`, `counted`, `shards`, `skiff_cat`) plus their e2e tests. |
@@ -1315,10 +1315,19 @@ iterations without a crash.
 ### Shipped
 
 - **GitHub**: [sshaplygin/ytsaurus-rs](https://github.com/sshaplygin/ytsaurus-rs),
-  public, CI green, tagged `v0.1.0` with a release.
-- **crates.io**: [`ytsaurus-yson` 0.1.0](https://crates.io/crates/ytsaurus-yson)
-  and [`ytsaurus-job` 0.1.0](https://crates.io/crates/ytsaurus-job); docs.rs
-  built both.
+  public, CI green, tagged `v0.2.5`.
+- **crates.io**: all six crates at **0.2.5**, released together —
+  [`ytsaurus-yson`](https://crates.io/crates/ytsaurus-yson),
+  [`ytsaurus-skiff`](https://crates.io/crates/ytsaurus-skiff),
+  [`ytsaurus-format`](https://crates.io/crates/ytsaurus-format),
+  [`ytsaurus-helpers`](https://crates.io/crates/ytsaurus-helpers),
+  [`ytsaurus-job`](https://crates.io/crates/ytsaurus-job) and
+  [`ytsaurus-client`](https://crates.io/crates/ytsaurus-client). The version is
+  the workspace's, so they move as one. `ytsaurus-skiff` and `ytsaurus-format`
+  were `publish = false` until 0.2.5 and are **still pre-release**; they are on
+  the registry only because the two crates above them depend on them.
+  `ytsaurus-yson` and `ytsaurus-job` were on crates.io at 0.1.0 and 0.2.0
+  before this, and `ytsaurus-client` at 0.2.0.
 - **Upstream courtesy**: the fork and the three fixed defects are filed as
   [ss123she/yson-rs#1](https://github.com/ss123she/yson-rs/issues/1). The fork
   is licence-compliant on its own, so nothing waits on a reply.
@@ -1393,7 +1402,8 @@ needs a human — see below.
   `ytsaurus-skiff` and `ytsaurus-format` exist and Skiff is selectable end to
   end: worker I/O, operation specs and direct table I/O. Binary YSON is still
   what every spec renders unless a caller asks otherwise, both crates are
-  `publish = false`, and which compatibility gates are still open is
+  published-but-pre-release from 0.2.5, and which compatibility gates are still
+  open is
   [`docs/skiff-compatibility.md`](docs/skiff-compatibility.md). The reference
   implementation is the `skiff` package in the
   [Go SDK](https://pkg.go.dev/go.ytsaurus.tech/yt/go), pinned at v0.0.33.
@@ -1423,9 +1433,10 @@ a local Docker cluster is enough for everything else.
 ## Non-goals
 
 RPC proxy (custom binary protocol), protobuf row format, dynamic tables,
-non-Linux targets, publishing to crates.io. *(Custom job statistics were on this
-list until the backlog ranked them P1 #7 — a human decision, and they ship now
-as `JobStatistics`.)*
+non-Linux targets. *(Custom job statistics were on this list until the backlog
+ranked them P1 #7 — a human decision, and they ship now as `JobStatistics`.
+Publishing to crates.io was on it too, and is now done, at 0.2.5, by the same
+kind of decision; Hard rule 1 still governs every release after it.)*
 
 ## Reference
 
