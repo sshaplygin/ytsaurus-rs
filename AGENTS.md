@@ -78,7 +78,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-cargo test --workspace            # 618 tests
+cargo test --workspace            # 668 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -559,6 +559,99 @@ per command. Cluster facts:
   nothing truncates the table.
 - A reader never sees a partial append — `@row_count` holds its old value until
   the upload transaction commits.
+
+### Selecting columns and rows on a path
+
+The read-side half of the same mechanism, and the sibling-parameter trap
+generalised: `columns` and `ranges` are attributes **on the path** too, and the
+cluster's answer to one in the wrong place is again a 200.
+
+- **A read selection on a *write* is ignored and the whole table is replaced,
+  with a 200.** Measured in both spellings: `write_table_rows("//tmp/t[#0:#2]",
+  rows)` replaced everything and reported success, and a `write_table` whose
+  path carried `ranges` as a typed *attribute* did exactly the same — 200, three
+  rows replaced by one. Same shape as the append trap: an attribute in the wrong
+  place costs a table and says nothing. Hence `TablePath::write_refusal`.
+- **An unknown name in `columns` is not an error**: 200, with the key simply
+  absent from every row. A typo reads clean and decodes short — loudly into a
+  struct, silently into a map.
+- **`columns=[]` is answered 200 with one empty map per row**, and it composes
+  with a range: `<columns=[];ranges=[{lower_limit={row_index=0};
+  upper_limit={row_index=2}}]>` came back as two empty maps, and the same range
+  spelled with `key` bounds as three. That counts the rows of a *range* with no
+  column bytes on the wire — something `@row_count` cannot do, speaking as it
+  does for a whole static table — so the client **sends** it. The first round
+  refused it by analogy with `update_operation_parameters({})`; the analogy was
+  false, because that one is a mutation silently no-op'd and reported as
+  success while this is a read that returns one correct record per row.
+- **A negative `row_index` is clamped to 0, not rejected** — the correction that
+  cost the most here, because the first measurement did not isolate the
+  variable. `{lower_limit={row_index=-5}}` returned **all five rows** of a
+  five-row table and `-5..2` returned rows 0 and 1: a negative lower limit reads
+  exactly as `0` would. Only a negative *upper* limit comes back empty
+  (`{upper_limit={row_index=-2}}` → 200, no rows), and that is the clamp too.
+  The earlier "`-5..0` is answered 200 and no rows" was true of `upper_limit=0`,
+  not of the negative bound. The client still refuses it — a bound arriving only
+  from arithmetic that went wrong, silently replaced by one that reads the whole
+  table, is worth an error — but for that reason, not the false one.
+- **A backwards range is answered 200 with no rows, in either selector**:
+  `{lower_limit={row_index=5};upper_limit={row_index=3}}` and
+  `{lower_limit={key=[3]};upper_limit={key=[1]}}` both came back empty. The
+  client refuses both, which it did not at first — it checked only row indices.
+- **Measure the shape the client actually sends, not the flat text.** This one
+  cost two wrong rounds. The client sends `path` as a **YSON string node with
+  its attributes hung outside** — `<columns=[n]>"//tmp/t{k}"` — while a `curl`
+  with JSON parameters sends the *flat text* `<columns=[n]>//tmp/t{k}` as one
+  string. **They parse differently and give opposite answers.** In flat text
+  the string's `{k}` wins; in the YSON shape the attribute wins. Reproduce the
+  real one with `-H 'X-YT-Header-Format: <format=text>yson'` and parameters
+  `{path=<columns=["n"]>"//tmp/t{k}";output_format=json}`. A JSON-parameter
+  `curl` is not evidence about this client's behaviour.
+- **The attribute beats the string when both spell the same kind of selection,
+  silently, at 200.** Measured in the YSON shape, on a table `k,n`:
+  `<columns=["n"]>"//tmp/t{k}"` → column `n` (the `{k}` discarded);
+  `<ranges=[…0:2]>"//tmp/t[#3:#5]"` → rows 0–1 (the `[#3:#5]` discarded);
+  `<columns=["k"]>"<columns=["n"]>//tmp/t"` → column `k`. **Different kinds
+  compose**: `<columns=["n"]>"//tmp/t[#3:#5]"` → rows 3–4 carrying only `n`,
+  and `<ranges=[…0:2]>"//tmp/t{k}"` → rows 0–1 carrying only `k`. So the client
+  refuses the doubled *kind* and sends the pairing. Nothing here is corrupted —
+  the read is exactly what the attribute asked for — the loss is that the
+  caller's own half is thrown away with no mention, which is what the refusal
+  is for.
+- **There is no 400 in any of this.** Every combination above answers 200,
+  including a string that opens with `<…>`: `"<columns=["n"]>//tmp/t"` alone
+  → column `n`, and `<ranges=[…0:2]>"<columns=["n"]>//tmp/t"` → rows 0–1
+  carrying only `n`, composing like any other different kinds. A leading `<…>`
+  is still refused, but for the honest reason: **the client cannot parse the
+  block to know which attribute it names**, and if it names the one being added
+  the caller's is discarded silently. (The earlier "two blocks → 400, *does not
+  start with a valid root-designator*" was the flat-text artefact — two `<…>`
+  concatenated into one string — not anything this client can send.)
+- **A `uint64` key column does not insist on the `u` suffix**: on a
+  `uint64`-keyed table `{exact={key=[42]}}` and `{exact={key=[42u]}}` both
+  returned the row. `yson_build::uint` earns its place on *range* instead —
+  `Key::from(i64)` stops at `i64::MAX`, and the row keyed
+  `18446744073709551615u` came back only for the uint spelling.
+- **`key` and `key_bound` compare a short key by opposite rules**, which is the
+  finding worth the most here. Under `key` the row's whole key is compared
+  component-wise, the shorter tuple being smaller when equal so far. Under
+  `key_bound` the row's key is **truncated** to the bound's length first, so
+  every row sharing the prefix compares *equal* to it. On a table keyed
+  `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
+
+  | sent | rows back |
+  | --- | --- |
+  | `{key=[a]}` … `{key=[b]}` | `(a,/x) (a,/y)` |
+  | `{key=[a]}` … `{key_bound=["<=";[b]]}` | `(a,/x) (a,/y) (b,/x) (b,/y)` |
+  | `{key_bound=[">";[a]]}` | `(b,/x) (b,/y) (c,/x)` |
+  | `{exact={key=[a]}}` | `(a,/x) (a,/y)` |
+
+  So `a..b` and `a..=b` differ by a whole prefix group, and `>` on a prefix
+  drops every row of that prefix — there is no "the row just after `a`".
+- **A range entry mixing `key` on one side with `key_bound` on the other is
+  accepted**, which is what `keys(a..=b)` sends. The reference documents the two
+  selectors separately and never together; the cluster takes the mixture.
+- All of the above is checked by `examples/rich_path.rs`.
 
 ### Tracing
 

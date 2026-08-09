@@ -119,8 +119,8 @@ fn run() -> Result<(), ClientError> {
     let id = client.start_map(&spec)?;
     client.wait_for_operation(&id)?;
 
-    let before = client.read_table(&format!("{BASE}/input"))?;
-    let after = client.read_table(&format!("{BASE}/output"))?;
+    let before = client.read_table(format!("{BASE}/input"))?;
+    let after = client.read_table(format!("{BASE}/output"))?;
     check(
         "the identity map reproduced its input",
         before == after && !after.is_empty(),

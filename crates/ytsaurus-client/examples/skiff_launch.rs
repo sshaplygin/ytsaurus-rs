@@ -45,7 +45,7 @@ fn main() -> Result<(), ytsaurus_client::ClientError> {
     let operation = client.start_map(&spec)?;
     client.wait_for_operation(&operation)?;
 
-    let output = client.read_table_with_format(&format!("{BASE}/output"), &data_format)?;
+    let output = client.read_table_with_format(format!("{BASE}/output"), &data_format)?;
     let mut decoder = Decoder::new(output.as_slice(), format);
     for row in &rows {
         let Some((table, decoded)) =

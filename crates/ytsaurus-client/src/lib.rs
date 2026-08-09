@@ -216,7 +216,7 @@ pub use crate::operation::{
     Operation, OperationEvent, OperationFilter, OperationInfo, OperationList, OperationParameters,
     OperationStatus,
 };
-pub use crate::path::TablePath;
+pub use crate::path::{Key, RowRange, TablePath};
 pub use crate::retry::{MutationId, Repeatable, RetryPolicy};
 pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
 // The derive and the trait share a name, as `serde::Serialize` does: they live
@@ -1769,9 +1769,18 @@ impl Client {
     /// `rows` must be a binary YSON list fragment — exactly what a
     /// `ytsaurus-job` worker writes.
     ///
+    /// A path carrying a read selection — [`TablePath::columns`],
+    /// [`TablePath::range`], or rich YPath syntax spelled into the path
+    /// string — is **refused locally**, before anything is sent. The cluster
+    /// ignores those on a write and replaces the whole table with a 200
+    /// (measured: `write_table_rows("//tmp/t[#0:#2]", rows)` replaced
+    /// everything and reported success), and this refusal is what keeps that
+    /// silent loss unwritable. See [`TablePath`].
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails.
+    /// Returns [`ClientError::Config`] if the path carries a read selection,
+    /// or [`ClientError`] if the request fails.
     pub fn write_table(&self, path: impl Into<TablePath>, rows: &[u8]) -> Result<()> {
         self.write_table_with_format(path, rows, &DataFormat::binary_yson())
     }
@@ -1802,6 +1811,7 @@ impl Client {
     }
 
     fn write_yson_table(&self, path: &TablePath, rows: &[u8], format: YsonFormat) -> Result<()> {
+        refuse_selection_on_write(path)?;
         let params = yson_build::map([
             ("path", path.to_yson()),
             ("input_format", DataFormat::yson(format).to_yson()),
@@ -1842,6 +1852,7 @@ impl Client {
         rows: &[u8],
         format: &SkiffFormat,
     ) -> Result<()> {
+        refuse_selection_on_write(path)?;
         // The path first: it is what rejects a format that is not single-table
         // direct I/O. Checking the stream first would answer a multi-table
         // format with a decode error about a tag mismatch, which describes a
@@ -1868,6 +1879,20 @@ impl Client {
     /// Reads it into memory: this is for results a launcher inspects, not for
     /// bulk export.
     ///
+    /// The path can select which part of the table to read —
+    /// [`TablePath::columns`] and [`TablePath::range`] travel as attributes on
+    /// it, so three columns of a hundred rows cost three columns of a hundred
+    /// rows, not the whole table:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, TablePath};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// let head = client.read_table(TablePath::new("//tmp/log").columns(["host"]).range(0..100))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// The result is checked to be a complete list fragment. That is not
     /// pedantry — the proxy reports a mid-stream failure in a trailer this
     /// client cannot see (see the `http` module), so a truncated body is the
@@ -1877,7 +1902,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails or the stream is truncated.
-    pub fn read_table(&self, path: &str) -> Result<Vec<u8>> {
+    pub fn read_table(&self, path: impl Into<TablePath>) -> Result<Vec<u8>> {
         self.read_table_with_format(path, &DataFormat::binary_yson())
     }
 
@@ -1891,17 +1916,23 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the format is unsupported, the response is
     /// incomplete, or the request fails.
-    pub fn read_table_with_format(&self, path: &str, format: &DataFormat) -> Result<Vec<u8>> {
+    pub fn read_table_with_format(
+        &self,
+        path: impl Into<TablePath>,
+        format: &DataFormat,
+    ) -> Result<Vec<u8>> {
+        let path = path.into();
         match format {
-            DataFormat::Yson(format) => self.read_yson_table(path, *format),
-            DataFormat::Skiff(format) => self.read_skiff_table_impl(path, format),
+            DataFormat::Yson(format) => self.read_yson_table(&path, *format),
+            DataFormat::Skiff(format) => self.read_skiff_table_impl(&path, format),
             _ => Err(unsupported_data_format()),
         }
     }
 
-    fn read_yson_table(&self, path: &str, format: YsonFormat) -> Result<Vec<u8>> {
+    fn read_yson_table(&self, path: &TablePath, format: YsonFormat) -> Result<Vec<u8>> {
+        refuse_mixed_selection_on_read(path)?;
         let params = yson_build::map([
-            ("path", yson_build::string(path)),
+            ("path", path.to_yson()),
             ("output_format", DataFormat::yson(format).to_yson()),
         ]);
         let body = self.transport.call(
@@ -1923,21 +1954,47 @@ impl Client {
     /// Reads one table as a complete Skiff stream.
     ///
     /// `format` must have exactly one table schema. Its named fields select
-    /// the table columns and determine the bytes returned. The response is
-    /// decoded to its end before being returned so a truncated Skiff stream is
-    /// never reported as a successful table read.
+    /// the table columns and determine the bytes returned — which is why a
+    /// path that *also* names columns is refused. That covers both spellings,
+    /// [`TablePath::columns`] and `{…}` in the path *string*, because the
+    /// format's fields become a `columns` attribute here whether the caller
+    /// named one or not.
+    ///
+    /// **What that costs is a silently ignored filter, not a corrupt decode.**
+    /// Measured, the synthesised attribute wins: `<columns=[n]>"//tmp/t{k}"`
+    /// answered with column `n`. A Skiff read therefore still receives exactly
+    /// the columns its format names, and the tuple stays aligned — but the
+    /// `{…}` the caller wrote is discarded without a word, at 200. Refusing is
+    /// how they get to hear about it. A path string opening with `<…>` is
+    /// refused one step removed: this client cannot parse the block to see
+    /// whether it names `columns` as well.
+    ///
+    /// **Row selections are not column selections and are not refused.** A
+    /// [`TablePath::range`] combines, and so does a range spelled into the
+    /// string — measured, `<columns=[n]>"//tmp/t[#0:#2]"` answered 200 with
+    /// rows 0-1 carrying only `n`. Ranges pick rows, the schema picks columns.
+    ///
+    /// The response is decoded to its end before being returned so a truncated
+    /// Skiff stream is never reported as a successful table read.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the format is not a direct-table format, the
+    /// path also selects columns — through [`TablePath::columns`] or as `{…}`
+    /// in its string — the path string opens with an attribute block, the
     /// response is incomplete, or the request fails.
-    pub fn read_skiff_table(&self, path: &str, format: &SkiffFormat) -> Result<Vec<u8>> {
+    pub fn read_skiff_table(
+        &self,
+        path: impl Into<TablePath>,
+        format: &SkiffFormat,
+    ) -> Result<Vec<u8>> {
         self.read_table_with_format(path, &DataFormat::skiff(format.clone()))
     }
 
-    fn read_skiff_table_impl(&self, path: &str, format: &SkiffFormat) -> Result<Vec<u8>> {
+    fn read_skiff_table_impl(&self, path: &TablePath, format: &SkiffFormat) -> Result<Vec<u8>> {
+        refuse_mixed_selection_on_read(path)?;
         let params = yson_build::map([
-            ("path", skiff_table_path(&TablePath::from(path), format)?),
+            ("path", skiff_table_path(path, format)?),
             ("output_format", format.to_yson()),
         ]);
         let body = self.transport.call(
@@ -1987,19 +2044,23 @@ impl Client {
     /// than a million rows' worth of memory, and the caller never has to
     /// materialise them either.
     ///
-    /// Replaces the table's contents, as [`Client::write_table`] does.
+    /// Replaces the table's contents, as [`Client::write_table`] does — and
+    /// refuses a path carrying a read selection before anything is sent, for
+    /// the reason given there.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Decode`] naming the row if one cannot be
-    /// serialised — the write fails rather than sending the rows before it —
-    /// or [`ClientError`] if the request fails.
+    /// Returns [`ClientError::Config`] if the path carries a read selection,
+    /// [`ClientError::Decode`] naming the row if one cannot be serialised —
+    /// the write fails rather than sending the rows before it — or
+    /// [`ClientError`] if the request fails.
     pub fn write_table_rows<T, I>(&self, path: impl Into<TablePath>, rows: I) -> Result<()>
     where
         T: serde::Serialize,
         I: IntoIterator<Item = T>,
     {
         let path = path.into();
+        refuse_selection_on_write(&path)?;
         let params = yson_build::map([
             ("path", path.to_yson()),
             ("input_format", yson_build::binary_yson_format()),
@@ -2047,14 +2108,34 @@ impl Client {
     /// [`Client::read_table_streaming`] feeds `ytsaurus_job::JobReader`.
     ///
     /// Columns the type does not mention are ignored, so a struct naming two
-    /// columns of a twenty-column table is a projection rather than an error.
+    /// columns of a twenty-column table is a projection rather than an error —
+    /// but the *whole* row still crosses the wire and is decoded before the
+    /// projection happens. [`TablePath::columns`] moves the projection to the
+    /// cluster, and [`TablePath::range`] does the same for rows:
+    ///
+    /// ```no_run
+    /// # use ytsaurus_client::{Client, TablePath};
+    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
+    /// # let client = Client::from_env()?;
+    /// # #[derive(serde::Deserialize)]
+    /// # struct Contact { name: String, age: i64 }
+    /// let some: Vec<Contact> = client.read_table_rows(
+    ///     TablePath::new("//tmp/contacts").columns(["name", "age"]).range(0..100),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails, the stream is truncated,
     /// or a row does not match `T`.
-    pub fn read_table_rows<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
-        decode_rows(&self.read_table(path)?, path)
+    pub fn read_table_rows<T: serde::de::DeserializeOwned>(
+        &self,
+        path: impl Into<TablePath>,
+    ) -> Result<Vec<T>> {
+        let path = path.into();
+        decode_rows(&self.read_table(&path)?, &path.to_string())
     }
 
     /// Reads a node, or an attribute, into a Rust type.
@@ -2145,13 +2226,20 @@ impl Client {
     /// fails on it — see [`TableReader`] for why that is the same protection
     /// rather than none.
     ///
+    /// The path can carry a read selection — [`TablePath::columns`] and
+    /// [`TablePath::range`] — which is worth the most here of anywhere: a
+    /// streaming read exists because the table is too big to hold, and a
+    /// selection is how most of it never arrives at all.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails. Failures *during* the read
     /// arrive from the reader, not from here.
-    pub fn read_table_streaming(&self, path: &str) -> Result<TableReader> {
+    pub fn read_table_streaming(&self, path: impl Into<TablePath>) -> Result<TableReader> {
+        let path = path.into();
+        refuse_mixed_selection_on_read(&path)?;
         let params = yson_build::map([
-            ("path", yson_build::string(path)),
+            ("path", path.to_yson()),
             ("output_format", yson_build::binary_yson_format()),
         ]);
         let body = self.transport.open(Method::Get, "read_table", &params)?;
@@ -2182,15 +2270,18 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, including when `rows`
-    /// itself fails to read.
+    /// Returns [`ClientError::Config`] if the path carries a read selection —
+    /// see [`Client::write_table`] — or [`ClientError`] if the request fails,
+    /// including when `rows` itself fails to read.
     pub fn write_table_streaming(
         &self,
         path: impl Into<TablePath>,
         mut rows: impl std::io::Read,
     ) -> Result<()> {
+        let path = path.into();
+        refuse_selection_on_write(&path)?;
         let params = yson_build::map([
-            ("path", path.into().to_yson()),
+            ("path", path.to_yson()),
             ("input_format", yson_build::binary_yson_format()),
         ]);
         self.transport
@@ -3826,7 +3917,66 @@ fn refuse_skiff_table_mismatch(mismatch: Option<String>) -> Result<()> {
     }
 }
 
+/// Refuses a write whose path carries a read selection, before it is sent.
+///
+/// The cluster ignores `columns` and `ranges` on a write and replaces the
+/// whole table with a 200 — measured on a local cluster, where
+/// `write_table_rows("//tmp/t[#0:#2]", rows)` replaced everything and
+/// reported success. Refusing locally is the only version of this that the
+/// caller ever hears about; the [rich YPath
+/// reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath) agrees
+/// on the scope, listing both attributes as recognized by the *read*
+/// commands. The rule and the string-syntax half of it live on
+/// [`TablePath`].
+fn refuse_selection_on_write(path: &TablePath) -> Result<()> {
+    match path.write_refusal() {
+        Some(reason) => Err(ClientError::Config(reason)),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a read that spells the *same kind* of selection twice — once in
+/// the path string, once through the typed API. Measured, the typed attribute
+/// wins and the caller's string half is discarded at 200, so the filter they
+/// wrote into the path simply never happens and nothing says so. Rows against
+/// columns compose and are sent; a string opening with `<…>` is refused
+/// because this client cannot parse the block to see which attribute it names.
+fn refuse_mixed_selection_on_read(path: &TablePath) -> Result<()> {
+    match path.read_refusal() {
+        Some(reason) => Err(ClientError::Config(reason)),
+        None => Ok(()),
+    }
+}
+
 fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue> {
+    if path.selected_columns().is_some() {
+        return Err(ClientError::Config(format!(
+            "{}: a Skiff table read's columns are its format's fields, so \
+             TablePath::columns cannot also apply — put the projection in the \
+             Skiff schema, or read YSON",
+            path.as_str()
+        )));
+    }
+    // The same rule for the *string* spelling, which the typed check above
+    // cannot see: this function synthesises a `columns` attribute out of the
+    // format's fields whether the caller asked for one or not, so `//tmp/t{a}`
+    // is a doubled column selection even though nothing typed was set.
+    // Measured, the synthesised attribute wins — `<columns=[n]>"//tmp/t{k}"`
+    // came back as column `n` — so the Skiff tuple stays aligned with its
+    // schema and nothing is decoded wrong; what is lost is the caller's own
+    // `{a}`, discarded at 200 with no mention. Only the *column* half is a
+    // conflict: a string-spelled row range answers a different question and
+    // composes, as `<columns=[n]>"//tmp/t[#0:#2]"` confirmed by returning rows
+    // 0-1 carrying only `n`. A leading `<…>` is refused too, for the reason
+    // `selection_conflict` documents — the block cannot be read from here.
+    if let Some(reason) = path.selection_conflict(
+        true,
+        false,
+        "the Skiff format's fields become",
+        "the Skiff read adds",
+    ) {
+        return Err(ClientError::Config(reason));
+    }
     if format.table_schemas().len() != 1 {
         return Err(ClientError::Config(format!(
             "Skiff table I/O requires exactly one table schema, got {}",
@@ -3854,15 +4004,16 @@ fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue>
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut attributes = vec![("columns", yson_build::list(columns))];
-    if path.is_append() {
-        attributes.push(("append", yson_build::boolean(true)));
-    }
-
-    Ok(yson_build::with_attributes(
-        yson_build::string(path.as_str()),
-        attributes,
-    ))
+    // The path renders its own attributes — append, and any row ranges —
+    // and the format's field list joins them as `columns`. Ranges are rows,
+    // columns are the tuple shape; they answer different questions and
+    // combine freely.
+    let mut value = path.to_yson();
+    value
+        .attributes
+        .get_or_insert_with(std::collections::BTreeMap::new)
+        .insert(b"columns".to_vec(), yson_build::list(columns));
+    Ok(value)
 }
 
 /// Checks that a returned or submitted Skiff stream is a whole number of rows.
@@ -4065,6 +4216,60 @@ mod tests {
         let value = skiff_table_path(&TablePath::from("//tmp/table"), &skiff_format()).unwrap();
         let rendered = ytsaurus_yson::to_string(&value, YsonFormat::Text).unwrap();
         assert_eq!(rendered, r#"<columns=[found;rcl]>"//tmp/table""#);
+    }
+
+    #[test]
+    fn a_skiff_path_refuses_a_column_selection_spelled_into_its_string() {
+        // The branch's own invariant — one spelling of a selection per path —
+        // has a hole here that it has nowhere else: this function
+        // *synthesises* a `columns` attribute out of the format's fields, so
+        // there is a second column selection whether the caller typed one or
+        // not, and the typed check above cannot see a string-spelled first
+        // one. Measured, the synthesised attribute wins —
+        // `<columns=[n]>"//tmp/t{k}"` answered with column `n` — so the tuple
+        // stays aligned with the schema and no value is decoded wrong. What
+        // is lost is the caller's own `{found}`, silently discarded at 200,
+        // which is the trap: the filter they wrote simply never happened.
+        let refused = skiff_table_path(&TablePath::from("//tmp/table{found}"), &skiff_format());
+        assert!(
+            matches!(&refused, Err(ClientError::Config(reason)) if reason.contains("already selects columns")),
+            "a string column selection was not refused: {refused:?}"
+        );
+        // A leading attribute block is refused one step removed: the cluster
+        // takes it happily (`<ranges=[…0:2]>"<columns=[n]>//tmp/t"` composed
+        // at 200), but this client cannot read the block to know whether it
+        // names `columns` too, and if it does the synthesised one wins in
+        // silence.
+        for path in [
+            "<columns=[found]>//tmp/table",
+            "<primary_medium=default>//tmp/table",
+        ] {
+            let refused = skiff_table_path(&TablePath::from(path), &skiff_format());
+            assert!(
+                matches!(&refused, Err(ClientError::Config(reason)) if reason.contains("cannot tell whether")),
+                "{path} was not refused: {refused:?}"
+            );
+        }
+
+        // A *row* range is not a column selection. Measured on the cluster,
+        // `<columns=[n]>//tmp/t[#0:#2]` answers 200 with rows 0-1 carrying
+        // only `n` — the two attributes answer different questions — so the
+        // string spelling of a range goes through, as it does for read_table.
+        let ranged = skiff_table_path(&TablePath::from("//tmp/table[#0:#2]"), &skiff_format())
+            .expect("a string row range is not a column selection");
+        assert_eq!(
+            ytsaurus_yson::to_string(&ranged, YsonFormat::Text).unwrap(),
+            r#"<columns=[found;rcl]>"//tmp/table[#0:#2]""#
+        );
+        // And so is a typed one, which renders its own `ranges` alongside.
+        assert!(
+            skiff_table_path(&TablePath::from("//tmp/table").range(0..2), &skiff_format()).is_ok()
+        );
+
+        // An escaped bracket is part of a node name, and that table is
+        // readable as Skiff like any other.
+        assert!(skiff_table_path(&TablePath::from(r"//tmp/t\[x\]"), &skiff_format()).is_ok());
+        assert!(skiff_table_path(&TablePath::from(r"//tmp/t\{x\}"), &skiff_format()).is_ok());
     }
 
     #[test]

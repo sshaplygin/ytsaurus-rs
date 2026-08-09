@@ -143,7 +143,7 @@ fn launch() -> Result<(), ClientError> {
 
     step("Reading the result back");
     let rows = client.row_count(&format!("{BASE}/output"))?;
-    let output = client.read_table(&format!("{BASE}/output"))?;
+    let output = client.read_table(format!("{BASE}/output"))?;
     done(&format!("{rows} rows, {} bytes", output.len()));
 
     println!("\nOne binary, two roles. Output at {BASE}/output");
