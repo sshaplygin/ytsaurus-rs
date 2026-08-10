@@ -55,6 +55,23 @@ fn stub_answering(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
 /// Detached rather than joined: half of what these prove is that nobody
 /// connected at all, and there is nothing to wait for in that case. The thread
 /// ends with the test process.
+///
+/// **It keeps a connection open, because the client does.** None of the replies
+/// here says `Connection: close`, so HTTP/1.1 keep-alive applies and `ureq`
+/// returns a socket whose body it has read to its pool — then reuses it for the
+/// next request to the same origin, which for a same-origin redirect is the
+/// very next thing that happens. A stub that answered once and went back to
+/// `accept` left that pooled socket closed under the client, and the second hop
+/// died on `Connection reset by peer` if it lost the race and passed if it won.
+/// That is `a_bodiless_post_follows_a_canonicalising_balancer` failing on CI and
+/// nowhere else. So each connection is served until the client is finished with
+/// it, which is what the client already assumes.
+///
+/// **A thread per connection**, rather than a loop that serves them in turn: a
+/// client is free to open a second connection while it still holds the first —
+/// after a `Connection: close`, or simply because its pool had none free — and
+/// a single-threaded accept loop would leave that one waiting behind a socket
+/// nobody is going to write to again, for [`STUB_PATIENCE`] and then for ever.
 fn stub_answering_after(
     delay: Duration,
     replies: Vec<String>,
@@ -63,24 +80,44 @@ fn stub_answering_after(
     let address = listener.local_addr().expect("has an address");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&seen);
+    let replies = Arc::new(replies);
+    // Shared, so "the nth request gets the nth reply" survives a client that
+    // spread its requests over more than one connection.
+    let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     std::thread::spawn(move || {
-        let mut answered = 0_usize;
         while let Ok((mut stream, _)) = listener.accept() {
-            // So a client that goes away mid-request fails this stub rather
-            // than hanging the suite behind a read that will never finish.
-            stream.set_read_timeout(Some(STUB_PATIENCE)).ok();
-            let mut reader = BufReader::new(stream.try_clone().expect("clones"));
-            let request = read_request(&mut reader);
-            let reply = &replies[answered.min(replies.len() - 1)];
-            answered += 1;
-            // Recorded before the reply goes out, so a client that has been
-            // answered has already been counted: the assertions run after the
-            // call returns, and would otherwise race it.
-            recorded.lock().expect("not poisoned").push(request);
-            std::thread::sleep(delay);
-            stream.write_all(reply.as_bytes()).ok();
-            stream.flush().ok();
+            let replies = Arc::clone(&replies);
+            let recorded = Arc::clone(&recorded);
+            let answered = Arc::clone(&answered);
+
+            std::thread::spawn(move || {
+                // So a client that goes away mid-request fails this stub rather
+                // than hanging the suite behind a read that will never finish.
+                stream.set_read_timeout(Some(STUB_PATIENCE)).ok();
+                let mut reader = BufReader::new(stream.try_clone().expect("clones"));
+
+                loop {
+                    let request = read_request(&mut reader);
+                    // Nothing left to read: the client has closed its end, and
+                    // this connection is done rather than broken.
+                    if request.trim().is_empty() {
+                        break;
+                    }
+
+                    let nth = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let reply = &replies[nth.min(replies.len() - 1)];
+                    // Recorded before the reply goes out, so a client that has
+                    // been answered has already been counted: the assertions run
+                    // after the call returns, and would otherwise race it.
+                    recorded.lock().expect("not poisoned").push(request);
+                    std::thread::sleep(delay);
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                    stream.flush().ok();
+                }
+            });
         }
     });
 
