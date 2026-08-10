@@ -1,11 +1,10 @@
 //! End-to-end job throughput, measured the way a real job pays for it.
 //!
-//! The microbenchmark in `ytsaurus-yson` parses one big slice; a job instead
-//! streams a pipe, finds record boundaries, and decodes row by row. The gap
-//! between those two numbers is what the phase-5 Skiff decision turns on, so
-//! this measures the job path specifically.
+//! The microbenchmarks in `ytsaurus-yson` and `ytsaurus-skiff` parse one big
+//! slice; a job instead streams a pipe, finds record boundaries, and decodes
+//! row by row. This measures that job path for both formats.
 //!
-//! The four cases are chosen to separate the costs:
+//! The cases are chosen to separate the costs:
 //!
 //! - `pass_through`  — read + find boundaries, never decode. The floor: what an
 //!   identity job costs, and the share of time that is pure framing.
@@ -13,16 +12,27 @@
 //!   well-written job costs.
 //! - `parse_owned`    — decode into `String`, forcing a copy per string column.
 //! - `parse_dynamic`  — decode into `YsonValue`, allocating a whole DOM per row.
+//! - `skiff_dynamic`  — decode the equivalent Skiff schema into its current
+//!   dynamic `Value` representation.
 //!
 //! `pass_through` versus `parse_borrowed` is the answer to "how much of job cpu
-//! is YSON parsing": if the difference is small, Skiff would buy little.
+//! is YSON parsing". `skiff_dynamic` is deliberately separate: Skiff currently
+//! exposes dynamic rows, so comparing it to a borrowed Serde struct would hide
+//! the allocation cost of its public job API.
 
-use std::hint::black_box;
+use std::{
+    hint::black_box,
+    io::{BufReader, Cursor},
+};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use serde::Deserialize;
-use ytsaurus_job::{Event, JobReader};
+use ytsaurus_job::{Event, JobReader, SkiffJobReader};
+use ytsaurus_skiff::{Encoder, Format, Schema, SchemaRef, Value, WireType};
 use ytsaurus_yson::YsonValue;
+
+const ROWS: usize = 100_000;
+const INPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// A plausible table row: a few string columns, a few numeric ones.
 #[derive(Deserialize)]
@@ -89,9 +99,7 @@ fn column(key: &[u8], out: &mut Vec<u8>, first: &mut bool) {
 
 /// 100 000 rows, about 17.7 MiB — enough to dwarf warm-up and to cross the
 /// reader's 1 MiB buffer many times over.
-fn generate_input() -> Vec<u8> {
-    const ROWS: usize = 100_000;
-
+fn generate_yson_input() -> Vec<u8> {
     let mut out = Vec::with_capacity(32 * 1024 * 1024);
     for i in 0..ROWS {
         out.push(b'{');
@@ -131,17 +139,61 @@ fn generate_input() -> Vec<u8> {
     out
 }
 
-fn benchmark(c: &mut Criterion) {
-    let input = generate_input();
+fn skiff_schema() -> Schema {
+    Schema::tuple([
+        Schema::named("user_id", WireType::String32),
+        Schema::named("url", WireType::String32),
+        Schema::named("referer", WireType::String32),
+        Schema::named("timestamp", WireType::Int64),
+        Schema::named("duration", WireType::Int64),
+        Schema::named("is_mobile", WireType::Boolean),
+        Schema::named("score", WireType::Double),
+    ])
+}
 
-    let mut group = c.benchmark_group("job throughput");
-    group.throughput(Throughput::Bytes(input.len() as u64));
+fn skiff_row(i: usize) -> Value {
+    Value::Tuple(vec![
+        Value::Bytes(format!("user-{i:08}").into_bytes()),
+        Value::Bytes(
+            format!("https://example.com/page/{}/section/{}", i % 997, i % 31).into_bytes(),
+        ),
+        Value::Bytes(format!("https://referer.example.org/{}", i % 613).into_bytes()),
+        Value::Int64(1_700_000_000 + i as i64),
+        Value::Int64((i % 3600) as i64),
+        Value::Boolean(i.is_multiple_of(3)),
+        Value::Double(i as f64 / 7.0),
+    ])
+}
+
+fn generate_skiff_input(schema: &Schema) -> Vec<u8> {
+    let mut encoder = Encoder::new(Vec::with_capacity(16 * 1024 * 1024), schema.clone()).unwrap();
+    for i in 0..ROWS {
+        encoder.write(&skiff_row(i)).unwrap();
+    }
+    encoder.into_inner().unwrap()
+}
+
+fn skiff_duration(row: &Value) -> i64 {
+    match row {
+        Value::Tuple(fields) => match fields.get(4) {
+            Some(Value::Int64(duration)) => *duration,
+            _ => unreachable!("the benchmark schema fixes duration at tuple index four"),
+        },
+        _ => unreachable!("the benchmark table schema has a tuple root"),
+    }
+}
+
+fn benchmark(c: &mut Criterion) {
+    let yson_input = generate_yson_input();
+
+    let mut group = c.benchmark_group("YSON job throughput");
+    group.throughput(Throughput::Bytes(yson_input.len() as u64));
     group.sample_size(20);
 
     // Framing only: what an identity job pays.
     group.bench_function("pass_through", |b| {
         b.iter(|| {
-            let mut reader = JobReader::binary(black_box(input.as_slice()));
+            let mut reader = JobReader::binary(black_box(yson_input.as_slice()));
             let mut total = 0usize;
             while let Some(event) = reader.next_event().unwrap() {
                 if let Event::Row(row) = event {
@@ -154,7 +206,7 @@ fn benchmark(c: &mut Criterion) {
 
     group.bench_function("parse_borrowed", |b| {
         b.iter(|| {
-            let mut reader = JobReader::binary(black_box(input.as_slice()));
+            let mut reader = JobReader::binary(black_box(yson_input.as_slice()));
             let mut total = 0i64;
             while let Some(event) = reader.next_event().unwrap() {
                 if let Event::Row(row) = event {
@@ -168,7 +220,7 @@ fn benchmark(c: &mut Criterion) {
 
     group.bench_function("parse_owned", |b| {
         b.iter(|| {
-            let mut reader = JobReader::binary(black_box(input.as_slice()));
+            let mut reader = JobReader::binary(black_box(yson_input.as_slice()));
             let mut total = 0i64;
             while let Some(event) = reader.next_event().unwrap() {
                 if let Event::Row(row) = event {
@@ -182,7 +234,7 @@ fn benchmark(c: &mut Criterion) {
 
     group.bench_function("parse_dynamic", |b| {
         b.iter(|| {
-            let mut reader = JobReader::binary(black_box(input.as_slice()));
+            let mut reader = JobReader::binary(black_box(yson_input.as_slice()));
             let mut rows = 0usize;
             while let Some(event) = reader.next_event().unwrap() {
                 if let Event::Row(row) = event {
@@ -194,6 +246,29 @@ fn benchmark(c: &mut Criterion) {
         });
     });
 
+    group.finish();
+
+    let skiff_schema = skiff_schema();
+    let skiff_format = Format::new(vec![SchemaRef::Inline(skiff_schema.clone())]).unwrap();
+    let skiff_input = generate_skiff_input(&skiff_schema);
+
+    let mut group = c.benchmark_group("Skiff job throughput");
+    group.throughput(Throughput::Bytes(skiff_input.len() as u64));
+    group.sample_size(20);
+    group.bench_function("skiff_dynamic", |b| {
+        b.iter(|| {
+            let input = BufReader::with_capacity(
+                INPUT_BUFFER_BYTES,
+                Cursor::new(black_box(skiff_input.as_slice())),
+            );
+            let mut reader = SkiffJobReader::new(input, skiff_format.clone()).unwrap();
+            let mut total = 0i64;
+            while let Some(row) = reader.next_row().unwrap() {
+                total += skiff_duration(row.value());
+            }
+            black_box(total)
+        });
+    });
     group.finish();
 }
 

@@ -13,16 +13,25 @@ evidence, not the verdict.
 
 Two layers, on an Apple M1 Max, rustc 1.94.0, `lto = "fat"`, `codegen-units = 1`.
 
-### 1. Codec microbenchmark
+### 1. Codec microbenchmarks
 
 `cargo bench -p ytsaurus-yson` — parses one whole slice, no streaming.
 Baseline in [`crates/ytsaurus-yson/BENCHMARKS.md`](../crates/ytsaurus-yson/BENCHMARKS.md).
 Binary deserialisation: **263 MiB/s**.
 
+`cargo bench -p ytsaurus-skiff --bench codec_throughput` measures the same
+realistic seven-column rows that the job benchmark uses. Its three cases make
+the current dynamic API visible: `encode_dynamic`, `decode_dynamic`, and
+`validate_and_skip`. The last validates the stream's framing and schema without
+building a `Value` tree; it is a codec baseline, not a job API. Do not compare
+the dynamic Skiff result directly with YSON's borrowed-Serde result: Skiff does
+not expose typed or borrowing rows yet.
+
 ### 2. Job-path benchmark
 
 `cargo bench -p ytsaurus-job` — the real path: streaming reads, record framing,
-per-row decoding. Four cases isolate where the time goes.
+per-row decoding. The YSON cases isolate where the time goes, and the Skiff case
+uses the equivalent schema through `SkiffJobReader`.
 
 | Case | What it does |
 | --- | --- |
@@ -30,8 +39,10 @@ per-row decoding. Four cases isolate where the time goes.
 | `parse_borrowed` | decode into `&str` / `&[u8]` fields |
 | `parse_owned` | decode into `String` fields, copying every string column |
 | `parse_dynamic` | decode into `YsonValue`, a DOM per row |
+| `skiff_dynamic` | decode the equivalent schema into Skiff's dynamic `Value` tree |
 
-Measured on 100 000 rows (~17.7 MiB) with a realistic seven-column schema:
+The recorded results below are binary YSON, measured on 100 000 rows (~17.7
+MiB) with a realistic seven-column schema:
 
 | Case | Time | Throughput |
 | --- | ---: | ---: |
@@ -320,6 +331,7 @@ outlives it, so no caller of `abort_operation` can observe it.
 
 ```sh
 cargo bench -p ytsaurus-yson     # codec
+cargo bench -p ytsaurus-skiff --bench codec_throughput  # Skiff codec
 cargo bench -p ytsaurus-job      # job path
 cargo bench -p ytsaurus-client   # the launcher's own cost, over loopback
 
