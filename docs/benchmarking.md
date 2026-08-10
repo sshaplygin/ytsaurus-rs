@@ -31,7 +31,10 @@ not expose typed or borrowing rows yet.
 
 `cargo bench -p ytsaurus-job` — the real path: streaming reads, record framing,
 per-row decoding. The YSON cases isolate where the time goes, and the Skiff case
-uses the equivalent schema through `SkiffJobReader`.
+uses the equivalent schema through `SkiffJobReader`. Its dedicated **YSON vs
+Skiff dynamic job API** group compares the two formats directly: each decodes
+the same 100 000 logical rows and reads the `duration` field through its public
+dynamic value type.
 
 | Case | What it does |
 | --- | --- |
@@ -40,6 +43,13 @@ uses the equivalent schema through `SkiffJobReader`.
 | `parse_owned` | decode into `String` fields, copying every string column |
 | `parse_dynamic` | decode into `YsonValue`, a DOM per row |
 | `skiff_dynamic` | decode the equivalent schema into Skiff's dynamic `Value` tree |
+| `YSON vs Skiff dynamic job API/{yson,skiff}_dynamic` | directly compare those dynamic APIs, reported in rows/sec |
+
+The direct-comparison group intentionally uses **rows/sec**, not bytes/sec:
+Skiff and YSON are different-sized streams by design, while the logical row
+work is identical. It compares the current dynamic public APIs — positional
+Skiff values against keyed YSON values — and is not a claim about a future
+typed or borrowing Skiff interface.
 
 The recorded results below are binary YSON, measured on 100 000 rows (~17.7
 MiB) with a realistic seven-column schema:

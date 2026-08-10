@@ -19,6 +19,11 @@
 //! is YSON parsing". `skiff_dynamic` is deliberately separate: Skiff currently
 //! exposes dynamic rows, so comparing it to a borrowed Serde struct would hide
 //! the allocation cost of its public job API.
+//!
+//! The `YSON vs Skiff dynamic job API` group makes the like-for-like comparison
+//! explicit. Both cases decode these exact rows, then read `duration` through
+//! their public dynamic representations. It reports rows/sec rather than
+//! bytes/sec because the two wire encodings have different sizes.
 
 use std::{
     hint::black_box,
@@ -183,6 +188,30 @@ fn skiff_duration(row: &Value) -> i64 {
     }
 }
 
+fn yson_dynamic_duration(input: &[u8]) -> i64 {
+    let mut reader = JobReader::binary(input);
+    let mut total = 0i64;
+    while let Some(event) = reader.next_event().unwrap() {
+        if let Event::Row(row) = event {
+            let value: YsonValue = row.value().unwrap();
+            total += value["duration"]
+                .as_i64()
+                .expect("the benchmark fixture gives duration an int64 value");
+        }
+    }
+    total
+}
+
+fn skiff_dynamic_duration(input: &[u8], format: &Format) -> i64 {
+    let input = BufReader::with_capacity(INPUT_BUFFER_BYTES, Cursor::new(input));
+    let mut reader = SkiffJobReader::new(input, format.clone()).unwrap();
+    let mut total = 0i64;
+    while let Some(row) = reader.next_row().unwrap() {
+        total += skiff_duration(row.value());
+    }
+    total
+}
+
 fn benchmark(c: &mut Criterion) {
     let yson_input = generate_yson_input();
 
@@ -257,16 +286,28 @@ fn benchmark(c: &mut Criterion) {
     group.sample_size(20);
     group.bench_function("skiff_dynamic", |b| {
         b.iter(|| {
-            let input = BufReader::with_capacity(
-                INPUT_BUFFER_BYTES,
-                Cursor::new(black_box(skiff_input.as_slice())),
-            );
-            let mut reader = SkiffJobReader::new(input, skiff_format.clone()).unwrap();
-            let mut total = 0i64;
-            while let Some(row) = reader.next_row().unwrap() {
-                total += skiff_duration(row.value());
-            }
-            black_box(total)
+            black_box(skiff_dynamic_duration(
+                black_box(skiff_input.as_slice()),
+                &skiff_format,
+            ))
+        });
+    });
+    group.finish();
+
+    // Row throughput, rather than wire-byte throughput: the same logical rows
+    // are deliberately different sized byte streams in the two formats.
+    let mut group = c.benchmark_group("YSON vs Skiff dynamic job API");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.sample_size(20);
+    group.bench_function("yson_dynamic", |b| {
+        b.iter(|| black_box(yson_dynamic_duration(black_box(yson_input.as_slice()))));
+    });
+    group.bench_function("skiff_dynamic", |b| {
+        b.iter(|| {
+            black_box(skiff_dynamic_duration(
+                black_box(skiff_input.as_slice()),
+                &skiff_format,
+            ))
         });
     });
     group.finish();
