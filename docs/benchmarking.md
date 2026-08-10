@@ -51,6 +51,20 @@ work is identical. It compares the current dynamic public APIs — positional
 Skiff values against keyed YSON values — and is not a claim about a future
 typed or borrowing Skiff interface.
 
+#### Direct dynamic API comparison
+
+On the same Apple M1 Max / rustc 1.94.0 setup, the 20-sample Criterion run
+decoded 100 000 identical rows per iteration:
+
+| Format | Time | Throughput |
+| --- | ---: | ---: |
+| binary YSON → `YsonValue` + keyed `duration` lookup | 97.94 ms | **1.021 M rows/s** |
+| Skiff → `Value` + positional `duration` lookup | 30.67 ms | **3.261 M rows/s** |
+
+For this dynamic-job-API comparison, Skiff was **3.19×** faster. This is a
+result about the current Rust implementations and their public dynamic values,
+not a protocol-wide claim or a prediction for a job that uses typed YSON rows.
+
 The recorded results below are binary YSON, measured on 100 000 rows (~17.7
 MiB) with a realistic seven-column schema:
 
