@@ -24,4 +24,8 @@ ytsaurus-yson.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 
+[[bench]]
+name = "codec_throughput"
+harness = false
