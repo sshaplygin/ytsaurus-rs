@@ -34,7 +34,9 @@ per-row decoding. The YSON cases isolate where the time goes, and the Skiff case
 uses the equivalent schema through `SkiffJobReader`. Its dedicated **YSON vs
 Skiff dynamic job API** group compares the two formats directly: each decodes
 the same 100 000 logical rows and reads the `duration` field through its public
-dynamic value type.
+dynamic value type. The accompanying **YSON vs Skiff dynamic encoding** group
+constructs those same dynamic rows and emits one output-table stream in each
+format.
 
 | Case | What it does |
 | --- | --- |
@@ -44,12 +46,18 @@ dynamic value type.
 | `parse_dynamic` | decode into `YsonValue`, a DOM per row |
 | `skiff_dynamic` | decode the equivalent schema into Skiff's dynamic `Value` tree |
 | `YSON vs Skiff dynamic job API/{yson,skiff}_dynamic` | directly compare those dynamic APIs, reported in rows/sec |
+| `YSON vs Skiff dynamic encoding/{yson,skiff}_dynamic` | compare dynamic row construction and encoding, reported in rows/sec |
 
 The direct-comparison group intentionally uses **rows/sec**, not bytes/sec:
 Skiff and YSON are different-sized streams by design, while the logical row
 work is identical. It compares the current dynamic public APIs — positional
 Skiff values against keyed YSON values — and is not a claim about a future
 typed or borrowing Skiff interface.
+
+The encoding comparison includes dynamic row construction as well as encoding:
+YSON builds a keyed `YsonValue` map, and Skiff builds a positional `Value`
+tuple. In both cases the timed output is one complete table stream, including
+the format's record separator or table tag.
 
 #### Direct dynamic API comparison
 
@@ -64,6 +72,21 @@ decoded 100 000 identical rows per iteration:
 For this dynamic-job-API comparison, Skiff was **3.19×** faster. This is a
 result about the current Rust implementations and their public dynamic values,
 not a protocol-wide claim or a prediction for a job that uses typed YSON rows.
+
+#### Direct dynamic encoding comparison
+
+The same 20-sample Criterion run encoded 100 000 identical dynamic rows per
+iteration, including construction of the map or tuple that the respective
+encoder accepts:
+
+| Format | Time | Throughput |
+| --- | ---: | ---: |
+| binary YSON `YsonValue` map → table stream | 79.16 ms | **1.263 M rows/s** |
+| Skiff `Value` tuple → table stream | 29.19 ms | **3.426 M rows/s** |
+
+For this dynamic encode path, Skiff was **2.71×** faster. As above, this is a
+measurement of the current dynamic Rust APIs, including their different row
+representations, rather than a protocol-wide claim.
 
 The recorded results below are binary YSON, measured on 100 000 rows (~17.7
 MiB) with a realistic seven-column schema:

@@ -24,17 +24,22 @@
 //! explicit. Both cases decode these exact rows, then read `duration` through
 //! their public dynamic representations. It reports rows/sec rather than
 //! bytes/sec because the two wire encodings have different sizes.
+//!
+//! `YSON vs Skiff dynamic encoding` does the complementary write comparison.
+//! Both cases build the same logical dynamic rows and encode them into one table
+//! stream, including each format's row separator or table tag.
 
 use std::{
+    collections::BTreeMap,
     hint::black_box,
     io::{BufReader, Cursor},
 };
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ytsaurus_job::{Event, JobReader, SkiffJobReader};
 use ytsaurus_skiff::{Encoder, Format, Schema, SchemaRef, Value, WireType};
-use ytsaurus_yson::YsonValue;
+use ytsaurus_yson::{YsonNode, YsonValue, ser::Serializer};
 
 const ROWS: usize = 100_000;
 const INPUT_BUFFER_BYTES: usize = 1024 * 1024;
@@ -168,6 +173,59 @@ fn skiff_row(i: usize) -> Value {
         Value::Boolean(i.is_multiple_of(3)),
         Value::Double(i as f64 / 7.0),
     ])
+}
+
+fn yson_value(node: YsonNode) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node,
+    }
+}
+
+fn yson_dynamic_row(i: usize) -> YsonValue {
+    yson_value(YsonNode::Map(BTreeMap::from([
+        (
+            b"user_id".to_vec(),
+            yson_value(YsonNode::String(format!("user-{i:08}").into_bytes())),
+        ),
+        (
+            b"url".to_vec(),
+            yson_value(YsonNode::String(
+                format!("https://example.com/page/{}/section/{}", i % 997, i % 31).into_bytes(),
+            )),
+        ),
+        (
+            b"referer".to_vec(),
+            yson_value(YsonNode::String(
+                format!("https://referer.example.org/{}", i % 613).into_bytes(),
+            )),
+        ),
+        (
+            b"timestamp".to_vec(),
+            yson_value(YsonNode::Int64(1_700_000_000 + i as i64)),
+        ),
+        (
+            b"duration".to_vec(),
+            yson_value(YsonNode::Int64((i % 3600) as i64)),
+        ),
+        (
+            b"is_mobile".to_vec(),
+            yson_value(YsonNode::Boolean(i.is_multiple_of(3))),
+        ),
+        (
+            b"score".to_vec(),
+            yson_value(YsonNode::Double(i as f64 / 7.0)),
+        ),
+    ])))
+}
+
+fn encode_yson_dynamic() -> Vec<u8> {
+    let mut serializer = Serializer::new(true);
+    for i in 0..ROWS {
+        yson_dynamic_row(i).serialize(&mut serializer).unwrap();
+        serializer.output.push(b';');
+    }
+    serializer.output
 }
 
 fn generate_skiff_input(schema: &Schema) -> Vec<u8> {
@@ -309,6 +367,20 @@ fn benchmark(c: &mut Criterion) {
                 &skiff_format,
             ))
         });
+    });
+    group.finish();
+
+    // Both loops include dynamic row construction: a YSON map in one case and
+    // a positional Skiff tuple in the other. That is the public encoding work a
+    // caller does before the bytes can reach a job output stream.
+    let mut group = c.benchmark_group("YSON vs Skiff dynamic encoding");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.sample_size(20);
+    group.bench_function("yson_dynamic", |b| {
+        b.iter(|| black_box(encode_yson_dynamic()));
+    });
+    group.bench_function("skiff_dynamic", |b| {
+        b.iter(|| black_box(generate_skiff_input(&skiff_schema)));
     });
     group.finish();
 }
