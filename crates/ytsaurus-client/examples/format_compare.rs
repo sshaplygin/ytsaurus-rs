@@ -1,17 +1,23 @@
 //! `format_compare` — a Rust worker against a YQL query, on one task.
 //!
-//! Phases 1 and 2 of `docs/format-comparison.md`, restricted to two of its four
-//! legs: **leg 1**, the `wordcount` worker reading and writing binary YSON, and
-//! **leg 4**, the same computation as a plain YQL query. The Skiff legs are not
-//! here yet.
+//! Phases 1 and 2 of `docs/format-comparison.md`. Three legs of its four:
+//! **leg 1** twice — the `wordcount` worker on binary YSON, once summing within
+//! a row and once summing within the job — and **leg 4**, the same computation
+//! as a plain YQL query. The dynamic-YSON control and Skiff are not here yet.
 //!
 //! It is worth being exact about what this compares, because "YQL versus YSON"
 //! is not a comparison that exists: YQL is a query engine and YSON is a wire
 //! format. What is measured is *an idiomatic Rust worker, whose job I/O happens
 //! to be YSON, against what an engineer who writes no code would run instead* —
-//! and any difference decomposes into the runtime, the plan, and the format,
-//! which this two-leg version cannot separate. Separating them is what legs 2
-//! and 3 are for.
+//! and any difference decomposes into the runtime, the plan, and the format.
+//!
+//! The second worker leg exists because the first version of this comparison
+//! could not make that decomposition and reported the sum. It found YQL 1.84×
+//! faster, and the whole of that gap turned out to be one thing: YQL's planner
+//! combines in the map stage, so 3 750 rows crossed its shuffle where the
+//! worker's 3 114 964 did. `map-combine` is the worker doing the same, and the
+//! difference between the two worker legs is the price of that plan — leaving
+//! whatever remains against YQL as the part that might be about the runtime.
 //!
 //! ```sh
 //! tests/e2e/run_local_cluster.sh
@@ -105,6 +111,7 @@ fn run() -> Result<(), ClientError> {
 
     let input = format!("{BASE}/lines");
     let rust_out = format!("{BASE}/counts_rust");
+    let combine_out = format!("{BASE}/counts_combine");
     let yql_out = format!("{BASE}/counts_yql");
 
     step(&format!("Writing about {mib} MiB of text"));
@@ -127,21 +134,33 @@ fn run() -> Result<(), ClientError> {
     // -------------------------------------------------------- correctness
 
     step("Correctness — the same computation, or nothing to time");
-    let rust = run_worker(&client, &input, &rust_out)?;
-    println!("   worker: {}", rust.describe());
-    let yql = run_query(&client, &wordcount_query(&input, &yql_out))?;
-    println!("   YQL:    {}", yql.describe());
+    let mut legs = vec![
+        Leg::worker("worker, per row", "map", rust_out.clone()),
+        Leg::worker("worker, combining", "map-combine", combine_out.clone()),
+        Leg::query("YQL", yql_out.clone()),
+    ];
+    for leg in &legs {
+        let measure = run_leg(&client, &input, leg)?;
+        println!("   {:<18} {}", leg.label, measure.describe());
+    }
 
-    let left = counts(&client, &rust_out)?;
-    let right = counts(&client, &yql_out)?;
-    match disagreement(&left, &right) {
-        None => println!("   both sides agree on {} distinct words", left.len()),
-        Some(reason) => {
+    // Everything is compared against the first leg, which is the one the
+    // repository already ships and the one every other number is relative to.
+    let reference = counts(&client, &legs[0].output)?;
+    for leg in &legs[1..] {
+        let other = counts(&client, &leg.output)?;
+        if let Some(reason) = disagreement(&reference, &other) {
             return Err(ClientError::Config(format!(
-                "the two sides disagree, so there is nothing to time: {reason}"
+                "{} disagrees with {}, so there is nothing to time: {reason}",
+                leg.label, legs[0].label
             )));
         }
     }
+    println!(
+        "   all {} legs agree on {} distinct words",
+        legs.len(),
+        reference.len()
+    );
 
     // ------------------------------------------------------------ timings
 
@@ -150,12 +169,10 @@ fn run() -> Result<(), ClientError> {
     ));
     println!("   worker memory limit {WORKER_MEMORY} B, query pragma 640M");
 
-    let mut worker_runs = Vec::new();
-    let mut query_runs = Vec::new();
     let mut lost = 0;
     for round in 0..=rounds {
-        // Interleaved rather than all of one then all of the other: whatever
-        // the cluster is doing to one side, it is doing to the other at the
+        // Interleaved rather than all of one leg then all of the next: whatever
+        // the cluster is doing to one side, it is doing to the others at the
         // same time, which is the only defence a single-CPU emulated cluster
         // allows against drift.
         //
@@ -163,14 +180,13 @@ fn run() -> Result<(), ClientError> {
         // ended on its last round with Query Tracker's own cell losing its
         // peers — the operations had run, only the bookkeeping was gone — and
         // twenty minutes of measurement went with it.
-        let round_result = (|| -> Result<(Measure, Measure), ClientError> {
-            let worker = run_worker(&client, &input, &rust_out)?;
-            let query = run_query(&client, &wordcount_query(&input, &yql_out))?;
-            Ok((worker, query))
-        })();
+        let measured = legs
+            .iter()
+            .map(|leg| run_leg(&client, &input, leg))
+            .collect::<Result<Vec<_>, _>>();
 
-        let (worker, query) = match round_result {
-            Ok(pair) => pair,
+        let measures = match measured {
+            Ok(measures) => measures,
             Err(e) => {
                 lost += 1;
                 println!("   round {round} lost: {e}");
@@ -182,16 +198,13 @@ fn run() -> Result<(), ClientError> {
             println!("   warm-up discarded");
             continue;
         }
-        println!(
-            "   round {round}: worker {} | YQL {}",
-            worker.describe(),
-            query.describe()
-        );
-        worker_runs.push(worker);
-        query_runs.push(query);
+        for (leg, measure) in legs.iter_mut().zip(measures) {
+            println!("   round {round}: {:<18} {}", leg.label, measure.describe());
+            leg.runs.push(measure);
+        }
     }
 
-    if worker_runs.is_empty() {
+    if legs.iter().any(|leg| leg.runs.is_empty()) {
         return Err(ClientError::Config(
             "every round was lost; nothing to report".to_owned(),
         ));
@@ -201,10 +214,10 @@ fn run() -> Result<(), ClientError> {
     if lost > 0 {
         println!(
             "   {lost} round(s) lost to cluster failures; {} counted\n",
-            worker_runs.len()
+            legs[0].runs.len()
         );
     }
-    report(&worker_runs, &query_runs);
+    report(&legs);
     println!("\n   Left at {BASE}; remove with: yt remove {BASE} --recursive");
     Ok(())
 }
@@ -235,6 +248,43 @@ struct Measure {
     stages: Vec<Stage>,
 }
 
+/// One way of computing the answer, and what it cost in each round.
+struct Leg {
+    label: &'static str,
+    /// Which of the worker's mappers to run, or `None` for the query.
+    mapper: Option<&'static str>,
+    /// Where this leg writes, so the outputs can be diffed against each other.
+    output: String,
+    runs: Vec<Measure>,
+}
+
+impl Leg {
+    fn worker(label: &'static str, mapper: &'static str, output: String) -> Self {
+        Self {
+            label,
+            mapper: Some(mapper),
+            output,
+            runs: Vec::new(),
+        }
+    }
+
+    fn query(label: &'static str, output: String) -> Self {
+        Self {
+            label,
+            mapper: None,
+            output,
+            runs: Vec::new(),
+        }
+    }
+}
+
+fn run_leg(client: &Client, input: &str, leg: &Leg) -> Result<Measure, ClientError> {
+    match leg.mapper {
+        Some(mapper) => run_worker(client, input, &leg.output, mapper),
+        None => run_query(client, &wordcount_query(input, &leg.output)),
+    }
+}
+
 /// One job type's share of one side.
 struct Stage {
     job_type: String,
@@ -261,12 +311,23 @@ impl Measure {
 }
 
 /// Leg 1: the `wordcount` worker, binary YSON in and out.
-fn run_worker(client: &Client, input: &str, output: &str) -> Result<Measure, ClientError> {
+///
+/// `mapper` selects which of the worker's two mappers runs — `map`, which sums
+/// within a row, or `map-combine`, which sums within the job. They are the same
+/// computation and produce the same output table; what differs is how much goes
+/// through the shuffle, which is the whole of what the first version of this
+/// comparison actually measured.
+fn run_worker(
+    client: &Client,
+    input: &str,
+    output: &str,
+    mapper: &str,
+) -> Result<Measure, ClientError> {
     client.remove_tree(output)?;
     client.create("table", output)?;
 
     let spec = MapReduceSpec::new("./wordcount reduce", [input], [output], ["word"])
-        .with_mapper("./wordcount map")
+        .with_mapper(format!("./wordcount {mapper}"))
         .with_local_file(format!("{BASE}/wordcount"))
         .with_memory_limit(WORKER_MEMORY);
 
@@ -474,95 +535,115 @@ fn by_job_type(statistics: &YsonValue, path: &str) -> BTreeMap<String, (i64, i64
 
 // ------------------------------------------------------------------ reporting
 
-fn report(worker: &[Measure], query: &[Measure]) {
-    let line = |what: &str, left: String, right: String, ratio: String| {
-        println!("   {what:<22} {left:>16} {right:>16} {ratio:>10}");
-    };
+fn report(legs: &[Leg]) {
+    row("", legs.iter().map(|leg| leg.label.to_owned()));
 
-    line(
-        "",
-        "worker (YSON)".to_owned(),
-        "YQL".to_owned(),
-        "ratio".to_owned(),
-    );
-
-    let wall_l = fastest(worker, |m| Some(m.wall.as_millis() as i64));
-    let wall_r = fastest(query, |m| Some(m.wall.as_millis() as i64));
-    line(
+    let wall = |m: &Measure| Some(m.wall.as_millis() as i64);
+    row(
         "wall, fastest",
-        ms(wall_l),
-        ms(wall_r),
-        ratio(wall_l, wall_r),
+        legs.iter().map(|leg| ms(fastest(&leg.runs, wall))),
     );
-    line(
+    row("wall, vs first", ratios(legs, wall));
+    row(
         "wall, spread",
-        spread(worker, |m| Some(m.wall.as_millis() as i64)),
-        spread(query, |m| Some(m.wall.as_millis() as i64)),
-        String::new(),
+        legs.iter().map(|leg| spread(&leg.runs, wall)),
     );
 
-    let exec_l = fastest(worker, |m| m.exec_ms);
-    let exec_r = fastest(query, |m| m.exec_ms);
-    line(
+    let exec = |m: &Measure| m.exec_ms;
+    row(
         "time/exec, fastest",
-        ms(exec_l),
-        ms(exec_r),
-        ratio(exec_l, exec_r),
+        legs.iter().map(|leg| ms(fastest(&leg.runs, exec))),
     );
-    line(
+    row("time/exec, vs first", ratios(legs, exec));
+    row(
         "time/exec, spread",
-        spread(worker, |m| m.exec_ms),
-        spread(query, |m| m.exec_ms),
-        String::new(),
+        legs.iter().map(|leg| spread(&leg.runs, exec)),
     );
 
-    let cpu_l = fastest(worker, |m| m.cpu_ms);
-    let cpu_r = fastest(query, |m| m.cpu_ms);
-    if cpu_l.is_some() || cpu_r.is_some() {
-        line(
+    let cpu = |m: &Measure| m.cpu_ms;
+    if legs.iter().any(|leg| fastest(&leg.runs, cpu).is_some()) {
+        row(
             "job cpu, fastest",
-            ms(cpu_l),
-            ms(cpu_r),
-            ratio(cpu_l, cpu_r),
+            legs.iter().map(|leg| ms(fastest(&leg.runs, cpu))),
         );
+        row("job cpu, vs first", ratios(legs, cpu));
     } else {
-        println!("   job cpu                this cluster reports nothing under user_job/cpu");
+        println!("   job cpu               this cluster reports nothing under user_job/cpu");
     }
 
-    line(
+    row(
         "operations",
-        worker.first().map_or(0, |m| m.operations).to_string(),
-        query.first().map_or(0, |m| m.operations).to_string(),
-        String::new(),
+        legs.iter()
+            .map(|leg| leg.runs.first().map_or(0, |m| m.operations).to_string()),
     );
-    line(
+    row(
         "bytes read",
-        bytes(worker.first().and_then(|m| m.input_bytes)),
-        bytes(query.first().and_then(|m| m.input_bytes)),
-        String::new(),
+        legs.iter()
+            .map(|leg| bytes(leg.runs.first().and_then(|m| m.input_bytes))),
     );
-    line(
+    row(
         "bytes written",
-        bytes(worker.first().and_then(|m| m.output_bytes)),
-        bytes(query.first().and_then(|m| m.output_bytes)),
-        String::new(),
+        legs.iter()
+            .map(|leg| bytes(leg.runs.first().and_then(|m| m.output_bytes))),
     );
 
     // Where the time went, which is the part that decides whether the totals
     // above mean what they look like.
-    stage_table("worker (YSON)", worker);
-    stage_table("YQL", query);
+    for leg in legs {
+        stage_table(leg.label, &leg.runs);
+    }
 
-    // The guard: on this cluster the rounds scatter, and a difference smaller
-    // than the scatter is not a difference. Saying so is the whole value of
-    // having measured the spread at all.
-    if let (Some(l), Some(r)) = (wall_l, wall_r) {
-        let gap = (l - r).abs();
-        let noise = scatter(worker).max(scatter(query));
+    // The guard, per metric rather than once: on this cluster the rounds
+    // scatter, and a difference smaller than the scatter is not a difference.
+    // Applying it to the wall clock alone — which an earlier version did —
+    // prints "no measurable difference" beside an exec column where the gap is
+    // ten times the noise.
+    guard(legs, "wall", wall);
+    guard(legs, "time/exec", exec);
+}
+
+fn row(label: &str, cells: impl IntoIterator<Item = String>) {
+    let mut line = format!("   {label:<21}");
+    for cell in cells {
+        line.push_str(&format!("{cell:>18}"));
+    }
+    println!("{line}");
+}
+
+/// Each leg against the first, which is the one the repository already ships.
+fn ratios(legs: &[Leg], of: impl Fn(&Measure) -> Option<i64> + Copy) -> Vec<String> {
+    let base = fastest(&legs[0].runs, of);
+    legs.iter()
+        .map(|leg| match (base, fastest(&leg.runs, of)) {
+            (Some(base), Some(value)) if base > 0 && value > 0 => {
+                format!("{:.2}x", value as f64 / base as f64)
+            }
+            _ => String::new(),
+        })
+        .collect()
+}
+
+/// Says so when a gap is smaller than the noise it was measured against.
+fn guard(legs: &[Leg], metric: &str, of: impl Fn(&Measure) -> Option<i64> + Copy) {
+    let Some(base) = fastest(&legs[0].runs, of) else {
+        return;
+    };
+    let noise = legs
+        .iter()
+        .map(|leg| scatter(&leg.runs, of))
+        .max()
+        .unwrap_or(0);
+
+    for leg in &legs[1..] {
+        let Some(value) = fastest(&leg.runs, of) else {
+            continue;
+        };
+        let gap = (base - value).abs();
         if gap < noise {
             println!(
-                "\n   The gap ({gap} ms) is smaller than the scatter within one side \
-                 ({noise} ms).\n   Read this as \"no measurable difference here\", not as a winner."
+                "\n   {metric}: {} against {} differ by {gap} ms, which is less than the \n   \
+                 scatter within one leg ({noise} ms). No measurable difference, not a winner.",
+                legs[0].label, leg.label
             );
         }
     }
@@ -572,7 +653,7 @@ fn fastest(runs: &[Measure], of: impl Fn(&Measure) -> Option<i64>) -> Option<i64
     runs.iter().filter_map(of).min()
 }
 
-/// Where one side's time and rows went, from its fastest round.
+/// Where one leg's time and rows went, from its fastest round.
 ///
 /// Rows matter as much as milliseconds here: a stage reading far more rows
 /// than the input table holds is reading a shuffle, and that is the number
@@ -603,8 +684,8 @@ fn stage_table(label: &str, runs: &[Measure]) {
     }
 }
 
-fn scatter(runs: &[Measure]) -> i64 {
-    let values: Vec<i64> = runs.iter().map(|m| m.wall.as_millis() as i64).collect();
+fn scatter(runs: &[Measure], of: impl Fn(&Measure) -> Option<i64> + Copy) -> i64 {
+    let values: Vec<i64> = runs.iter().filter_map(of).collect();
     match (values.iter().min(), values.iter().max()) {
         (Some(min), Some(max)) => max - min,
         _ => 0,
@@ -614,27 +695,20 @@ fn scatter(runs: &[Measure]) -> i64 {
 fn spread(runs: &[Measure], of: impl Fn(&Measure) -> Option<i64> + Copy) -> String {
     let values: Vec<i64> = runs.iter().filter_map(of).collect();
     match (values.iter().min(), values.iter().max()) {
-        (Some(min), Some(max)) => format!("{min}–{max} ms"),
-        _ => "—".to_owned(),
+        (Some(min), Some(max)) => format!("{min}-{max} ms"),
+        _ => "-".to_owned(),
     }
 }
 
 fn ms(value: Option<i64>) -> String {
-    value.map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms"))
+    value.map_or_else(|| "-".to_owned(), |ms| format!("{ms} ms"))
 }
 
 fn bytes(value: Option<i64>) -> String {
     value.map_or_else(
-        || "—".to_owned(),
+        || "-".to_owned(),
         |b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
     )
-}
-
-fn ratio(left: Option<i64>, right: Option<i64>) -> String {
-    match (left, right) {
-        (Some(l), Some(r)) if l > 0 && r > 0 => format!("{:.2}×", r as f64 / l as f64),
-        _ => String::new(),
-    }
 }
 
 // -------------------------------------------------------------------- corpus
