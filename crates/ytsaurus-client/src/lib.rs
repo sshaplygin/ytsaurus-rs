@@ -323,7 +323,7 @@ pub mod yson_build;
 pub use crate::batch::BatchRequest;
 pub use crate::error::{ClientError, RedirectRefusal, Result};
 pub use crate::http::Method;
-pub use crate::jobs::{JobFailure, JobInfo};
+pub use crate::jobs::{JobFailure, JobInfo, error_summary};
 pub use crate::lock::{Lock, LockMode};
 pub use crate::operation::{
     Operation, OperationEvent, OperationFilter, OperationInfo, OperationList, OperationParameters,

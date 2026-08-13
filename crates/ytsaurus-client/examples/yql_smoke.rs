@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use ytsaurus_client::{
     Client, ClientError, Column, ColumnType, Method, OperationFilter, Repeatable, TableSchema,
-    yson_build,
+    error_summary, yson_build,
 };
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice, to_string};
 
@@ -141,7 +141,7 @@ fn run() -> Result<bool, ClientError> {
     // ------------------------------------------------------------ SELECT 1
 
     step("1. SELECT 1 — does this installation run YQL?");
-    let trivial = match run_query(&client, "SELECT 1;", true) {
+    let trivial = match wait_for_agent(&client) {
         Ok(outcome) => outcome,
         Err(e) => {
             println!("   start_query itself failed: {e}");
@@ -356,6 +356,8 @@ struct Outcome {
     timed_out: bool,
     answer: YsonValue,
     error: Option<Vec<String>>,
+    /// The error document itself, for `error_summary`.
+    error_tree: Option<YsonValue>,
 }
 
 impl Outcome {
@@ -363,12 +365,14 @@ impl Outcome {
         self.state == "completed"
     }
 
-    /// One line: the state, and the innermost thing that went wrong.
+    /// One line: the state, and what went wrong.
     ///
-    /// The innermost, because `error_messages` returns the tree outermost
-    /// first and the outer entries are categories — `Failed to run query`,
-    /// `There are some issues`. Clipping the front of the chain, which an
-    /// earlier version did, threw away the only sentence a reader needs.
+    /// The category and the innermost cause, which is what
+    /// [`ytsaurus_client::error_summary`] produces — the crate has known how to
+    /// flatten one of these since jobs had errors, and this example carried its
+    /// own worse version until that function was made public. The chain is
+    /// still collected and printed in full elsewhere here, because this is an
+    /// observation program and the whole tree is sometimes the point.
     fn summary(&self) -> String {
         let mut line = if self.timed_out {
             format!(
@@ -379,11 +383,9 @@ impl Outcome {
         } else {
             self.state.clone()
         };
-        if let Some(messages) = &self.error
-            && let Some(cause) = messages.last()
-        {
+        if let Some(cause) = self.error_tree.as_ref().and_then(error_summary) {
             line.push_str(" — ");
-            line.push_str(&clip_str(cause, 300));
+            line.push_str(&clip_str(&cause, 300));
         }
         line
     }
@@ -449,8 +451,10 @@ fn run_query(client: &Client, query: &str, verbose: bool) -> Result<Outcome, Cli
         let terminal = TERMINAL.contains(&state.as_str());
         let timed_out = !terminal && Instant::now() >= deadline;
         if terminal || timed_out {
-            let error = field(&answer, "error")
-                .map(|e| error_messages(&e))
+            let error_tree = field(&answer, "error");
+            let error = error_tree
+                .as_ref()
+                .map(error_messages)
                 .filter(|messages| !messages.is_empty());
             if state != "completed" {
                 for message in error.iter().flatten() {
@@ -476,11 +480,45 @@ fn run_query(client: &Client, query: &str, verbose: bool) -> Result<Outcome, Cli
                 timed_out,
                 answer,
                 error,
+                error_tree,
             });
         }
 
         sleep(Duration::from_millis(500));
     }
+}
+
+/// `SELECT 1`, retried while the YQL agent is still coming up.
+///
+/// A freshly started or resumed cluster answers `ping` in seconds, publishes
+/// `//sys/@cluster_name` a little later, and registers its YQL agent later
+/// still. In between, Query Tracker **accepts** a query and then fails it with
+/// `YQL agent stage "production" is not found in cluster directory` — so a gate
+/// run too early reports "this installation does not run YQL" about an
+/// installation that does. That is a wrong answer to the one question this
+/// program exists to answer, which is worth a minute of patience.
+///
+/// Only that one error is waited on. Anything else is the answer.
+fn wait_for_agent(client: &Client) -> Result<Outcome, ClientError> {
+    const ATTEMPTS: usize = 12;
+    const GAP: Duration = Duration::from_secs(10);
+
+    for attempt in 1..=ATTEMPTS {
+        let outcome = run_query(client, "SELECT 1;", attempt == ATTEMPTS)?;
+        let still_starting = outcome
+            .error
+            .iter()
+            .flatten()
+            .any(|message| message.contains("is not found in cluster directory"));
+
+        if !still_starting {
+            return Ok(outcome);
+        }
+        println!("   the YQL agent has not registered yet; waiting ({attempt}/{ATTEMPTS})");
+        sleep(GAP);
+    }
+
+    run_query(client, "SELECT 1;", true)
 }
 
 /// Stops a query this program has given up on.
