@@ -33,7 +33,10 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use ytsaurus_job::yson::{YsonNode, YsonValue};
+use ytsaurus_job::{DataFormat, WorkerEvent, WorkerReader, WorkerRow, WorkerWriter};
 use ytsaurus_job::{Event, JobError, JobReader, JobWriter, Row, TableId};
+use ytsaurus_skiff::{Format, Schema, SchemaRef, Value, WireType};
 
 /// Inactivity gap that starts a new session, in microseconds.
 const SESSION_GAP_US: i64 = 30 * 60 * 1_000_000;
@@ -133,9 +136,14 @@ fn main() {
         "map-frames" => ytsaurus_job::run(map_frames),
         "map-parse" => ytsaurus_job::run(map_parse),
         "map-one" => ytsaurus_job::run(map_one),
+        "map-parse-dynamic" => ytsaurus_job::run(map_parse_dynamic),
+        "map-one-dynamic" => ytsaurus_job::run(map_one_dynamic),
+        "map-parse-skiff" => ytsaurus_job::run(map_parse_skiff),
+        "map-one-skiff" => ytsaurus_job::run(map_one_skiff),
         other => {
             eprintln!(
-                "usage: sessionize <map|map-one|reduce|map-frames|map-parse>   (got {other:?})"
+                "usage: sessionize <map|map-one|map-one-dynamic|map-one-skiff|reduce|\
+                 map-frames|map-parse|map-parse-dynamic|map-parse-skiff>   (got {other:?})"
             );
             std::process::exit(2);
         }
@@ -247,6 +255,324 @@ fn map_one() -> Result<(), JobError> {
     }
 
     eprintln!("sessionize map-one: kept {kept}, dropped {rejected}");
+    writer.finish()
+}
+
+// ------------------------------------------------------------ the Skiff legs
+//
+// The same job again, on a positional wire format. Written out by hand because
+// Skiff has no schema inference yet (`docs/skiff-compatibility.md` lists it as
+// planned), and positionally because that is what the format is: there are no
+// field names on the wire, so a column is wherever the schema says it is and
+// nowhere else. Get the order wrong and the job reads a timestamp as a status
+// without complaining — which is the trade this leg exists to price.
+//
+// There is deliberately no `map-frames-skiff`. A Skiff stream has no
+// self-describing record boundaries: finding the end of a row *is* decoding it
+// against the schema, so the frames-only stop that the YSON legs subtract
+// cannot exist here. That asymmetry is a fact about the formats, not a gap in
+// this file, and it is why the Skiff comparison is stop-to-stop against the
+// dynamic YSON legs rather than a subtraction of its own.
+
+/// The nine columns of the input table, in the order the schema fixes them.
+///
+/// `referer` is `optional`, which on the wire is `variant8<nothing; string32>`
+/// — one tag byte on every row, present or not.
+fn input_format() -> DataFormat {
+    DataFormat::skiff(
+        Format::new(vec![SchemaRef::Inline(Schema::tuple([
+            Schema::named("user_id", WireType::String32),
+            Schema::named("timestamp", WireType::Int64),
+            Schema::named("url", WireType::String32),
+            Schema::named("referer", WireType::String32).optional(),
+            Schema::named("user_agent", WireType::String32),
+            Schema::named("status", WireType::Int64),
+            Schema::named("bytes_sent", WireType::Uint64),
+            Schema::named("is_mobile", WireType::Boolean),
+            Schema::named("latency_ms", WireType::Double),
+        ]))])
+        .expect("the input schema is a valid Skiff format"),
+    )
+}
+
+/// What the mapper writes: the input's nine less `referer`, plus `is_external`.
+fn output_format() -> DataFormat {
+    DataFormat::skiff(
+        Format::new(vec![SchemaRef::Inline(Schema::tuple([
+            Schema::named("user_id", WireType::String32),
+            Schema::named("timestamp", WireType::Int64),
+            Schema::named("url", WireType::String32),
+            Schema::named("user_agent", WireType::String32),
+            Schema::named("status", WireType::Int64),
+            Schema::named("bytes_sent", WireType::Uint64),
+            Schema::named("is_mobile", WireType::Boolean),
+            Schema::named("latency_ms", WireType::Double),
+            Schema::named("is_external", WireType::Boolean),
+        ]))])
+        .expect("the output schema is a valid Skiff format"),
+    )
+}
+
+/// Field positions in [`input_format`]. Named so the job reads like the others.
+mod at {
+    pub const USER_ID: usize = 0;
+    pub const TIMESTAMP: usize = 1;
+    pub const URL: usize = 2;
+    pub const REFERER: usize = 3;
+    pub const USER_AGENT: usize = 4;
+    pub const STATUS: usize = 5;
+    pub const BYTES_SENT: usize = 6;
+    pub const IS_MOBILE: usize = 7;
+    pub const LATENCY_MS: usize = 8;
+}
+
+/// [`map_parse_dynamic`]'s stop, on Skiff.
+///
+/// Decoding is not optional here — see the note above — so this measures the
+/// whole read path against the dynamic YSON leg's, which is the comparison the
+/// Skiff question actually needs.
+fn map_parse_skiff() -> Result<(), JobError> {
+    let mut reader = WorkerReader::from_stdin(input_format())?;
+    let mut kept = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let WorkerEvent::Skiff(row) = event else {
+            unreachable!("the reader was configured for Skiff");
+        };
+        if let Value::Tuple(fields) = row.value()
+            && let Some(Value::Int64(timestamp)) = fields.get(at::TIMESTAMP)
+        {
+            kept += *timestamp as u64 & 1;
+        }
+    }
+
+    eprintln!("sessionize map-parse-skiff: {kept}");
+    Ok(())
+}
+
+/// [`map_one`] on Skiff: same five rules, same derived column, positional.
+fn map_one_skiff() -> Result<(), JobError> {
+    let mut reader = WorkerReader::from_stdin(input_format())?;
+    let mut writer = WorkerWriter::descriptors(output_format(), 1)?;
+
+    let mut kept = 0u64;
+    let mut rejected = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let WorkerEvent::Skiff(row) = event else {
+            unreachable!("the reader was configured for Skiff");
+        };
+        let Value::Tuple(fields) = row.value() else {
+            rejected += 1;
+            continue;
+        };
+
+        let (
+            Some(Value::Bytes(user_id)),
+            Some(Value::Int64(timestamp)),
+            Some(Value::Bytes(url)),
+            Some(Value::Int64(status)),
+            Some(Value::Double(latency_ms)),
+        ) = (
+            fields.get(at::USER_ID),
+            fields.get(at::TIMESTAMP),
+            fields.get(at::URL),
+            fields.get(at::STATUS),
+            fields.get(at::LATENCY_MS),
+        )
+        else {
+            rejected += 1;
+            continue;
+        };
+
+        if user_id.is_empty()
+            || *timestamp <= 0
+            || !(100..=599).contains(status)
+            || !latency_ms.is_finite()
+            || *latency_ms < 0.0
+            || url.is_empty()
+        {
+            rejected += 1;
+            continue;
+        }
+
+        // An absent optional arrives as the nothing arm of the variant.
+        let is_external = match fields.get(at::REFERER) {
+            Some(Value::Variant { value, .. }) => match value.as_ref() {
+                Value::Bytes(referer) => !referer.is_empty() && !referer.starts_with(b"/"),
+                _ => false,
+            },
+            _ => false,
+        };
+
+        let clean = Value::Tuple(vec![
+            fields[at::USER_ID].clone(),
+            fields[at::TIMESTAMP].clone(),
+            fields[at::URL].clone(),
+            fields[at::USER_AGENT].clone(),
+            fields[at::STATUS].clone(),
+            fields[at::BYTES_SENT].clone(),
+            fields[at::IS_MOBILE].clone(),
+            fields[at::LATENCY_MS].clone(),
+            Value::Boolean(is_external),
+        ]);
+
+        writer.write(0, WorkerRow::Skiff(&clean))?;
+        kept += 1;
+    }
+
+    eprintln!("sessionize map-one-skiff: kept {kept}, dropped {rejected}");
+    writer.finish()
+}
+
+// ------------------------------------------------- the dynamic control legs
+//
+// The same two stops again, through `YsonValue` instead of a typed struct.
+//
+// They exist to make a format comparison mean something. Skiff's job API has no
+// typed rows yet — `docs/skiff-compatibility.md` lists them as planned — so a
+// Skiff leg can only be dynamic, and putting it against the typed YSON legs
+// would compare two APIs while calling it a comparison of two formats. These
+// are the control: same format as the typed legs, same API level as the Skiff
+// one. `docs/benchmarking.md` already warns not to compare Skiff's dynamic
+// result with YSON's borrowed-serde one; this is how that warning is obeyed on
+// a cluster rather than in a benchmark harness.
+
+/// A dynamic value carrying no attributes.
+///
+/// There is no builder for these, which is part of what the control measures:
+/// the dynamic path costs a `BTreeMap` per row and this much ceremony per
+/// field, against a `#[derive(Serialize)]` on the typed side.
+fn node(node: YsonNode) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node,
+    }
+}
+
+/// A field of a dynamic row, without the panic `Index` gives on a missing key.
+fn field<'row>(row: &'row YsonValue, key: &str) -> Option<&'row YsonValue> {
+    match &row.node {
+        YsonNode::Map(fields) => fields.get(key.as_bytes()),
+        _ => None,
+    }
+}
+
+fn bytes_of<'row>(row: &'row YsonValue, key: &str) -> Option<&'row [u8]> {
+    match &field(row, key)?.node {
+        YsonNode::String(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+fn int_of(row: &YsonValue, key: &str) -> Option<i64> {
+    match &field(row, key)?.node {
+        YsonNode::Int64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// [`map_parse`], decoding into a `YsonValue` DOM instead of a struct.
+fn map_parse_dynamic() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut kept = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+        let value: YsonValue = row.value()?;
+        // Touch one field, so the DOM cannot be built and discarded unread.
+        kept += int_of(&value, "timestamp").unwrap_or(0) as u64 & 1;
+    }
+
+    eprintln!("sessionize map-parse-dynamic: {kept}");
+    Ok(())
+}
+
+/// [`map_one`] through the dynamic value type, start to finish.
+///
+/// Reads a DOM, validates by walking it, and builds another DOM to write. No
+/// serde on either side — which is the point: this is what a job author writes
+/// when the format has no typed rows.
+fn map_one_dynamic() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut writer = JobWriter::descriptors(1)?;
+
+    let mut kept = 0u64;
+    let mut rejected = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+
+        let value: YsonValue = match row.value() {
+            Ok(value) => value,
+            Err(e) if e.is_row_local() => {
+                rejected += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let (Some(user_id), Some(timestamp), Some(url), Some(status)) = (
+            bytes_of(&value, "user_id"),
+            int_of(&value, "timestamp"),
+            bytes_of(&value, "url"),
+            int_of(&value, "status"),
+        ) else {
+            rejected += 1;
+            continue;
+        };
+        let latency = match &field(&value, "latency_ms").map(|v| &v.node) {
+            Some(YsonNode::Double(latency)) => *latency,
+            _ => {
+                rejected += 1;
+                continue;
+            }
+        };
+
+        // The same five rules as `validate`, spelled against the DOM.
+        if user_id.is_empty()
+            || timestamp <= 0
+            || !(100..=599).contains(&status)
+            || !latency.is_finite()
+            || latency < 0.0
+            || url.is_empty()
+        {
+            rejected += 1;
+            continue;
+        }
+
+        let is_external = match bytes_of(&value, "referer") {
+            Some(referer) => !referer.is_empty() && !referer.starts_with(b"/"),
+            None => false,
+        };
+
+        let mut out = std::collections::BTreeMap::new();
+        for key in [
+            "user_id",
+            "timestamp",
+            "url",
+            "user_agent",
+            "status",
+            "bytes_sent",
+            "is_mobile",
+            "latency_ms",
+        ] {
+            let Some(field) = field(&value, key) else {
+                rejected += 1;
+                continue;
+            };
+            out.insert(key.as_bytes().to_vec(), field.clone());
+        }
+        out.insert(
+            b"is_external".to_vec(),
+            node(YsonNode::Boolean(is_external)),
+        );
+
+        writer.write(0, &node(YsonNode::Map(out)))?;
+        kept += 1;
+    }
+
+    eprintln!("sessionize map-one-dynamic: kept {kept}, dropped {rejected}");
     writer.finish()
 }
 

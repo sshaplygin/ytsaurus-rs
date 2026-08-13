@@ -86,8 +86,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use ytsaurus_client::{
-    Client, ClientError, Column, ColumnType, MapReduceSpec, MapSpec, Method, OperationFilter,
-    Repeatable, TableSchema, yson_build,
+    Client, ClientError, Column, ColumnType, DataFormat, MapReduceSpec, MapSpec, Method,
+    OperationFilter, Repeatable, SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType,
+    TableSchema, yson_build,
 };
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
@@ -173,10 +174,16 @@ fn run() -> Result<(), ClientError> {
             println!("   {} wrote {rows} rows", only.label);
         }
         [first, rest @ ..] => {
-            let reference = counts(&client, &first.output)?;
+            // What "the same answer" means is the task's business: wordcount
+            // produces a word-to-count map whose row order is not meaningful,
+            // and the depth series produces the input's own rows in the input's
+            // own order. Reading one as the other is how this check spent a run
+            // failing on a missing `word` column.
+            let rows = task == "project";
+            let reference = answer(&client, &first.output, rows)?;
             for leg in rest {
-                let other = counts(&client, &leg.output)?;
-                if let Some(reason) = disagreement(&reference, &other) {
+                let other = answer(&client, &leg.output, rows)?;
+                if let Some(reason) = reference.disagreement(&other) {
                     return Err(ClientError::Config(format!(
                         "{} disagrees with {}, so there is nothing to time: {reason}",
                         leg.label, first.label
@@ -184,9 +191,9 @@ fn run() -> Result<(), ClientError> {
                 }
             }
             println!(
-                "   all {} computing legs agree on {} distinct words",
+                "   all {} computing legs agree, {}",
                 results.len(),
-                reference.len()
+                reference.describe()
             );
         }
     }
@@ -349,6 +356,26 @@ fn prepare_project(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), Cl
                 Kind::Depth("map-one"),
                 format!("{BASE}/project_full"),
             ),
+            Leg::new(
+                "decoded, dynamic",
+                Kind::Depth("map-parse-dynamic"),
+                format!("{BASE}/project_parse_dyn"),
+            ),
+            Leg::new(
+                "the whole map, dynamic",
+                Kind::Depth("map-one-dynamic"),
+                format!("{BASE}/project_full_dyn"),
+            ),
+            Leg::new(
+                "decoded, Skiff",
+                Kind::Skiff("map-parse-skiff"),
+                format!("{BASE}/project_parse_skiff"),
+            ),
+            Leg::new(
+                "the whole map, Skiff",
+                Kind::Skiff("map-one-skiff"),
+                format!("{BASE}/project_full_skiff"),
+            ),
         ],
     ))
 }
@@ -472,6 +499,8 @@ enum Kind {
     WordCount(&'static str),
     /// `sessionize` as a map, with this command — one stop of the depth series.
     Depth(&'static str),
+    /// The same, with the operation's job I/O set to Skiff both ways.
+    Skiff(&'static str),
     /// The same computation as a query.
     Query,
 }
@@ -501,16 +530,68 @@ impl Leg {
     /// that is what makes them shallow — so a diff against them would compare
     /// a computation with the absence of one.
     fn produces_rows(&self) -> bool {
-        !matches!(self.kind, Kind::Depth(command) if command != "map-one")
+        match self.kind {
+            Kind::Depth(command) => command == "map-one" || command == "map-one-dynamic",
+            Kind::Skiff(command) => command == "map-one-skiff",
+            _ => true,
+        }
     }
 }
 
 fn run_leg(client: &Client, input: &str, leg: &Leg) -> Result<Measure, ClientError> {
     match leg.kind {
         Kind::WordCount(mapper) => run_worker(client, input, &leg.output, mapper),
-        Kind::Depth(command) => run_map(client, input, &leg.output, command),
+        Kind::Depth(command) => run_map(client, input, &leg.output, command, false),
+        Kind::Skiff(command) => run_map(client, input, &leg.output, command, true),
         Kind::Query => run_query(client, &wordcount_query(input, &leg.output)),
     }
+}
+
+/// The input table's nine columns as Skiff, spelled here a second time.
+///
+/// The worker declares the same schema in
+/// `crates/ytsaurus-job/examples/sessionize.rs`, and that duplication is the
+/// point: two independent spellings have to agree with each other, where one
+/// shared constant would agree with itself however wrong it was. It is the same
+/// reason `skiff_cat` and its test each write out their own, and the same
+/// reason `run_e2e.sh` reads the tables back with somebody else's client.
+///
+/// Positional: a column is wherever the schema puts it. Swap two of the same
+/// width here and the job reads one column as another in silence, which is what
+/// this leg is measuring the price of.
+fn skiff_input() -> DataFormat {
+    DataFormat::skiff(
+        SkiffFormat::new(vec![SkiffSchemaRef::Inline(SkiffSchema::tuple([
+            SkiffSchema::named("user_id", SkiffWireType::String32),
+            SkiffSchema::named("timestamp", SkiffWireType::Int64),
+            SkiffSchema::named("url", SkiffWireType::String32),
+            SkiffSchema::named("referer", SkiffWireType::String32).optional(),
+            SkiffSchema::named("user_agent", SkiffWireType::String32),
+            SkiffSchema::named("status", SkiffWireType::Int64),
+            SkiffSchema::named("bytes_sent", SkiffWireType::Uint64),
+            SkiffSchema::named("is_mobile", SkiffWireType::Boolean),
+            SkiffSchema::named("latency_ms", SkiffWireType::Double),
+        ]))])
+        .expect("the input schema is a valid Skiff format"),
+    )
+}
+
+/// What the mapper writes: the input's nine less `referer`, plus `is_external`.
+fn skiff_output() -> DataFormat {
+    DataFormat::skiff(
+        SkiffFormat::new(vec![SkiffSchemaRef::Inline(SkiffSchema::tuple([
+            SkiffSchema::named("user_id", SkiffWireType::String32),
+            SkiffSchema::named("timestamp", SkiffWireType::Int64),
+            SkiffSchema::named("url", SkiffWireType::String32),
+            SkiffSchema::named("user_agent", SkiffWireType::String32),
+            SkiffSchema::named("status", SkiffWireType::Int64),
+            SkiffSchema::named("bytes_sent", SkiffWireType::Uint64),
+            SkiffSchema::named("is_mobile", SkiffWireType::Boolean),
+            SkiffSchema::named("latency_ms", SkiffWireType::Double),
+            SkiffSchema::named("is_external", SkiffWireType::Boolean),
+        ]))])
+        .expect("the output schema is a valid Skiff format"),
+    )
 }
 
 /// One stop of the depth series: `sessionize` as a plain map.
@@ -525,14 +606,19 @@ fn run_map(
     input: &str,
     output: &str,
     command: &str,
+    skiff: bool,
 ) -> Result<Measure, ClientError> {
     client.remove_tree(output)?;
     client.create("table", output)?;
 
-    let spec = MapSpec::new(format!("./sessionize {command}"), [input], [output])
+    let mut spec = MapSpec::new(format!("./sessionize {command}"), [input], [output])
         .with_local_file(format!("{BASE}/sessionize"))
         .with_memory_limit(WORKER_MEMORY)
         .with_raw("data_weight_per_job", yson_build::int(DATA_WEIGHT_PER_JOB));
+
+    if skiff {
+        spec = spec.with_formats(skiff_input(), skiff_output());
+    }
 
     let started = Instant::now();
     let id = client.start_map(&spec)?;
@@ -981,7 +1067,9 @@ fn report(legs: &[Leg]) {
 /// out in order, no share is reported. A decode share read off numbers that
 /// came out backwards is not a small error, it is the whole quantity.
 fn subtraction(legs: &[Leg]) {
-    let [frames, parse, full] = legs else { return };
+    let [frames, parse, full, ..] = legs else {
+        return;
+    };
     if frames.label != "frames only" {
         return;
     }
@@ -1233,6 +1321,48 @@ fn distinct_words(lines: &[Line]) -> usize {
         }
     }
     seen.len()
+}
+
+/// What a leg computed, in whichever shape the task's answer has.
+enum Answer {
+    /// wordcount: a word-to-count map, where row order carries nothing.
+    Counts(BTreeMap<String, i64>),
+    /// The depth series: the rows themselves, in the order one job wrote them.
+    Rows(Vec<YsonValue>),
+}
+
+impl Answer {
+    fn describe(&self) -> String {
+        match self {
+            Self::Counts(counts) => format!("{} distinct words", counts.len()),
+            Self::Rows(rows) => format!("{} rows", rows.len()),
+        }
+    }
+
+    /// The first way two answers differ, or `None` if they do not.
+    fn disagreement(&self, other: &Self) -> Option<String> {
+        match (self, other) {
+            (Self::Counts(left), Self::Counts(right)) => disagreement(left, right),
+            (Self::Rows(left), Self::Rows(right)) => {
+                if left.len() != right.len() {
+                    return Some(format!("{} rows against {}", left.len(), right.len()));
+                }
+                left.iter()
+                    .zip(right)
+                    .position(|(a, b)| a != b)
+                    .map(|index| format!("row {index} differs"))
+            }
+            _ => Some("the two answers are not even the same shape".to_owned()),
+        }
+    }
+}
+
+fn answer(client: &Client, path: &str, rows: bool) -> Result<Answer, ClientError> {
+    if rows {
+        Ok(Answer::Rows(client.read_table_rows::<YsonValue>(path)?))
+    } else {
+        Ok(Answer::Counts(counts(client, path)?))
+    }
 }
 
 fn counts(client: &Client, path: &str) -> Result<BTreeMap<String, i64>, ClientError> {
