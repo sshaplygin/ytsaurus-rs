@@ -132,8 +132,11 @@ fn main() {
         // worth.
         "map-frames" => ytsaurus_job::run(map_frames),
         "map-parse" => ytsaurus_job::run(map_parse),
+        "map-one" => ytsaurus_job::run(map_one),
         other => {
-            eprintln!("usage: sessionize <map|reduce|map-frames|map-parse>   (got {other:?})");
+            eprintln!(
+                "usage: sessionize <map|map-one|reduce|map-frames|map-parse>   (got {other:?})"
+            );
             std::process::exit(2);
         }
     }
@@ -149,7 +152,11 @@ fn map_frames() -> Result<(), JobError> {
 
     while let Some(event) = reader.next_event()? {
         if let Event::Row(row) = event {
-            // Touch the bytes, so nothing here can be optimised away.
+            // Reads the slice's length, not its contents — and that is enough,
+            // because `next_event` reads stdin and cannot be elided. An earlier
+            // comment here claimed this "touches the bytes"; it does not, and
+            // saying so mattered: this leg is the denominator's first bucket in
+            // every decode-share number the harness prints.
             rows += row.raw().len() as u64 & 1;
         }
     }
@@ -178,6 +185,69 @@ fn map_parse() -> Result<(), JobError> {
 
     eprintln!("sessionize map-parse: {kept}");
     Ok(())
+}
+
+/// The mapper with one output instead of two.
+///
+/// The comparison task of `docs/format-comparison.md`: read nine mixed-type
+/// columns, validate, derive one, write the survivors — and **no shuffle**, so
+/// nothing about plan shape can get into the measurement. That was the lesson
+/// of the wordcount comparison, where the whole of a 1.8× gap turned out to be
+/// a combiner.
+///
+/// One output rather than two for the same reason as the reduce is absent: a
+/// second output descriptor is outside the single shape Skiff is
+/// cluster-verified in (`docs/skiff-compatibility.md`, required test 4), and
+/// the Skiff leg has to run the same job as this one or the legs are not
+/// comparable. Bad rows are counted and dropped instead of quarantined — the
+/// count goes to stderr, which the operation shows.
+///
+/// Together with [`map_frames`] and [`map_parse`] this is the deepest of three
+/// stops over one table: frames, then decode, then the work. The differences
+/// are what each layer costs.
+fn map_one() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut writer = JobWriter::descriptors(1)?;
+
+    let mut kept = 0u64;
+    let mut rejected = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+
+        let clean = match row.parse::<RawEvent>() {
+            Err(e) if !e.is_row_local() => return Err(e),
+            Err(_) => {
+                rejected += 1;
+                continue;
+            }
+            Ok(event) => {
+                if validate(&event).is_err() {
+                    rejected += 1;
+                    continue;
+                }
+                CleanEvent {
+                    is_external: event
+                        .referer
+                        .is_some_and(|r| !r.is_empty() && !r.starts_with('/')),
+                    user_id: event.user_id,
+                    timestamp: event.timestamp,
+                    url: event.url,
+                    user_agent: event.user_agent,
+                    status: event.status,
+                    bytes_sent: event.bytes_sent,
+                    is_mobile: event.is_mobile,
+                    latency_ms: event.latency_ms,
+                }
+            }
+        };
+
+        writer.write(0, &clean)?;
+        kept += 1;
+    }
+
+    eprintln!("sessionize map-one: kept {kept}, dropped {rejected}");
+    writer.finish()
 }
 
 /// Why a row is unusable. Returning a reason rather than a bool means the

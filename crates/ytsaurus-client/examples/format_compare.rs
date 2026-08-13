@@ -86,16 +86,24 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use ytsaurus_client::{
-    Client, ClientError, Column, ColumnType, MapReduceSpec, Method, OperationFilter, Repeatable,
-    TableSchema, yson_build,
+    Client, ClientError, Column, ColumnType, MapReduceSpec, MapSpec, Method, OperationFilter,
+    Repeatable, TableSchema, yson_build,
 };
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
 /// Where the comparison keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_compare";
 
-/// The worker, as `scripts/build-worker.sh wordcount` leaves it.
-const WORKER: &str = "target/x86_64-unknown-linux-musl/release-worker/wordcount";
+/// Where `scripts/build-worker.sh` leaves the workers.
+const WORKER_DIR: &str = "target/x86_64-unknown-linux-musl/release-worker";
+
+/// Pinned so every leg runs the same number of jobs.
+///
+/// `time/exec` sums over jobs and a job start costs ~640 ms on this cluster, so
+/// a leg left on the controller's default is compared on how it was scheduled
+/// rather than on what it computed. 1 GiB is what YQL's own spec asks for, and
+/// it puts every leg of a 16 MiB task in a single job.
+const DATA_WEIGHT_PER_JOB: i64 = 1024 * 1024 * 1024;
 
 /// What the worker is given, and what the query is told to match.
 const WORKER_MEMORY: i64 = 512 * 1024 * 1024;
@@ -123,67 +131,65 @@ fn main() -> ExitCode {
 fn run() -> Result<(), ClientError> {
     let client = Client::from_env()?;
 
-    if !std::path::Path::new(WORKER).exists() {
-        return Err(ClientError::Config(format!(
-            "{WORKER} is missing; build it with: scripts/build-worker.sh wordcount"
-        )));
-    }
-
     let mib = number("YT_COMPARE_MIB", 16);
     let rounds = number("YT_COMPARE_ROUNDS", 5).max(1);
+    let task = std::env::var("YT_COMPARE_TASK").unwrap_or_else(|_| "wordcount".to_owned());
 
-    let input = format!("{BASE}/lines");
-    let rust_out = format!("{BASE}/counts_rust");
-    let combine_out = format!("{BASE}/counts_combine");
-    let yql_out = format!("{BASE}/counts_yql");
-
-    step(&format!("Writing about {mib} MiB of text"));
     client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
-    client.create_table(
-        &input,
-        &TableSchema::new([Column::new("text", ColumnType::String).required()]),
-    )?;
-    let lines = corpus(mib);
-    let words: usize = lines.iter().map(|line| line.text.split(' ').count()).sum();
-    client.write_table_rows(&input, lines.iter())?;
-    println!(
-        "   {} rows, {words} words, {} distinct",
-        client.row_count(&input)?,
-        distinct_words(&lines)
-    );
-    client.upload_worker(WORKER, &format!("{BASE}/wordcount"))?;
+
+    let (input, mut legs) = match task.as_str() {
+        "project" => prepare_project(&client, mib)?,
+        "wordcount" => prepare_wordcount(&client, mib)?,
+        other => {
+            return Err(ClientError::Config(format!(
+                "YT_COMPARE_TASK is \"wordcount\" or \"project\", not {other:?}"
+            )));
+        }
+    };
 
     // -------------------------------------------------------- correctness
 
     step("Correctness — the same computation, or nothing to time");
-    let mut legs = vec![
-        Leg::worker("worker, per row", "map", rust_out.clone()),
-        Leg::worker("worker, combining", "map-combine", combine_out.clone()),
-        Leg::query("YQL", yql_out.clone()),
-    ];
     for leg in &legs {
         let measure = run_leg(&client, &input, leg)?;
         println!("   {:<18} {}", leg.label, measure.describe());
     }
 
-    // Everything is compared against the first leg, which is the one the
-    // repository already ships and the one every other number is relative to.
-    let reference = counts(&client, &legs[0].output)?;
-    for leg in &legs[1..] {
-        let other = counts(&client, &leg.output)?;
-        if let Some(reason) = disagreement(&reference, &other) {
-            return Err(ClientError::Config(format!(
-                "{} disagrees with {}, so there is nothing to time: {reason}",
-                leg.label, legs[0].label
-            )));
+    // Only legs that compute a result are compared, and they are compared
+    // against the first of them. The shallow stops of a depth series write
+    // nothing on purpose, so there is nothing of theirs to diff.
+    let results: Vec<&Leg> = legs.iter().filter(|leg| leg.produces_rows()).collect();
+    match results.as_slice() {
+        [] => println!("   no leg produces rows; nothing to compare"),
+        [only] => {
+            let rows = client.row_count(&only.output)?;
+            if rows == 0 {
+                return Err(ClientError::Config(format!(
+                    "{} wrote no rows, so there is nothing to time",
+                    only.label
+                )));
+            }
+            println!("   {} wrote {rows} rows", only.label);
+        }
+        [first, rest @ ..] => {
+            let reference = counts(&client, &first.output)?;
+            for leg in rest {
+                let other = counts(&client, &leg.output)?;
+                if let Some(reason) = disagreement(&reference, &other) {
+                    return Err(ClientError::Config(format!(
+                        "{} disagrees with {}, so there is nothing to time: {reason}",
+                        leg.label, first.label
+                    )));
+                }
+            }
+            println!(
+                "   all {} computing legs agree on {} distinct words",
+                results.len(),
+                reference.len()
+            );
         }
     }
-    println!(
-        "   all {} legs agree on {} distinct words",
-        legs.len(),
-        reference.len()
-    );
 
     // ------------------------------------------------------------ timings
 
@@ -245,6 +251,180 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
+// ------------------------------------------------------------------- tasks
+
+/// Uploads a worker, refusing early if it was not built.
+fn upload(client: &Client, name: &str) -> Result<(), ClientError> {
+    let local = format!("{WORKER_DIR}/{name}");
+    if !std::path::Path::new(&local).exists() {
+        return Err(ClientError::Config(format!(
+            "{local} is missing; build it with: scripts/build-worker.sh {name}"
+        )));
+    }
+    client.upload_worker(&local, &format!("{BASE}/{name}"))
+}
+
+/// `wordcount`: two worker mappers and the query, all summing the same words.
+///
+/// Kept because it is what found the harness's own defects, but it is not the
+/// task this comparison is for: it shuffles, so plan shape gets into every
+/// number it produces.
+fn prepare_wordcount(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), ClientError> {
+    let input = format!("{BASE}/lines");
+
+    step(&format!("Writing about {mib} MiB of text"));
+    client.create_table(
+        &input,
+        &TableSchema::new([Column::new("text", ColumnType::String).required()]),
+    )?;
+    let lines = corpus(mib);
+    let words: usize = lines.iter().map(|line| line.text.split(' ').count()).sum();
+    client.write_table_rows(&input, lines.iter())?;
+    println!(
+        "   {} rows, {words} words, {} distinct",
+        client.row_count(&input)?,
+        distinct_words(&lines)
+    );
+    upload(client, "wordcount")?;
+
+    Ok((
+        input,
+        vec![
+            Leg::new(
+                "worker, per row",
+                Kind::WordCount("map"),
+                format!("{BASE}/counts_rust"),
+            ),
+            Leg::new(
+                "worker, combining",
+                Kind::WordCount("map-combine"),
+                format!("{BASE}/counts_combine"),
+            ),
+            Leg::new("YQL", Kind::Query, format!("{BASE}/counts_yql")),
+        ],
+    ))
+}
+
+/// `project`: the pilot's map at three depths over one table.
+///
+/// The task `docs/format-comparison.md` chose, and for the reason the wordcount
+/// run demonstrated: **no shuffle**, one output, so nothing about plan shape or
+/// combiners can enter the measurement. The three stops differ only in how far
+/// into each row they go, so their differences are what framing, decoding and
+/// the work itself cost — the subtraction `profile.rs` established, now with a
+/// format leg to hang off it.
+fn prepare_project(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), ClientError> {
+    let input = format!("{BASE}/events");
+
+    step(&format!("Writing about {mib} MiB of access-log events"));
+    client.create_table(&input, &events_schema())?;
+    let events = events(mib);
+    client.write_table_rows(&input, events.iter())?;
+    println!(
+        "   {} rows, {} MiB on the cluster",
+        client.row_count(&input)?,
+        client
+            .get(&format!("{input}/@data_weight"))?
+            .as_i64()
+            .unwrap_or(0) as f64
+            / (1024.0 * 1024.0)
+    );
+    upload(client, "sessionize")?;
+
+    Ok((
+        input,
+        vec![
+            Leg::new(
+                "frames only",
+                Kind::Depth("map-frames"),
+                format!("{BASE}/project_frames"),
+            ),
+            Leg::new(
+                "framed + decoded",
+                Kind::Depth("map-parse"),
+                format!("{BASE}/project_parse"),
+            ),
+            Leg::new(
+                "the whole map",
+                Kind::Depth("map-one"),
+                format!("{BASE}/project_full"),
+            ),
+        ],
+    ))
+}
+
+/// The nine columns `sessionize`'s `RawEvent` expects.
+///
+/// Byte columns are `String` rather than `Utf8`: real user agents are not
+/// valid UTF-8, and a schema that promised they were would be a lie the
+/// cluster enforces.
+fn events_schema() -> TableSchema {
+    TableSchema::new([
+        Column::new("user_id", ColumnType::String).required(),
+        Column::new("timestamp", ColumnType::Int64).required(),
+        Column::new("url", ColumnType::String).required(),
+        Column::new("referer", ColumnType::String),
+        Column::new("user_agent", ColumnType::String).required(),
+        Column::new("status", ColumnType::Int64).required(),
+        Column::new("bytes_sent", ColumnType::Uint64).required(),
+        Column::new("is_mobile", ColumnType::Boolean).required(),
+        Column::new("latency_ms", ColumnType::Double).required(),
+    ])
+}
+
+/// One access-log event, wide and mixed-typed on purpose.
+#[derive(serde::Serialize)]
+struct EventRow {
+    #[serde(with = "serde_bytes")]
+    user_id: Vec<u8>,
+    timestamp: i64,
+    url: &'static str,
+    referer: Option<&'static str>,
+    #[serde(with = "serde_bytes")]
+    user_agent: &'static [u8],
+    status: i64,
+    bytes_sent: u64,
+    is_mobile: bool,
+    latency_ms: f64,
+}
+
+/// Deterministic events, the same shape `profile.rs` measures the pilot on.
+///
+/// About 122 bytes of data weight a row, measured rather than guessed — the
+/// first version of this assumed 190 and produced a table two fifths the size
+/// asked for. The actual weight is still read back off the cluster and printed,
+/// because an estimate that drifts is exactly how a benchmark ends up
+/// comparing two different amounts of work.
+fn events(mib: usize) -> Vec<EventRow> {
+    /// Not valid UTF-8, as real user agents frequently are not.
+    const AGENT: &[u8] = b"Mozilla/5.0 (\xff\xfe compatible) Gecko/20100101";
+    const URLS: [&str; 4] = [
+        "/index.html",
+        "/search?q=ytsaurus&page=2",
+        "/api/v1/items/48291",
+        "/static/app.4f2c1d.js",
+    ];
+
+    let count = (mib * 1024 * 1024 / 122) as u64;
+    (0..count)
+        .map(|n| EventRow {
+            user_id: format!("user-{:06}", n % 5_000).into_bytes(),
+            timestamp: 1_767_225_600_000_000 + (n as i64) * 1_000_000,
+            url: URLS[(n % 4) as usize],
+            referer: if n % 3 == 0 {
+                None
+            } else {
+                Some("https://example.com/from")
+            },
+            user_agent: AGENT,
+            status: if n % 17 == 0 { 500 } else { 200 },
+            bytes_sent: 1_024 + n % 100_000,
+            is_mobile: n % 2 == 0,
+            latency_ms: 12.5 + (n % 400) as f64 / 10.0,
+        })
+        .collect()
+}
+
 // ----------------------------------------------------------------- the legs
 
 /// What one side of one round cost.
@@ -286,41 +466,80 @@ struct Measure {
     stages: Vec<Stage>,
 }
 
+/// What a leg does with the input.
+enum Kind {
+    /// `wordcount` as a map-reduce, with this mapper mode.
+    WordCount(&'static str),
+    /// `sessionize` as a map, with this command — one stop of the depth series.
+    Depth(&'static str),
+    /// The same computation as a query.
+    Query,
+}
+
 /// One way of computing the answer, and what it cost in each round.
 struct Leg {
     label: &'static str,
-    /// Which of the worker's mappers to run, or `None` for the query.
-    mapper: Option<&'static str>,
-    /// Where this leg writes, so the outputs can be diffed against each other.
+    kind: Kind,
+    /// Where this leg writes, so the outputs can be compared where they exist.
     output: String,
     runs: Vec<Measure>,
 }
 
 impl Leg {
-    fn worker(label: &'static str, mapper: &'static str, output: String) -> Self {
+    fn new(label: &'static str, kind: Kind, output: String) -> Self {
         Self {
             label,
-            mapper: Some(mapper),
+            kind,
             output,
             runs: Vec::new(),
         }
     }
 
-    fn query(label: &'static str, output: String) -> Self {
-        Self {
-            label,
-            mapper: None,
-            output,
-            runs: Vec::new(),
-        }
+    /// Whether this leg's output table is a result worth diffing.
+    ///
+    /// The shallow stops of the depth series write nothing by construction —
+    /// that is what makes them shallow — so a diff against them would compare
+    /// a computation with the absence of one.
+    fn produces_rows(&self) -> bool {
+        !matches!(self.kind, Kind::Depth(command) if command != "map-one")
     }
 }
 
 fn run_leg(client: &Client, input: &str, leg: &Leg) -> Result<Measure, ClientError> {
-    match leg.mapper {
-        Some(mapper) => run_worker(client, input, &leg.output, mapper),
-        None => run_query(client, &wordcount_query(input, &leg.output)),
+    match leg.kind {
+        Kind::WordCount(mapper) => run_worker(client, input, &leg.output, mapper),
+        Kind::Depth(command) => run_map(client, input, &leg.output, command),
+        Kind::Query => run_query(client, &wordcount_query(input, &leg.output)),
     }
+}
+
+/// One stop of the depth series: `sessionize` as a plain map.
+///
+/// No shuffle and one output, so the three stops differ only by how deep into
+/// the row each goes. `data_weight_per_job` is pinned so every leg runs the
+/// same number of jobs: `time/exec` sums over jobs, and on this cluster a job
+/// start is ~640 ms, so a leg that split differently would be compared on how
+/// it was scheduled rather than on what it computed.
+fn run_map(
+    client: &Client,
+    input: &str,
+    output: &str,
+    command: &str,
+) -> Result<Measure, ClientError> {
+    client.remove_tree(output)?;
+    client.create("table", output)?;
+
+    let spec = MapSpec::new(format!("./sessionize {command}"), [input], [output])
+        .with_local_file(format!("{BASE}/sessionize"))
+        .with_memory_limit(WORKER_MEMORY)
+        .with_raw("data_weight_per_job", yson_build::int(DATA_WEIGHT_PER_JOB));
+
+    let started = Instant::now();
+    let id = client.start_map(&spec)?;
+    client.wait_for_operation(&id)?;
+    let wall = started.elapsed();
+
+    Ok(measure(client, wall, &[id]))
 }
 
 /// One job type's share of one side.
@@ -522,7 +741,16 @@ fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
             let YsonNode::Map(indices) = &subtree.node else {
                 continue;
             };
-            for index in indices.values() {
+            for (name, index) in indices {
+                // `user_job/pipes/output` carries a `total` beside its numeric
+                // descriptors — the cluster's own aggregate — and adding it to
+                // the descriptors it aggregates doubles the answer. This
+                // harness published 171.4 MiB and a 4.1× ratio that way; both
+                // were exactly twice the truth, and the shape of the error made
+                // them look like a finding about the format.
+                if name.as_slice() == b"total" {
+                    continue;
+                }
                 for (_, (value, _)) in by_job_type_of(index, leaf) {
                     sum = Some(sum.unwrap_or(0) + value);
                 }
@@ -728,6 +956,8 @@ fn report(legs: &[Leg]) {
         stage_table(leg.label, &leg.runs);
     }
 
+    subtraction(legs);
+
     // The guard, per metric rather than once: on this cluster the rounds
     // scatter, and a difference smaller than the scatter is not a difference.
     // Applying it to the wall clock alone — which an earlier version did —
@@ -735,6 +965,99 @@ fn report(legs: &[Leg]) {
     // ten times the noise.
     guard(legs, "wall", wall);
     guard(legs, "time/exec", exec);
+}
+
+/// What each layer of the depth series cost, by subtraction.
+///
+/// Paired by round, not by minimum. The legs are interleaved precisely so that
+/// round `i` of each stop met the same cluster, and subtracting one leg's
+/// fastest round from another's throws that away — the two minima can come from
+/// different rounds, and the difference then carries both rounds' noise with no
+/// way to see it. The first version of this did exactly that and printed
+/// "15.1 %" from minima taken 4 seconds apart; paired by round the same five
+/// rounds say 13 % with a spread of 203–317 ms, which is the honest precision.
+///
+/// The method is `profile.rs`'s and so is the refusal: if the stops do not come
+/// out in order, no share is reported. A decode share read off numbers that
+/// came out backwards is not a small error, it is the whole quantity.
+fn subtraction(legs: &[Leg]) {
+    let [frames, parse, full] = legs else { return };
+    if frames.label != "frames only" {
+        return;
+    }
+
+    let rounds = frames.runs.len().min(parse.runs.len()).min(full.runs.len());
+    let mut decode = Vec::new();
+    let mut work = Vec::new();
+    let mut whole = Vec::new();
+    let mut handed = Vec::new();
+    for i in 0..rounds {
+        let (Some(f), Some(p), Some(w)) = (
+            frames.runs[i].exec_ms,
+            parse.runs[i].exec_ms,
+            full.runs[i].exec_ms,
+        ) else {
+            continue;
+        };
+        if f > p || p > w {
+            println!(
+                "\n   Round {} came out {f}, {p}, {w} ms — out of order, so it is dropped.",
+                i + 1
+            );
+            continue;
+        }
+        handed.push(f);
+        decode.push(p - f);
+        work.push(w - p);
+        whole.push(w);
+    }
+
+    if decode.is_empty() {
+        println!(
+            "\n   No round separated the stops. No decode share is reported — that is the\n   \
+             refusal working, not a missing number."
+        );
+        return;
+    }
+
+    let mean = |values: &[i64]| values.iter().sum::<i64>() / values.len() as i64;
+    let range = |values: &[i64]| {
+        let (min, max) = (
+            values.iter().min().copied().unwrap_or(0),
+            values.iter().max().copied().unwrap_or(0),
+        );
+        format!("{min}–{max}")
+    };
+    let total = mean(&whole);
+    let share = |part: i64| format!("{:.0} %", 100.0 * part as f64 / total as f64);
+
+    println!(
+        "\n   By subtraction, paired by round ({} of {} rounds usable):",
+        decode.len(),
+        rounds
+    );
+    for (name, values) in [
+        ("being handed the rows", &handed),
+        ("decoding them", &decode),
+        ("validating and writing", &work),
+        ("the whole map", &whole),
+    ] {
+        println!(
+            "     {name:<24} {:>6} ms   {:>5}   (rounds {} ms)",
+            mean(values),
+            share(mean(values)),
+            range(values)
+        );
+    }
+
+    println!(
+        "\n   Read the first bucket before the second: it is not framing, it is framing\n   \
+         plus process start plus waiting for the first batch, and on this cluster that\n   \
+         fixed part is several hundred milliseconds of any job. The decode share is a\n   \
+         share of a denominator that large, measured in per-job wall time — the 30 %\n   \
+         threshold in docs/benchmarking.md is stated over job CPU, which this cluster\n   \
+         does not report at all."
+    );
 }
 
 fn row(label: &str, cells: impl IntoIterator<Item = String>) {
