@@ -12,12 +12,27 @@
 //! and any difference decomposes into the runtime, the plan, and the format.
 //!
 //! The second worker leg exists because the first version of this comparison
-//! could not make that decomposition and reported the sum. It found YQL 1.84×
-//! faster, and the whole of that gap turned out to be one thing: YQL's planner
-//! combines in the map stage, so 3 750 rows crossed its shuffle where the
-//! worker's 3 114 964 did. `map-combine` is the worker doing the same, and the
-//! difference between the two worker legs is the price of that plan — leaving
-//! whatever remains against YQL as the part that might be about the runtime.
+//! could not make that decomposition and reported the sum. It found YQL ~1.8×
+//! faster on summed job exec time, and the largest single cause was plan
+//! shape: YQL's planner combines in the map stage, so 3 750 rows crossed its
+//! shuffle where the worker's 3 114 964 did. `map-combine` is the worker doing
+//! the same.
+//!
+//! **What the difference between the two worker legs is not.** It is not
+//! "runtime and format, once plan is subtracted". Adversarial review of the
+//! first result established that most of every number here is per-job process
+//! startup — about 640 ms a job on this cluster, against 150–500 ms of actual
+//! wordcount — and that the legs do not even run the same number of jobs: YQL's
+//! spec sets `data_weight_per_job` to 1 GiB and gets one map job, the worker
+//! takes the controller's default and gets three, while `time/exec` sums over
+//! jobs. Charge YQL only what the worker's own reduce cost and its 4650 ms
+//! becomes 3396 against 2787 — 1.22×, not 1.67×. On the stage that touches
+//! every row the two are within a few per cent per byte.
+//!
+//! So the honest reading of a run of this harness is: **a job-level combiner
+//! is worth about 3× on this workload, and the rest is plan shape and job
+//! startup.** Nothing here is evidence about wire formats — the format is the
+//! one thing held constant across all three legs.
 //!
 //! ```sh
 //! tests/e2e/run_local_cluster.sh
@@ -53,9 +68,17 @@
 //! has one column; the query must contain an `INSERT`, so YQL pays the full
 //! output cost rather than Query Tracker's first 10 000 rows; the query cache
 //! is disabled, without which a repeated query completes having spawned no
-//! operations at all; and both memory limits are printed, because YQL's default
-//! (545 MB) and the worker's (512 MB) are close enough that neither side is
-//! being flattered — see `yql_smoke.rs` for how that was measured.
+//! operations at all; and both memory limits are printed — the query is given
+//! 640 MB against the worker's 512 MB, a 1.25× asymmetry in the query's favour
+//! that exists because 576 MB is where YQL fails on this cluster (`yql_smoke.rs`
+//! measured it) and 512 MB is what every other example here gives a worker.
+//!
+//! **Rules it does not enforce, and should before anything is published:** the
+//! two sides run different numbers of jobs (see above), the corpus's vocabulary
+//! is capped at 3 750 words and does not grow with the input, which flatters a
+//! combiner without bound, and the query tokenises with `Re2` where this
+//! space-separated corpus would let it use the cheaper `String::SplitToList` —
+//! and that sits in exactly the stage where the per-row work happens.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -229,13 +252,28 @@ struct Measure {
     /// Wall clock as the launcher sees it, including waiting for the scheduler.
     wall: Duration,
     /// The cluster's own `time/exec`, summed over every operation this side ran.
+    ///
+    /// Per-job **wall** time including process start, summed over jobs — so a
+    /// leg that splits its work into more jobs pays its startup once per job
+    /// in this number while getting the wall-clock benefit of the parallelism.
+    /// On this cluster a job's fixed cost is ~640 ms, which is most of what
+    /// this metric contains for a 16 MiB task. Read it with `stages` beside it,
+    /// never alone.
     exec_ms: Option<i64>,
+    /// `time/prepare`, which `time/exec` does not include.
+    prepare_ms: Option<i64>,
+    /// `time/total` — the closest thing here to what a job really cost.
+    total_ms: Option<i64>,
     /// `user_job/cpu/user`, where the cluster reports it. A local one does not.
     cpu_ms: Option<i64>,
     /// How many cluster operations this side took.
     operations: usize,
     input_bytes: Option<i64>,
     output_bytes: Option<i64>,
+    /// Bytes across the job's input pipes — the encoded stream itself.
+    pipe_in_bytes: Option<i64>,
+    /// Bytes across the job's output pipes.
+    pipe_out_bytes: Option<i64>,
     /// The same numbers split by job type.
     ///
     /// The reason this is collected at all: the first run of this comparison
@@ -437,11 +475,57 @@ fn run_query(client: &Client, query: &str) -> Result<Measure, ClientError> {
 
 /// Everything the scheduler will say about a side's operations, summed.
 fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
+    // `None` when any operation's statistics could not be read, rather than the
+    // sum of the ones that could: a leg is one or two operations, and a total
+    // silently missing one of them is a plausible-looking undercount — the
+    // worst kind of wrong number in a comparison.
     let total = |path: &str| {
         let mut sum = None;
         for id in ids {
-            if let Ok(Some(value)) = client.job_statistic_sum(id, path) {
-                sum = Some(sum.unwrap_or(0) + value);
+            match client.job_statistic_sum(id, path) {
+                Ok(Some(value)) => sum = Some(sum.unwrap_or(0) + value),
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        sum
+    };
+
+    // Output volume is indexed by output table — `data/output/0/data_weight`,
+    // not `data/output/data_weight`. Asking for the flat path returns `None`
+    // for every leg, which this harness printed as a blank column for two full
+    // measurement runs before anyone looked in the tree.
+    let per_table = |path: &str, leaf: &str| {
+        let mut sum = None;
+        for id in ids {
+            let Ok(statistics) = client.job_statistics(id) else {
+                return None;
+            };
+            // Descend component by component: `field_ref` takes one key, and
+            // asking it for "data/output" looks up a key spelled with a slash,
+            // which no cluster has. That mistake is what kept this column blank
+            // after the first attempt at fixing it.
+            let mut subtree = &statistics;
+            let mut found = true;
+            for component in path.split('/') {
+                match field_ref(subtree, component) {
+                    Some(next) => subtree = next,
+                    None => {
+                        found = false;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                continue;
+            }
+            let YsonNode::Map(indices) = &subtree.node else {
+                continue;
+            };
+            for index in indices.values() {
+                for (_, (value, _)) in by_job_type_of(index, leaf) {
+                    sum = Some(sum.unwrap_or(0) + value);
+                }
             }
         }
         sum
@@ -488,10 +572,19 @@ fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
     Measure {
         wall,
         exec_ms: total("time/exec"),
+        // Not in `time/exec` and worth 656–752 ms per job on this cluster,
+        // which is the same order as the exec time of a whole stage here.
+        prepare_ms: total("time/prepare"),
+        total_ms: total("time/total"),
         cpu_ms: total("user_job/cpu/user"),
         operations: ids.len(),
         input_bytes: total("data/input/data_weight"),
-        output_bytes: total("data/output/data_weight"),
+        output_bytes: per_table("data/output", "data_weight"),
+        // The bytes that actually crossed the job's pipes: the encoded stream,
+        // which is the one number in here that a wire format decides. It is
+        // what legs 2 and 3 will be compared on.
+        pipe_in_bytes: total("user_job/pipes/input/bytes"),
+        pipe_out_bytes: per_table("user_job/pipes/output", "bytes"),
         stages: stages.into_values().collect(),
     }
 }
@@ -510,6 +603,23 @@ fn by_job_type(statistics: &YsonValue, path: &str) -> BTreeMap<String, (i64, i64
             None => return BTreeMap::new(),
         }
     }
+    by_job_type_of(node, "")
+}
+
+/// As [`by_job_type`], from a subtree that is already at the right place.
+///
+/// `leaf` is one more path component to descend first, or `""` to stay put —
+/// which is what reading `data/output/<index>/data_weight` needs, since the
+/// index is discovered rather than named.
+fn by_job_type_of(node: &YsonValue, leaf: &str) -> BTreeMap<String, (i64, i64)> {
+    let node = if leaf.is_empty() {
+        node
+    } else {
+        match field_ref(node, leaf) {
+            Some(next) => next,
+            None => return BTreeMap::new(),
+        }
+    };
 
     let Some(separated) = field_ref(node, "$$").or_else(|| field_ref(node, "$")) else {
         return BTreeMap::new();
@@ -586,6 +696,31 @@ fn report(legs: &[Leg]) {
         legs.iter()
             .map(|leg| bytes(leg.runs.first().and_then(|m| m.output_bytes))),
     );
+    row(
+        "pipe bytes in",
+        legs.iter()
+            .map(|leg| bytes(leg.runs.first().and_then(|m| m.pipe_in_bytes))),
+    );
+    row(
+        "pipe bytes out",
+        legs.iter()
+            .map(|leg| bytes(leg.runs.first().and_then(|m| m.pipe_out_bytes))),
+    );
+
+    let total_time = |m: &Measure| m.total_ms;
+    row(
+        "time/total, fastest",
+        legs.iter().map(|leg| ms(fastest(&leg.runs, total_time))),
+    );
+    row("time/total, vs first", ratios(legs, total_time));
+    // Printed because it is not inside `time/exec` and is the same order of
+    // magnitude as it: a comparison that quotes exec alone is quoting about
+    // half of what the jobs cost.
+    row(
+        "time/prepare, extra",
+        legs.iter()
+            .map(|leg| ms(fastest(&leg.runs, |m| m.prepare_ms))),
+    );
 
     // Where the time went, which is the part that decides whether the totals
     // above mean what they look like.
@@ -624,27 +759,32 @@ fn ratios(legs: &[Leg], of: impl Fn(&Measure) -> Option<i64> + Copy) -> Vec<Stri
 }
 
 /// Says so when a gap is smaller than the noise it was measured against.
+///
+/// Every pair, not just each leg against the first: the number a reader quotes
+/// is whichever two legs interest them, and a guard that vets only one column
+/// leaves the interesting comparison unvetted. That is not hypothetical — the
+/// headline this harness produced ("1.67x") was a pair the harness itself
+/// never compared and never guarded.
 fn guard(legs: &[Leg], metric: &str, of: impl Fn(&Measure) -> Option<i64> + Copy) {
-    let Some(base) = fastest(&legs[0].runs, of) else {
-        return;
-    };
     let noise = legs
         .iter()
         .map(|leg| scatter(&leg.runs, of))
         .max()
         .unwrap_or(0);
 
-    for leg in &legs[1..] {
-        let Some(value) = fastest(&leg.runs, of) else {
-            continue;
-        };
-        let gap = (base - value).abs();
-        if gap < noise {
-            println!(
-                "\n   {metric}: {} against {} differ by {gap} ms, which is less than the \n   \
-                 scatter within one leg ({noise} ms). No measurable difference, not a winner.",
-                legs[0].label, leg.label
-            );
+    for (index, left) in legs.iter().enumerate() {
+        for right in &legs[index + 1..] {
+            let (Some(l), Some(r)) = (fastest(&left.runs, of), fastest(&right.runs, of)) else {
+                continue;
+            };
+            let gap = (l - r).abs();
+            if gap < noise {
+                println!(
+                    "\n   {metric}: {} against {} differ by {gap} ms, which is less than the\n   \
+                     scatter within one leg ({noise} ms). No measurable difference, not a winner.",
+                    left.label, right.label
+                );
+            }
         }
     }
 }

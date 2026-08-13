@@ -32,9 +32,19 @@
 //! Measured on the local cluster over 16 MiB of text — `cargo run -p
 //! ytsaurus-client --example format_compare` — `map` sent **3 114 964 rows**
 //! into the shuffle where the same computation in YQL sent **3 750**, because
-//! YQL's planner puts a combiner in its map stage as a matter of course. That
-//! difference was the whole of a 1.84× gap in total job time; nothing about
-//! the format or the language was in it.
+//! YQL's planner puts a combiner in its map stage as a matter of course. At
+//! that size the query finished in about **1.8×** less summed job exec time;
+//! on wall clock the two were indistinguishable, and at 1 MiB the plain `map`
+//! was already 2.5× *faster* than the query. The direction is a property of
+//! the input size, not of the two implementations.
+//!
+//! With `map-combine` the worker's total exec falls 8432 → 2787 ms against the
+//! query's 4650. Where the 5645 ms went: 1294 ms is the mapper no longer
+//! encoding 3.1 M output rows, 4351 ms is the reducer no longer reading 39.7
+//! MiB of them back. **This is a result about plan shape**, and the same is
+//! true of the gap it closes — neither number says anything about the wire
+//! format or the language, and both are dominated by per-job process startup
+//! (~640 ms per job here, against 150–500 ms of actual wordcount).
 //!
 //! The reason it was not written this way to begin with is visible in the
 //! signature: `map`'s keys are `&[u8]` borrowed from the reader's buffer, and
@@ -89,8 +99,10 @@ fn main() {
 
 /// Splits each line into words and emits `{word=...; count=1}`.
 ///
-/// Counts are pre-aggregated per row, which cuts the volume the shuffle has to
-/// move without changing the result.
+/// Counts are pre-aggregated per row. On short lines that is worth almost
+/// nothing — on the measured corpus 3 126 408 words became 3 114 964 shuffle
+/// rows, a **0.4 %** reduction, because a word rarely repeats inside one line.
+/// That is why [`map_combine`] exists.
 fn map() -> Result<(), JobError> {
     let mut reader = JobReader::from_stdin();
     let mut writer = JobWriter::descriptors(1)?;
@@ -136,8 +148,16 @@ const COMBINE_LIMIT: usize = 1 << 20;
 /// Splits each line into words and sums them **within the job**.
 ///
 /// The difference from [`map`] is one `HashMap` that outlives the row, which
-/// is why its keys are owned. See the module docs for what it was worth when
-/// measured: the shuffle carried 830× fewer rows.
+/// is why its keys are owned. Measured, the shuffle carried **277× fewer
+/// rows** — 11 250 against 3 114 964. That 11 250 is 3 map jobs × the corpus's
+/// 3 750 distinct words, each job flushing the whole vocabulary; YQL reached
+/// 3 750 because its map ran as a single job, so the remaining factor of 3 is
+/// job count rather than combining.
+///
+/// The corpus is also the friendliest case a combiner can have: its vocabulary
+/// is small enough that every job sees every word, and it does not grow with
+/// the input. On a real corpus, where distinct words keep appearing, the
+/// saving is smaller and the flush below starts to matter.
 fn map_combine() -> Result<(), JobError> {
     let mut reader = JobReader::from_stdin();
     let mut writer = JobWriter::descriptors(1)?;
