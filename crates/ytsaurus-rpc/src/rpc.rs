@@ -317,6 +317,20 @@ mod tests {
     /// The proxy refuses a call that announces the wrong major version, and the
     /// right version depends on which service is being called — not on the
     /// connection. Getting this wrong fails every call to that service.
+    /// Numbers the server matches on, written out.
+    #[test]
+    fn the_wire_constants_are_the_documented_ones() {
+        assert_eq!(
+            CREDENTIALS_EXT_FIELD, 110,
+            "TCredentialsExt is extension 110"
+        );
+        assert_eq!(CODEC_NONE, 0, "ECodec::None is 0");
+        assert_eq!(PROTOCOL_VERSION_MAJOR, 1);
+        assert_eq!(DEFAULT_PROTOCOL_VERSION_MAJOR, 0);
+        assert_eq!(API_SERVICE, "ApiService");
+        assert_eq!(DISCOVERY_SERVICE, "DiscoveryService");
+    }
+
     #[test]
     fn the_protocol_version_is_per_service() {
         assert_eq!(protocol_version_major(API_SERVICE), 1);

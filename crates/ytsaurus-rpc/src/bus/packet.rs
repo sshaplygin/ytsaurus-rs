@@ -449,7 +449,11 @@ mod tests {
         encode(&packet, &mut buffer).unwrap();
 
         assert_eq!(buffer.len(), FIXED_HEADER_SIZE, "an ack is header-only");
-        assert_eq!(&buffer[0..4], &SIGNATURE.to_le_bytes());
+        // Against the literal bytes, not against `SIGNATURE`: an assertion that
+        // reads the same constant the encoder reads pins the offset and not the
+        // value, and this value is the first thing a proxy checks.
+        assert_eq!(&buffer[0..4], b"Omax");
+        assert_eq!(SIGNATURE, 0x7861_6d4f);
         assert_eq!(&buffer[4..6], &1u16.to_le_bytes(), "type");
         assert_eq!(&buffer[6..8], &0u16.to_le_bytes(), "flags");
         assert_eq!(
@@ -761,6 +765,27 @@ mod tests {
             // Either "need more" or a clean error; never a panic.
             let _ = decode(&mut truncated, NO_LIMIT);
         }
+    }
+
+    /// The protocol's own numbers, written out.
+    ///
+    /// Every other limit test is phrased as `MAX_X + 1`, which passes just as
+    /// happily if the limit itself is wrong — halving `MAX_PART_SIZE` would
+    /// start refusing traffic the protocol allows, with the suite green.
+    #[test]
+    fn the_limits_are_the_protocol_s_limits() {
+        assert_eq!(
+            MAX_PART_SIZE,
+            1024 * 1024 * 1024,
+            "MaxMessagePartSize is 1 GB"
+        );
+        assert_eq!(
+            MAX_PART_COUNT, 268_435_456,
+            "MaxMessagePartCount is 1 << 28"
+        );
+        assert_eq!(FIXED_HEADER_SIZE, 36);
+        assert_eq!(NULL_PART_SIZE, 4_294_967_295);
+        assert_eq!(NULL_CHECKSUM, 0);
     }
 
     /// A part larger than the size word can hold must be refused, not

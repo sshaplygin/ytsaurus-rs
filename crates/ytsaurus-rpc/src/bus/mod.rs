@@ -281,6 +281,22 @@ mod tests {
         address
     }
 
+    /// The bytes of a handshake reply for a given packet id.
+    fn handshake_bytes(id: Guid) -> Vec<u8> {
+        let handshake = proto::bus::THandshake {
+            connection_id: Guid::random().to_proto(),
+            encryption_mode: Some(0),
+            ..Default::default()
+        };
+        let mut part = Vec::new();
+        part.extend_from_slice(&HANDSHAKE_SIGNATURE.to_le_bytes());
+        handshake.encode(&mut part).unwrap();
+        let reply = Packet::message(id, vec![Some(Bytes::from(part))], PacketFlags::NONE);
+        let mut out = BytesMut::new();
+        packet::encode(&reply, &mut out).unwrap();
+        out.to_vec()
+    }
+
     fn handshake_reply(mode: EncryptionMode) -> Packet {
         let handshake = proto::bus::THandshake {
             connection_id: Guid::random().to_proto(),
@@ -323,11 +339,16 @@ mod tests {
         assert_eq!(request.parts.len(), 1);
 
         let payload = request.parts[0].as_ref().unwrap();
-        assert_eq!(
-            u32::from_le_bytes(payload[0..4].try_into().unwrap()),
-            HANDSHAKE_SIGNATURE
-        );
+        // Literals throughout: these are the bytes a proxy matches on, and an
+        // assertion written in terms of the constants would follow them
+        // wherever they went.
         assert_eq!(&payload[0..4], b"bush", "the signature spells bush");
+        assert_eq!(HANDSHAKE_SIGNATURE, 0x6873_7562);
+        assert_eq!(
+            request.id.0,
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "the handshake packet id is the GUID 1-0-0-0"
+        );
         let handshake = proto::bus::THandshake::decode(&payload[4..]).unwrap();
         assert_eq!(handshake.encryption_mode, Some(0), "encryption is disabled");
     }
@@ -412,6 +433,54 @@ mod tests {
         assert!(
             error.to_string().contains("no handshake within"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The reader must apply the ceiling it was given.
+    ///
+    /// The limit is tested thoroughly one layer down, where tests hand a bound
+    /// straight to `packet::decode` — but nothing checked that `BusReader`
+    /// passes its own configured value along, and it is the only thing standing
+    /// between a hostile length word and an unbounded reservation.
+    #[tokio::test]
+    async fn the_reader_applies_its_own_size_ceiling() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read_half, mut write_half) = stream.into_split();
+            let mut buffer = BytesMut::new();
+            // Answer the handshake, then announce a packet far above the
+            // ceiling this connection was opened with.
+            loop {
+                if let Ok(Some(request)) = packet::decode(&mut buffer, DEFAULT_MAX_MESSAGE_SIZE) {
+                    let _ = write_half.write_all(&handshake_bytes(request.id)).await;
+                    break;
+                }
+                if read_half.read_buf(&mut buffer).await.unwrap_or(0) == 0 {
+                    return;
+                }
+            }
+            let big = Packet::message(
+                Guid::random(),
+                vec![Some(Bytes::from(vec![0u8; 128 * 1024]))],
+                PacketFlags::NONE,
+            );
+            let mut out = BytesMut::new();
+            packet::encode(&big, &mut out).unwrap();
+            let _ = write_half.write_all(&out).await;
+            std::future::pending::<()>().await;
+        });
+
+        // A ceiling below the packet the peer is about to send.
+        let mut bus = Bus::connect_with(&address, 4096, DEFAULT_CONNECT_TIMEOUT)
+            .await
+            .expect("the handshake itself is small");
+        let error = bus.reader.receive().await.unwrap_err();
+        assert!(
+            error.to_string().contains("more than the 4096"),
+            "the reader ignored its ceiling: {error}"
         );
     }
 

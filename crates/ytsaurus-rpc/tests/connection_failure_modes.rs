@@ -107,10 +107,18 @@ async fn a_call_after_the_reader_dies_fails_rather_than_hanging() {
         "TRspPingTransaction",
     );
     let outcome = tokio::time::timeout(Duration::from_millis(1500), call).await;
-    match outcome {
-        Err(_) => panic!("HANG CONFIRMED: the call never returned after the reader died"),
-        Ok(result) => println!("call returned: {result:?}"),
-    }
+    let error = match outcome {
+        Err(_) => panic!("the call never returned after the reader died"),
+        Ok(result) => result.expect_err("a dead connection cannot answer"),
+    };
+
+    // The *kind* matters, not just that something came back. This call was
+    // refused because the connection is gone, and reporting it as a timeout
+    // would tell a caller to wait and retry when there is nothing to wait for.
+    assert!(
+        matches!(error, ytsaurus_rpc::Error::ConnectionClosed { .. }),
+        "expected ConnectionClosed, got {error}"
+    );
 }
 
 /// A deadline has to cover queuing the request, not only waiting for the reply.
