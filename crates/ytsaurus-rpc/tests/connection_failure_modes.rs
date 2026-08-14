@@ -1,4 +1,12 @@
-//! Scratch probes for the review. Deleted afterwards.
+//! The ways a connection fails, and what a caller sees when it does.
+//!
+//! Every test here started as a defect. A client that speaks a multiplexed
+//! protocol has failure modes a request/response client does not, and the ones
+//! that hurt are those where a caller waits for ever instead of getting an
+//! error: they look like a slow cluster, not like a bug.
+//!
+//! Each uses a stub peer that misbehaves in one specific way, because a real
+//! proxy will not corrupt a packet or stop reading on demand.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,10 +37,17 @@ fn handshake_reply(id: Guid) -> Vec<u8> {
     out.to_vec()
 }
 
-/// Probe 1: a single corrupt packet kills the reader task while the writer
-/// stays alive. Does a later call with no timeout hang forever?
+/// A corrupt packet ends the reader task, and the connection must then refuse
+/// new calls rather than accept them into a void.
+///
+/// The reader is what delivers every response, so once it stops nothing can
+/// ever complete. Before this was fixed, a call issued afterwards with no
+/// timeout waited for ever: the request was queued, the writer sent it
+/// happily, and no reader remained to route the answer. Rejecting a malformed
+/// packet is deliberate behaviour, so anything that corrupts a byte on the
+/// wire reaches this.
 #[tokio::test]
-async fn probe_reader_death_hangs_later_calls() {
+async fn a_call_after_the_reader_dies_fails_rather_than_hanging() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
 
@@ -57,7 +72,11 @@ async fn probe_reader_death_hangs_later_calls() {
         // errors, which ends its read loop.
         let mut junk = BytesMut::new();
         packet::encode(
-            &Packet::message(Guid::random(), vec![Some(Bytes::from_static(b"x"))], PacketFlags::NONE),
+            &Packet::message(
+                Guid::random(),
+                vec![Some(Bytes::from_static(b"x"))],
+                PacketFlags::NONE,
+            ),
             &mut junk,
         );
         junk[0] ^= 0xff;
@@ -93,10 +112,16 @@ async fn probe_reader_death_hangs_later_calls() {
     }
 }
 
-/// Probe 2: the peer stops reading. Does a call with a 100 ms timeout still
-/// return in anything like 100 ms?
+/// A deadline has to cover queuing the request, not only waiting for the reply.
+///
+/// The outbound channel is bounded, which is what makes backpressure real. But
+/// a peer that stops reading backs the writer up until that channel is full,
+/// and then `send` blocks — so a deadline applied only to the reply is no
+/// deadline at all in precisely the case a caller most needs one. Before this
+/// was fixed, 134 of these 200 calls were still stuck three seconds into a
+/// 100 ms deadline.
 #[tokio::test]
-async fn probe_stalled_writer_ignores_the_timeout() {
+async fn a_stalled_peer_does_not_outlast_the_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
 
@@ -151,15 +176,20 @@ async fn probe_stalled_writer_ignores_the_timeout() {
     let done = finished.load(Ordering::Relaxed);
     println!("after 3 s, {done}/200 calls with a 100 ms timeout have returned");
     assert_eq!(
-        done, 200,
+        done,
+        200,
         "HANG CONFIRMED: {} of 200 calls are still stuck 30x past their timeout",
         200 - done
     );
 }
 
-/// Probe 3: dropping the invoke future part-way. Is a cancellation sent?
+/// Dropping a call sends the protocol's cancellation.
+///
+/// Duplicated from the unit tests on purpose: this one goes through a real
+/// socket rather than the in-process stub, so it covers the encoding and
+/// framing of the cancellation message as well as the decision to send it.
 #[tokio::test]
-async fn probe_plain_drop_sends_no_cancelation() {
+async fn dropping_a_call_cancels_it_through_a_real_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let (seen_sender, mut seen) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();

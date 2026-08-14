@@ -28,7 +28,30 @@ use crate::rpc::{self, ResponseMessage};
 /// How many outbound messages may be queued before senders wait.
 const OUTBOUND_QUEUE: usize = 64;
 
-type Pending = Arc<Mutex<HashMap<Guid, oneshot::Sender<ResponseMessage>>>>;
+/// The callers waiting for responses, and whether the connection is still
+/// usable.
+///
+/// The two live under one lock on purpose. A caller registers itself and the
+/// reader task declares the connection dead; if those could interleave, a
+/// caller could register just after the reader cleared the map and then wait
+/// for a response no one will ever deliver.
+#[derive(Debug, Default)]
+struct Waiters {
+    closed: bool,
+    by_request: HashMap<Guid, oneshot::Sender<ResponseMessage>>,
+}
+
+impl Waiters {
+    /// Marks the connection dead and wakes everyone waiting on it. Dropping the
+    /// senders is what turns a lost connection into an error for each caller
+    /// rather than a hang.
+    fn close(&mut self) {
+        self.closed = true;
+        self.by_request.clear();
+    }
+}
+
+type Pending = Arc<Mutex<Waiters>>;
 
 /// A live connection to one RPC proxy.
 #[derive(Debug)]
@@ -53,7 +76,12 @@ impl Connection {
         let closed = Arc::new(AtomicBool::new(false));
         let (outbound, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE);
 
-        tokio::spawn(write_loop(writer, outbound_receiver, Arc::clone(&closed)));
+        tokio::spawn(write_loop(
+            writer,
+            outbound_receiver,
+            Arc::clone(&pending),
+            Arc::clone(&closed),
+        ));
         tokio::spawn(read_loop(reader, Arc::clone(&pending), Arc::clone(&closed)));
 
         Self {
@@ -112,40 +140,69 @@ impl Connection {
         let request_id = builder.request_id;
         let header = builder.build();
 
+        // The deadline covers the whole call, not just the wait for a reply.
+        // Queuing the request can block too — the outbound channel is bounded,
+        // and a peer that stops reading backs the writer up until it is full —
+        // so a deadline applied only to the reply would be no deadline at all
+        // in exactly the case a caller most needs one.
+        let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+        let timed_out = || Error::Timeout {
+            service: service.to_owned(),
+            method: method.to_owned(),
+            timeout: timeout.unwrap_or_default(),
+        };
+
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(request_id, sender);
+        {
+            let mut waiters = self.pending.lock().await;
+            // Checked under the same lock the reader closes with, so a
+            // connection that has already died fails the call here instead of
+            // parking it for ever.
+            if waiters.closed {
+                return Err(Error::ConnectionClosed { request_id });
+            }
+            waiters.by_request.insert(request_id, sender);
+        }
 
         // Armed from here on. However this function leaves — returning, or the
         // caller dropping the future part-way — the guard removes the pending
-        // entry and tells the server to stop working on a result nobody will
-        // read.
+        // entry and, once the request has actually been queued, tells the
+        // server to stop working on a result nobody will read.
         let mut guard = PendingGuard {
             pending: Arc::clone(&self.pending),
-            outbound: Some(self.outbound.clone()),
+            outbound: self.outbound.clone(),
             request_id,
             service: service.to_owned(),
             method: method.to_owned(),
+            completed: false,
+            sent: false,
         };
 
         let parts = rpc::encode_request(&header, self.token.as_deref(), body, attachments);
         let packet = Packet::message(Guid::random(), parts, PacketFlags::NONE);
-        if self.outbound.send(packet).await.is_err() {
-            guard.disarm();
+        let queued = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, self.outbound.send(packet)).await {
+                    Ok(queued) => queued,
+                    // Never queued, so there is nothing for the server to cancel;
+                    // the guard still removes the pending entry.
+                    Err(_) => return Err(timed_out()),
+                }
+            }
+            None => self.outbound.send(packet).await,
+        };
+        if queued.is_err() {
+            guard.complete();
             return Err(Error::ConnectionClosed { request_id });
         }
+        guard.sent = true;
 
-        let response = match timeout {
-            Some(limit) => match tokio::time::timeout(limit, receiver).await {
+        let response = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, receiver).await {
                 Ok(received) => received,
                 // Dropping the guard sends the cancellation, so the timeout
                 // path needs nothing of its own.
-                Err(_) => {
-                    return Err(Error::Timeout {
-                        service: service.to_owned(),
-                        method: method.to_owned(),
-                        timeout: limit,
-                    });
-                }
+                Err(_) => return Err(timed_out()),
             },
             None => receiver.await,
         };
@@ -155,12 +212,12 @@ impl Connection {
             // The sender was dropped, which only happens when the reader task
             // ended — the connection is gone, and there is nothing to cancel.
             Err(_) => {
-                guard.disarm();
+                guard.complete();
                 return Err(Error::ConnectionClosed { request_id });
             }
         };
         // The answer is in hand: nothing to remove and nothing to cancel.
-        guard.disarm();
+        guard.complete();
 
         if let Some(error) = response.error() {
             return Err(Error::response(service, method, error));
@@ -178,49 +235,61 @@ impl Connection {
 /// merely stops waiting leaves the proxy computing a result nobody will read,
 /// which is exactly the cost this crate exists to avoid.
 ///
-/// Disarmed once the response is in hand, since there is then nothing to remove
-/// and nothing to cancel.
+/// Stood down once the response is in hand, since there is then nothing to
+/// remove and nothing to cancel.
 struct PendingGuard {
     pending: Pending,
-    outbound: Option<mpsc::Sender<Packet>>,
+    outbound: mpsc::Sender<Packet>,
     request_id: Guid,
     service: String,
     method: String,
+    /// The call finished on its own; no cleanup is owed.
+    completed: bool,
+    /// The request reached the outbound queue, so the server may be working on
+    /// it. A request that never got that far has nothing to cancel, and saying
+    /// otherwise would send a cancellation for a request id the server has
+    /// never seen.
+    sent: bool,
 }
 
 impl PendingGuard {
-    fn disarm(&mut self) {
-        self.outbound = None;
+    fn complete(&mut self) {
+        self.completed = true;
     }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        let Some(outbound) = self.outbound.take() else {
+        if self.completed {
             return;
-        };
+        }
 
         let pending = Arc::clone(&self.pending);
         let request_id = self.request_id;
         // `Drop` cannot await, so the removal is handed to the runtime. It is
         // idempotent, so racing with the reader task is harmless.
         tokio::spawn(async move {
-            pending.lock().await.remove(&request_id);
+            pending.lock().await.by_request.remove(&request_id);
         });
+
+        if !self.sent {
+            return;
+        }
 
         // Best-effort and non-blocking: if the queue is full or the connection
         // is gone there is nothing useful to do, and dropping a future must not
         // block.
-        // MUTANT: cancellation never sent.
-        if true { return; }
         let parts = rpc::encode_cancelation(request_id, &self.service, &self.method);
-        let _ = outbound.try_send(Packet::message(Guid::random(), parts, PacketFlags::NONE));
+        let _ = self
+            .outbound
+            .try_send(Packet::message(Guid::random(), parts, PacketFlags::NONE));
     }
 }
 
 async fn write_loop(
     mut writer: BusWriter,
     mut outbound: mpsc::Receiver<Packet>,
+    pending: Pending,
     closed: Arc<AtomicBool>,
 ) {
     while let Some(packet) = outbound.recv().await {
@@ -229,6 +298,7 @@ async fn write_loop(
         }
     }
     closed.store(true, Ordering::Relaxed);
+    pending.lock().await.close();
     let _ = writer.shutdown().await;
 }
 
@@ -253,16 +323,16 @@ async fn read_loop(mut reader: BusReader, pending: Pending, closed: Arc<AtomicBo
         let Some(request_id) = response.request_id() else {
             continue;
         };
-        if let Some(sender) = pending.lock().await.remove(&request_id) {
+        if let Some(sender) = pending.lock().await.by_request.remove(&request_id) {
             let _ = sender.send(response);
         }
     }
 
     closed.store(true, Ordering::Relaxed);
-    // Waking every waiter is what turns a dropped connection into an error for
-    // each caller instead of a hang: dropping the senders resolves their
-    // `oneshot`s with a receive error.
-    pending.lock().await.clear();
+    // The reader is what delivers every response, so once it stops the
+    // connection is finished: waiters are woken with an error, and later calls
+    // are refused rather than parked for ever.
+    pending.lock().await.close();
 }
 
 /// Asks a proxy for the current set of RPC proxies.
@@ -694,7 +764,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            connection.pending.lock().await.is_empty(),
+            connection.pending.lock().await.by_request.is_empty(),
             "a dropped call left its entry in the pending map"
         );
     }
