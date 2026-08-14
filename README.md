@@ -169,7 +169,7 @@ run can be made bigger without editing code:
 
 ```sh
 ./scripts/init-protos.sh        # once after cloning: the .proto submodule
-cargo test --workspace          # 866 tests
+cargo test --workspace          # 884 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```
