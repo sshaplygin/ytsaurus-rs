@@ -396,6 +396,21 @@ mod tests {
     async fn stub_proxy(
         answer: impl Fn(&proto::rpc::TRequestHeader) -> Option<Vec<Option<Bytes>>> + Send + 'static,
     ) -> StubProxy {
+        stub_proxy_with_batching(answer, 1).await
+    }
+
+    /// A stub that collects `batch` requests before answering any of them, and
+    /// then answers them in **reverse** order.
+    ///
+    /// With `batch = 1` this is an ordinary echo server. Above 1 it is the only
+    /// way to test that responses are routed by request id: a serial stub
+    /// replies in the order it was asked, so first-come-first-served dispatch
+    /// and id-keyed dispatch produce identical results and a test cannot tell
+    /// them apart.
+    async fn stub_proxy_with_batching(
+        answer: impl Fn(&proto::rpc::TRequestHeader) -> Option<Vec<Option<Bytes>>> + Send + 'static,
+        batch: usize,
+    ) -> StubProxy {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let (seen_sender, seen) = mpsc::unbounded_channel();
@@ -405,6 +420,7 @@ mod tests {
             let (mut read_half, mut write_half) = stream.into_split();
             let mut buffer = BytesMut::new();
             let mut handshaken = false;
+            let mut pending_replies: Vec<Vec<Option<Bytes>>> = Vec::new();
 
             loop {
                 let decoded = packet::decode(&mut buffer, crate::bus::DEFAULT_MAX_MESSAGE_SIZE);
@@ -438,11 +454,19 @@ mod tests {
                         let _ = seen_sender.send(request.clone());
 
                         if let Some(parts) = answer(&header) {
-                            let reply = Packet::message(Guid::random(), parts, PacketFlags::NONE);
-                            let mut out = BytesMut::new();
-                            packet::encode(&reply, &mut out);
-                            if write_half.write_all(&out).await.is_err() {
-                                return;
+                            pending_replies.push(parts);
+                        }
+                        if pending_replies.len() >= batch {
+                            // Reversed: the last request asked is the first
+                            // answered.
+                            for parts in pending_replies.drain(..).rev() {
+                                let reply =
+                                    Packet::message(Guid::random(), parts, PacketFlags::NONE);
+                                let mut out = BytesMut::new();
+                                packet::encode(&reply, &mut out);
+                                if write_half.write_all(&out).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         continue;
@@ -548,20 +572,30 @@ mod tests {
     }
 
     /// The point of the actor: several requests in flight on one connection,
-    /// answered out of order, each reaching its own caller.
+    /// answered **out of order**, each reaching its own caller.
+    ///
+    /// The reversal is what gives this test teeth. A stub that answers in the
+    /// order it was asked cannot distinguish routing by request id from
+    /// answering whoever asked first — both deliver the right bytes to the
+    /// right caller by accident. This one holds all four requests and replies
+    /// last-first, so first-come-first-served dispatch hands every caller
+    /// somebody else's answer.
     #[tokio::test]
     async fn concurrent_requests_are_routed_by_request_id() {
-        let stub = stub_proxy(|header| {
-            let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
-            // Echo the method name back inside the response so each caller can
-            // check it got *its* answer.
-            Some(success_reply(
-                request_id,
-                &proto::api::TRspGetNode {
-                    value: header.method.clone().into_bytes(),
-                },
-            ))
-        })
+        let stub = stub_proxy_with_batching(
+            |header| {
+                let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
+                // Echo the method name back inside the response so each caller can
+                // check it got *its* answer.
+                Some(success_reply(
+                    request_id,
+                    &proto::api::TRspGetNode {
+                        value: header.method.clone().into_bytes(),
+                    },
+                ))
+            },
+            4,
+        )
         .await;
 
         let connection = Arc::new(Connection::connect(&stub.address, None).await.unwrap());
@@ -584,7 +618,15 @@ mod tests {
         }
 
         for (method, handle) in methods.iter().zip(handles) {
-            assert_eq!(&handle.await.unwrap().unwrap(), method);
+            let answer = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("a call is stuck: the stub answers only once all four have arrived")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                &answer, method,
+                "the caller for {method} was handed another call's answer"
+            );
         }
     }
 
@@ -683,7 +725,10 @@ mod tests {
         // Killing the stub closes the socket, which must wake the caller with
         // an error rather than leaving it parked forever.
         drop(stub);
-        let error = call.await.unwrap_err();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("dropping the connection must fail the call, not park it")
+            .unwrap_err();
         assert!(
             matches!(error, Error::ConnectionClosed { .. }),
             "got {error}"
