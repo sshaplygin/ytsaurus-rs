@@ -307,7 +307,11 @@ fn prepare_wordcount(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), 
                 Kind::WordCount("map-combine"),
                 format!("{BASE}/counts_combine"),
             ),
-            Leg::new("YQL", Kind::Query, format!("{BASE}/counts_yql")),
+            Leg::new(
+                "YQL",
+                Kind::Query(wordcount_query),
+                format!("{BASE}/counts_yql"),
+            ),
         ],
     ))
 }
@@ -342,39 +346,44 @@ fn prepare_project(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), Cl
         input,
         vec![
             Leg::new(
-                "frames only",
+                "typed: frames",
                 Kind::Depth("map-frames"),
                 format!("{BASE}/project_frames"),
             ),
             Leg::new(
-                "framed + decoded",
+                "typed: decoded",
                 Kind::Depth("map-parse"),
                 format!("{BASE}/project_parse"),
             ),
             Leg::new(
-                "the whole map",
+                "typed: full",
                 Kind::Depth("map-one"),
                 format!("{BASE}/project_full"),
             ),
             Leg::new(
-                "decoded, dynamic",
+                "dynamic: decoded",
                 Kind::Depth("map-parse-dynamic"),
                 format!("{BASE}/project_parse_dyn"),
             ),
             Leg::new(
-                "the whole map, dynamic",
+                "dynamic: full",
                 Kind::Depth("map-one-dynamic"),
                 format!("{BASE}/project_full_dyn"),
             ),
             Leg::new(
-                "decoded, Skiff",
+                "skiff: decoded",
                 Kind::Skiff("map-parse-skiff"),
                 format!("{BASE}/project_parse_skiff"),
             ),
             Leg::new(
-                "the whole map, Skiff",
+                "skiff: full",
                 Kind::Skiff("map-one-skiff"),
                 format!("{BASE}/project_full_skiff"),
+            ),
+            Leg::new(
+                "YQL",
+                Kind::Query(project_query),
+                format!("{BASE}/project_yql"),
             ),
         ],
     ))
@@ -501,8 +510,8 @@ enum Kind {
     Depth(&'static str),
     /// The same, with the operation's job I/O set to Skiff both ways.
     Skiff(&'static str),
-    /// The same computation as a query.
-    Query,
+    /// The same computation as a query, built by this function.
+    Query(fn(&str, &str) -> String),
 }
 
 /// One way of computing the answer, and what it cost in each round.
@@ -543,7 +552,7 @@ fn run_leg(client: &Client, input: &str, leg: &Leg) -> Result<Measure, ClientErr
         Kind::WordCount(mapper) => run_worker(client, input, &leg.output, mapper),
         Kind::Depth(command) => run_map(client, input, &leg.output, command, false),
         Kind::Skiff(command) => run_map(client, input, &leg.output, command, true),
-        Kind::Query => run_query(client, &wordcount_query(input, &leg.output)),
+        Kind::Query(build) => run_query(client, &build(input, &leg.output)),
     }
 }
 
@@ -704,6 +713,30 @@ fn wordcount_query(input: &str, output: &str) -> String {
          FROM (SELECT $tokens(text) AS words FROM `{input}`)\n\
          FLATTEN LIST BY words AS word\n\
          GROUP BY word;"
+    )
+}
+
+/// Leg 4 for the depth-series task: the same map, as a query.
+///
+/// Sharper than the wordcount mirror was, and for one reason: there is no
+/// grouping here, so the planner has nothing to shuffle and the query runs as
+/// **one** map operation — the same shape as every worker leg. In wordcount it
+/// needed two, and 42 % of its time went to the second.
+///
+/// The five rules are `sessionize`'s `validate`, and `is_external` is its
+/// referer test. On this input nothing is rejected, so no leg pays for the
+/// reject branch — which is a property of the fixture, not of the engines.
+fn project_query(input: &str, output: &str) -> String {
+    format!(
+        "{PRAGMAS}INSERT INTO `{output}` WITH TRUNCATE\n\
+         SELECT user_id, `timestamp`, url, user_agent, status, bytes_sent,\n\
+         \x20      is_mobile, latency_ms,\n\
+         \x20      IF(referer IS NULL, false,\n\
+         \x20         referer != \"\" AND NOT StartsWith(referer, \"/\")) AS is_external\n\
+         FROM `{input}`\n\
+         WHERE user_id != \"\" AND `timestamp` > 0\n\
+         \x20 AND status >= 100 AND status <= 599\n\
+         \x20 AND latency_ms >= 0.0 AND url != \"\";"
     )
 }
 
@@ -1070,7 +1103,7 @@ fn subtraction(legs: &[Leg]) {
     let [frames, parse, full, ..] = legs else {
         return;
     };
-    if frames.label != "frames only" {
+    if frames.label != "typed: frames" {
         return;
     }
 
@@ -1128,7 +1161,7 @@ fn subtraction(legs: &[Leg]) {
         ("being handed the rows", &handed),
         ("decoding them", &decode),
         ("validating and writing", &work),
-        ("the whole map", &whole),
+        ("typed: full", &whole),
     ] {
         println!(
             "     {name:<24} {:>6} ms   {:>5}   (rounds {} ms)",
@@ -1149,9 +1182,9 @@ fn subtraction(legs: &[Leg]) {
 }
 
 fn row(label: &str, cells: impl IntoIterator<Item = String>) {
-    let mut line = format!("   {label:<21}");
+    let mut line = format!("   {label:<20}");
     for cell in cells {
-        line.push_str(&format!("{cell:>18}"));
+        line.push_str(&format!("{cell:>17}"));
     }
     println!("{line}");
 }
@@ -1183,20 +1216,41 @@ fn guard(legs: &[Leg], metric: &str, of: impl Fn(&Measure) -> Option<i64> + Copy
         .max()
         .unwrap_or(0);
 
+    let mut muddy = Vec::new();
+    let mut pairs = 0usize;
     for (index, left) in legs.iter().enumerate() {
         for right in &legs[index + 1..] {
             let (Some(l), Some(r)) = (fastest(&left.runs, of), fastest(&right.runs, of)) else {
                 continue;
             };
-            let gap = (l - r).abs();
-            if gap < noise {
-                println!(
-                    "\n   {metric}: {} against {} differ by {gap} ms, which is less than the\n   \
-                     scatter within one leg ({noise} ms). No measurable difference, not a winner.",
-                    left.label, right.label
-                );
+            pairs += 1;
+            if (l - r).abs() < noise {
+                muddy.push((left.label, right.label, (l - r).abs()));
             }
         }
+    }
+
+    if muddy.is_empty() {
+        return;
+    }
+
+    // When a metric cannot separate any pair, saying so once is the finding;
+    // saying it n² times buries every other line of the report. The wall clock
+    // on this cluster does exactly that — it is quantised by the launcher's own
+    // poll loop, so every leg reads the same and the scatter swamps the lot.
+    if muddy.len() == pairs {
+        println!(
+            "\n   {metric}: no pair of legs differs by more than the scatter within one leg\n   \
+             ({noise} ms). This metric separates nothing here; read another."
+        );
+        return;
+    }
+
+    for (left, right, gap) in muddy {
+        println!(
+            "\n   {metric}: {left} against {right} differ by {gap} ms, which is less than\n   \
+             the scatter within one leg ({noise} ms). No measurable difference, not a winner."
+        );
     }
 }
 
