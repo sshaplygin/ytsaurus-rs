@@ -83,6 +83,40 @@ around it, and all of it is fixed here:
 - **The four methods the crate exists for had no request coverage.** Request
   building is now separate from calling, and each field is asserted.
 
+### Found by a second review, at the final state
+
+Four more reviewers read the crate in isolated worktrees, where they could
+break it freely, and one judge re-checked every finding: 24 of 29 stood. The
+protocol was clean again; the defects were around it.
+
+- **Two ways to lose a connection's resources.** `Drop` handed its cleanup to
+  `tokio::spawn`, which panics outside a runtime — and a panic while unwinding
+  aborts the process. Dropping a `Connection` left its reader task and socket
+  alive against any peer that did not close first: measured, 128 descriptors
+  and 181 tasks still held after 60 connections were dropped.
+- **The packet encoder had the defect the rowset encoder was just fixed for**,
+  truncating part sizes to `u32`: a 4 GiB part declared 64 bytes and wrote
+  4294967368, after which the peer parses the rest as further packets.
+- **The size ceiling did not bound memory.** A part is 12 bytes on the wire and
+  about 44 once decoded, so a packet inside a 512 MB ceiling could declare 44
+  million empty parts — 2.31 GiB of peak RSS, measured. Part counts now have
+  their own, much lower ceiling.
+- **Cancellation failed exactly when it mattered**, posted with `try_send` onto
+  the request queue whose fullness is what causes timeouts: 72 requests reached
+  a stalled proxy and not one cancellation followed. Cancellations now have a
+  channel the writer drains first.
+- **`init-protos.sh` reported success on a checkout that was not one**, because
+  the fetch was guarded on the commit and the commit says nothing about the
+  working tree.
+
+And the tests were measured rather than admired: 85 deliberate defects were run
+through the suite. Twelve of thirteen in the async client survived, because
+nothing outside the live-cluster example ever built a `Client`; four
+wire-visible constants were asserted against themselves, so changing the packet
+signature or the credentials field number kept the suite green. Both are closed,
+and the fourteen reported survivors were re-run afterwards — all fourteen now
+fail.
+
 ### Not implemented
 
 TLS, compression codecs, versioned rowsets, streaming reads and writes, retry

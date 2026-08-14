@@ -87,6 +87,12 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Aborting skips the tail of `read_loop`, so `closed` is never set and
+        // the waiters are never woken on this path. That is sound only because
+        // every call borrows the `Connection`: there can be no waiter left to
+        // wake, and nobody can ask for one afterwards. Anything that hands out
+        // calls outliving the connection — an owned handle, a `'static`
+        // future — has to close the waiters here instead.
         self.reader_task.abort();
     }
 }
