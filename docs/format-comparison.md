@@ -370,6 +370,61 @@ does not run queries, the plan stops and gets reported, not worked around.
 **DoD**: one command prints the query id, the ids and states of the operations
 it spawned, the three answers above, and a green `skiff_launch`.
 
+### Where this stands, 14 August 2026
+
+Phases 1 and 2 are built and have run; phase 3 is not written, because the
+numbers below have not been through an adversarial pass yet — the one that was
+launched for them died on a session limit, and every earlier claim in this
+effort that skipped that step turned out false.
+
+**On the `project` task** — the pilot's map, 412 554 rows / 48 MiB, one job per
+leg, nine rounds, all four computing legs agreeing row for row:
+
+| paired by round | median | across rounds |
+| --- | ---: | --- |
+| Skiff against the **dynamic** YSON leg, whole map | **1.85×** | 1.74–1.96 |
+| Skiff against the dynamic leg, read only | 1.65× | 1.59–1.77 |
+| Skiff against the **typed** YSON leg, whole map | **1.10×** | 1.08–1.21 |
+| Skiff against the query | 1.44× | 1.32–1.48 |
+| typed YSON against the dynamic leg | 1.61× | 1.55–1.70 |
+| decoding, by subtraction | 322 ms | 201–508 |
+
+Wire volume, which does not scatter at all: Skiff moves **54.6 MiB in and 47.2
+out** where binary YSON moves 91.1 and 85.7.
+
+**Three things the runs settled about the method itself**, each of which had
+already produced a wrong number:
+
+- **Pair by round, never minimum against minimum.** Two legs' fastest rounds
+  can fall minutes apart and carry different weather; the two legs of one round
+  cannot. A run whose minima said "no pair is separable" gave ratios that held
+  their sign in all nine rounds.
+- **Pin the job count.** `time/exec` sums over jobs and a job start is several
+  hundred milliseconds here, so a leg left on the controller's default is
+  compared on how it was scheduled.
+- **Read the statistics tree before summing it.** `user_job/pipes/output`
+  carries a `total` beside its numeric descriptors, and adding both doubled
+  every pipe figure this harness printed for two runs.
+
+**Two findings about the formats**, as opposed to about the measurement:
+
+- **Skiff cannot have a frames-only stop.** Its stream has no self-describing
+  record boundaries: finding the end of a row is decoding it against the
+  schema. The subtraction the YSON legs support does not exist on that side.
+- **YQL's own job I/O is Skiff**, confirmed from the operation's spec. Its
+  schema carries `$row_index` as a `variant8<nothing;int64>` and writes
+  `is_external` as an optional boolean where the worker writes a plain one —
+  which is the whole of the difference between its 55.0/47.6 MiB and the
+  hand-written schema's 54.6/47.2. An independently written positional schema
+  matching the engine's to within its system columns is the strongest evidence
+  so far that the Skiff leg is right.
+
+**What none of it settles**: the decode share against the 30 % threshold, which
+[`benchmarking.md`](benchmarking.md) states over **job CPU**. This cluster
+reports nothing under `user_job/cpu`, half the denominator here is process
+start and waiting for the first batch, and every figure above is per-job wall
+time on one emulated core.
+
 ### Phase 1 — the queries and the modes, correctness before timing
 
 **Worker modes.** Extend `sessionize` with three single-output map modes beside
@@ -559,7 +614,8 @@ with Docker reproduces the local half.
 | [`crates/ytsaurus-client/examples/yql_smoke.rs`](../crates/ytsaurus-client/examples/yql_smoke.rs) | **done** — phase 0's gate and the four answers, plus `YT_YQL_QUERY` for running one query verbatim |
 | `crates/ytsaurus-job/examples/sessionize.rs` | three single-output map modes: `map-one`, `map-one-dynamic`, `map-one-skiff` |
 | `tests/e2e/yql/{project_filter,wordcount,sessionize}.sql` | the query texts, versioned next to the workers they mirror |
-| [`crates/ytsaurus-client/examples/format_compare.rs`](../crates/ytsaurus-client/examples/format_compare.rs) | **two legs of four**: the `wordcount` worker on binary YSON against the same computation in YQL — phase 1's diff and phase 2's timings, on one input table. Legs 2 and 3 (the dynamic YSON control and Skiff) are not in it yet |
+| [`crates/ytsaurus-client/examples/format_compare.rs`](../crates/ytsaurus-client/examples/format_compare.rs) | **done, all four legs**, on two tasks: `wordcount` (which shuffles, and whose numbers turned out to be about plan shape) and `project` — the pilot's map at three depths, plus the dynamic-YSON control, plus Skiff, plus the query. Phase 1's diff and phase 2's timings |
+| [`crates/ytsaurus-job/examples/sessionize.rs`](../crates/ytsaurus-job/examples/sessionize.rs) | **done**: `map-one`, `map-one-dynamic`, `map-parse-dynamic`, `map-one-skiff`, `map-parse-skiff` beside the `map-frames` / `map-parse` stops that already existed |
 | [`tests/e2e/README.md`](../tests/e2e/README.md) | how to run it, in the table of what has actually been run |
 | [`docs/benchmarking.md`](benchmarking.md) | §5 and the four edits in phase 3 |
 | this file | kept current as the phases land |
