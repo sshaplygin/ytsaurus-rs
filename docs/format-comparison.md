@@ -14,7 +14,15 @@ is of two kinds, and neither settles it:
 
 - **In-process Criterion benchmarks** — Skiff decodes 3.19× and encodes 2.71×
   faster than YSON *through the dynamic APIs*. Real, reproducible, and about
-  two Rust libraries rather than about a job.
+  two Rust libraries rather than about a job — and, as the 14 August adversarial
+  pass showed, about two *row representations* rather than two formats. That
+  pass did not re-run this benchmark. It ran the whole map, nine columns,
+  412 554 rows, off-cluster, where the same pair of APIs stands at 3.14× end to
+  end and 2.56× on decode alone; giving the Skiff side a
+  `BTreeMap<Vec<u8>, Value>` keyed by the same column names — format, codec and
+  wire bytes unchanged — took it from 315 ms to 594 ms and collapsed that 3.14×
+  to 1.66×. The 3.19× above has not itself been re-measured under the swap;
+  treat the swap as bounding it, not as replacing it.
 - **The pilot on a cluster** — decoding is 10.6 % of the job locally and
   36.2 % on a production installation, either side of the 30 % threshold, on
   rounds that scatter by 2×. The document's own words: the question is **open**.
@@ -44,39 +52,93 @@ with what the agent loads, **the task changes, not the rule**.
 | # | Leg | Reads | Writes | Isolates |
 | --- | --- | --- | --- | --- |
 | 1 | **worker, YSON typed** | borrowed serde struct | serde struct | what a job author writes today, and what §3/§4 of `benchmarking.md` already measured |
-| 2 | **worker, YSON dynamic** | `YsonValue` | `YsonValue` | the control: same format, same API level as leg 3 |
+| 2 | **worker, YSON dynamic** | `YsonValue` | `YsonValue` | the intended control: same format as leg 1, nominally the same API level as leg 3 — but **not the same representation**, which is what the run found (see below) |
 | 3 | **worker, Skiff dynamic** | `ytsaurus_skiff::Value` | `Value` | the format under decision, at the only API it has |
 | 4 | **YQL** | the query's projection | `INSERT INTO` | a C++ runtime with an optimizer |
 
-Legs **2 against 3** are the format delta at equal API — the cluster-side
-version of the Criterion numbers. Legs **1 against 3** are the decision a job
-author would actually face today. Legs **1 and 3 against 4** are the outside
-opinion. Leg 2 is what stops the whole thing from being a comparison of APIs
-wearing format labels: `SkiffJobReader` yields an **owned** `Value` while YSON
-rows are borrowed and byte-exact, and without leg 2 every Skiff result is
-confounded by that difference. `benchmarking.md` already warns, in its own
-words, *"do not compare the dynamic Skiff result directly with YSON's
-borrowed-Serde result"* — leg 2 is how this plan obeys its own document.
+Legs **1 against 3** are the decision a job author would actually face today.
+Legs **1 and 3 against 4** are the outside opinion. Leg **2 against 3** was
+designed as the format delta at equal API — the cluster-side version of the
+Criterion numbers.
+
+**That design is refuted, and the refutation is the finding.** The argument for
+leg 2 was that `SkiffJobReader` yields an **owned** `Value` while YSON rows are
+borrowed and byte-exact, so without leg 2 every Skiff result is confounded — and
+that `benchmarking.md` says so in its own words, *"do not compare the dynamic
+Skiff result directly with YSON's borrowed-Serde result"*. Leg 2 does remove the
+borrowed-versus-owned confound. It introduces a **larger** one in its place: a
+`YsonValue` map is keyed by column name and a Skiff `Value` is positional, so
+leg 2 versus leg 3 also compares ~87 byte-slice key comparisons a row against 0,
+26.67 allocations a row against 11.67, and 12 wasted `str::from_utf8` scans a
+row on the write path against none — `ByteString::serialize` validates every key
+and every byte-string value so that *text* output can use the
+unquoted-identifier form, and in binary both branches emit the same bytes, so
+the eleven that succeed are as wasted as the one that fails. Measured:
+**79–88 % of the leg-2-to-leg-3 gap on the cluster — 88 %, 82 % and 79 % across
+the three runs — and 98 % of it off-cluster, sits between the two YSON legs** —
+identical format, identical bytes, identical reader and serializer. The decisive
+experiment gave the Skiff leg the dynamic YSON leg's representation and changed
+nothing else: 315 ms → 594 ms, and 3.14× → 1.66×, itself still an upper bound
+because the named-Skiff leg does less work than leg 2 does.
+
+So leg 2 is not the control this section claimed. It is a **second, differently
+handicapped API**, and the sentence to use about legs 2 and 3 is "two row
+representations, one of which also changes format" — never "the format delta at
+equal API". The leg that answers the question this document asks is **leg 1
+against leg 3**, and the one that would settle it — today's typed YSON against a
+typed Skiff — cannot be run by anyone, because Skiff has no typed rows (§3.2).
 
 ### What the existing numbers predict
 
 Worth writing down **before** the run, so the measurement can disagree with it.
-This is arithmetic over recorded results, not a measurement:
+This is arithmetic over recorded results, not a measurement.
+
+*Pre-registered 13 August 2026 and kept verbatim. The verdicts were added on
+14 August, after three nine-round runs and an adversarial pass. Not one of the
+four came through as written; that is what pre-registering is for, and none of
+it is deleted.*
 
 - Skiff-dynamic decodes 3.19× faster than YSON-dynamic; `YsonValue` costs about
   1.8× a typed struct. So against **leg 1** — the path anyone would actually
   write — Skiff's decode advantage should land near **1.7×**, not 3.19×.
+
+  **Not measured as stated, and wrong as far as it can be checked.** The
+  prediction is about decode; the decode-adjacent pairing off-cluster is 270 ms
+  against 205 ms, **1.32×**, not 1.7×. On the whole map the measured figures are
+  1.10× / 1.16× / 1.20×. The arithmetic was invalid in a way worth naming: both
+  input factors were measured between *representations*, so dividing one by the
+  other does not leave a format behind.
 - The pilot's decode share is 10.6 % locally and 36.2 % on production. A 1.7×
   decode improvement therefore removes roughly **4 % of local job time** and
   **15 % of production job time**.
+
+  **Its input survived; its conclusion did not, and its unit was wrong.** The
+  local decode share came out at 13 % / 13 % / 10 %, which is the 10.6 % this
+  bullet assumed, so the 4 % follows validly from its own premises. What the run
+  found is that Skiff's whole-map advantage over the typed leg is 1.10–1.20× —
+  it removes 9–17 % of job time, not 4 % — and that the gain is consistent with
+  the output pipe rather than with decode. The prediction under-shot the size
+  and mis-named the cause. And the unit does not carry: this is per-job **wall**
+  time, because the cluster reports nothing under `user_job/cpu`, while the
+  10.6 %/36.2 % figures and the 30 % threshold are stated over job CPU.
 - Local rounds scatter by 2×. **4 % is not observable there.** The Skiff leg is
   a production-cluster measurement or it is nothing, and the local run's job is
   to prove the harness works and to produce the YQL comparison.
+
+  **Refuted in part, by a better estimator.** Pairing legs by round — the legs
+  interleaved so round *i* of each met the same cluster — held the sign in all
+  nine rounds of all three runs, locally. What the local run cannot do is turn
+  the sign into a format number; a production run is still owed.
 - The write side is weaker still as a prediction: the recorded encode
   comparison is dynamic-to-dynamic, and leg 1 writes through serde. Locally the
   pilot spends 43.6 % on validate-and-write, so the output path is where the
   local run may still see something — which is the one local result worth
   waiting for.
+
+  **Stands, and it is where the leg-1-versus-leg-3 gap now looks likely to
+  live**: Skiff pushes 38.5 MiB less output through the pipe (47.2 MiB against
+  binary YSON's 85.7), and off-cluster, with output discarded, the two legs'
+  in-process time differs by only 1.01–1.13×.
 
 If the run contradicts any of this, the contradiction is the finding.
 
@@ -372,25 +434,107 @@ it spawned, the three answers above, and a green `skiff_launch`.
 
 ### Where this stands, 14 August 2026
 
-Phases 1 and 2 are built and have run; phase 3 is not written, because the
-numbers below have not been through an adversarial pass yet — the one that was
-launched for them died on a session limit, and every earlier claim in this
-effort that skipped that step turned out false.
+Phases 1 and 2 are built and have run, three times, and the numbers below **have
+now been through an adversarial pass** — three independent agents, code-reading
+plus an off-cluster reproduction of every leg over the same 412 554 rows under a
+counting global allocator. It refuted more than it confirmed, and the
+refutations are recorded here and in §1 rather than in a phase-3 report that
+would have carried the wrong claims into `benchmarking.md`.
 
 **On the `project` task** — the pilot's map, 412 554 rows / 48 MiB, one job per
-leg, nine rounds, all four computing legs agreeing row for row:
+leg (`data_weight_per_job` pinned), one output table, no shuffle, rounds
+interleaved, outputs diffed row for row, exactly and in order, once at the start
+of each run and before any clock was read, all four computing legs agreeing.
+**Three nine-round runs**, every ratio paired by round:
 
-| paired by round | median | across rounds |
-| --- | ---: | --- |
-| Skiff against the **dynamic** YSON leg, whole map | **1.85×** | 1.74–1.96 |
-| Skiff against the dynamic leg, read only | 1.65× | 1.59–1.77 |
-| Skiff against the **typed** YSON leg, whole map | **1.10×** | 1.08–1.21 |
-| Skiff against the query | 1.44× | 1.32–1.48 |
-| typed YSON against the dynamic leg | 1.61× | 1.55–1.70 |
-| decoding, by subtraction | 322 ms | 201–508 |
+| paired by round | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| Skiff against the **dynamic** YSON leg, whole map | 1.85× | 1.88× | 1.93× |
+| Skiff against the dynamic leg, read only | 1.65× | 1.61× | — |
+| Skiff against the **typed** YSON leg, whole map | 1.10× | 1.16× | **1.20×** |
+| Skiff against the query | 1.44× | 1.47× | 1.49× |
+| typed YSON against the dynamic leg | 1.61× | 1.62× | — |
+| decoding, by subtraction | 322 ms, 13 % | 281 ms, 13 % | 308 ms, 10 % |
 
-Wire volume, which does not scatter at all: Skiff moves **54.6 MiB in and 47.2
-out** where binary YSON moves 91.1 and 85.7.
+**The metric.** Every ratio here is `time/exec`: the cluster's per-job wall
+time, summed over jobs, which is the only timing this cluster offers. It does
+not include `time/prepare` — a further 650–800 ms a job, the same for every leg
+— and a constant omitted from both sides makes a ratio larger than the whole-job
+comparison would be. Fold prepare back in on these figures and 1.20× is about
+1.15×, 1.93× about 1.7×. That arithmetic is over medians, not a measured
+pairing, and it is the direction every number here would move if the metric
+included the whole job.
+
+**Run 3 is not a third weather sample for any Skiff row.** It ran after
+`2debf16` removed eight `Value` clones a row from the Skiff mapper, so 1.93×,
+1.20× and 1.49× are all partly that fix rather than run-to-run variation, and
+the drift across the three columns is not a spread. The only row here that is
+three measurements of one program is `typed YSON against the dynamic leg`. The
+`—` cells are blanks in the harness's output and it is not recorded which kind:
+`paired_ratios` prints nothing for a pair whose sign flips between rounds, which
+would make them results rather than gaps, but the run output was not kept.
+
+Individual rounds of the first row range 1.68–2.18, and the decode bucket's
+rounds range 100–731 ms in the noisiest run. Read the decode row as an **upper
+estimate rather than a central one**: it is a mean over only the rounds that
+came out in order, and dropping the out-of-order ones can only remove rounds
+where noise made the difference small or negative. The 1.20× is the 1.16×
+measurement with a handicap removed: the Skiff leg had been cloning eight
+`Value`s a row where `SkiffRow::into_value` exists — three allocations a row,
+12 % of the leg, fixed in `2debf16` — so every earlier Skiff figure was a floor
+for the Skiff side rather than an estimate of it.
+
+**What survives as a measurement, and what does not.** The adversarial pass
+reproduced all of it off-cluster and left the table meaning less than it looks:
+
+- **The 1.85–1.93× is not "the format at equal API".** 79–88 % of that gap on
+  the cluster — 88 %, 82 % and 79 % across the three runs — and 98 % off it
+  ((989 − 328) / (989 − 315) on the medians below), sits **between the two YSON
+  legs** — same format, same bytes, same reader, same serializer (§1).
+- **The three legs do not do the same work.** Per row: allocations 0.00 typed /
+  11.67 Skiff (8.67 after `2debf16`) / 26.67 dynamic; clones 0 / 8 / 8;
+  byte-slice key comparisons ~9–18 / 0 / ~87; and 12 `str::from_utf8` scans a
+  row on the dynamic *write* path, all of them wasted — `ByteString::serialize`
+  validates every key and every byte-string value so that text output can use
+  the unquoted-identifier form, and in binary both branches emit the same bytes,
+  so the eleven that succeed are as wasted as the one that fails on the
+  deliberately non-UTF-8 `user_agent`. Off-cluster medians of 9, in ms — these
+  are **in-process elapsed times on the development machine**, native arm64,
+  reading from memory, with no pipe, no process start and no scheduler, which
+  `benchmarking.md` calls a proxy and an optimistic one: typed frames 96, typed
+  decoded 270, typed full 328; dynamic decoded 524, dynamic full 989; Skiff
+  decoded 205, Skiff full 315. None of these is CPU.
+- **The 1.10–1.20× keeps its sign and loses its unit.** The sign held in all
+  nine rounds of all three runs and reproduces off-cluster. The number is not a
+  format measurement: the Skiff decoder `Box::new()`s the `referer` variant on
+  every row including the absent ones, and the Skiff path reads through
+  `BufReader` with ~14 `read_exact` a row where the YSON legs parse in place.
+  With output bytes discarded the two legs' in-process time differs by only
+  1.01–1.13×, so the cluster's advantage is consistent with being mostly the
+  38.5 MiB of output Skiff does not push through the pipe.
+
+Wire volume, which does not scatter at all and was identical in all three runs:
+Skiff moves **54.6 MiB in and 47.2 out** where binary YSON moves 91.1 and 85.7.
+Reproduced byte for byte off-cluster from the generator and the encodings — 54.6
+/ 47.2 and 90.7 / 85.7, the cluster's extra 0.4 MiB on the YSON input being the
+control records its stream also carries. Comparing the two **row** streams —
+90.7 against 54.6 over 412 554 rows, since control records are not row bytes —
+the difference is **~92 bytes a row**, and it is a net of three terms: YSON adds
+71 bytes of repeated column names and ~38 bytes of map syntax (a marker and a
+length for each of nine keys, nine `=`, eight `;`, two braces, one record
+separator), and gets ~17 bytes back, because its varint integers and one-byte
+length prefixes beat Skiff's fixed-width `int64`/`uint64` and four-byte
+`string32` prefixes — `status` costs 3 bytes against 8 — and because Skiff pays
+a two-byte table tag a row that YSON does not. 71 + 38 − 17 ≈ 92, against a
+measured 91.8. The row's payload is ~122 bytes, the data weight the cluster
+reports, so a YSON row is ~231 bytes and a Skiff row ~139.
+
+**Two limits on generalising, both inside that arithmetic:** the names are 71
+bytes against 122 of payload because this row's nine columns are short and
+numerous, and a table of five wide blobs would show almost none of it; and the
+17-byte credit is Skiff's fixed-width encoding *losing* to YSON on small
+integers and short strings, so on a table of small integers it grows and the
+direction of the whole comparison is not guaranteed.
 
 **Three things the runs settled about the method itself**, each of which had
 already produced a wrong number:
@@ -421,9 +565,22 @@ already produced a wrong number:
 
 **What none of it settles**: the decode share against the 30 % threshold, which
 [`benchmarking.md`](benchmarking.md) states over **job CPU**. This cluster
-reports nothing under `user_job/cpu`, half the denominator here is process
-start and waiting for the first batch, and every figure above is per-job wall
-time on one emulated core.
+reports nothing under `user_job/cpu`; roughly half the denominator here is
+process start and waiting for the first batch — a job start costs ~640 ms on
+this cluster and `latency/input/time_to_first_read_batch` is a further ~504 ms
+of a ~2000 ms job, with `time/prepare` another 650–800 ms that `time/exec` does
+not include at all; and every figure above is per-job wall time on a single-node
+local Docker cluster running x86-64 images under arm64 emulation, one job per
+leg.
+
+**And what none of it can settle, by construction**: whether Skiff is the
+faster *format* for a job that reads it well. That comparison is today's typed
+YSON against a typed Skiff, and Skiff has no typed rows — they are listed as
+planned in [`skiff-compatibility.md`](skiff-compatibility.md), so no one can
+measure it yet. Bytes cannot stand in for it either: they cannot explain a
+difference between two legs that move identical bytes, which is where most of
+the 1.85–1.93× turned out to be. A production run is still owed, and so is
+required test 4 (§3.2).
 
 ### Phase 1 — the queries and the modes, correctness before timing
 
@@ -543,11 +700,13 @@ after "The same pilot, on a production cluster", and — this is the point of th
 widening — into the parts of that document that decide things:
 
 - **Decision criteria #1** ("parsing is the bottleneck … exceeds ~30 % of job
-  CPU") currently rests on leg 1 measured at three depths. Legs 2 and 3 give it
-  the other half: not just what decoding costs, but **what changing the format
-  would recover**, measured on the same cluster in the same harness. A share
-  above 30 % that Skiff cannot actually recover is not a reason to implement
-  Skiff, and no measurement in the document has been able to say that until now.
+  CPU") rests on leg 1 measured at three depths. Legs 2 and 3 were expected to
+  give it the other half — not just what decoding costs, but what changing the
+  format would recover. **They did not, and could not.** The criterion is stated
+  over job CPU; a local cluster reports none, so everything measured here is
+  per-job wall time, and about half of the denominator is process start and
+  waiting for the first batch. §5 of `benchmarking.md` says so in those words,
+  and criterion 1 stands where §3 and §4 left it.
 - **Decision criteria #2** ("the Rust job is not already fast enough … if it
   already beats the C++ baseline") has never had any evidence at all. Leg 4 is
   its first. If leg 1 already matches or beats YQL, that is a serious argument
@@ -579,9 +738,13 @@ with Docker reproduces the local half.
   predicted Skiff gain is ~4 % of local job time against rounds that scatter by
   2×. Locally this plan produces a YQL comparison and a working harness; the
   Skiff answer needs the production installation.
-- **Leg 3 is handicapped by its API, not only by its format.** Leg 2 is the
-  control that keeps that honest. If leg 2 is dropped for time, the Skiff
-  numbers become uninterpretable — drop the task instead.
+- **Both dynamic legs are handicapped by their APIs, and leg 2 more than leg 3
+  — the opposite of what this bullet assumed.** Leg 3 pays for owning its
+  values; leg 2 pays for owning them *and* for keying them by name, ~87 key
+  comparisons and 12 dead UTF-8 scans a row. Leg 2 is worth keeping as a
+  measured artefact, not as a control: the honest use of it is "what a
+  `YsonValue` job costs", never "what YSON costs". The Skiff numbers are
+  interpretable only against **leg 1**.
 - **Skiff on a cluster is verified for one shape only** (§3.2). Staying inside
   it is a constraint on the task, and stepping outside it turns a benchmark into
   debugging.
@@ -616,7 +779,7 @@ with Docker reproduces the local half.
 | `tests/e2e/yql/{project_filter,wordcount,sessionize}.sql` | the query texts, versioned next to the workers they mirror |
 | [`crates/ytsaurus-client/examples/format_compare.rs`](../crates/ytsaurus-client/examples/format_compare.rs) | **done, all four legs**, on two tasks: `wordcount` (which shuffles, and whose numbers turned out to be about plan shape) and `project` — the pilot's map at three depths, plus the dynamic-YSON control, plus Skiff, plus the query. Phase 1's diff and phase 2's timings |
 | [`crates/ytsaurus-job/examples/sessionize.rs`](../crates/ytsaurus-job/examples/sessionize.rs) | **done**: `map-one`, `map-one-dynamic`, `map-parse-dynamic`, `map-one-skiff`, `map-parse-skiff` beside the `map-frames` / `map-parse` stops that already existed |
-| [`tests/e2e/README.md`](../tests/e2e/README.md) | how to run it, in the table of what has actually been run |
+| [`tests/e2e/README.md`](../tests/e2e/README.md) | **still owed** — `format_compare` appears nowhere in it, so the one command that reproduces any of this is undocumented outside this file |
 | [`docs/benchmarking.md`](benchmarking.md) | §5 and the four edits in phase 3 |
 | this file | kept current as the phases land |
 
@@ -625,7 +788,7 @@ with Docker reproduces the local half.
 | | |
 | --- | --- |
 | **Scope** | Rust-versus-YQL → four legs on one task, so the YQL numbers enter the Skiff decision instead of sitting next to it |
-| **Added** | legs 2 and 3, the worker modes that implement them, and the control-leg argument that keeps leg 3 interpretable |
+| **Added** | legs 2 and 3, the worker modes that implement them, and the control leg — which turned out to introduce a larger confound than it removed, and is recorded as such in §1 |
 | **Added** | the pre-registered prediction in §1 — and its consequence, that the local cluster cannot resolve the Skiff delta |
 | **Task** | wordcount + full sessionize → *project-and-filter* (the pilot's map, one output) for the four-way comparison; the other two stay YSON-versus-YQL, inside phase 1 |
 | **Constraint** | one input, one output, no key switch — the only Skiff shape verified on a cluster |

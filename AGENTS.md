@@ -1449,6 +1449,28 @@ needs a human — see below.
   the shape to expect — but both readings scatter by 2× across rounds, so what
   is owed is a spread from repeated production runs, not a third single number.
   Do not quote the 10 % on its own again.
+
+  **What now exists, and what it did to the question** —
+  [`docs/format-comparison.md`](docs/format-comparison.md)'s status section, from
+  `cargo run -p ytsaurus-client --example format_compare` with
+  `YT_COMPARE_TASK=project`: eight legs over one 412 554-row table, three
+  nine-round runs, ratios paired by round, plus a three-agent adversarial pass
+  that reproduced every leg off-cluster under a counting allocator. It moved the
+  question **sideways, not forward**, and the four things to take from it are:
+  Skiff beats the typed YSON leg by **1.10–1.20×** on whole-map per-job wall
+  time on the local emulated cluster, over one 48 MiB table, sign reproduced
+  everywhere — and off-cluster, with output bytes discarded, the two legs'
+  in-process time differs by only 1.01–1.13×, so most of that gap looks like the
+  38.5 MiB of output Skiff does not push through the pipe; the headline
+  **1.85–1.93× against the `YsonValue` leg is 79–88 % a representation
+  difference**, not a format one, and must not be quoted as a format ratio; wire
+  volume is the one solid result — 54.6/47.2 MiB against 91.1/85.7, reproduced
+  byte for byte off-cluster, though column names are 71 bytes of a ~122-byte
+  payload on *this* row and that does not generalise; and the comparison that
+  would actually decide the default — typed YSON against typed Skiff — **cannot
+  be run by anyone**, because Skiff has no typed rows. So this adds no third
+  single number and does not discharge the spread owed above; a production run
+  is still owed, and so is required test 4.
 - **Upstreaming** to
   [ytsaurus/ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk) —
   the maintainers' stance in ytsaurus#6 is "PRs welcome". **Do not start without
