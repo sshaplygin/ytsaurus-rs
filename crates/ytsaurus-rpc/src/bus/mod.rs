@@ -210,9 +210,12 @@ impl Bus {
 
 impl BusWriter {
     /// Writes one packet and flushes it.
+    ///
+    /// A packet too large to represent is refused here rather than written as a
+    /// truncated header, which would desynchronise the connection for good.
     pub async fn send(&mut self, message: &Packet) -> Result<()> {
         self.buffer.clear();
-        packet::encode(message, &mut self.buffer);
+        packet::encode(message, &mut self.buffer)?;
         self.stream.write_all(&self.buffer).await?;
         self.stream.flush().await?;
         Ok(())
@@ -261,7 +264,7 @@ mod tests {
                     Ok(Some(request)) => {
                         if let Some(response) = reply(request) {
                             let mut out = BytesMut::new();
-                            packet::encode(&response, &mut out);
+                            packet::encode(&response, &mut out).unwrap();
                             let _ = write_half.write_all(&out).await;
                             let _ = write_half.flush().await;
                         }

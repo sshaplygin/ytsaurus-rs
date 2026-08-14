@@ -28,6 +28,20 @@ use crate::rpc::{self, ResponseMessage};
 /// How many outbound messages may be queued before senders wait.
 const OUTBOUND_QUEUE: usize = 64;
 
+/// How many cancellations may be queued.
+///
+/// Cancellations travel on their own channel, and the writer takes them first.
+/// Sharing the request queue made cancellation fail exactly when it matters: a
+/// full queue is what makes calls time out, and a cancellation posted with
+/// `try_send` into a full queue is dropped. Measured before this existed, 72
+/// requests reached a stalled proxy and not one cancellation followed them.
+///
+/// Small, because a cancellation is a few dozen bytes and one per in-flight
+/// request is the worst case that matters. It cannot help when the *socket*
+/// itself is blocked — nothing can be written then — but that is a narrower
+/// case than a backed-up queue.
+const CANCEL_QUEUE: usize = 256;
+
 /// The callers waiting for responses, and whether the connection is still
 /// usable.
 ///
@@ -54,13 +68,27 @@ impl Waiters {
 type Pending = Arc<Mutex<Waiters>>;
 
 /// A live connection to one RPC proxy.
+///
+/// Dropping it ends both background tasks and releases the socket. That is not
+/// automatic: the writer stops on its own once the last sender is gone, but the
+/// reader would stay parked in `receive()` holding the read half until the peer
+/// closed — and against a peer that never does, the task and its file
+/// descriptor would live as long as the process.
 #[derive(Debug)]
 pub struct Connection {
     outbound: mpsc::Sender<Packet>,
+    cancels: mpsc::Sender<Packet>,
     pending: Pending,
     address: String,
     token: Option<String>,
     closed: Arc<AtomicBool>,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
 }
 
 impl Connection {
@@ -75,21 +103,26 @@ impl Connection {
         let pending: Pending = Arc::default();
         let closed = Arc::new(AtomicBool::new(false));
         let (outbound, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE);
+        let (cancels, cancel_receiver) = mpsc::channel(CANCEL_QUEUE);
 
         tokio::spawn(write_loop(
             writer,
             outbound_receiver,
+            cancel_receiver,
             Arc::clone(&pending),
             Arc::clone(&closed),
         ));
-        tokio::spawn(read_loop(reader, Arc::clone(&pending), Arc::clone(&closed)));
+        let reader_task =
+            tokio::spawn(read_loop(reader, Arc::clone(&pending), Arc::clone(&closed)));
 
         Self {
             outbound,
+            cancels,
             pending,
             address,
             token,
             closed,
+            reader_task,
         }
     }
 
@@ -170,7 +203,7 @@ impl Connection {
         // server to stop working on a result nobody will read.
         let mut guard = PendingGuard {
             pending: Arc::clone(&self.pending),
-            outbound: self.outbound.clone(),
+            cancels: self.cancels.clone(),
             request_id,
             service: service.to_owned(),
             method: method.to_owned(),
@@ -241,7 +274,7 @@ impl Connection {
 /// remove and nothing to cancel.
 struct PendingGuard {
     pending: Pending,
-    outbound: mpsc::Sender<Packet>,
+    cancels: mpsc::Sender<Packet>,
     request_id: Guid,
     service: String,
     method: String,
@@ -268,22 +301,41 @@ impl Drop for PendingGuard {
 
         let pending = Arc::clone(&self.pending);
         let request_id = self.request_id;
-        // `Drop` cannot await, so the removal is handed to the runtime. It is
-        // idempotent, so racing with the reader task is harmless.
-        tokio::spawn(async move {
-            pending.lock().await.by_request.remove(&request_id);
-        });
+        // `Drop` cannot await, so the removal is handed to the runtime — but
+        // only if there is one. `tokio::spawn` panics outside a runtime
+        // context, and a future can perfectly well be dropped there: polled
+        // inside `block_on` and released afterwards, or held in a struct that
+        // outlives it. A panic in `Drop` during unwinding aborts the process,
+        // so this checks first and falls back to the blocking path, which is
+        // sound because the lock is only ever held for a map operation.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    pending.lock().await.by_request.remove(&request_id);
+                });
+            }
+            Err(_) => {
+                if let Ok(mut waiters) = pending.try_lock() {
+                    waiters.by_request.remove(&request_id);
+                }
+                // A contended lock with no runtime to defer to leaves the entry
+                // for `Waiters::close` to sweep when the connection ends. That
+                // is bounded by the connection's lifetime, and unreachable in
+                // practice: the only other holders are the reader task and
+                // other callers, which need a runtime to be running at all.
+            }
+        }
 
         if !self.sent {
             return;
         }
 
-        // Best-effort and non-blocking: if the queue is full or the connection
-        // is gone there is nothing useful to do, and dropping a future must not
-        // block.
+        // Non-blocking, because dropping a future must not block — but onto
+        // the cancellation channel, which the writer drains first and which the
+        // request backlog cannot fill.
         let parts = rpc::encode_cancelation(request_id, &self.service, &self.method);
         let _ = self
-            .outbound
+            .cancels
             .try_send(Packet::message(Guid::random(), parts, PacketFlags::NONE));
     }
 }
@@ -291,10 +343,21 @@ impl Drop for PendingGuard {
 async fn write_loop(
     mut writer: BusWriter,
     mut outbound: mpsc::Receiver<Packet>,
+    mut cancels: mpsc::Receiver<Packet>,
     pending: Pending,
     closed: Arc<AtomicBool>,
 ) {
-    while let Some(packet) = outbound.recv().await {
+    loop {
+        // `biased` so cancellations overtake queued requests. A cancellation
+        // frees work the proxy is doing for nobody, so it is worth more than
+        // the request behind it, and under load there is always a request
+        // behind it.
+        let packet = tokio::select! {
+            biased;
+            Some(packet) = cancels.recv() => packet,
+            Some(packet) = outbound.recv() => packet,
+            else => break,
+        };
         if writer.send(&packet).await.is_err() {
             break;
         }
@@ -442,16 +505,28 @@ mod tests {
                                 PacketFlags::NONE,
                             );
                             let mut out = BytesMut::new();
-                            packet::encode(&reply, &mut out);
+                            packet::encode(&reply, &mut out).unwrap();
                             if write_half.write_all(&out).await.is_err() {
                                 return;
                             }
                             continue;
                         }
 
-                        let header_part = request.parts[0].as_ref().unwrap().clone();
-                        let header = proto::rpc::TRequestHeader::decode(&header_part[4..]).unwrap();
+                        // Tolerant on purpose: a test may put packets on this
+                        // connection that are not RPC requests, and a stub that
+                        // panicked on them would fail the test for the wrong
+                        // reason.
+                        let Some(Some(header_part)) = request.parts.first().cloned() else {
+                            continue;
+                        };
                         let _ = seen_sender.send(request.clone());
+                        if header_part.len() < 4 {
+                            continue;
+                        }
+                        let Ok(header) = proto::rpc::TRequestHeader::decode(&header_part[4..])
+                        else {
+                            continue;
+                        };
 
                         if let Some(parts) = answer(&header) {
                             pending_replies.push(parts);
@@ -463,7 +538,7 @@ mod tests {
                                 let reply =
                                     Packet::message(Guid::random(), parts, PacketFlags::NONE);
                                 let mut out = BytesMut::new();
-                                packet::encode(&reply, &mut out);
+                                packet::encode(&reply, &mut out).unwrap();
                                 if write_half.write_all(&out).await.is_err() {
                                     return;
                                 }
@@ -811,6 +886,182 @@ mod tests {
             stub.seen.try_recv().is_err(),
             "a completed call must not be followed by a cancellation"
         );
+    }
+
+    /// A request that never reached the outbound queue has nothing for the
+    /// server to cancel: an `rpcc` naming a request id the proxy has never seen
+    /// is noise at best, and at worst cancels an unrelated request that later
+    /// reuses the id.
+    ///
+    /// Tested on the guard directly rather than through a stub, because the
+    /// distinction is one flag and a stub cannot be held reliably in the state
+    /// that exercises it — the writer drains the queue as fast as the peer
+    /// reads. This is the mutation that survived round two: setting `sent` at
+    /// construction left every other test in the crate green.
+    #[tokio::test]
+    async fn the_guard_cancels_only_what_it_actually_sent() {
+        async fn drain(receiver: &mut mpsc::Receiver<Packet>) -> Vec<Packet> {
+            // The guard defers its work to the runtime, so give it a turn.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut packets = Vec::new();
+            while let Ok(packet) = receiver.try_recv() {
+                packets.push(packet);
+            }
+            packets
+        }
+
+        fn guard(
+            pending: &Pending,
+            cancels: &mpsc::Sender<Packet>,
+            request_id: Guid,
+            sent: bool,
+        ) -> PendingGuard {
+            PendingGuard {
+                pending: Arc::clone(pending),
+                cancels: cancels.clone(),
+                request_id,
+                service: rpc::API_SERVICE.to_owned(),
+                method: "LookupRows".to_owned(),
+                completed: false,
+                sent,
+            }
+        }
+
+        let pending: Pending = Arc::default();
+        let (outbound, mut receiver) = mpsc::channel(16);
+        let request_id = Guid::random();
+
+        // Never queued: nothing may go out.
+        drop(guard(&pending, &outbound, request_id, false));
+        assert!(
+            drain(&mut receiver).await.is_empty(),
+            "cancelled a request the proxy never received"
+        );
+
+        // Queued: the cancellation must name exactly that request.
+        drop(guard(&pending, &outbound, request_id, true));
+        let sent_packets = drain(&mut receiver).await;
+        assert_eq!(sent_packets.len(), 1, "expected exactly one cancellation");
+        let part = sent_packets[0].parts[0].as_ref().unwrap();
+        assert_eq!(&part[0..4], b"rpcc");
+        let header = proto::rpc::TRequestCancelationHeader::decode(&part[4..]).unwrap();
+        assert_eq!(Guid::from_proto(&header.request_id), request_id);
+
+        // Completed: the answer is in hand, so neither removal nor cancellation.
+        let mut done = guard(&pending, &outbound, request_id, true);
+        done.complete();
+        drop(done);
+        assert!(
+            drain(&mut receiver).await.is_empty(),
+            "cancelled a call that had already returned"
+        );
+    }
+
+    /// The same rule, but through `invoke_raw` — which is where the flag is
+    /// actually set, and therefore the only place a mistake in setting it can
+    /// be caught. Constructing a guard by hand, as the test above does, cannot
+    /// catch it.
+    ///
+    /// The request queue is given capacity 1, filled, and left undrained, so
+    /// the call cannot get its request out and times out *while queuing*. That
+    /// is deterministic where a stalled real peer is not — a socket absorbs
+    /// megabytes before it blocks. The cancellation channel is separate and
+    /// empty, so a cancellation for a request that never left would be visible.
+    #[tokio::test]
+    async fn a_call_that_times_out_while_queuing_cancels_nothing() {
+        let (outbound, _outbound_receiver) = mpsc::channel(1);
+        let (cancels, mut cancel_receiver) = mpsc::channel(CANCEL_QUEUE);
+        let connection = Connection {
+            outbound,
+            cancels,
+            pending: Arc::default(),
+            address: "test".to_owned(),
+            token: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            // Nothing to read: this test never reaches the wire.
+            reader_task: tokio::spawn(std::future::pending()),
+        };
+
+        connection
+            .outbound
+            .try_send(Packet::message(
+                Guid::random(),
+                vec![Some(Bytes::from_static(b"blocker"))],
+                PacketFlags::NONE,
+            ))
+            .expect("the queue starts empty");
+
+        let request = proto::api::TReqPingTransaction {
+            transaction_id: Guid::random().to_proto(),
+            ..Default::default()
+        };
+        let error = connection
+            .invoke_raw(
+                rpc::API_SERVICE,
+                "PingTransaction",
+                &request,
+                Vec::new(),
+                Some(std::time::Duration::from_millis(50)),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Timeout { .. }), "got {error}");
+
+        // Let the guard's deferred work run before looking.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            cancel_receiver.try_recv().is_err(),
+            "cancelled a request that never left the queue"
+        );
+        assert!(
+            connection.pending.lock().await.by_request.is_empty(),
+            "the timed-out call left its entry behind"
+        );
+    }
+
+    /// Dropping a call outside a runtime must not panic.
+    ///
+    /// `Drop` cannot await, so the cleanup is normally handed to the runtime —
+    /// but a future can be dropped with no runtime entered, and a panic while
+    /// unwinding aborts the process.
+    #[test]
+    fn dropping_a_call_outside_a_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Built inside the runtime, but owned out here, so the call below can
+        // borrow them and still be dropped on a plain thread.
+        let (stub, connection) = runtime.block_on(async {
+            let stub = stub_proxy(|_| None).await;
+            let connection = Connection::connect(&stub.address, None).await.unwrap();
+            (stub, connection)
+        });
+        let request = proto::api::TReqPingTransaction {
+            transaction_id: Guid::random().to_proto(),
+            ..Default::default()
+        };
+
+        let mut call = Box::pin(connection.invoke_raw(
+            rpc::API_SERVICE,
+            "PingTransaction",
+            &request,
+            Vec::new(),
+            None,
+            None,
+        ));
+        // Polled far enough to register the waiter and arm the guard.
+        runtime.block_on(async {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), &mut call).await;
+        });
+
+        // Dropped here, on a plain thread with no runtime entered: the case
+        // that used to abort the process through a panic in `Drop`.
+        drop(call);
+        drop(connection);
+        drop(stub);
     }
 
     #[tokio::test]

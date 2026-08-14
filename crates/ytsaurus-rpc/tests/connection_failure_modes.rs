@@ -33,7 +33,7 @@ fn handshake_reply(id: Guid) -> Vec<u8> {
     handshake.encode(&mut part).unwrap();
     let reply = Packet::message(id, vec![Some(Bytes::from(part))], PacketFlags::NONE);
     let mut out = BytesMut::new();
-    packet::encode(&reply, &mut out);
+    packet::encode(&reply, &mut out).unwrap();
     out.to_vec()
 }
 
@@ -78,7 +78,8 @@ async fn a_call_after_the_reader_dies_fails_rather_than_hanging() {
                 PacketFlags::NONE,
             ),
             &mut junk,
-        );
+        )
+        .unwrap();
         junk[0] ^= 0xff;
         write_half.write_all(&junk).await.unwrap();
         // Keep the socket open and keep draining, so the writer half stays fine.
