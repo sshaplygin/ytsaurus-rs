@@ -122,6 +122,11 @@ fn run() -> Result<bool, ClientError> {
     // in the module docs was settled through here.
     if let Ok(query) = std::env::var("YT_YQL_QUERY") {
         step("One query, verbatim");
+        // Through the same wait as the gate: a cluster that has just come up
+        // fails this query with "YQL agent stage ... is not found", and the
+        // knob is what a person uses most, so it is the last place that should
+        // report a starting cluster as a broken one.
+        wait_for_agent(&client)?;
         let outcome = run_query(&client, &query, true)?;
         return Ok(outcome.completed());
     }

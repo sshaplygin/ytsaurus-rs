@@ -1075,6 +1075,7 @@ fn report(legs: &[Leg]) {
         stage_table(leg.label, &leg.runs);
     }
 
+    paired_ratios(legs);
     subtraction(legs);
 
     // The guard, per metric rather than once: on this cluster the rounds
@@ -1179,6 +1180,74 @@ fn subtraction(legs: &[Leg]) {
          threshold in docs/benchmarking.md is stated over job CPU, which this cluster\n   \
          does not report at all."
     );
+}
+
+/// Every pair of legs, as the ratio each round gave rather than the ratio of
+/// the minima.
+///
+/// This is the estimator the rig was built for and the one two runs proved
+/// necessary. The absolute numbers on this cluster scatter by hundreds of
+/// milliseconds — one leg's fastest round and another's can fall minutes apart
+/// and carry different weather — but the two legs of a single round met the
+/// same cluster, so their ratio is stable even when neither number is. A run
+/// whose minima said "no pair is separable" gave ratios that held their sign in
+/// all nine rounds.
+///
+/// A pair whose sign flips between rounds is reported as not separable, which
+/// is the honest reading of a difference the noise can turn around.
+fn paired_ratios(legs: &[Leg]) {
+    println!("\n   Paired by round, on time/exec — the ratio each round gave:");
+
+    let mut unstable = 0usize;
+    for (index, left) in legs.iter().enumerate() {
+        for right in &legs[index + 1..] {
+            let rounds = left.runs.len().min(right.runs.len());
+            let mut ratios: Vec<f64> = Vec::new();
+            for round in 0..rounds {
+                if let (Some(l), Some(r)) = (left.runs[round].exec_ms, right.runs[round].exec_ms)
+                    && l > 0
+                {
+                    ratios.push(r as f64 / l as f64);
+                }
+            }
+            if ratios.is_empty() {
+                continue;
+            }
+
+            let faster_left = ratios.iter().all(|ratio| *ratio > 1.0);
+            let faster_right = ratios.iter().all(|ratio| *ratio < 1.0);
+            if !faster_left && !faster_right {
+                unstable += 1;
+                continue;
+            }
+
+            // Report it in the direction that reads as "how much slower":
+            // the ratios are right-over-left, so when the right leg is the
+            // quicker one every ratio is inverted, ends included.
+            let mut sorted = ratios.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN ratios"));
+            if faster_right {
+                sorted = sorted.iter().rev().map(|ratio| 1.0 / ratio).collect();
+            }
+
+            let (quicker, slower) = if faster_left {
+                (left.label, right.label)
+            } else {
+                (right.label, left.label)
+            };
+            println!(
+                "     {slower:<17} is {:.2}× {quicker:<17} ({:.2}–{:.2}, all {} rounds)",
+                sorted[sorted.len() / 2],
+                sorted[0],
+                sorted[sorted.len() - 1],
+                sorted.len()
+            );
+        }
+    }
+
+    if unstable > 0 {
+        println!("     {unstable} pair(s) changed sign between rounds and are not separable.");
+    }
 }
 
 fn row(label: &str, cells: impl IntoIterator<Item = String>) {
