@@ -90,7 +90,7 @@ use ytsaurus_client::{
     OperationFilter, Repeatable, SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType,
     TableSchema, yson_build,
 };
-use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
+use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice, to_vec};
 
 /// Where the comparison keeps its tables.
 const BASE: &str = "//tmp/ytsaurus_rs_compare";
@@ -1450,8 +1450,9 @@ fn distinct_words(lines: &[Line]) -> usize {
 enum Answer {
     /// wordcount: a word-to-count map, where row order carries nothing.
     Counts(BTreeMap<String, i64>),
-    /// The depth series: the rows themselves, in the order one job wrote them.
-    Rows(Vec<YsonValue>),
+    /// The depth series: canonical row encodings, sorted so table order carries
+    /// nothing while duplicate rows still count.
+    Rows(Vec<Vec<u8>>),
 }
 
 impl Answer {
@@ -1473,7 +1474,7 @@ impl Answer {
                 left.iter()
                     .zip(right)
                     .position(|(a, b)| a != b)
-                    .map(|index| format!("row {index} differs"))
+                    .map(|index| format!("normalized row {index} differs"))
             }
             _ => Some("the two answers are not even the same shape".to_owned()),
         }
@@ -1482,10 +1483,32 @@ impl Answer {
 
 fn answer(client: &Client, path: &str, rows: bool) -> Result<Answer, ClientError> {
     if rows {
-        Ok(Answer::Rows(client.read_table_rows::<YsonValue>(path)?))
+        Ok(Answer::Rows(canonical_rows(
+            client.read_table_rows::<YsonValue>(path)?,
+        )?))
     } else {
         Ok(Answer::Counts(counts(client, path)?))
     }
+}
+
+/// Turns rows into a comparison key independent of a table's physical order.
+///
+/// `YsonValue` keeps map keys in a `BTreeMap`, so binary YSON gives every row
+/// a canonical representation. Sorting those representations compares the two
+/// outputs as multisets: a query may reorder rows, but it cannot hide a
+/// missing, extra, or duplicated one.
+fn canonical_rows(rows: Vec<YsonValue>) -> Result<Vec<Vec<u8>>, ClientError> {
+    let mut canonical = rows
+        .into_iter()
+        .map(|row| {
+            to_vec(&row, YsonFormat::Binary).map_err(|e| ClientError::Decode {
+                command: "read_table".to_owned(),
+                reason: format!("could not canonicalize a comparison row: {e}"),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical.sort_unstable();
+    Ok(canonical)
 }
 
 fn counts(client: &Client, path: &str) -> Result<BTreeMap<String, i64>, ClientError> {
@@ -1586,8 +1609,9 @@ fn step(what: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{corpus, disagreement};
+    use super::{Answer, canonical_rows, corpus, disagreement};
     use std::collections::BTreeMap;
+    use ytsaurus_yson::{YsonNode, YsonValue};
 
     #[test]
     fn corpus_is_deterministic_and_roughly_the_size_asked_for() {
@@ -1618,6 +1642,25 @@ mod tests {
         assert_eq!(
             disagreement(&left, &wrong).as_deref(),
             Some("\"b\": worker 1, query 9")
+        );
+    }
+
+    #[test]
+    fn row_answers_ignore_table_order_but_preserve_duplicate_counts() {
+        let row = |value| YsonValue {
+            attributes: None,
+            node: YsonNode::Int64(value),
+        };
+        let answer = |rows| Answer::Rows(canonical_rows(rows).expect("rows serialize"));
+
+        let expected = answer(vec![row(1), row(2), row(2)]);
+        let reordered = answer(vec![row(2), row(1), row(2)]);
+        let different_multiplicity = answer(vec![row(1), row(1), row(2)]);
+
+        assert!(expected.disagreement(&reordered).is_none());
+        assert_eq!(
+            expected.disagreement(&different_multiplicity).as_deref(),
+            Some("normalized row 1 differs")
         );
     }
 }
