@@ -55,6 +55,20 @@ pub const MAX_PART_SIZE: u32 = 1 << 30;
 /// `MaxMessagePartCount` — `yt/yt/core/bus/public.h`.
 pub const MAX_PART_COUNT: u32 = 1 << 28;
 
+/// How many parts this crate will accept in one packet, by default.
+///
+/// Far below the protocol's `MAX_PART_COUNT`, and deliberately. A part costs 12
+/// bytes on the wire but about 44 in memory once decoded — 4 in the sizes
+/// vector, 8 in the checksums, 32 in the `Option<Bytes>` that represents it —
+/// so a packet within a 512 MB byte ceiling can still declare 44 million empty
+/// parts and cost several gigabytes to receive. Measured before this existed: a
+/// 512 MiB packet drove peak RSS to 2.31 GiB.
+///
+/// A real message has a header, a body and a handful of attachments. Sixty-four
+/// thousand is already far more than anything the API service sends, so this
+/// costs nothing legitimate and turns a memory amplification into an error.
+pub const DEFAULT_MAX_PART_COUNT: u32 = 1 << 16;
+
 /// `NullChecksum`. A checksum field holding this means the sender did not
 /// compute one, and the receiver must not verify it —
 /// `yt/yt/core/bus/tcp/packet.cpp` guards every comparison with
@@ -260,6 +274,18 @@ fn variable_header_size(part_count: usize) -> usize {
 /// header cannot make the caller reserve an arbitrary buffer. The part-size and
 /// part-count limits from the C++ are enforced first and independently.
 pub fn decode(input: &mut BytesMut, max_message_size: u64) -> Result<Option<Packet>, PacketError> {
+    decode_with(input, max_message_size, DEFAULT_MAX_PART_COUNT)
+}
+
+/// Decodes with an explicit part-count ceiling as well as a byte ceiling.
+///
+/// Both are needed: the byte ceiling bounds what arrives, and the part ceiling
+/// bounds what receiving it costs, which is a much larger number.
+pub fn decode_with(
+    input: &mut BytesMut,
+    max_message_size: u64,
+    max_part_count: u32,
+) -> Result<Option<Packet>, PacketError> {
     if input.len() < FIXED_HEADER_SIZE {
         return Ok(None);
     }
@@ -289,7 +315,10 @@ pub fn decode(input: &mut BytesMut, max_message_size: u64) -> Result<Option<Pack
         }
     }
 
-    if part_count > MAX_PART_COUNT {
+    // The protocol's limit first, then this connection's — so a packet that is
+    // illegal everywhere is reported as such, and one that is merely more
+    // than this client will carry is reported against the ceiling it broke.
+    if part_count > MAX_PART_COUNT.min(max_part_count) {
         return Err(PacketError::TooManyParts { count: part_count });
     }
 
@@ -731,11 +760,14 @@ mod tests {
         ));
     }
 
+    /// A part count that is legal for the protocol but ruinous to receive.
+    ///
+    /// 2^27 parts is under `MAX_PART_COUNT` and, being 12 wire bytes each,
+    /// describes a 1.5 GB packet — but receiving it costs nearer 44 bytes a
+    /// part, so the byte ceiling alone is not a memory bound. Rejected here
+    /// while 36 bytes are buffered and nothing has been reserved.
     #[test]
     fn a_huge_part_count_is_rejected_before_the_bytes_arrive() {
-        // 2^27 parts is under MAX_PART_COUNT but implies a 1.5 GB variable
-        // header. The size limit must catch it while only 36 bytes are
-        // buffered, without reserving anything.
         let mut buffer = BytesMut::new();
         encode(
             &Packet::message(Guid::NULL, vec![], PacketFlags::NONE),
@@ -745,9 +777,49 @@ mod tests {
         buffer[24..28].copy_from_slice(&(1u32 << 27).to_le_bytes());
         let checksum = crc64::checksum(&buffer[..28]);
         buffer[28..36].copy_from_slice(&checksum.to_le_bytes());
+        // The fixed header plus the trailing variable-header checksum a
+        // zero-part message packet still carries — and nothing of the 1.5 GB
+        // the header now claims.
+        assert_eq!(buffer.len(), FIXED_HEADER_SIZE + 8);
         assert!(matches!(
             decode(&mut buffer, 64 * 1024 * 1024),
-            Err(PacketError::MessageTooLarge { .. })
+            Err(PacketError::TooManyParts { .. })
+        ));
+    }
+
+    /// The byte ceiling does not bound what receiving a packet costs, so the
+    /// part count has its own.
+    ///
+    /// Measured before this ceiling existed: a peer sending 512 MiB that
+    /// declared 44 739 239 empty parts drove peak RSS to 2.31 GiB — every one
+    /// of those parts is 12 bytes on the wire and about 44 in memory. The
+    /// packet below is well inside a 512 MB byte ceiling and must still be
+    /// refused.
+    #[test]
+    fn a_part_count_within_the_byte_ceiling_is_still_bounded() {
+        let mut buffer = BytesMut::new();
+        encode(
+            &Packet::message(Guid::NULL, vec![], PacketFlags::NONE),
+            &mut buffer,
+        )
+        .unwrap();
+        let parts = DEFAULT_MAX_PART_COUNT + 1;
+        buffer[24..28].copy_from_slice(&parts.to_le_bytes());
+        let checksum = crc64::checksum(&buffer[..28]);
+        buffer[28..36].copy_from_slice(&checksum.to_le_bytes());
+
+        // 65 537 parts is 786 KB of wire, far inside the byte ceiling.
+        assert!(u64::from(parts) * 12 < 512 * 1024 * 1024);
+        assert_eq!(
+            decode(&mut buffer.clone(), 512 * 1024 * 1024),
+            Err(PacketError::TooManyParts { count: parts })
+        );
+
+        // A caller that genuinely wants more can raise it, and then the byte
+        // ceiling is what applies.
+        assert!(matches!(
+            decode_with(&mut buffer, 512 * 1024 * 1024, MAX_PART_COUNT),
+            Ok(None)
         ));
     }
 

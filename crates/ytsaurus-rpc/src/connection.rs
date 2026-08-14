@@ -448,6 +448,16 @@ mod tests {
         address: String,
         seen: mpsc::UnboundedReceiver<Packet>,
         task: tokio::task::JoinHandle<()>,
+        inject: mpsc::UnboundedSender<Packet>,
+    }
+
+    impl StubProxy {
+        /// Sends a packet the client never asked for.
+        async fn inject(&self, packet: Packet) {
+            let _ = self.inject.send(packet);
+            // Give the stub's loop a turn to pick it up.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     impl Drop for StubProxy {
@@ -477,6 +487,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let (seen_sender, seen) = mpsc::unbounded_channel();
+        let (inject, mut injected) = mpsc::unbounded_channel::<Packet>();
 
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -486,6 +497,15 @@ mod tests {
             let mut pending_replies: Vec<Vec<Option<Bytes>>> = Vec::new();
 
             loop {
+                // Anything a test wants to push at the client, unsolicited.
+                while let Ok(packet) = injected.try_recv() {
+                    let mut out = BytesMut::new();
+                    packet::encode(&packet, &mut out).unwrap();
+                    if write_half.write_all(&out).await.is_err() {
+                        return;
+                    }
+                }
+
                 let decoded = packet::decode(&mut buffer, crate::bus::DEFAULT_MAX_MESSAGE_SIZE);
                 match decoded {
                     Ok(Some(request)) => {
@@ -559,6 +579,7 @@ mod tests {
             address,
             seen,
             task,
+            inject,
         }
     }
 
@@ -621,16 +642,22 @@ mod tests {
             transaction_id: Guid::random().to_proto(),
             ..Default::default()
         };
-        let (_response, attachments) = connection
-            .invoke::<proto::api::TRspPingTransaction>(
+        // Bounded, like every other await on a call in this file: a test that
+        // hangs when the client stops answering is indistinguishable from a
+        // stuck CI runner.
+        let (_response, attachments) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.invoke::<proto::api::TRspPingTransaction>(
                 "PingTransaction",
                 &request,
                 Vec::new(),
                 None,
                 "TRspPingTransaction",
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .expect("the stub answers immediately")
+        .unwrap();
         assert!(attachments.is_empty(), "the stub sent no attachments");
 
         // The stub answers only the request id it was given, so reaching here
@@ -718,8 +745,9 @@ mod tests {
         .await;
 
         let connection = Connection::connect(&stub.address, None).await.unwrap();
-        let error = connection
-            .invoke::<proto::api::TRspPingTransaction>(
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.invoke::<proto::api::TRspPingTransaction>(
                 "PingTransaction",
                 &proto::api::TReqPingTransaction {
                     transaction_id: Guid::random().to_proto(),
@@ -728,9 +756,11 @@ mod tests {
                 Vec::new(),
                 None,
                 "TRspPingTransaction",
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("the stub answers immediately")
+        .unwrap_err();
 
         assert!(error.has_code(crate::error::codes::NO_SUCH_TRANSACTION));
         assert!(
@@ -746,8 +776,13 @@ mod tests {
         let mut stub = stub_proxy(|_| None).await;
         let connection = Connection::connect(&stub.address, None).await.unwrap();
 
-        let error = connection
-            .invoke::<proto::api::TRspPingTransaction>(
+        // Bounded well above the 50 ms deadline under test. Without this, a
+        // regression in that deadline makes the test hang instead of fail —
+        // which in CI is indistinguishable from a stuck runner, and is the
+        // exact shape this suite has already been caught in twice.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.invoke::<proto::api::TRspPingTransaction>(
                 "PingTransaction",
                 &proto::api::TReqPingTransaction {
                     transaction_id: Guid::random().to_proto(),
@@ -756,9 +791,11 @@ mod tests {
                 Vec::new(),
                 Some(std::time::Duration::from_millis(50)),
                 "TRspPingTransaction",
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("the local deadline did not fire: the call outlived it twentyfold")
+        .unwrap_err();
         assert!(matches!(error, Error::Timeout { .. }), "got {error}");
 
         // The request, then the cancellation for it.
@@ -778,6 +815,79 @@ mod tests {
         assert_eq!(&part[0..4], b"rpcc", "cancellation is an rpcc message");
         let cancel_header = proto::rpc::TRequestCancelationHeader::decode(&part[4..]).unwrap();
         assert_eq!(Guid::from_proto(&cancel_header.request_id), request_id);
+    }
+
+    /// A message the client cannot route must be ignored, not fatal.
+    ///
+    /// A proxy may send an ack, a response for a request that has already timed
+    /// out, or something this crate does not parse. Ending the read loop on any
+    /// of those would take down every other call on the connection — and both
+    /// `continue`s that prevent it survived mutation, so nothing was checking.
+    #[tokio::test]
+    async fn junk_from_the_peer_does_not_kill_the_connection() {
+        let stub = stub_proxy(|header| {
+            let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
+            Some(success_reply(
+                request_id,
+                &proto::api::TRspPingTransaction::default(),
+            ))
+        })
+        .await;
+
+        let connection = Connection::connect(&stub.address, None).await.unwrap();
+        let request = proto::api::TReqPingTransaction {
+            transaction_id: Guid::random().to_proto(),
+            ..Default::default()
+        };
+
+        // A response nobody is waiting for, and a message that is not a
+        // response at all: both arrive before any call is made.
+        let orphan = {
+            let header = proto::rpc::TResponseHeader {
+                request_id: Some(Guid::random().to_proto()),
+                ..Default::default()
+            };
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(rpc::MessageType::Response as u32).to_le_bytes());
+            header.encode(&mut bytes).unwrap();
+            Packet::message(
+                Guid::random(),
+                vec![Some(Bytes::from(bytes))],
+                PacketFlags::NONE,
+            )
+        };
+        let unparseable = Packet::message(
+            Guid::random(),
+            vec![Some(Bytes::from_static(b"not an rpc message at all"))],
+            PacketFlags::NONE,
+        );
+        let ack = Packet {
+            packet_type: PacketType::Ack,
+            flags: PacketFlags::NONE,
+            id: Guid::random(),
+            parts: Vec::new(),
+        };
+
+        for packet in [orphan, unparseable, ack] {
+            stub.inject(packet).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The connection must still work.
+        assert!(!connection.is_closed(), "junk closed the connection");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.invoke::<proto::api::TRspPingTransaction>(
+                "PingTransaction",
+                &request,
+                Vec::new(),
+                Some(std::time::Duration::from_secs(5)),
+                "TRspPingTransaction",
+            ),
+        )
+        .await
+        .expect("the connection stopped answering after the junk")
+        .expect("a call after the junk must still work");
     }
 
     #[tokio::test]
@@ -869,16 +979,19 @@ mod tests {
             transaction_id: Guid::random().to_proto(),
             ..Default::default()
         };
-        connection
-            .invoke::<proto::api::TRspPingTransaction>(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.invoke::<proto::api::TRspPingTransaction>(
                 "PingTransaction",
                 &request,
                 Vec::new(),
                 None,
                 "TRspPingTransaction",
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .expect("the stub answers immediately")
+        .unwrap();
 
         let _request = next_packet(&mut stub).await.expect("the request");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -995,17 +1108,20 @@ mod tests {
             transaction_id: Guid::random().to_proto(),
             ..Default::default()
         };
-        let error = connection
-            .invoke_raw(
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connection.invoke_raw(
                 rpc::API_SERVICE,
                 "PingTransaction",
                 &request,
                 Vec::new(),
                 Some(std::time::Duration::from_millis(50)),
                 None,
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("the deadline must end a call that cannot even be queued")
+        .unwrap_err();
         assert!(matches!(error, Error::Timeout { .. }), "got {error}");
 
         // Let the guard's deferred work run before looking.

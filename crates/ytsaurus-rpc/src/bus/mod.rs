@@ -45,11 +45,16 @@ pub enum EncryptionMode {
 /// handshake is a plain read with nothing above it to impose a deadline.
 pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How large a single packet may be before the connection rejects it.
+/// How many bytes of one packet the connection will accept.
 ///
 /// The protocol allows 1 GB per part; this is a much lower default so a corrupt
-/// or hostile length word cannot make the client reserve unbounded memory. A
-/// caller reading genuinely large rowsets can raise it.
+/// or hostile length word cannot make the client read unbounded input. A caller
+/// reading genuinely large rowsets can raise it.
+///
+/// This bounds the **wire bytes**, which is not the same as the memory
+/// receiving them costs: a part is 12 bytes of header on the wire and about 44
+/// once decoded. `packet::DEFAULT_MAX_PART_COUNT` is what bounds that
+/// multiplier, and the two ceilings are needed together.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 512 * 1024 * 1024;
 
 /// One TCP connection speaking bus, after a successful handshake.
@@ -69,6 +74,7 @@ pub struct BusReader {
     stream: OwnedReadHalf,
     buffer: BytesMut,
     max_message_size: u64,
+    max_part_count: u32,
 }
 
 #[derive(Debug)]
@@ -125,6 +131,7 @@ impl Bus {
                 stream: read_half,
                 buffer: BytesMut::with_capacity(64 * 1024),
                 max_message_size,
+                max_part_count: packet::DEFAULT_MAX_PART_COUNT,
             },
             writer: BusWriter {
                 stream: write_half,
@@ -231,7 +238,9 @@ impl BusReader {
     /// Reads until one whole packet is available.
     pub async fn receive(&mut self) -> Result<Packet> {
         loop {
-            if let Some(message) = packet::decode(&mut self.buffer, self.max_message_size)? {
+            if let Some(message) =
+                packet::decode_with(&mut self.buffer, self.max_message_size, self.max_part_count)?
+            {
                 return Ok(message);
             }
             let read = self.stream.read_buf(&mut self.buffer).await?;
