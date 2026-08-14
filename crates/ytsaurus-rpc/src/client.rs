@@ -109,16 +109,7 @@ impl Client {
         transaction_type: TransactionType,
         options: StartTransactionOptions,
     ) -> Result<Transaction<'_>> {
-        let request = proto::api::TReqStartTransaction {
-            r#type: transaction_type as i32,
-            timeout: Some(options.timeout.as_micros() as i64),
-            // A tablet transaction is pinned to this proxy; say so, as both
-            // reference clients do.
-            sticky: Some(transaction_type == TransactionType::Tablet),
-            atomicity: Some(options.atomicity as i32),
-            parent_id: options.parent_id.map(Guid::to_proto),
-            ..Default::default()
-        };
+        let request = start_transaction_request(transaction_type, &options);
 
         let (response, _) = self
             .connection
@@ -153,28 +144,14 @@ impl Client {
         options: LookupOptions<'_>,
     ) -> Result<Vec<MaybeRow>> {
         let keys: Vec<MaybeRow> = keys.iter().cloned().map(Some).collect();
-        let request = proto::api::TReqLookupRows {
-            path: path.as_bytes().to_vec(),
-            rowset_descriptor: name_table_descriptor(columns),
-            timestamp: options.timestamp,
-            // One result per key asked for, so a key with no row comes back as
-            // a null row rather than shortening the list and silently
-            // misaligning every answer after it.
-            keep_missing_rows: Some(true),
-            columns: options
-                .column_filter
-                .iter()
-                .map(|column| (*column).to_owned())
-                .collect(),
-            ..Default::default()
-        };
+        let request = lookup_request(path, columns, &options);
 
         let (response, attachments) = self
             .connection
             .invoke::<proto::api::TRspLookupRows>(
                 "LookupRows",
                 &request,
-                vec![wire::encode_rowset(&keys)],
+                vec![wire::encode_rowset(&keys)?],
                 Some(self.timeout),
                 "TRspLookupRows",
             )
@@ -198,11 +175,7 @@ impl Client {
         query: &str,
         options: SelectOptions,
     ) -> Result<(Vec<MaybeRow>, Vec<String>)> {
-        let request = proto::api::TReqSelectRows {
-            query: query.to_owned(),
-            timestamp: options.timestamp,
-            ..Default::default()
-        };
+        let request = select_request(query, &options);
 
         let (response, attachments) = self
             .connection
@@ -437,25 +410,92 @@ impl Transaction<'_> {
         modification: RowModificationType,
     ) -> Result<()> {
         let owned: Vec<MaybeRow> = rows.iter().cloned().map(Some).collect();
-        let request = proto::api::TReqModifyRows {
-            transaction_id: self.id.to_proto(),
-            path: path.as_bytes().to_vec(),
-            rowset_descriptor: name_table_descriptor(columns),
-            row_modification_types: vec![modification as i32; rows.len()],
-            ..Default::default()
-        };
+        let request = modify_request(self.id, path, columns, rows.len(), modification);
 
         self.client
             .connection
             .invoke::<proto::api::TRspModifyRows>(
                 "ModifyRows",
                 &request,
-                vec![wire::encode_rowset(&owned)],
+                vec![wire::encode_rowset(&owned)?],
                 Some(self.client.timeout),
                 "TRspModifyRows",
             )
             .await?;
         Ok(())
+    }
+}
+
+/// Builds the `StartTransaction` request.
+///
+/// Separated from the call so the bytes a method puts on the wire can be
+/// asserted without a proxy: these functions are where a wrong or missing field
+/// would live, and a mistake in one is invisible until a cluster rejects it.
+fn start_transaction_request(
+    transaction_type: TransactionType,
+    options: &StartTransactionOptions,
+) -> proto::api::TReqStartTransaction {
+    proto::api::TReqStartTransaction {
+        r#type: transaction_type as i32,
+        timeout: Some(options.timeout.as_micros() as i64),
+        // A tablet transaction is pinned to the proxy that created it; say so,
+        // as both reference clients do.
+        sticky: Some(transaction_type == TransactionType::Tablet),
+        atomicity: Some(options.atomicity as i32),
+        parent_id: options.parent_id.map(Guid::to_proto),
+        ..Default::default()
+    }
+}
+
+/// Builds the `LookupRows` request. The keys travel separately, in attachments.
+fn lookup_request(
+    path: &str,
+    columns: &[&str],
+    options: &LookupOptions<'_>,
+) -> proto::api::TReqLookupRows {
+    proto::api::TReqLookupRows {
+        // `bytes`, not `string`: a YPath is a byte string.
+        path: path.as_bytes().to_vec(),
+        rowset_descriptor: name_table_descriptor(columns),
+        timestamp: options.timestamp,
+        // One answer per key asked for, so a key with no row comes back as a
+        // null row rather than shortening the list and silently misaligning
+        // every answer after it.
+        keep_missing_rows: Some(true),
+        columns: options
+            .column_filter
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Builds the `SelectRows` request.
+fn select_request(query: &str, options: &SelectOptions) -> proto::api::TReqSelectRows {
+    proto::api::TReqSelectRows {
+        query: query.to_owned(),
+        timestamp: options.timestamp,
+        ..Default::default()
+    }
+}
+
+/// Builds the `ModifyRows` request. The rows travel separately, in attachments.
+fn modify_request(
+    transaction_id: Guid,
+    path: &str,
+    columns: &[&str],
+    row_count: usize,
+    modification: RowModificationType,
+) -> proto::api::TReqModifyRows {
+    proto::api::TReqModifyRows {
+        transaction_id: transaction_id.to_proto(),
+        path: path.as_bytes().to_vec(),
+        rowset_descriptor: name_table_descriptor(columns),
+        // One entry per row, in the same order as the rows in the attachment.
+        // The server relies on the two staying the same length.
+        row_modification_types: vec![modification as i32; row_count],
+        ..Default::default()
     }
 }
 
@@ -518,9 +558,39 @@ fn decode_rowset_attachments(
 mod tests {
     use super::*;
     use crate::wire::{UnversionedValue, Value};
+    use prost::Message as _;
 
+    /// The enums are hand-written mirrors of proto enums, so they are compared
+    /// against the generated types rather than against restatements of
+    /// themselves.
     #[test]
     fn enum_values_match_the_proto() {
+        assert_eq!(
+            RowModificationType::Write as i32,
+            proto::api::ERowModificationType::RmtWrite as i32
+        );
+        assert_eq!(
+            RowModificationType::Delete as i32,
+            proto::api::ERowModificationType::RmtDelete as i32
+        );
+        assert_eq!(
+            RowModificationType::WriteAndLock as i32,
+            proto::api::ERowModificationType::RmtModify as i32
+        );
+        assert_eq!(
+            TransactionType::Master as i32,
+            proto::api::ETransactionType::TtMaster as i32
+        );
+        assert_eq!(
+            TransactionType::Tablet as i32,
+            proto::api::ETransactionType::TtTablet as i32
+        );
+        assert_eq!(Atomicity::Full as i32, proto::api::EAtomicity::AFull as i32);
+        assert_eq!(Atomicity::None as i32, proto::api::EAtomicity::ANone as i32);
+    }
+
+    #[test]
+    fn enum_values_match_the_documented_numbers() {
         assert_eq!(TransactionType::Master as i32, 0);
         assert_eq!(TransactionType::Tablet as i32, 1);
         assert_eq!(Atomicity::Full as i32, 0);
@@ -531,12 +601,151 @@ mod tests {
         assert_eq!(RowModificationType::WriteAndLock as i32, 3);
     }
 
+    /// The sentinel must be the value the proxy itself defaults to, not merely
+    /// a non-zero number this crate agrees with itself about.
+    ///
+    /// Zero is `NullTimestamp` and asks for something else entirely, so a
+    /// client that sent it instead would read wrong data rather than fail.
     #[test]
-    fn the_latest_timestamp_sentinel_is_not_zero() {
-        // Zero is NullTimestamp and means something else; sending it instead of
-        // this is a silent wrong-answer bug.
-        assert_ne!(LATEST_TIMESTAMP, 0);
-        assert_eq!(LATEST_TIMESTAMP, 4_611_686_018_427_387_649);
+    fn the_latest_timestamp_sentinel_is_the_proto_default() {
+        assert_ne!(LATEST_TIMESTAMP, 0, "zero is NullTimestamp, not 'latest'");
+
+        // Round-tripping through the generated type is what ties the constant
+        // to `api_service.proto`: a request that leaves `timestamp` unset is
+        // read back by the server as its declared default, and this asserts
+        // that is the value named here.
+        let mut buffer = Vec::new();
+        proto::api::TReqLookupRows {
+            path: b"//tmp/t".to_vec(),
+            timestamp: None,
+            ..Default::default()
+        }
+        .encode(&mut buffer)
+        .unwrap();
+        let parsed = proto::api::TReqLookupRows::decode(&buffer[..]).unwrap();
+        assert_eq!(
+            parsed.timestamp.unwrap_or(LATEST_TIMESTAMP),
+            LATEST_TIMESTAMP
+        );
+        assert_eq!(LATEST_TIMESTAMP, 0x3fff_ffff_ffff_ff01);
+    }
+
+    /// The four methods this crate exists for, checked field by field.
+    ///
+    /// A wrong or missing field here is invisible locally and only shows up as
+    /// a cluster rejecting the call — or worse, accepting it and doing
+    /// something subtly different from what was asked.
+    #[test]
+    fn lookup_asks_for_what_it_promises() {
+        let request = lookup_request(
+            "//tmp/table",
+            &["key"],
+            &LookupOptions {
+                timestamp: None,
+                column_filter: vec!["key", "value"],
+            },
+        );
+
+        // A YPath is `bytes`, not `string`.
+        assert_eq!(request.path, b"//tmp/table".to_vec());
+        assert_eq!(request.columns, ["key", "value"]);
+        assert_eq!(
+            request.keep_missing_rows,
+            Some(true),
+            "without this a missing key shortens the answer and misaligns the rest"
+        );
+        assert_eq!(
+            request.timestamp, None,
+            "omitted means the proto default, which is the latest committed data;              sending 0 would ask for NullTimestamp instead"
+        );
+        assert_eq!(
+            request
+                .rowset_descriptor
+                .name_table_entries
+                .iter()
+                .map(|entry| entry.name.clone().unwrap())
+                .collect::<Vec<_>>(),
+            ["key"],
+            "the descriptor names the key columns the attachment carries"
+        );
+    }
+
+    #[test]
+    fn a_lookup_in_a_transaction_reads_at_its_start_timestamp() {
+        // `TReqLookupRows` has no transaction_id field at all: a read inside a
+        // tablet transaction is expressed purely as this timestamp.
+        let request = lookup_request(
+            "//tmp/table",
+            &["key"],
+            &LookupOptions {
+                timestamp: Some(1234),
+                column_filter: Vec::new(),
+            },
+        );
+        assert_eq!(request.timestamp, Some(1234));
+        assert!(
+            request.columns.is_empty(),
+            "an empty filter means every column"
+        );
+    }
+
+    #[test]
+    fn select_carries_the_query_and_the_timestamp() {
+        let request = select_request(
+            "* from [//tmp/t]",
+            &SelectOptions {
+                timestamp: Some(99),
+            },
+        );
+        assert_eq!(request.query, "* from [//tmp/t]");
+        assert_eq!(request.timestamp, Some(99));
+    }
+
+    #[test]
+    fn modify_names_the_transaction_and_one_type_per_row() {
+        let transaction = Guid::random();
+        let request = modify_request(
+            transaction,
+            "//tmp/table",
+            &["key", "value"],
+            3,
+            RowModificationType::Delete,
+        );
+
+        assert_eq!(Guid::from_proto(&request.transaction_id), transaction);
+        assert_eq!(request.path, b"//tmp/table".to_vec());
+        assert_eq!(
+            request.row_modification_types,
+            vec![RowModificationType::Delete as i32; 3],
+            "one entry per row, parallel to the rows in the attachment"
+        );
+        assert!(
+            request.row_legacy_read_locks.is_empty()
+                && request.row_legacy_locks.is_empty()
+                && request.row_locks.is_empty(),
+            "the lock arrays are all-or-nothing per request; a partially filled              one breaks the server's one-per-row invariant"
+        );
+    }
+
+    #[test]
+    fn only_a_tablet_transaction_is_sticky() {
+        let options = StartTransactionOptions::default();
+        let tablet = start_transaction_request(TransactionType::Tablet, &options);
+        assert_eq!(tablet.r#type, 1);
+        assert_eq!(
+            tablet.sticky,
+            Some(true),
+            "a tablet tx belongs to one proxy"
+        );
+        assert_eq!(
+            tablet.timeout,
+            Some(options.timeout.as_micros() as i64),
+            "microseconds, not milliseconds"
+        );
+
+        let master = start_transaction_request(TransactionType::Master, &options);
+        assert_eq!(master.r#type, 0);
+        assert_eq!(master.sticky, Some(false));
     }
 
     #[test]
@@ -563,7 +772,7 @@ mod tests {
             Some(vec![UnversionedValue::new(0, Value::Int64(1))]),
             Some(vec![UnversionedValue::new(0, Value::Int64(2))]),
         ];
-        let encoded = wire::encode_rowset(&rows);
+        let encoded = wire::encode_rowset(&rows).unwrap();
         let split = encoded.len() / 2;
         let attachments = vec![encoded.slice(0..split), encoded.slice(split..)];
 

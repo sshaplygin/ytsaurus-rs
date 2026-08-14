@@ -134,7 +134,7 @@ fn cases() -> Vec<(&'static str, Vec<MaybeRow>)> {
 fn the_encoder_reproduces_the_go_sdk_bytes() {
     for (name, rows) in cases() {
         let expected = read_vector(name);
-        let encoded = wire::encode_rowset(&rows);
+        let encoded = wire::encode_rowset(&rows).expect("the reference cases are all valid");
         assert_eq!(
             encoded,
             expected,

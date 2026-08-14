@@ -217,29 +217,62 @@ pub fn encoded_size(rows: &[MaybeRow]) -> usize {
 }
 
 /// Encodes a rowset into the wire format.
-pub fn encode_rowset(rows: &[MaybeRow]) -> Bytes {
+///
+/// Fails rather than emitting a rowset the server will reject or, worse,
+/// misread: the limits are checked here as well as on decode, because the
+/// length word is a `u32` and a blob larger than that would wrap silently.
+/// The Go writer validates the same three limits before producing a byte.
+pub fn encode_rowset(rows: &[MaybeRow]) -> Result<Bytes, WireError> {
     let mut buffer = BytesMut::with_capacity(encoded_size(rows));
-    encode_rowset_into(rows, &mut buffer);
-    buffer.freeze()
+    encode_rowset_into(rows, &mut buffer)?;
+    Ok(buffer.freeze())
 }
 
 /// Encodes a rowset, appending to an existing buffer.
-pub fn encode_rowset_into(rows: &[MaybeRow], out: &mut BytesMut) {
+///
+/// On failure `out` may hold a partial rowset; callers that reuse a buffer
+/// should truncate it back themselves.
+pub fn encode_rowset_into(rows: &[MaybeRow], out: &mut BytesMut) -> Result<(), WireError> {
+    if rows.len() as u64 > MAX_ROWS_PER_ROWSET {
+        return Err(WireError::TooManyRows {
+            count: rows.len() as u64,
+        });
+    }
+
     out.put_u64_le(rows.len() as u64);
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let Some(row) = row else {
             out.put_u64_le(NULL_ROW_MARKER);
             continue;
         };
+        if row.len() as u64 > MAX_VALUES_PER_ROW {
+            return Err(WireError::TooManyValues {
+                row: index,
+                count: row.len() as u64,
+            });
+        }
         out.put_u64_le(row.len() as u64);
         for value in row {
-            encode_value(value, out);
+            encode_value(value, out)?;
         }
     }
+    Ok(())
 }
 
-fn encode_value(value: &UnversionedValue, out: &mut BytesMut) {
+fn encode_value(value: &UnversionedValue, out: &mut BytesMut) -> Result<(), WireError> {
     let blob = value.value.blob();
+    if let Some(blob) = blob
+        && blob.len() as u64 > u64::from(MAX_VALUE_LENGTH)
+    {
+        // Checked against the protocol limit rather than against `u32::MAX`:
+        // a blob between the two would fit the length word and still be
+        // refused by the server, and one beyond `u32::MAX` would wrap the word
+        // and turn the rest of the payload into garbage value headers.
+        return Err(WireError::ValueTooLong {
+            length: blob.len().min(u32::MAX as usize) as u32,
+        });
+    }
+
     out.put_u16_le(value.id);
     out.put_u8(value.value.value_type() as u8);
     out.put_u8(u8::from(value.aggregate));
@@ -256,6 +289,7 @@ fn encode_value(value: &UnversionedValue, out: &mut BytesMut) {
         // non-deterministic and the golden vectors meaningless.
         out.put_bytes(0, padding_for(blob.len()));
     }
+    Ok(())
 }
 
 /// Decodes a rowset from the wire format.
@@ -374,8 +408,13 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
+    /// Encodes a rowset that is known to be valid.
+    fn unwrap_encode(rows: &[MaybeRow]) -> Bytes {
+        encode_rowset(rows).expect("this rowset is within every limit")
+    }
+
     fn round_trip(rows: &[MaybeRow]) -> Vec<MaybeRow> {
-        let encoded = encode_rowset(rows);
+        let encoded = unwrap_encode(rows);
         assert_eq!(
             encoded.len(),
             encoded_size(rows),
@@ -419,7 +458,7 @@ mod tests {
 
     #[test]
     fn the_rowset_and_row_headers_are_single_words() {
-        let encoded = encode_rowset(&[Some(vec![UnversionedValue::new(0, Value::Int64(7))])]);
+        let encoded = unwrap_encode(&[Some(vec![UnversionedValue::new(0, Value::Int64(7))])]);
         assert_eq!(&encoded[0..8], &1u64.to_le_bytes(), "row count");
         assert_eq!(&encoded[8..16], &1u64.to_le_bytes(), "value count");
         assert_eq!(encoded.len(), 8 + 8 + 8 + 8);
@@ -432,7 +471,7 @@ mod tests {
             aggregate: true,
             value: Value::String(Bytes::from_static(b"abc")),
         };
-        let encoded = encode_rowset(&[Some(vec![value])]);
+        let encoded = unwrap_encode(&[Some(vec![value])]);
         let header = &encoded[16..24];
         assert_eq!(&header[0..2], &0x1234u16.to_le_bytes(), "id");
         assert_eq!(header[2], ValueType::String as u8, "type");
@@ -448,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_null_value_has_no_payload_at_all() {
-        let encoded = encode_rowset(&[Some(vec![UnversionedValue::new(1, Value::Null)])]);
+        let encoded = unwrap_encode(&[Some(vec![UnversionedValue::new(1, Value::Null)])]);
         // rowset header + row header + one 8-byte value header, and nothing else.
         assert_eq!(encoded.len(), 24);
         assert_eq!(
@@ -466,7 +505,7 @@ mod tests {
             Value::Double(-0.0),
             Value::Boolean(true),
         ] {
-            let encoded = encode_rowset(&[Some(vec![UnversionedValue::new(0, value.clone())])]);
+            let encoded = unwrap_encode(&[Some(vec![UnversionedValue::new(0, value.clone())])]);
             assert_eq!(
                 encoded.len(),
                 32,
@@ -488,8 +527,8 @@ mod tests {
 
     #[test]
     fn a_null_row_is_not_an_empty_row() {
-        let encoded_null = encode_rowset(&[None]);
-        let encoded_empty = encode_rowset(&[Some(Vec::new())]);
+        let encoded_null = unwrap_encode(&[None]);
+        let encoded_empty = unwrap_encode(&[Some(Vec::new())]);
         assert_ne!(encoded_null, encoded_empty);
         assert_eq!(&encoded_null[8..16], &NULL_ROW_MARKER.to_le_bytes());
         assert_eq!(&encoded_empty[8..16], &0u64.to_le_bytes());
@@ -511,7 +550,7 @@ mod tests {
                 0,
                 Value::String(blob.clone()),
             )])];
-            let encoded = encode_rowset(&rows);
+            let encoded = unwrap_encode(&rows);
             assert_eq!(
                 encoded.len() % ALIGNMENT,
                 0,
@@ -565,7 +604,7 @@ mod tests {
             0,
             Value::Double(f64::NAN),
         )])];
-        let encoded = encode_rowset(&rows);
+        let encoded = unwrap_encode(&rows);
         match decode_rowset(&encoded).unwrap()[0].as_ref().unwrap()[0].value {
             Value::Double(read) => assert!(read.is_nan()),
             ref other => panic!("expected a double, got {other:?}"),
@@ -575,7 +614,7 @@ mod tests {
     #[test]
     fn negative_integers_use_two_s_complement_in_the_word() {
         let rows = vec![Some(vec![UnversionedValue::new(0, Value::Int64(-42))])];
-        let encoded = encode_rowset(&rows);
+        let encoded = unwrap_encode(&rows);
         assert_eq!(&encoded[24..32], &(-42i64 as u64).to_le_bytes());
         assert_eq!(round_trip(&rows), rows);
     }
@@ -590,24 +629,36 @@ mod tests {
         assert_eq!(round_trip(&rows), rows);
     }
 
+    /// Every prefix of a valid rowset must be rejected, and rejected as a
+    /// *truncation* rather than as some incidental error — a decoder that
+    /// mistook a short buffer for a different fault would be reporting the
+    /// wrong thing to the caller.
     #[test]
     fn truncated_input_is_an_error_not_a_panic() {
         let rows = vec![Some(sample_row())];
-        let whole = encode_rowset(&rows);
+        let whole = unwrap_encode(&rows);
         for length in 0..whole.len() {
             let truncated = whole.slice(0..length);
-            let result = decode_rowset(&truncated);
-            assert!(
-                result.is_err(),
-                "a rowset cut to {length} of {} bytes decoded anyway",
-                whole.len()
-            );
+            match decode_rowset(&truncated) {
+                Err(WireError::Truncated { offset, needed }) => {
+                    assert!(
+                        needed > 0,
+                        "a truncation that needs no more bytes is not one"
+                    );
+                    assert!(
+                        offset <= length,
+                        "reported offset {offset} is past the {length} bytes given"
+                    );
+                }
+                Err(other) => panic!("cut to {length} bytes gave {other:?}, not a truncation"),
+                Ok(rows) => panic!("a rowset cut to {length} bytes decoded to {rows:?}"),
+            }
         }
     }
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let mut encoded = BytesMut::from(&encode_rowset(&[Some(sample_row())])[..]);
+        let mut encoded = BytesMut::from(&unwrap_encode(&[Some(sample_row())])[..]);
         encoded.put_u64_le(0);
         assert_eq!(
             decode_rowset(&encoded.freeze()),
@@ -618,7 +669,7 @@ mod tests {
     #[test]
     fn an_unknown_value_type_is_rejected() {
         let mut encoded = BytesMut::from(
-            &encode_rowset(&[Some(vec![UnversionedValue::new(0, Value::Int64(1))])])[..],
+            &unwrap_encode(&[Some(vec![UnversionedValue::new(0, Value::Int64(1))])])[..],
         );
         encoded[18] = 0x7f;
         assert_eq!(
@@ -681,6 +732,36 @@ mod tests {
             decode_rowset(&buffer.freeze()),
             Err(WireError::Truncated { .. })
         ));
+    }
+
+    /// The decoder refuses these; so must the encoder. A rowset this crate
+    /// emits and then cannot read back would be a bug the golden vectors would
+    /// never catch, because they only cover valid input.
+    #[test]
+    fn the_encoder_refuses_what_the_decoder_would() {
+        let too_many_values = vec![Some(
+            (0..MAX_VALUES_PER_ROW as u16 + 1)
+                .map(|id| UnversionedValue::new(id, Value::Int64(0)))
+                .collect::<Row>(),
+        )];
+        assert_eq!(
+            encode_rowset(&too_many_values),
+            Err(WireError::TooManyValues {
+                row: 0,
+                count: MAX_VALUES_PER_ROW + 1
+            })
+        );
+
+        let too_long = vec![Some(vec![UnversionedValue::new(
+            0,
+            Value::String(Bytes::from(vec![0u8; MAX_VALUE_LENGTH as usize + 1])),
+        )])];
+        assert_eq!(
+            encode_rowset(&too_long),
+            Err(WireError::ValueTooLong {
+                length: MAX_VALUE_LENGTH + 1
+            })
+        );
     }
 
     #[test]

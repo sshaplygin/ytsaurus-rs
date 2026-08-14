@@ -133,9 +133,13 @@ Each must be green before this is published or described as anything but
 pre-release.
 
 - **A — the sans-io layers are checked against a reference, not against
-  themselves.** *Green.* Rowset vectors are produced by the pinned Go SDK and
-  consumed in both directions; the CRC-64 matches all twelve canonical vectors
-  plus bus-shaped ones.
+  themselves.** *Green for layer 4 and the checksum, not for layer 1.* Rowset
+  vectors are produced by the pinned Go SDK and consumed in both directions,
+  and the CRC-64 matches all twelve canonical vectors plus bus-shaped ones.
+  **No reference-produced bus *packet* exists**: the framing is checked against
+  this crate's own encoder, plus a live proxy that accepts what it writes. The
+  Go SDK's packet encoder is unexported, so closing this properly means
+  capturing bytes from a real proxy as a fixture.
 - **B — a live proxy accepts what this writes and this reads what it sends.**
   *Green.* `cargo run -p ytsaurus-rpc --example e2e` writes, looks up, selects
   and deletes on a real cluster. Not in CI: it needs a multi-GB image and an
@@ -153,6 +157,11 @@ pre-release.
 - **E — the parsers are fuzzed.** *Not started.* Both the packet decoder and the
   rowset decoder consume untrusted bytes off a socket. There are exhaustive
   truncation tests, which is not the same thing.
+- **F2 — the connection's failure modes are covered.** *Green.*
+  `connection_failure_modes.rs` holds one test per defect that shipped: a
+  deadline that did not cover queuing the request, and a dead reader that left
+  later calls waiting for ever. Both were found by review rather than by use,
+  which is the argument for keeping the tests.
 - **F — a connection survives a proxy dying.** *Not started.* An in-flight call
   fails cleanly when the connection drops, which is tested; reconnection and
   per-proxy banning are not implemented.

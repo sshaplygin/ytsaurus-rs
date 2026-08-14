@@ -38,6 +38,13 @@ pub enum EncryptionMode {
     Required = 2,
 }
 
+/// How long connecting and completing the handshake may take.
+///
+/// A proxy that accepts a connection and then never speaks is otherwise
+/// indistinguishable from a slow one, and would park the caller for ever: the
+/// handshake is a plain read with nothing above it to impose a deadline.
+pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How large a single packet may be before the connection rejects it.
 ///
 /// The protocol allows 1 GB per part; this is a much lower default so a corrupt
@@ -73,11 +80,34 @@ pub struct BusWriter {
 impl Bus {
     /// Connects and completes the handshake.
     pub async fn connect(address: &str) -> Result<Self> {
-        Self::connect_with(address, DEFAULT_MAX_MESSAGE_SIZE).await
+        Self::connect_with(address, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_CONNECT_TIMEOUT).await
     }
 
-    /// Connects with an explicit packet-size ceiling.
-    pub async fn connect_with(address: &str, max_message_size: u64) -> Result<Self> {
+    /// Connects with an explicit packet-size ceiling and connect deadline.
+    ///
+    /// The deadline covers the TCP connect *and* the handshake, because a peer
+    /// that accepts and then says nothing is the case a connect timeout alone
+    /// would miss.
+    pub async fn connect_with(
+        address: &str,
+        max_message_size: u64,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        tokio::time::timeout(
+            connect_timeout,
+            Self::connect_inner(address, max_message_size),
+        )
+        .await
+        .map_err(|_| Error::Connect {
+            address: address.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no handshake within {connect_timeout:?}"),
+            ),
+        })?
+    }
+
+    async fn connect_inner(address: &str, max_message_size: u64) -> Result<Self> {
         let stream = TcpStream::connect(address)
             .await
             .map_err(|source| Error::Connect {
@@ -347,6 +377,37 @@ mod tests {
         let error = Bus::connect(&address).await.unwrap_err();
         assert!(
             error.to_string().contains("closed the connection"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A peer that accepts the connection and then says nothing must not park
+    /// the caller for ever.
+    #[tokio::test]
+    async fn a_silent_peer_does_not_hang_the_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        // Accept and hold the socket open, without ever replying.
+        let _accepting = tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+
+        let started = std::time::Instant::now();
+        let error = Bus::connect_with(
+            &address,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "it waited too long"
+        );
+        assert!(
+            error.to_string().contains("no handshake within"),
             "unexpected error: {error}"
         );
     }

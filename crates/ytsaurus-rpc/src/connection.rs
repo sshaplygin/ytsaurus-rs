@@ -192,7 +192,9 @@ impl Connection {
             None => self.outbound.send(packet).await,
         };
         if queued.is_err() {
-            guard.complete();
+            // Not `complete()`: the entry was inserted and still has to go. The
+            // guard removes it, and `sent` is still false, so nothing is
+            // cancelled for a request the server never received.
             return Err(Error::ConnectionClosed { request_id });
         }
         guard.sent = true;
@@ -461,6 +463,18 @@ mod tests {
         }
     }
 
+    /// The next packet the stub saw, or `None` if none arrives promptly.
+    ///
+    /// Bounded on purpose. A bare `recv().await` turns "the client never sent
+    /// the thing this test is about" into a test that hangs for ever instead of
+    /// one that fails, which in CI is indistinguishable from a stuck runner.
+    async fn next_packet(stub: &mut StubProxy) -> Option<Packet> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), stub.seen.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
     fn success_reply(request_id: Guid, body: &impl Message) -> Vec<Option<Bytes>> {
         let header = proto::rpc::TResponseHeader {
             request_id: Some(request_id.to_proto()),
@@ -494,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_gets_its_own_response() {
-        let stub = stub_proxy(|header| {
+        let mut stub = stub_proxy(|header| {
             let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
             Some(success_reply(
                 request_id,
@@ -504,20 +518,33 @@ mod tests {
         .await;
 
         let connection = Connection::connect(&stub.address, None).await.unwrap();
+        let request = proto::api::TReqPingTransaction {
+            transaction_id: Guid::random().to_proto(),
+            ..Default::default()
+        };
         let (_response, attachments) = connection
             .invoke::<proto::api::TRspPingTransaction>(
                 "PingTransaction",
-                &proto::api::TReqPingTransaction {
-                    transaction_id: Guid::random().to_proto(),
-                    ..Default::default()
-                },
+                &request,
                 Vec::new(),
                 None,
                 "TRspPingTransaction",
             )
             .await
             .unwrap();
-        assert!(attachments.is_empty());
+        assert!(attachments.is_empty(), "the stub sent no attachments");
+
+        // The stub answers only the request id it was given, so reaching here
+        // at all means the response was routed by id. Check the request that
+        // arrived really is the one that was made.
+        let sent = next_packet(&mut stub).await.expect("the request");
+        let header_part = sent.parts[0].as_ref().unwrap();
+        let header = proto::rpc::TRequestHeader::decode(&header_part[4..]).unwrap();
+        assert_eq!(header.method, "PingTransaction");
+        assert_eq!(header.service, rpc::API_SERVICE);
+        let body = proto::api::TReqPingTransaction::decode(sent.parts[1].as_ref().unwrap().clone())
+            .unwrap();
+        assert_eq!(body.transaction_id, request.transaction_id);
     }
 
     /// The point of the actor: several requests in flight on one connection,
@@ -618,7 +645,7 @@ mod tests {
         assert!(matches!(error, Error::Timeout { .. }), "got {error}");
 
         // The request, then the cancellation for it.
-        let request = stub.seen.recv().await.unwrap();
+        let request = next_packet(&mut stub).await.expect("the request");
         let header_part = request.parts[0].as_ref().unwrap();
         assert_eq!(&header_part[0..4], b"rpci");
         let header = proto::rpc::TRequestHeader::decode(&header_part[4..]).unwrap();
@@ -627,7 +654,9 @@ mod tests {
         // even if the cancellation is lost.
         assert_eq!(header.timeout, Some(50_000));
 
-        let cancelation = stub.seen.recv().await.expect("a cancellation must follow");
+        let cancelation = next_packet(&mut stub)
+            .await
+            .expect("a cancellation must follow the timeout");
         let part = cancelation.parts[0].as_ref().unwrap();
         assert_eq!(&part[0..4], b"rpcc", "cancellation is an rpcc message");
         let cancel_header = proto::rpc::TRequestCancelationHeader::decode(&part[4..]).unwrap();
@@ -686,15 +715,13 @@ mod tests {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(50), call).await;
         }
 
-        let sent = stub.seen.recv().await.expect("the request");
+        let sent = next_packet(&mut stub).await.expect("the request");
         let header_part = sent.parts[0].as_ref().unwrap();
         assert_eq!(&header_part[0..4], b"rpci");
         let header = proto::rpc::TRequestHeader::decode(&header_part[4..]).unwrap();
         let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
 
-        let cancelation = stub
-            .seen
-            .recv()
+        let cancelation = next_packet(&mut stub)
             .await
             .expect("dropping the future must send a cancellation");
         let part = cancelation.parts[0].as_ref().unwrap();
@@ -733,7 +760,7 @@ mod tests {
             .await
             .unwrap();
 
-        let _request = stub.seen.recv().await.expect("the request");
+        let _request = next_packet(&mut stub).await.expect("the request");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             stub.seen.try_recv().is_err(),
