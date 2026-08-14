@@ -56,8 +56,9 @@ Recorded in full in [docs/rpc-compatibility.md](../../docs/rpc-compatibility.md)
   This follows the C++.
 - **The major protocol version is per service, not per connection.**
   `ApiService` is at 1 and `DiscoveryService` is still at 0; announcing 1 to the
-  latter is refused outright by a real proxy. Learned from a cluster, which is
-  the only place it is written down.
+  latter is refused outright by a real proxy. The C++ takes the version from
+  each service's descriptor, so it is derivable from the sources — but it is
+  stated nowhere as a rule, and a live proxy is what surfaced it here.
 
 ### Not implemented
 

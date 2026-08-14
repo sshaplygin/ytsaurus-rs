@@ -36,7 +36,8 @@ for every dynamic-table read and write.
 
 The parsers are **sans-io**: `crc64`, `bus::packet`, `rpc` and `wire` are pure
 functions from bytes to values with no `async` anywhere, so each is tested
-without a runtime. `async` appears only at the I/O edges, `bus::Bus` and
+without a runtime. That also makes them fuzzable, which they are not yet — see
+gate E. `async` appears only at the I/O edges, `bus::Bus` and
 `connection::Connection`.
 
 A connection is an **actor**: a writer task drains a bounded channel, so

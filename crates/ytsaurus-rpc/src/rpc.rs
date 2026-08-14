@@ -36,11 +36,13 @@ pub const PROTOCOL_VERSION_MAJOR: i32 = 1;
 
 /// The major protocol version of every other service on the proxy.
 ///
-/// The version is **per service**, not per connection. `DiscoveryService` is
-/// still at 0, and sending 1 to it earns a flat refusal from a real proxy:
-/// "Server major protocol version differs from client major protocol version:
-/// 1 != 0". Learned from the cluster, which is the only place it is written
-/// down.
+/// The version is **per service**, not per connection: the C++ takes it from
+/// the service descriptor (`client.cpp` sets `protocol_version_major` from
+/// `serviceDescriptor.ProtocolVersion.Major`), and `ApiService` is the only one
+/// that declares a major version of 1. `DiscoveryService` is still at 0, and
+/// announcing 1 to it earns a flat refusal from a real proxy — "Server major
+/// protocol version differs from client major protocol version" — which is how
+/// it was found here.
 pub const DEFAULT_PROTOCOL_VERSION_MAJOR: i32 = 0;
 
 /// The major protocol version to announce when calling `service`.

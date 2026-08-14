@@ -16,7 +16,7 @@ published, and the gates below are not all green.
 | --- | --- | --- |
 | `.proto` files | ytsaurus/ytsaurus `stable/25.4` @ `c91fcbe2cd0b9bf8a2fbae078885b9d423f22b62` | `third_party/ytsaurus` submodule |
 | Reference implementation for vectors | Go SDK `yt/go` v0.0.33 | `tests/rpc-go-interop/go.mod` |
-| Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server 25.4.260522002 | `crates/ytsaurus-rpc/examples/e2e.rs` |
+| Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server `25.4.260522002` | recorded here; the run is `crates/ytsaurus-rpc/examples/e2e.rs`, which is not in CI |
 
 The protos are a **submodule, not a copy**. A submodule records an exact
 upstream commit, so the definitions are pinned the way protocol work needs
@@ -133,13 +133,14 @@ Each must be green before this is published or described as anything but
 pre-release.
 
 - **A — the sans-io layers are checked against a reference, not against
-  themselves.** *Green for layer 4 and the checksum, not for layer 1.* Rowset
-  vectors are produced by the pinned Go SDK and consumed in both directions,
-  and the CRC-64 matches all twelve canonical vectors plus bus-shaped ones.
-  **No reference-produced bus *packet* exists**: the framing is checked against
-  this crate's own encoder, plus a live proxy that accepts what it writes. The
-  Go SDK's packet encoder is unexported, so closing this properly means
-  capturing bytes from a real proxy as a fixture.
+  themselves.** *Green for two of the four.* The row wire format has rowset
+  vectors produced by the pinned Go SDK and consumed in both directions, and
+  the CRC-64 matches all twelve canonical vectors plus bus-shaped ones.
+  **Bus framing and the RPC envelope have no reference-produced vectors**:
+  both are checked against this crate's own encoder, plus a live proxy that
+  accepts what they write and whose replies they read. The Go SDK's packet
+  encoder is unexported, so closing this properly means capturing bytes off a
+  real proxy and keeping them as fixtures.
 - **B — a live proxy accepts what this writes and this reads what it sends.**
   *Green.* `cargo run -p ytsaurus-rpc --example e2e` writes, looks up, selects
   and deletes on a real cluster. Not in CI: it needs a multi-GB image and an

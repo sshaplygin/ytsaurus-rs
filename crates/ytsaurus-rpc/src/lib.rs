@@ -24,8 +24,10 @@
 //!
 //! The parsers are **sans-io**: [`crc64`], [`bus::packet`], [`rpc`] and
 //! [`wire`] are pure functions from bytes to values, with no `async` anywhere,
-//! so every one of them is tested and fuzzed without a runtime. `async` appears
-//! only at the I/O edges — [`bus::Bus`] and [`connection::Connection`].
+//! so every one of them is testable without a runtime — and fuzzable, though
+//! they are not yet fuzzed (gate E in `docs/rpc-compatibility.md`). `async`
+//! appears only at the I/O edges — [`bus::Bus`] and
+//! [`connection::Connection`].
 //!
 //! # Example
 //!

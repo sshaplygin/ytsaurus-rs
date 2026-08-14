@@ -5,7 +5,8 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
 
-All six crates are on crates.io at **0.2.6**, released together — the version is
+Six of the eight crates are on crates.io at **0.2.6**, released together — the
+two RPC crates are pre-release and unpublished. The version is
 the workspace's, so they move as one.
 
 | Crate | Version | Docs | What it is |
@@ -167,7 +168,7 @@ run can be made bigger without editing code:
 ## Build and test
 
 ```sh
-cargo test --workspace          # 759 tests
+cargo test --workspace          # 866 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```

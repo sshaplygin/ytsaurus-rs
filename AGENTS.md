@@ -88,7 +88,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ```sh
 ./scripts/init-protos.sh          # once after cloning: the .proto submodule, shallow and sparse
 
-cargo test --workspace            # 759 tests: 685 unit and integration, 74 doc
+cargo test --workspace            # 866 tests: 790 unit and integration, 76 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 

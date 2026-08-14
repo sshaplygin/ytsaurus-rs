@@ -28,7 +28,8 @@
 //!
 //! There is no `async` in this file, and there must not be: it is the part that
 //! parses untrusted bytes off a socket, so it stays a pure function of its
-//! input and is tested and fuzzed without a runtime.
+//! input and is tested without a runtime. Fuzzing it is gate E in
+//! `docs/rpc-compatibility.md`, and is not done yet.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
