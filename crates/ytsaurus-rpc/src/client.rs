@@ -292,6 +292,12 @@ pub struct LookupOptions<'a> {
 pub struct SelectOptions {
     /// The read timestamp; see [`LookupOptions::timestamp`].
     pub timestamp: Option<Timestamp>,
+    /// Stop after this many rows, if set.
+    ///
+    /// This is a request option, rather than text appended to `query`: a query
+    /// may already have a `LIMIT`, end in a semicolon, or require its clauses
+    /// in a different order.
+    pub output_row_limit: Option<u64>,
 }
 
 /// An open transaction.
@@ -526,6 +532,7 @@ fn select_request(query: &str, options: &SelectOptions) -> proto::api::TReqSelec
     proto::api::TReqSelectRows {
         query: query.to_owned(),
         timestamp: options.timestamp,
+        output_row_limit: options.output_row_limit,
         ..Default::default()
     }
 }
@@ -749,15 +756,17 @@ mod tests {
     }
 
     #[test]
-    fn select_carries_the_query_and_the_timestamp() {
+    fn select_carries_the_query_timestamp_and_output_limit() {
         let request = select_request(
             "* from [//tmp/t]",
             &SelectOptions {
                 timestamp: Some(99),
+                output_row_limit: Some(10),
             },
         );
         assert_eq!(request.query, "* from [//tmp/t]");
         assert_eq!(request.timestamp, Some(99));
+        assert_eq!(request.output_row_limit, Some(10));
     }
 
     #[test]

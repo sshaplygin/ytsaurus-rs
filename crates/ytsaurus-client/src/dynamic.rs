@@ -24,16 +24,16 @@
 //! cluster's default.
 
 use ytsaurus_api::{LookupOptions, MaybeRow, Row, SelectOptions, Value};
-use ytsaurus_yson::{YsonNode, YsonValue};
+use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue};
 
 use crate::retry::Repeatable;
 use crate::{Client, ClientError, Method, Result, yson_build};
 
 /// Encodes rows as the YSON list fragment a tabular input stream expects.
-fn rows_to_fragment(rows: &[Row]) -> Vec<u8> {
+fn rows_to_fragment(rows: &[Row]) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     for row in rows {
-        let value = row_to_yson(row);
+        let value = row_to_yson(row)?;
         let mut serializer = ytsaurus_yson::ser::Serializer::with_buffer(buffer, true);
         // A `YsonValue` always serializes; the writer is a `Vec`, which cannot
         // fail either.
@@ -42,19 +42,20 @@ fn rows_to_fragment(rows: &[Row]) -> Vec<u8> {
         buffer = serializer.into_output();
         buffer.push(b';');
     }
-    buffer
+    Ok(buffer)
 }
 
-fn row_to_yson(row: &Row) -> YsonValue {
-    yson_build::map(
-        row.columns()
-            .iter()
-            .map(|(name, value)| (name.as_str(), value_to_yson(value))),
-    )
+fn row_to_yson(row: &Row) -> Result<YsonValue> {
+    let entries = row
+        .columns()
+        .iter()
+        .map(|(name, value)| value_to_yson(value).map(|value| (name.as_str(), value)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(yson_build::map(entries))
 }
 
-fn value_to_yson(value: &Value) -> YsonValue {
-    match value {
+fn value_to_yson(value: &Value) -> Result<YsonValue> {
+    Ok(match value {
         Value::Null => YsonValue {
             attributes: None,
             node: YsonNode::Entity,
@@ -64,13 +65,22 @@ fn value_to_yson(value: &Value) -> YsonValue {
         Value::Double(number) => yson_build::double(*number),
         Value::Boolean(flag) => yson_build::boolean(*flag),
         Value::String(bytes) => yson_build::string(bytes),
-        // A YSON-encoded value arrives as bytes; re-parsing it here would be
-        // the only way to nest it as structure, and it would also be the only
-        // place this crate could silently change a caller's value. It goes as a
-        // string, which is what the cluster stores for an `any` column written
-        // through a string-typed field.
-        Value::Any(bytes) => yson_build::string(bytes),
-    }
+        // `Any` names a YSON value, not a string holding its bytes. The API's
+        // response format is binary YSON, but accepting text here too means a
+        // caller can construct a row with either documented encoding. The
+        // fragment itself is always serialized as binary YSON below.
+        Value::Any(bytes) => ytsaurus_yson::from_slice(bytes, YsonFormat::Binary)
+            .or_else(|binary_error| {
+                ytsaurus_yson::from_slice(bytes, YsonFormat::Text).map_err(|text_error| {
+                    ClientError::Decode {
+                        command: "writing dynamic table row".to_owned(),
+                        reason: format!(
+                            "Value::Any is not one YSON value (binary: {binary_error}; text: {text_error})"
+                        ),
+                    }
+                })
+            })?,
+    })
 }
 
 /// Decodes a YSON list fragment of maps into rows.
@@ -194,11 +204,12 @@ impl Client {
             params.push(("timestamp", yson_build::uint(timestamp)));
         }
 
+        let keys = rows_to_fragment(keys)?;
         let body = self.raw_command_with(
             Method::Put,
             "lookup_rows",
             &yson_build::map(params),
-            Some(&rows_to_fragment(keys)),
+            Some(&keys),
             Repeatable::Heavy,
             None,
         )?;
@@ -247,11 +258,12 @@ impl Client {
             ("path", yson_build::string(path)),
             ("input_format", yson_build::binary_yson_format()),
         ]);
+        let body = rows_to_fragment(rows)?;
         self.raw_command_with(
             Method::Put,
             command,
             &params,
-            Some(&rows_to_fragment(rows)),
+            Some(&body),
             Repeatable::Never,
             None,
         )?;
@@ -348,7 +360,7 @@ mod tests {
             Row::new().with("key", 1i64).with("value", "one"),
             Row::new().with("key", 2i64),
         ];
-        let fragment = rows_to_fragment(&rows);
+        let fragment = rows_to_fragment(&rows).unwrap();
 
         // A list fragment terminates every value with a separator; without the
         // last one the cluster reads the final row as unterminated. Counting
@@ -396,7 +408,8 @@ mod tests {
             .with("raw", vec![0xffu8, 0x00])
             .with("n", None::<i64>);
 
-        let decoded = fragment_to_rows(&rows_to_fragment(std::slice::from_ref(&row))).unwrap();
+        let fragment = rows_to_fragment(std::slice::from_ref(&row)).unwrap();
+        let decoded = fragment_to_rows(&fragment).unwrap();
         let back = decoded[0].as_ref().unwrap();
 
         assert_eq!(back.get("i"), Some(&Value::Int64(1)));
@@ -413,7 +426,46 @@ mod tests {
 
     #[test]
     fn an_empty_row_set_encodes_to_nothing() {
-        assert!(rows_to_fragment(&[]).is_empty());
+        assert!(rows_to_fragment(&[]).unwrap().is_empty());
         assert!(fragment_to_rows(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn any_values_are_embedded_as_yson_not_strings() {
+        let any = yson_build::list([yson_build::int(1), yson_build::int(2)]);
+        let bytes = ytsaurus_yson::to_vec(&any, YsonFormat::Binary).unwrap();
+        let row = Row::new().with("value", Value::Any(bytes));
+
+        let fragment = rows_to_fragment(&[row]).unwrap();
+        let decoded = fragment_to_rows(&fragment).unwrap();
+        let value = decoded[0].as_ref().unwrap().get("value");
+
+        match value {
+            Some(Value::Any(bytes)) => {
+                let value: YsonValue =
+                    ytsaurus_yson::from_slice(bytes, YsonFormat::Binary).unwrap();
+                assert!(matches!(value.node, YsonNode::List(_)));
+            }
+            other => panic!("the list was encoded as {other:?}, not as YSON"),
+        }
+    }
+
+    #[test]
+    fn any_values_accept_text_yson_too() {
+        let row = Row::new().with("value", Value::Any(b"[1;2]".to_vec()));
+
+        let fragment = rows_to_fragment(&[row]).unwrap();
+        let decoded = fragment_to_rows(&fragment).unwrap();
+        assert!(matches!(
+            decoded[0].as_ref().unwrap().get("value"),
+            Some(Value::Any(_))
+        ));
+    }
+
+    #[test]
+    fn an_invalid_any_value_fails_before_the_request_is_sent() {
+        let row = Row::new().with("value", Value::Any(b"not a yson value".to_vec()));
+        let error = rows_to_fragment(&[row]).unwrap_err();
+        assert!(error.to_string().contains("Value::Any"), "{error}");
     }
 }

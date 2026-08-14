@@ -54,17 +54,6 @@ impl Client {
             timeout: None,
         }
     }
-
-    /// The asynchronous client underneath, for a caller that wants one call to
-    /// use the concurrency this facade gives up.
-    pub fn inner(&self) -> &Arc<AsyncClient> {
-        &self.inner
-    }
-
-    /// Runs a future to completion on this client's runtime.
-    pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        self.runtime.block_on(future)
-    }
 }
 
 /// Configuration for [`Client::connect`].
@@ -164,6 +153,15 @@ fn from_wire_rows(rows: Vec<MaybeRowWire>, columns: &[String]) -> ApiResult<Vec<
 
 type MaybeRowWire = Option<wire::Row>;
 
+/// Maps the common options onto the RPC request without changing the query
+/// text. `TReqSelectRows` has an `output_row_limit` field for exactly this.
+fn rpc_select_options(options: &SelectOptions) -> crate::client::SelectOptions {
+    crate::client::SelectOptions {
+        timestamp: options.timestamp,
+        output_row_limit: options.limit,
+    }
+}
+
 impl TableClient for Client {
     fn transport(&self) -> Transport {
         Transport::Rpc
@@ -196,18 +194,12 @@ impl TableClient for Client {
     }
 
     fn select_rows(&self, query: &str, options: &SelectOptions) -> ApiResult<Vec<Row>> {
-        let query = match options.limit {
-            Some(limit) => format!("{query} limit {limit}"),
-            None => query.to_owned(),
-        };
         let (rows, columns) = self
             .runtime
-            .block_on(self.inner.select_rows_with_columns(
-                &query,
-                crate::client::SelectOptions {
-                    timestamp: options.timestamp,
-                },
-            ))
+            .block_on(
+                self.inner
+                    .select_rows_with_columns(query, rpc_select_options(options)),
+            )
             .map_err(|error| map_error("select_rows", error))?;
 
         rows.into_iter()
@@ -285,17 +277,13 @@ impl TableTransaction for BlockingTransaction<'_> {
     }
 
     fn select_rows(&self, query: &str, options: &SelectOptions) -> ApiResult<Vec<Row>> {
-        let query = match options.limit {
-            Some(limit) => format!("{query} limit {limit}"),
-            None => query.to_owned(),
-        };
-        let (rows, columns) =
-            self.runtime
-                .block_on(self.transaction.select_rows_with_columns(
-                    &query,
-                    crate::client::SelectOptions { timestamp: None },
-                ))
-                .map_err(|error| map_error("select_rows", error))?;
+        let (rows, columns) = self
+            .runtime
+            .block_on(
+                self.transaction
+                    .select_rows_with_columns(query, rpc_select_options(options)),
+            )
+            .map_err(|error| map_error("select_rows", error))?;
 
         rows.into_iter()
             .flatten()
@@ -339,5 +327,24 @@ impl TableTransaction for BlockingTransaction<'_> {
         this.runtime
             .block_on(this.transaction.abort())
             .map_err(|error| map_error("abort_transaction", error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_limit_is_an_rpc_field_and_leaves_the_query_alone() {
+        let query = "* from [//tmp/t] limit 100;";
+        let options = SelectOptions {
+            timestamp: Some(99),
+            limit: Some(10),
+        };
+
+        let rpc = rpc_select_options(&options);
+        assert_eq!(rpc.timestamp, Some(99));
+        assert_eq!(rpc.output_row_limit, Some(10));
+        assert_eq!(query, "* from [//tmp/t] limit 100;");
     }
 }
