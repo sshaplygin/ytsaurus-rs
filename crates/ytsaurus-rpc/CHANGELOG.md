@@ -7,6 +7,21 @@ this crate follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rowset encoding validates before it allocates.** A row could contain many
+  clones of one 16 MiB `Bytes`, requiring tens of gibibytes of output while
+  holding only one backing allocation. The encoder now checks every row limit
+  and the 1 GiB RPC attachment limit before reserving, and returns allocation
+  failure as an error instead of aborting.
+- **Connection backpressure now includes requests already sent to a proxy.**
+  One connection accepts at most 256 in-flight calls. A cancellation retains
+  that call's slot until the writer handles its packet, so a blocked writer
+  cannot fill the cancellation queue and silently lose later cancellations.
+- **End-to-end examples have distinct Cargo target names.** Use `rpc_e2e` for
+  the RPC client and `client_e2e` for the HTTP client; building all examples no
+  longer makes both packages emit `target/.../examples/e2e`.
+
 ### Added
 
 First release of the crate: a client for the YTsaurus **RPC proxy**, covering
@@ -39,7 +54,7 @@ all four layers of the protocol from the TCP framing up.
   byte vectors the Rust tests consume in both directions — the same arrangement
   `tests/skiff-go-interop/` uses for Skiff.
 - **An end-to-end example** that writes, looks up, selects and deletes on a real
-  cluster: `cargo run -p ytsaurus-rpc --example e2e`.
+  cluster: `cargo run -p ytsaurus-rpc --example rpc_e2e`.
 
 ### Deliberate divergences from the reference clients
 

@@ -40,11 +40,11 @@ without a runtime. That also makes them fuzzable, which they are not yet — see
 gate E. `async` appears only at the I/O edges, `bus::Bus` and
 `connection::Connection`.
 
-A connection is an **actor**: a writer task drains a bounded channel, so
-backpressure is real, and a reader task routes each response to the `oneshot`
-waiting on it. Cancellation is protocol-level — a timed-out call sends the
-protocol's cancellation message, because a client-side-only timeout leaves the
-proxy working on a result nobody will read.
+A connection is an **actor**: a writer task drains a bounded channel and at
+most 256 calls may be in flight, so backpressure is real. A reader task routes
+each response to the `oneshot` waiting on it. Cancellation is protocol-level —
+a timed-out call sends the protocol's cancellation message, because a
+client-side-only timeout leaves the proxy working on a result nobody will read.
 
 Unlike the rest of this workspace, which is synchronous, this crate is async on
 tokio. Multiplexed in-flight requests are the entire justification for speaking
@@ -101,7 +101,7 @@ not needed on `PATH`; a vendored one is used unless `PROTOC` is set.
 ```sh
 cargo test -p ytsaurus-rpc                     # unit tests + golden vectors
 cd tests/rpc-go-interop && go test ./...       # regenerate the vectors
-cargo run -p ytsaurus-rpc --example e2e        # against a live RPC proxy
+cargo run -p ytsaurus-rpc --example rpc_e2e    # against a live RPC proxy
 ```
 
 The golden vectors are **produced by the pinned Go SDK**, not written by hand —
@@ -109,6 +109,6 @@ the same arrangement `tests/skiff-go-interop/` uses, because a binary format
 checked only against our own reading of the specification is checked against
 itself.
 
-The `e2e` example needs a cluster with an RPC proxy, which the stock Docker
+The `rpc_e2e` example needs a cluster with an RPC proxy, which the stock Docker
 local cluster does not have: it runs with `--rpc-proxy-count 0`. The example's
 own documentation gives the `docker run` that does.

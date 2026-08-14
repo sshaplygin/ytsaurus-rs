@@ -1283,7 +1283,7 @@ at, and that is the first thing a production deployment needs.
 
 ### The cluster end-to-end test no longer needs Python
 
-- **Added** the `e2e` example, which runs all three checks
+- **Added** the `e2e` example (now named `client_e2e`), which runs all three checks
   `tests/e2e/run_e2e.sh` runs — `cat` as an identity map compared
   byte-for-byte, two input and two output tables with table switching, and a
   `wordcount` map-reduce against a hand-computed reference — through this

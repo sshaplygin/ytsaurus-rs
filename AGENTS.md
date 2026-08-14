@@ -88,7 +88,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ```sh
 ./scripts/init-protos.sh          # once after cloning: the .proto submodule, shallow and sparse
 
-cargo test --workspace            # 884 tests: 808 unit and integration, 76 doc
+cargo test --workspace            # 892 tests: 813 unit and integration, 79 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -99,7 +99,7 @@ cargo bench -p ytsaurus-yson      # codec microbenchmark
 cargo bench -p ytsaurus-job       # job-path throughput
 
 cd tests/rpc-go-interop && go test ./...   # regenerate the RPC wire-format vectors
-cargo run -p ytsaurus-rpc --example e2e    # RPC client against a live RPC proxy
+cargo run -p ytsaurus-rpc --example rpc_e2e # RPC client against a live RPC proxy
 
 # 2 GB streaming memory test (ignored by default)
 cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocapture
@@ -1309,7 +1309,7 @@ Three layers:
    (`tests/e2e/capture_fixtures.sh`), so it is not our reading of the spec checked
    against itself.
 3. **Cluster e2e** — against a local YTsaurus in Docker, two readings of the
-   same three checks. `cargo run -p ytsaurus-client --example e2e` drives them
+   same three checks. `cargo run -p ytsaurus-client --example client_e2e` drives them
    through this crate and needs no Python; `tests/e2e/run_e2e.sh` drives them
    through the official Python client and so checks the worker's output against
    a **different implementation** rather than against ourselves. Keep both — the

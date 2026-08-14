@@ -19,7 +19,7 @@
 //! Then:
 //!
 //! ```sh
-//! cargo run -p ytsaurus-rpc --example e2e
+//! cargo run -p ytsaurus-rpc --example rpc_e2e
 //! ```
 //!
 //! `YT_RPC_PROXY` overrides the address, `YT_TOKEN` supplies a token for a

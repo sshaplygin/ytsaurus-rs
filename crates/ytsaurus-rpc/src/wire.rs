@@ -46,6 +46,10 @@ pub const MAX_VALUES_PER_ROW: u64 = 1024;
 /// `MaxStringValueLength` and `MaxAnyValueLength` — both 16 MB.
 pub const MAX_VALUE_LENGTH: u32 = 16 * 1024 * 1024;
 
+/// One rowset is one RPC attachment, so it cannot exceed the protocol's
+/// `MaxMessagePartSize`.
+pub const MAX_ROWSET_SIZE: usize = crate::bus::packet::MAX_PART_SIZE as usize;
+
 /// `EValueType` — `yt/yt/client/table_client/row_base.h`.
 ///
 /// The numbering is not dense: the scalar types are 0x02..0x06 and the
@@ -194,6 +198,10 @@ pub enum WireError {
     TooManyValues { row: usize, count: u64 },
     #[error("value is {length} bytes, more than the {MAX_VALUE_LENGTH} allowed")]
     ValueTooLong { length: u32 },
+    #[error("rowset is {size} bytes, more than the {MAX_ROWSET_SIZE}-byte RPC attachment limit")]
+    RowsetTooLarge { size: usize },
+    #[error("could not reserve {size} bytes for a rowset")]
+    AllocationFailed { size: usize },
     #[error("unknown value type {0:#04x}")]
     UnknownValueType(u8),
     #[error("{0} bytes are left over after the last row")]
@@ -204,7 +212,7 @@ const fn padding_for(length: usize) -> usize {
     (ALIGNMENT - (length % ALIGNMENT)) % ALIGNMENT
 }
 
-/// The number of bytes [`encode_rowset`] will produce.
+/// The number of bytes [`encode_rowset`] will produce for a valid rowset.
 pub fn encoded_size(rows: &[MaybeRow]) -> usize {
     let mut size = ALIGNMENT;
     for row in rows {
@@ -219,30 +227,50 @@ pub fn encoded_size(rows: &[MaybeRow]) -> usize {
 /// Encodes a rowset into the wire format.
 ///
 /// Fails rather than emitting a rowset the server will reject or, worse,
-/// misread: the limits are checked here as well as on decode, because the
-/// length word is a `u32` and a blob larger than that would wrap silently.
-/// The Go writer validates the same three limits before producing a byte.
+/// misread: every limit is checked before allocating the output buffer. This
+/// matters because [`Bytes`] may share its backing storage: many values can
+/// name one 16 MiB buffer, while their encoded rowset would require far more
+/// memory. The Go writer validates the same three per-row limits before
+/// producing a byte; the attachment limit is this client's additional bound.
 pub fn encode_rowset(rows: &[MaybeRow]) -> Result<Bytes, WireError> {
-    let mut buffer = BytesMut::with_capacity(encoded_size(rows));
-    encode_rowset_into(rows, &mut buffer)?;
+    let size = validate_and_measure(rows)?;
+    // `BytesMut::with_capacity` aborts on allocation failure. Reserve through
+    // `Vec` instead, so an impossible rowset is returned as an ordinary error.
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(size)
+        .map_err(|_| WireError::AllocationFailed { size })?;
+    // `Bytes::from(Vec)` and then `BytesMut::from(Bytes)` preserve a unique
+    // vector's allocation without a copy.
+    let mut buffer = BytesMut::from(Bytes::from(storage));
+    encode_rowset_unchecked(rows, &mut buffer);
     Ok(buffer.freeze())
 }
 
 /// Encodes a rowset, appending to an existing buffer.
 ///
-/// On failure `out` may hold a partial rowset; callers that reuse a buffer
-/// should truncate it back themselves.
+/// Does not modify `out` when validation fails.
 pub fn encode_rowset_into(rows: &[MaybeRow], out: &mut BytesMut) -> Result<(), WireError> {
+    validate_and_measure(rows)?;
+
+    encode_rowset_unchecked(rows, out);
+    Ok(())
+}
+
+/// Validates all of the limits the writer relies on and returns the exact
+/// encoded length. It deliberately precedes every allocation in
+/// [`encode_rowset`].
+fn validate_and_measure(rows: &[MaybeRow]) -> Result<usize, WireError> {
     if rows.len() as u64 > MAX_ROWS_PER_ROWSET {
         return Err(WireError::TooManyRows {
             count: rows.len() as u64,
         });
     }
 
-    out.put_u64_le(rows.len() as u64);
+    let mut size = ALIGNMENT;
     for (index, row) in rows.iter().enumerate() {
+        add_to_rowset_size(&mut size, ALIGNMENT)?;
         let Some(row) = row else {
-            out.put_u64_le(NULL_ROW_MARKER);
             continue;
         };
         if row.len() as u64 > MAX_VALUES_PER_ROW {
@@ -251,15 +279,39 @@ pub fn encode_rowset_into(rows: &[MaybeRow], out: &mut BytesMut) -> Result<(), W
                 count: row.len() as u64,
             });
         }
-        out.put_u64_le(row.len() as u64);
         for value in row {
-            encode_value(value, out)?;
+            validate_value(value)?;
+            add_to_rowset_size(&mut size, value.wire_size())?;
         }
+    }
+    Ok(size)
+}
+
+fn add_to_rowset_size(size: &mut usize, additional: usize) -> Result<(), WireError> {
+    *size = size
+        .checked_add(additional)
+        .ok_or(WireError::RowsetTooLarge { size: usize::MAX })?;
+    if *size > MAX_ROWSET_SIZE {
+        return Err(WireError::RowsetTooLarge { size: *size });
     }
     Ok(())
 }
 
-fn encode_value(value: &UnversionedValue, out: &mut BytesMut) -> Result<(), WireError> {
+fn encode_rowset_unchecked(rows: &[MaybeRow], out: &mut BytesMut) {
+    out.put_u64_le(rows.len() as u64);
+    for row in rows {
+        let Some(row) = row else {
+            out.put_u64_le(NULL_ROW_MARKER);
+            continue;
+        };
+        out.put_u64_le(row.len() as u64);
+        for value in row {
+            encode_value_unchecked(value, out);
+        }
+    }
+}
+
+fn validate_value(value: &UnversionedValue) -> Result<(), WireError> {
     let blob = value.value.blob();
     if let Some(blob) = blob
         && blob.len() as u64 > u64::from(MAX_VALUE_LENGTH)
@@ -272,6 +324,11 @@ fn encode_value(value: &UnversionedValue, out: &mut BytesMut) -> Result<(), Wire
             length: blob.len().min(u32::MAX as usize) as u32,
         });
     }
+    Ok(())
+}
+
+fn encode_value_unchecked(value: &UnversionedValue, out: &mut BytesMut) {
+    let blob = value.value.blob();
 
     out.put_u16_le(value.id);
     out.put_u8(value.value.value_type() as u8);
@@ -289,7 +346,6 @@ fn encode_value(value: &UnversionedValue, out: &mut BytesMut) -> Result<(), Wire
         // non-deterministic and the golden vectors meaningless.
         out.put_bytes(0, padding_for(blob.len()));
     }
-    Ok(())
 }
 
 /// Decodes a rowset from the wire format.
@@ -762,6 +818,57 @@ mod tests {
                 length: MAX_VALUE_LENGTH + 1
             })
         );
+    }
+
+    /// A [`Bytes`] clone shares its allocation, so this input holds one 16 MiB
+    /// blob while a naive pre-allocation would ask for more than 16 GiB. The
+    /// value-count check must therefore happen before sizing the output.
+    #[test]
+    fn too_many_shared_large_values_are_refused_before_allocation() {
+        let shared = Bytes::from(vec![0; MAX_VALUE_LENGTH as usize]);
+        let row = (0..=MAX_VALUES_PER_ROW)
+            .map(|_| UnversionedValue::new(0, Value::String(shared.clone())))
+            .collect::<Row>();
+
+        assert_eq!(
+            encode_rowset(&[Some(row)]),
+            Err(WireError::TooManyValues {
+                row: 0,
+                count: MAX_VALUES_PER_ROW + 1,
+            })
+        );
+    }
+
+    /// The row itself is legal, but its attachment is not. Without the
+    /// aggregate check this has one 16 MiB allocation on input and attempts a
+    /// one-gibibyte output allocation before packet framing rejects it.
+    #[test]
+    fn a_rowset_larger_than_one_rpc_attachment_is_refused_before_allocation() {
+        let shared = Bytes::from(vec![0; MAX_VALUE_LENGTH as usize]);
+        let row = (0..65)
+            .map(|_| UnversionedValue::new(0, Value::String(shared.clone())))
+            .collect::<Row>();
+
+        assert!(matches!(
+            encode_rowset(&[Some(row)]),
+            Err(WireError::RowsetTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rejected_encode_does_not_append_a_partial_rowset() {
+        let mut output = BytesMut::from(&b"prefix"[..]);
+        let rows = vec![Some(
+            (0..=MAX_VALUES_PER_ROW as u16)
+                .map(|id| UnversionedValue::new(id, Value::Int64(0)))
+                .collect::<Row>(),
+        )];
+
+        assert!(matches!(
+            encode_rowset_into(&rows, &mut output),
+            Err(WireError::TooManyValues { .. })
+        ));
+        assert_eq!(&output[..], b"prefix");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use prost::Message;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::bus::packet::{Packet, PacketFlags, PacketType};
 use crate::bus::{Bus, BusReader, BusWriter};
@@ -28,19 +28,21 @@ use crate::rpc::{self, ResponseMessage};
 /// How many outbound messages may be queued before senders wait.
 const OUTBOUND_QUEUE: usize = 64;
 
+/// How many calls may be in flight on one connection.
+///
+/// An outbound queue bounds packets the writer has not picked up yet, but not
+/// requests the proxy has accepted and has not answered. This is the latter
+/// bound: one permit lives from registration through the response, or through
+/// the cancellation packet's write when the caller goes away.
+const MAX_IN_FLIGHT: usize = 256;
+
 /// How many cancellations may be queued.
 ///
-/// Cancellations travel on their own channel, and the writer takes them first.
-/// Sharing the request queue made cancellation fail exactly when it matters: a
-/// full queue is what makes calls time out, and a cancellation posted with
-/// `try_send` into a full queue is dropped. Measured before this existed, 72
-/// requests reached a stalled proxy and not one cancellation followed them.
-///
-/// Small, because a cancellation is a few dozen bytes and one per in-flight
-/// request is the worst case that matters. It cannot help when the *socket*
-/// itself is blocked — nothing can be written then — but that is a narrower
-/// case than a backed-up queue.
-const CANCEL_QUEUE: usize = 256;
+/// A cancellation owns its call's in-flight permit until the writer has sent
+/// it. Consequently at most [`MAX_IN_FLIGHT`] can exist, so this channel can
+/// never fill while a new cancellation still needs a slot. The writer takes it
+/// first; a request backlog therefore cannot prevent cancellation.
+const CANCEL_QUEUE: usize = MAX_IN_FLIGHT;
 
 /// The callers waiting for responses, and whether the connection is still
 /// usable.
@@ -66,6 +68,24 @@ impl Waiters {
 }
 
 type Pending = Arc<Mutex<Waiters>>;
+type InFlight = Arc<Semaphore>;
+
+/// A protocol cancellation waiting for the writer.
+///
+/// The permit is deliberately carried with the packet rather than released by
+/// [`PendingGuard::drop`]. Releasing it at enqueue time permits a new call to
+/// time out and overflow this queue while an old cancellation is blocked on
+/// the socket.
+#[derive(Debug)]
+struct Cancellation {
+    packet: Packet,
+    _permit: OwnedSemaphorePermit,
+}
+
+enum Outgoing {
+    Request(Packet),
+    Cancellation(Cancellation),
+}
 
 /// A live connection to one RPC proxy.
 ///
@@ -77,8 +97,9 @@ type Pending = Arc<Mutex<Waiters>>;
 #[derive(Debug)]
 pub struct Connection {
     outbound: mpsc::Sender<Packet>,
-    cancels: mpsc::Sender<Packet>,
+    cancels: mpsc::Sender<Cancellation>,
     pending: Pending,
+    in_flight: InFlight,
     address: String,
     token: Option<String>,
     closed: Arc<AtomicBool>,
@@ -107,6 +128,7 @@ impl Connection {
     fn from_bus(bus: Bus, address: String, token: Option<String>) -> Self {
         let Bus { reader, writer, .. } = bus;
         let pending: Pending = Arc::default();
+        let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let closed = Arc::new(AtomicBool::new(false));
         let (outbound, outbound_receiver) = mpsc::channel(OUTBOUND_QUEUE);
         let (cancels, cancel_receiver) = mpsc::channel(CANCEL_QUEUE);
@@ -116,15 +138,21 @@ impl Connection {
             outbound_receiver,
             cancel_receiver,
             Arc::clone(&pending),
+            Arc::clone(&in_flight),
             Arc::clone(&closed),
         ));
-        let reader_task =
-            tokio::spawn(read_loop(reader, Arc::clone(&pending), Arc::clone(&closed)));
+        let reader_task = tokio::spawn(read_loop(
+            reader,
+            Arc::clone(&pending),
+            Arc::clone(&in_flight),
+            Arc::clone(&closed),
+        ));
 
         Self {
             outbound,
             cancels,
             pending,
+            in_flight,
             address,
             token,
             closed,
@@ -191,6 +219,25 @@ impl Connection {
             timeout: timeout.unwrap_or_default(),
         };
 
+        // This belongs inside the call's deadline just as the outbound queue
+        // does. Otherwise a full in-flight set would recreate the unbounded
+        // wait the semaphore exists to prevent.
+        let permit = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, Arc::clone(&self.in_flight).acquire_owned())
+                    .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return Err(Error::ConnectionClosed { request_id }),
+                    Err(_) => return Err(timed_out()),
+                }
+            }
+            None => Arc::clone(&self.in_flight)
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::ConnectionClosed { request_id })?,
+        };
+
         let (sender, receiver) = oneshot::channel();
         {
             let mut waiters = self.pending.lock().await;
@@ -215,6 +262,7 @@ impl Connection {
             method: method.to_owned(),
             completed: false,
             sent: false,
+            permit: Some(permit),
         };
 
         let parts = rpc::encode_request(&header, self.token.as_deref(), body, attachments);
@@ -280,7 +328,7 @@ impl Connection {
 /// remove and nothing to cancel.
 struct PendingGuard {
     pending: Pending,
-    cancels: mpsc::Sender<Packet>,
+    cancels: mpsc::Sender<Cancellation>,
     request_id: Guid,
     service: String,
     method: String,
@@ -291,6 +339,8 @@ struct PendingGuard {
     /// otherwise would send a cancellation for a request id the server has
     /// never seen.
     sent: bool,
+    /// Held until the call finishes, or moved into its cancellation packet.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PendingGuard {
@@ -336,21 +386,37 @@ impl Drop for PendingGuard {
             return;
         }
 
-        // Non-blocking, because dropping a future must not block — but onto
-        // the cancellation channel, which the writer drains first and which the
-        // request backlog cannot fill.
+        // Non-blocking, because dropping a future must not block. The permit
+        // moves with the packet and is released only after the writer handles
+        // it, so a full cancellation queue is impossible while a guard still
+        // owns a permit to turn into another cancellation.
         let parts = rpc::encode_cancelation(request_id, &self.service, &self.method);
-        let _ = self
-            .cancels
-            .try_send(Packet::message(Guid::random(), parts, PacketFlags::NONE));
+        let cancellation = Cancellation {
+            packet: Packet::message(Guid::random(), parts, PacketFlags::NONE),
+            _permit: self
+                .permit
+                .take()
+                .expect("every unfinished call holds an in-flight permit"),
+        };
+        match self.cancels.try_send(cancellation) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            // With one permit in every queued cancellation and a channel as
+            // large as the semaphore, `Full` cannot occur. Keep Drop
+            // non-panicking even if a future maintenance change breaks that
+            // invariant; debug builds still flag it immediately.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug_assert!(false, "cancellation queue exceeded in-flight limit");
+            }
+        }
     }
 }
 
 async fn write_loop(
     mut writer: BusWriter,
     mut outbound: mpsc::Receiver<Packet>,
-    mut cancels: mpsc::Receiver<Packet>,
+    mut cancels: mpsc::Receiver<Cancellation>,
     pending: Pending,
+    in_flight: InFlight,
     closed: Arc<AtomicBool>,
 ) {
     loop {
@@ -358,22 +424,32 @@ async fn write_loop(
         // frees work the proxy is doing for nobody, so it is worth more than
         // the request behind it, and under load there is always a request
         // behind it.
-        let packet = tokio::select! {
+        let outgoing = tokio::select! {
             biased;
-            Some(packet) = cancels.recv() => packet,
-            Some(packet) = outbound.recv() => packet,
+            Some(cancellation) = cancels.recv() => Outgoing::Cancellation(cancellation),
+            Some(packet) = outbound.recv() => Outgoing::Request(packet),
             else => break,
         };
-        if writer.send(&packet).await.is_err() {
+        let packet = match &outgoing {
+            Outgoing::Request(packet) => packet,
+            Outgoing::Cancellation(cancellation) => &cancellation.packet,
+        };
+        if writer.send(packet).await.is_err() {
             break;
         }
     }
     closed.store(true, Ordering::Relaxed);
+    in_flight.close();
     pending.lock().await.close();
     let _ = writer.shutdown().await;
 }
 
-async fn read_loop(mut reader: BusReader, pending: Pending, closed: Arc<AtomicBool>) {
+async fn read_loop(
+    mut reader: BusReader,
+    pending: Pending,
+    in_flight: InFlight,
+    closed: Arc<AtomicBool>,
+) {
     loop {
         let packet = match reader.receive().await {
             Ok(packet) => packet,
@@ -400,6 +476,7 @@ async fn read_loop(mut reader: BusReader, pending: Pending, closed: Arc<AtomicBo
     }
 
     closed.store(true, Ordering::Relaxed);
+    in_flight.close();
     // The reader is what delivers every response, so once it stops the
     // connection is finished: waiters are woken with an error, and later calls
     // are refused rather than parked for ever.
@@ -1019,19 +1096,20 @@ mod tests {
     /// construction left every other test in the crate green.
     #[tokio::test]
     async fn the_guard_cancels_only_what_it_actually_sent() {
-        async fn drain(receiver: &mut mpsc::Receiver<Packet>) -> Vec<Packet> {
+        async fn drain(receiver: &mut mpsc::Receiver<Cancellation>) -> Vec<Packet> {
             // The guard defers its work to the runtime, so give it a turn.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let mut packets = Vec::new();
-            while let Ok(packet) = receiver.try_recv() {
-                packets.push(packet);
+            while let Ok(cancellation) = receiver.try_recv() {
+                packets.push(cancellation.packet);
             }
             packets
         }
 
         fn guard(
             pending: &Pending,
-            cancels: &mpsc::Sender<Packet>,
+            cancels: &mpsc::Sender<Cancellation>,
+            in_flight: &InFlight,
             request_id: Guid,
             sent: bool,
         ) -> PendingGuard {
@@ -1043,22 +1121,28 @@ mod tests {
                 method: "LookupRows".to_owned(),
                 completed: false,
                 sent,
+                permit: Some(
+                    Arc::clone(in_flight)
+                        .try_acquire_owned()
+                        .expect("the test never holds more than one permit"),
+                ),
             }
         }
 
         let pending: Pending = Arc::default();
-        let (outbound, mut receiver) = mpsc::channel(16);
+        let in_flight = Arc::new(Semaphore::new(1));
+        let (cancels, mut receiver) = mpsc::channel(16);
         let request_id = Guid::random();
 
         // Never queued: nothing may go out.
-        drop(guard(&pending, &outbound, request_id, false));
+        drop(guard(&pending, &cancels, &in_flight, request_id, false));
         assert!(
             drain(&mut receiver).await.is_empty(),
             "cancelled a request the proxy never received"
         );
 
         // Queued: the cancellation must name exactly that request.
-        drop(guard(&pending, &outbound, request_id, true));
+        drop(guard(&pending, &cancels, &in_flight, request_id, true));
         let sent_packets = drain(&mut receiver).await;
         assert_eq!(sent_packets.len(), 1, "expected exactly one cancellation");
         let part = sent_packets[0].parts[0].as_ref().unwrap();
@@ -1067,13 +1151,128 @@ mod tests {
         assert_eq!(Guid::from_proto(&header.request_id), request_id);
 
         // Completed: the answer is in hand, so neither removal nor cancellation.
-        let mut done = guard(&pending, &outbound, request_id, true);
+        let mut done = guard(&pending, &cancels, &in_flight, request_id, true);
         done.complete();
         drop(done);
         assert!(
             drain(&mut receiver).await.is_empty(),
             "cancelled a call that had already returned"
         );
+    }
+
+    /// Every cancellation keeps the permit until the writer consumes it. If
+    /// permits were released by `PendingGuard::drop`, a permanently blocked
+    /// writer would eventually fill this queue and later `try_send`s would be
+    /// silently lost.
+    #[tokio::test]
+    async fn every_in_flight_call_has_room_for_its_cancellation() {
+        let pending: Pending = Arc::default();
+        let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+        let (cancels, mut receiver) = mpsc::channel(CANCEL_QUEUE);
+
+        for _ in 0..MAX_IN_FLIGHT {
+            let guard = PendingGuard {
+                pending: Arc::clone(&pending),
+                cancels: cancels.clone(),
+                request_id: Guid::random(),
+                service: rpc::API_SERVICE.to_owned(),
+                method: "LookupRows".to_owned(),
+                completed: false,
+                sent: true,
+                permit: Some(
+                    Arc::clone(&in_flight)
+                        .try_acquire_owned()
+                        .expect("the loop takes every permit exactly once"),
+                ),
+            };
+            drop(guard);
+        }
+
+        assert_eq!(receiver.len(), MAX_IN_FLIGHT);
+        assert!(
+            Arc::clone(&in_flight).try_acquire_owned().is_err(),
+            "a queued cancellation must retain its call's permit"
+        );
+
+        // Removing one cancellation also releases one permit, so the next
+        // call will have both an in-flight slot and a cancellation slot.
+        drop(receiver.recv().await.expect("the first cancellation"));
+        assert!(
+            Arc::clone(&in_flight).try_acquire_owned().is_ok(),
+            "the consumed cancellation did not release its permit"
+        );
+    }
+
+    /// The pending map holds only callers that have acquired a permit. An
+    /// outbound channel alone cannot provide this property: its writer can
+    /// drain all packets while a proxy answers none.
+    #[tokio::test]
+    async fn the_in_flight_limit_bounds_pending_waiters() {
+        let (outbound, _outbound_receiver) = mpsc::channel(MAX_IN_FLIGHT);
+        let (cancels, _cancel_receiver) = mpsc::channel(CANCEL_QUEUE);
+        let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+        let connection = Connection {
+            outbound,
+            cancels,
+            pending: Arc::default(),
+            in_flight: Arc::clone(&in_flight),
+            address: "test".to_owned(),
+            token: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            reader_task: tokio::spawn(std::future::pending()),
+        };
+        let request = proto::api::TReqPingTransaction {
+            transaction_id: Guid::random().to_proto(),
+            ..Default::default()
+        };
+        let mut calls = Vec::with_capacity(MAX_IN_FLIGHT);
+
+        for _ in 0..MAX_IN_FLIGHT {
+            let mut call = Box::pin(connection.invoke_raw(
+                rpc::API_SERVICE,
+                "PingTransaction",
+                &request,
+                Vec::new(),
+                None,
+                None,
+            ));
+            tokio::select! {
+                biased;
+                _ = call.as_mut() => panic!("the test connection cannot answer"),
+                _ = tokio::task::yield_now() => {}
+            }
+            calls.push(call);
+        }
+        assert_eq!(
+            connection.pending.lock().await.by_request.len(),
+            MAX_IN_FLIGHT
+        );
+
+        let mut overflow = Box::pin(connection.invoke_raw(
+            rpc::API_SERVICE,
+            "PingTransaction",
+            &request,
+            Vec::new(),
+            None,
+            None,
+        ));
+        tokio::select! {
+            biased;
+            _ = overflow.as_mut() => panic!("the overflow call cannot complete"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(
+            connection.pending.lock().await.by_request.len(),
+            MAX_IN_FLIGHT,
+            "a call waiting for capacity must not register another waiter"
+        );
+        assert!(
+            Arc::clone(&in_flight).try_acquire_owned().is_err(),
+            "all in-flight permits should be held by the registered calls"
+        );
+
+        drop(overflow);
+        drop(calls);
     }
 
     /// The same rule, but through `invoke_raw` — which is where the flag is
@@ -1094,6 +1293,7 @@ mod tests {
             outbound,
             cancels,
             pending: Arc::default(),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             address: "test".to_owned(),
             token: None,
             closed: Arc::new(AtomicBool::new(false)),

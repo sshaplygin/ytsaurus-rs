@@ -16,7 +16,7 @@ published, and the gates below are not all green.
 | --- | --- | --- |
 | `.proto` files | ytsaurus/ytsaurus `stable/25.4` @ `c91fcbe2cd0b9bf8a2fbae078885b9d423f22b62` | `third_party/ytsaurus` submodule |
 | Reference implementation for vectors | Go SDK `yt/go` v0.0.33 | `tests/rpc-go-interop/go.mod` |
-| Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server `25.4.260522002` | recorded here; the run is `crates/ytsaurus-rpc/examples/e2e.rs`, which is not in CI |
+| Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server `25.4.260522002` | recorded here; the run is `crates/ytsaurus-rpc/examples/rpc_e2e.rs`, which is not in CI |
 
 The protos are a **submodule, not a copy**. A submodule records an exact
 upstream commit, so the definitions are pinned the way protocol work needs
@@ -60,6 +60,7 @@ table and vectors.
 | `TError` with nesting and attributes preserved | Implemented | `nesting_survives_the_conversion` |
 | Protocol-level cancellation (`rpcc`) | Implemented, sent when a call times out | `a_timeout_reports_the_method_and_cancels_the_request` |
 | Timeouts, in the header and locally | Implemented, and the two agree | Same test |
+| In-flight calls and cancellations | Bounded at 256 per connection; cancellation retains its slot until the writer handles it | Connection unit tests |
 | Token auth via `TCredentialsExt` (field 110) | Implemented | `the_token_is_appended_as_extension_field_110` |
 | Compression codecs | **Not implemented** — `ECodec::None` only, and the header says so | — |
 | Streaming payload / feedback messages | **Not implemented** | — |
@@ -92,6 +93,7 @@ ordinary field with a reserved number — and a test decodes the bytes back to a
 | Null row vs empty row | Implemented, kept distinct | `the_null_row_survives_the_reference_bytes` |
 | 8-byte alignment and padding | Implemented | Every length 0..24 is walked |
 | Aggregate flag | Carried through | `the_aggregate_flag_survives` |
+| Aggregate rowset size | Refused above the 1 GiB RPC attachment limit before allocation | `a_rowset_larger_than_one_rpc_attachment_is_refused_before_allocation` |
 | Versioned rowsets | **Not implemented** — only on concrete need | — |
 | Row-stream block envelope | **Not implemented** — not used by these methods; see below | — |
 
@@ -142,7 +144,7 @@ pre-release.
   encoder is unexported, so closing this properly means capturing bytes off a
   real proxy and keeping them as fixtures.
 - **B — a live proxy accepts what this writes and this reads what it sends.**
-  *Green.* `cargo run -p ytsaurus-rpc --example e2e` writes, looks up, selects
+  *Green.* `cargo run -p ytsaurus-rpc --example rpc_e2e` writes, looks up, selects
   and deletes on a real cluster. Not in CI: it needs a multi-GB image and an
   RPC-enabled cluster.
 - **C — a differential test against the reference driver.** *Not started.* The
@@ -181,5 +183,5 @@ pre-release.
 ./scripts/init-protos.sh                       # once, after cloning
 cargo test -p ytsaurus-rpc                     # unit tests + golden vectors
 cd tests/rpc-go-interop && go test ./...       # regenerate the vectors
-cargo run -p ytsaurus-rpc --example e2e        # against a live RPC proxy
+cargo run -p ytsaurus-rpc --example rpc_e2e    # against a live RPC proxy
 ```
