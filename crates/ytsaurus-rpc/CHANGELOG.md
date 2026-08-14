@@ -60,6 +60,29 @@ Recorded in full in [docs/rpc-compatibility.md](../../docs/rpc-compatibility.md)
   each service's descriptor, so it is derivable from the sources — but it is
   stated nowhere as a rule, and a live proxy is what surfaced it here.
 
+### Found by independent review, before any of this shipped
+
+Four reviewers read the crate against the C++ and Go sources without having
+written any of it. The protocol itself came back clean — every byte offset,
+enum value, alignment rule and API field checked and sound. What they found was
+around it, and all of it is fixed here:
+
+- **Two ways a call could wait for ever.** A deadline did not cover queuing the
+  request, so a peer that stopped reading left calls stuck far past their
+  timeout — 134 of 200 in the test that found it. And once the reader task
+  died, which a single corrupt packet is enough to cause, later calls were
+  still queued and then waited for a reply nobody remained to route. Both are
+  regression-tested in `connection_failure_modes.rs`.
+- **The encoder trusted what the decoder checks**, writing the value length with
+  `as u32` and enforcing none of the three rowset limits, so an oversized blob
+  wrapped the length word into a silently corrupt stream.
+- **Connect and handshake had no deadline**, so a proxy that accepted a
+  connection and then said nothing parked the caller indefinitely.
+- **Four tests could not fail**, including two that hung rather than failing
+  when no cancellation was sent — in CI, indistinguishable from a stuck runner.
+- **The four methods the crate exists for had no request coverage.** Request
+  building is now separate from calling, and each field is asserted.
+
 ### Not implemented
 
 TLS, compression codecs, versioned rowsets, streaming reads and writes, retry
