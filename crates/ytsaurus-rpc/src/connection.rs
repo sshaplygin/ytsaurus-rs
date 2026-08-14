@@ -115,26 +115,31 @@ impl Connection {
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().await.insert(request_id, sender);
 
-        // From here on every exit path must remove the entry, or the map grows
-        // without bound on a connection that outlives many failures.
-        let guard = PendingGuard {
+        // Armed from here on. However this function leaves — returning, or the
+        // caller dropping the future part-way — the guard removes the pending
+        // entry and tells the server to stop working on a result nobody will
+        // read.
+        let mut guard = PendingGuard {
             pending: Arc::clone(&self.pending),
+            outbound: Some(self.outbound.clone()),
             request_id,
-            armed: true,
+            service: service.to_owned(),
+            method: method.to_owned(),
         };
 
         let parts = rpc::encode_request(&header, self.token.as_deref(), body, attachments);
         let packet = Packet::message(Guid::random(), parts, PacketFlags::NONE);
         if self.outbound.send(packet).await.is_err() {
+            guard.disarm();
             return Err(Error::ConnectionClosed { request_id });
         }
 
         let response = match timeout {
             Some(limit) => match tokio::time::timeout(limit, receiver).await {
                 Ok(received) => received,
+                // Dropping the guard sends the cancellation, so the timeout
+                // path needs nothing of its own.
                 Err(_) => {
-                    // The server is still working on it; tell it to stop.
-                    self.cancel(request_id, service, method);
                     return Err(Error::Timeout {
                         service: service.to_owned(),
                         method: method.to_owned(),
@@ -148,46 +153,53 @@ impl Connection {
         let response = match response {
             Ok(response) => response,
             // The sender was dropped, which only happens when the reader task
-            // ended — the connection is gone.
-            Err(_) => return Err(Error::ConnectionClosed { request_id }),
+            // ended — the connection is gone, and there is nothing to cancel.
+            Err(_) => {
+                guard.disarm();
+                return Err(Error::ConnectionClosed { request_id });
+            }
         };
-        drop(guard);
+        // The answer is in hand: nothing to remove and nothing to cancel.
+        guard.disarm();
 
         if let Some(error) = response.error() {
-            return Err(Error::Response {
-                service: service.to_owned(),
-                method: method.to_owned(),
-                error,
-            });
+            return Err(Error::response(service, method, error));
         }
         Ok(response)
     }
-
-    /// Sends a protocol-level cancellation for an in-flight request.
-    ///
-    /// Best-effort and non-blocking: if the outbound queue is full or the
-    /// connection is gone there is nothing useful to do, and the caller is
-    /// already on an error path.
-    fn cancel(&self, request_id: Guid, service: &str, method: &str) {
-        let parts = rpc::encode_cancelation(request_id, service, method);
-        let packet = Packet::message(Guid::random(), parts, PacketFlags::NONE);
-        let _ = self.outbound.try_send(packet);
-    }
 }
 
-/// Removes a request from the pending map however its future ends, including
-/// when it is dropped part-way.
+/// Cleans up after an in-flight request however its future ends — including
+/// when the caller drops it part-way.
+///
+/// Two jobs. It removes the entry from the pending map, or the map grows
+/// without bound on a long-lived connection. And it sends the protocol's
+/// cancellation, because **cancellation is protocol-level**: a client that
+/// merely stops waiting leaves the proxy computing a result nobody will read,
+/// which is exactly the cost this crate exists to avoid.
+///
+/// Disarmed once the response is in hand, since there is then nothing to remove
+/// and nothing to cancel.
 struct PendingGuard {
     pending: Pending,
+    outbound: Option<mpsc::Sender<Packet>>,
     request_id: Guid,
-    armed: bool,
+    service: String,
+    method: String,
+}
+
+impl PendingGuard {
+    fn disarm(&mut self) {
+        self.outbound = None;
+    }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        let Some(outbound) = self.outbound.take() else {
             return;
-        }
+        };
+
         let pending = Arc::clone(&self.pending);
         let request_id = self.request_id;
         // `Drop` cannot await, so the removal is handed to the runtime. It is
@@ -195,6 +207,12 @@ impl Drop for PendingGuard {
         tokio::spawn(async move {
             pending.lock().await.remove(&request_id);
         });
+
+        // Best-effort and non-blocking: if the queue is full or the connection
+        // is gone there is nothing useful to do, and dropping a future must not
+        // block.
+        let parts = rpc::encode_cancelation(request_id, &self.service, &self.method);
+        let _ = outbound.try_send(Packet::message(Guid::random(), parts, PacketFlags::NONE));
     }
 }
 
@@ -568,6 +586,86 @@ mod tests {
         assert!(
             matches!(error, Error::ConnectionClosed { .. }),
             "got {error}"
+        );
+    }
+
+    /// Dropping a call must tell the server to stop, not just stop listening.
+    /// A client that only stops waiting leaves the proxy computing a result
+    /// nobody will read — the exact cost this crate exists to avoid — which is
+    /// why `TRequestHeader` has an `uncancelable` flag at all.
+    #[tokio::test]
+    async fn dropping_a_call_cancels_it_on_the_wire() {
+        let mut stub = stub_proxy(|_| None).await;
+        let connection = Connection::connect(&stub.address, None).await.unwrap();
+
+        let request = proto::api::TReqSelectRows {
+            query: "* from [//tmp/t]".to_owned(),
+            ..Default::default()
+        };
+        {
+            let call = connection.invoke::<proto::api::TRspSelectRows>(
+                "SelectRows",
+                &request,
+                Vec::new(),
+                // No timeout: the drop is what has to do the cancelling.
+                None,
+                "TRspSelectRows",
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), call).await;
+        }
+
+        let sent = stub.seen.recv().await.expect("the request");
+        let header_part = sent.parts[0].as_ref().unwrap();
+        assert_eq!(&header_part[0..4], b"rpci");
+        let header = proto::rpc::TRequestHeader::decode(&header_part[4..]).unwrap();
+        let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
+
+        let cancelation = stub
+            .seen
+            .recv()
+            .await
+            .expect("dropping the future must send a cancellation");
+        let part = cancelation.parts[0].as_ref().unwrap();
+        assert_eq!(&part[0..4], b"rpcc");
+        let cancel_header = proto::rpc::TRequestCancelationHeader::decode(&part[4..]).unwrap();
+        assert_eq!(Guid::from_proto(&cancel_header.request_id), request_id);
+        assert_eq!(cancel_header.method, "SelectRows");
+    }
+
+    /// A completed call must NOT be cancelled: the answer is already in hand,
+    /// and a stray cancellation for a finished request is noise on the wire.
+    #[tokio::test]
+    async fn a_completed_call_sends_no_cancellation() {
+        let mut stub = stub_proxy(|header| {
+            let request_id = Guid::from_proto(header.request_id.as_ref().unwrap());
+            Some(success_reply(
+                request_id,
+                &proto::api::TRspPingTransaction::default(),
+            ))
+        })
+        .await;
+
+        let connection = Connection::connect(&stub.address, None).await.unwrap();
+        let request = proto::api::TReqPingTransaction {
+            transaction_id: Guid::random().to_proto(),
+            ..Default::default()
+        };
+        connection
+            .invoke::<proto::api::TRspPingTransaction>(
+                "PingTransaction",
+                &request,
+                Vec::new(),
+                None,
+                "TRspPingTransaction",
+            )
+            .await
+            .unwrap();
+
+        let _request = stub.seen.recv().await.expect("the request");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            stub.seen.try_recv().is_err(),
+            "a completed call must not be followed by a cancellation"
         );
     }
 

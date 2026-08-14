@@ -119,12 +119,16 @@ impl std::error::Error for YtError {}
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The server answered, and the answer was a failure.
+    ///
+    /// Boxed: a `YtError` carries a whole error tree with its attributes, and
+    /// leaving it inline would make every `Result` in the crate the size of the
+    /// largest failure it can report.
     #[error("{service}.{method} failed: {error}")]
     Response {
         service: String,
         method: String,
         #[source]
-        error: YtError,
+        error: Box<YtError>,
     },
 
     /// The bytes on the connection were not a well-formed packet.
@@ -179,6 +183,15 @@ impl Error {
         match self {
             Self::Response { error, .. } => Some(error),
             _ => None,
+        }
+    }
+
+    /// Builds a response failure.
+    pub(crate) fn response(service: &str, method: &str, error: YtError) -> Self {
+        Self::Response {
+            service: service.to_owned(),
+            method: method.to_owned(),
+            error: Box::new(error),
         }
     }
 
@@ -291,15 +304,15 @@ mod tests {
 
     #[test]
     fn has_code_reaches_through_the_crate_error() {
-        let error = Error::Response {
-            service: "ApiService".to_owned(),
-            method: "LookupRows".to_owned(),
-            error: YtError::from_proto(&proto_error(
+        let error = Error::response(
+            "ApiService",
+            "LookupRows",
+            YtError::from_proto(&proto_error(
                 1,
                 "outer",
                 vec![proto_error(codes::NO_SUCH_TRANSACTION, "gone", vec![])],
             )),
-        };
+        );
         assert!(error.has_code(codes::NO_SUCH_TRANSACTION));
         assert!(!error.has_code(codes::TIMEOUT));
         assert!(error.yt_error().is_some());
