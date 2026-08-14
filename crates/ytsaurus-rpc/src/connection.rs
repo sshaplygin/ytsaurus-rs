@@ -211,6 +211,8 @@ impl Drop for PendingGuard {
         // Best-effort and non-blocking: if the queue is full or the connection
         // is gone there is nothing useful to do, and dropping a future must not
         // block.
+        // MUTANT: cancellation never sent.
+        if true { return; }
         let parts = rpc::encode_cancelation(request_id, &self.service, &self.method);
         let _ = outbound.try_send(Packet::message(Guid::random(), parts, PacketFlags::NONE));
     }
