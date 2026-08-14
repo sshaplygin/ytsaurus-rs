@@ -1,0 +1,4 @@
+# a byte string that is not valid UTF-8 -- YT columns are byte strings
+# Produced by the Go SDK v0.0.33; do not hand-edit.
+01000000000000000100000000000000
+0000100004000000fffe008000000000

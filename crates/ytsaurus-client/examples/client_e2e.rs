@@ -1,4 +1,4 @@
-//! `e2e` — everything `tests/e2e/run_e2e.sh` checks, with no Python involved.
+//! `client_e2e` — everything `tests/e2e/run_e2e.sh` checks, with no Python involved.
 //!
 //! The shell script needs the `yt` CLI, which means a Python installation, which
 //! is the one thing this stack exists to avoid. Every command it sends has a
@@ -34,7 +34,7 @@
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
 //! scripts/build-worker.sh cat wordcount
-//! cargo run -p ytsaurus-client --example e2e
+//! cargo run -p ytsaurus-client --example client_e2e
 //! ```
 //!
 //! This binary is a *launcher*: it runs on your machine, built for the host. The

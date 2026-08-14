@@ -1,0 +1,4 @@
+# a null row followed by a row with no values -- the two must not encode alike
+# Produced by the Go SDK v0.0.33; do not hand-edit.
+0200000000000000ffffffffffffffff
+0000000000000000

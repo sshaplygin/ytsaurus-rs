@@ -7,6 +7,8 @@ members = [
     "crates/ytsaurus-job",
     "crates/ytsaurus-client",
     "crates/ytsaurus-helpers",
+    "crates/ytsaurus-proto",
+    "crates/ytsaurus-rpc",
 ]
 
 [workspace.package]
@@ -25,6 +27,8 @@ ytsaurus-format = { path = "crates/ytsaurus-format", version = "0.2.6" }
 ytsaurus-job = { path = "crates/ytsaurus-job", version = "0.2.6" }
 ytsaurus-client = { path = "crates/ytsaurus-client", version = "0.2.6" }
 ytsaurus-helpers = { path = "crates/ytsaurus-helpers", version = "0.2.6" }
+ytsaurus-proto = { path = "crates/ytsaurus-proto", version = "0.2.6" }
+ytsaurus-rpc = { path = "crates/ytsaurus-rpc", version = "0.2.6" }
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"

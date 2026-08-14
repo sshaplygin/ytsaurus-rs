@@ -21,8 +21,12 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, and published from 0.2.5 with `ytsaurus-skiff`, whose status it inherits. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
-| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one). |
+| `crates/ytsaurus-proto/` | Generated protobuf bindings for the RPC proxy, built from the upstream `.proto` files in the `third_party/ytsaurus` submodule — not from a copy. Pre-release, unpublished. |
+| `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope and the dynamic-table row wire format. **Async on tokio**, unlike everything above it. Pre-release, unpublished; see [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
+| `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one), [rpc-compatibility.md](docs/rpc-compatibility.md) (what the RPC client implements, every deliberate divergence from the reference clients, and the gates still open). |
 | `tests/e2e/` | Cluster scripts and captured golden fixtures. |
+| `tests/rpc-go-interop/` | Version-pinned Go program that *produces* byte vectors for the RPC row wire format and CRC-64, which the Rust tests consume. Same shape as `tests/skiff-go-interop/`. |
+| `third_party/ytsaurus` | Submodule: the YTsaurus monorepo, sparse-checked-out for its `.proto` files only. `./scripts/init-protos.sh`. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
 
 ## Fixed decisions — do not revisit without a human
@@ -69,15 +73,22 @@ repository builds the minimal stack — a YSON codec and a job runtime.
    one written by the people reimplementing it.
 4. Every change ends with green CI: `cargo fmt --check`, `cargo clippy
    --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
-5. **No scope creep.** RPC proxy, protobuf row format, dynamic tables, non-Linux
-   targets are out of scope until a human decides otherwise. *(Custom job
-   statistics were on this list until the backlog ranked them P1 #7; that is the
-   human decision, and they now ship as `JobStatistics`.)*
+5. **No scope creep.** Non-Linux targets are out of scope until a human decides
+   otherwise. *(Custom job statistics were on this list until the backlog ranked
+   them P1 #7; that is the human decision, and they now ship as `JobStatistics`.
+   **The RPC proxy, the protobuf row format and dynamic tables came off it the
+   same way** — a human asked for the RPC protocol to be implemented, and it
+   ships pre-release as `ytsaurus-rpc`. The scope there is deliberately narrow:
+   transactions, `lookup_rows`, `select_rows` and `modify_rows`, not the other
+   150 request types. What is in and what is out is
+   [docs/rpc-compatibility.md](docs/rpc-compatibility.md).)*
 
 ## Commands
 
 ```sh
-cargo test --workspace            # 759 tests: 685 unit and integration, 74 doc
+./scripts/init-protos.sh          # once after cloning: the .proto submodule, shallow and sparse
+
+cargo test --workspace            # 892 tests: 813 unit and integration, 79 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -86,6 +97,9 @@ cargo fmt --all
 
 cargo bench -p ytsaurus-yson      # codec microbenchmark
 cargo bench -p ytsaurus-job       # job-path throughput
+
+cd tests/rpc-go-interop && go test ./...   # regenerate the RPC wire-format vectors
+cargo run -p ytsaurus-rpc --example rpc_e2e # RPC client against a live RPC proxy
 
 # 2 GB streaming memory test (ignored by default)
 cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocapture
@@ -1295,7 +1309,7 @@ Three layers:
    (`tests/e2e/capture_fixtures.sh`), so it is not our reading of the spec checked
    against itself.
 3. **Cluster e2e** — against a local YTsaurus in Docker, two readings of the
-   same three checks. `cargo run -p ytsaurus-client --example e2e` drives them
+   same three checks. `cargo run -p ytsaurus-client --example client_e2e` drives them
    through this crate and needs no Python; `tests/e2e/run_e2e.sh` drives them
    through the official Python client and so checks the worker's output against
    a **different implementation** rather than against ourselves. Keep both — the
@@ -1443,8 +1457,10 @@ a local Docker cluster is enough for everything else.
 
 ## Non-goals
 
-RPC proxy (custom binary protocol), protobuf row format, dynamic tables,
-non-Linux targets. *(Custom job statistics were on this list until the backlog
+Non-Linux targets. *(The RPC proxy, the protobuf row format and dynamic tables
+were here until a human asked for them; `ytsaurus-rpc` implements a deliberately
+narrow slice of all three and is pre-release. Streaming table I/O over RPC, the
+gRPC proxy, chaos/replication, queues and Query Tracker remain non-goals.)* *(Custom job statistics were on this list until the backlog
 ranked them P1 #7 — a human decision, and they ship now as `JobStatistics`.
 Publishing to crates.io was on it too, and is now done, at 0.2.5, by the same
 kind of decision; Hard rule 1 still governs every release after it.)*

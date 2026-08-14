@@ -90,18 +90,20 @@ Two facts about that, both established against a cluster rather than assumed:
 Each of these is a decision already recorded in
 [AGENTS.md](../AGENTS.md); none is an oversight.
 
-**Dynamic tables** — `dynamic-table`, `ordered-dynamic-table`, and the data path
-of `query-tracker`. AGENTS.md, *Non-goals*: "RPC proxy (custom binary protocol),
-protobuf row format, **dynamic tables**, non-Linux targets, publishing to
-crates.io", and hard rule 5: "**No scope creep.** … out of scope until a human
-decides otherwise." An ordered table is a dynamic table without key columns, so
-both examples land inside the exclusion. `mount_table`, `insert_rows`,
-`select_rows` and `lookup_rows` are absent accordingly.
+**Dynamic tables over HTTP** — `dynamic-table`, `ordered-dynamic-table`, and the
+data path of `query-tracker`. These were excluded outright while the RPC proxy,
+the protobuf row format and dynamic tables were all non-goals. **That decision
+has since been made the other way**: `ytsaurus-rpc` implements `insert_rows`,
+`select_rows`, `lookup_rows` and `delete_rows` over the RPC proxy, pre-release,
+and [rpc-compatibility.md](rpc-compatibility.md) is its contract. What is still
+absent here is the *HTTP* path to those commands and the Cypress side of
+`mount_table`; `Client::raw_command` reaches both untyped in the meantime.
 
-**The discovery service** — `discovery-client`. Excluded by mechanism rather
-than by name: it does not speak HTTP at all, but the bus protocol with protobuf
-bodies, which is the "RPC proxy (custom binary protocol), protobuf row format"
-non-goal twice over.
+**The discovery service** — `discovery-client`. It does not speak HTTP at all,
+but the bus protocol with protobuf bodies, so it was excluded by mechanism from
+an HTTP client. `ytsaurus-rpc` now speaks that protocol and wraps
+`DiscoverProxies`; what remains absent is the standalone discovery-client
+surface, which is a different service from the proxy's.
 
 **Tracing** — `tracing`. The backlog ranked it P3 #15 with the note "only worth
 doing if a user asks". **One did**, it became the first item of the pinned

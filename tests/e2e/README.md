@@ -39,12 +39,12 @@ input and two output tables to exercise table switching, and finishes with a
 `wordcount` map-reduce checked against a hand-computed result.
 
 **The same three checks run without Python**, as
-[`examples/e2e.rs`](../../crates/ytsaurus-client/examples/e2e.rs):
+[`examples/client_e2e.rs`](../../crates/ytsaurus-client/examples/client_e2e.rs):
 
 ```sh
 export YT_PROXY=http://localhost:8000
 scripts/build-worker.sh cat wordcount
-cargo run -p ytsaurus-client --example e2e
+cargo run -p ytsaurus-client --example client_e2e
 ```
 
 Every command the script sends has a method on `Client` — `remove --recursive
@@ -62,7 +62,7 @@ can drive the cluster unaided; the shell script proves the *worker's* output is
 right according to a **different implementation** — the official Python client
 reading the same tables. A check that only ever agrees with itself is worth less
 than one that has to agree with somebody else, so `run_e2e.sh` stays as the
-independent reading, and `examples/e2e.rs` is what runs on a machine with no
+independent reading, and `examples/client_e2e.rs` is what runs on a machine with no
 Python.
 
 ### Dynamic Skiff map
@@ -114,7 +114,7 @@ Python on `PATH`:
 ```sh
 export YT_PROXY=http://localhost:8000
 scripts/build-worker.sh cat boom selfrun wordcount
-cargo run -p ytsaurus-client --example e2e          # all of run_e2e.sh, no Python
+cargo run -p ytsaurus-client --example client_e2e   # all of run_e2e.sh, no Python
 cargo run -p ytsaurus-client --example launch       # the happy path
 cargo run -p ytsaurus-client --example diagnose     # the failure path
 cargo run -p ytsaurus-client --example sort_reduce  # sort, then reduce over it
@@ -625,7 +625,7 @@ Three things the cluster settled that could not be settled by reading:
 
 ### The same three checks, without Python
 
-`cargo run -p ytsaurus-client --example e2e`, on `ghcr.io/ytsaurus/local:stable`
+`cargo run -p ytsaurus-client --example client_e2e`, on `ghcr.io/ytsaurus/local:stable`
 on 2026-08-06. Compare the byte counts and the word count with `run_e2e.sh`'s
 above — they are the same numbers, reached without the `yt` CLI:
 

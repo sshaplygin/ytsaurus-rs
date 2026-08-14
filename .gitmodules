@@ -1,0 +1,14 @@
+# The YTsaurus monorepo, present only for its `.proto` files: `ytsaurus-proto`
+# generates its bindings straight from `third_party/ytsaurus/yt/yt_proto/`
+# rather than from a copy, so the protocol definitions cannot silently drift
+# from upstream's.
+#
+# A submodule records an exact commit, which is what the pinning rule asks for.
+# Do NOT init it with a bare `git submodule update --init`: that checks out the
+# whole monorepo. Use `./scripts/init-protos.sh`, which clones it shallow and
+# sparse — 23 MB instead of the whole tree.
+[submodule "ytsaurus"]
+	path = third_party/ytsaurus
+	url = https://github.com/ytsaurus/ytsaurus.git
+	branch = stable/25.4
+	shallow = true
