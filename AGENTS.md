@@ -21,6 +21,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, and published from 0.2.5 with `ytsaurus-skiff`, whose status it inherits. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
+| `crates/ytsaurus-api/` | The transport-independent client interface — `TableClient`, and the row model both transports speak. Mirrors `yt/yt/client/api` in the C++, and is what lets `create_client` (HTTP) and `create_rpc_client` (RPC) return the same thing. Unpublished. |
 | `crates/ytsaurus-proto/` | Generated protobuf bindings for the RPC proxy, built from the upstream `.proto` files in the `third_party/ytsaurus` submodule — not from a copy. Pre-release, unpublished. |
 | `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope and the dynamic-table row wire format. **Async on tokio**, unlike everything above it. Pre-release, unpublished; see [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one), [rpc-compatibility.md](docs/rpc-compatibility.md) (what the RPC client implements, every deliberate divergence from the reference clients, and the gates still open). |
@@ -100,6 +101,8 @@ cargo bench -p ytsaurus-job       # job-path throughput
 
 cd tests/rpc-go-interop && go test ./...   # regenerate the RPC wire-format vectors
 cargo run -p ytsaurus-rpc --example rpc_e2e # RPC client against a live RPC proxy
+cargo run -p ytsaurus-client --features rpc --example both_transports
+                                           # the same code over HTTP and over RPC, compared
 
 # 2 GB streaming memory test (ignored by default)
 cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocapture
