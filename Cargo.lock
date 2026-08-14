@@ -1632,6 +1632,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "ytsaurus-api"
+version = "0.2.6"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "ytsaurus-client"
 version = "0.2.6"
 dependencies = [
@@ -1644,9 +1653,11 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "ureq",
+ "ytsaurus-api",
  "ytsaurus-format",
  "ytsaurus-helpers",
  "ytsaurus-job",
+ "ytsaurus-rpc",
  "ytsaurus-skiff",
  "ytsaurus-yson",
 ]
@@ -1703,6 +1714,7 @@ dependencies = [
  "rand",
  "thiserror 2.0.19",
  "tokio",
+ "ytsaurus-api",
  "ytsaurus-proto",
 ]
 

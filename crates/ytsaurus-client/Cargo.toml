@@ -29,6 +29,12 @@ platform-verifier = ["tls", "ureq/platform-verifier"]
 # have. Off by default: it is a compiler plugin, and a crate that only launches
 # operations should not pay to build one.
 derive = ["dep:ytsaurus-helpers"]
+# The RPC proxy as a second transport, so `create_rpc_client` exists alongside
+# `create_client` — the arrangement the C++ client has. **Off by default**, and
+# it must stay off: it pulls in tokio and prost, and this crate is a
+# dev-dependency of `ytsaurus-job`, whose examples are the musl worker binaries.
+# The same reason `tls` and `tracing` are off there.
+rpc = ["dep:ytsaurus-rpc"]
 # Spans and events through the `tracing` facade: one span per attempt, and the
 # retry message as a `WARN` event instead of a line on stderr. Off by default
 # for the same reason `tls` is — this crate is linked into worker binaries, and
@@ -38,6 +44,8 @@ derive = ["dep:ytsaurus-helpers"]
 tracing = ["dep:tracing"]
 
 [dependencies]
+ytsaurus-api.workspace = true
+ytsaurus-rpc = { workspace = true, optional = true }
 ytsaurus-yson.workspace = true
 ytsaurus-skiff.workspace = true
 ytsaurus-format.workspace = true
@@ -82,3 +90,8 @@ harness = false
 
 [package.metadata.docs.rs]
 all-features = true
+
+# Needs both transports compiled in, which is the whole point of it.
+[[example]]
+name = "both_transports"
+required-features = ["rpc"]

@@ -17,6 +17,7 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+ytsaurus-api.workspace = true
 ytsaurus-proto.workspace = true
 
 bytes = "1.10"

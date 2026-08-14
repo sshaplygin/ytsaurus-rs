@@ -160,6 +160,37 @@ impl Client {
         decode_rowset_attachments(&attachments, Some(&response.rowset_descriptor))
     }
 
+    /// Looks rows up, returning the names of the columns as well as the rows.
+    ///
+    /// A value carries a numeric id, not a name, and the reply's descriptor is
+    /// what resolves them. Callers that map rows onto named columns — the
+    /// blocking facade, and anything building a `serde` row — need both.
+    pub async fn lookup_rows_with_columns(
+        &self,
+        path: &str,
+        columns: &[&str],
+        keys: &[Row],
+        options: LookupOptions<'_>,
+    ) -> Result<(Vec<MaybeRow>, Vec<String>)> {
+        let keys: Vec<MaybeRow> = keys.iter().cloned().map(Some).collect();
+        let request = lookup_request(path, columns, &options);
+
+        let (response, attachments) = self
+            .connection
+            .invoke::<proto::api::TRspLookupRows>(
+                "LookupRows",
+                &request,
+                vec![wire::encode_rowset(&keys)?],
+                Some(self.timeout),
+                "TRspLookupRows",
+            )
+            .await?;
+
+        let descriptor = &response.rowset_descriptor;
+        let rows = decode_rowset_attachments(&attachments, Some(descriptor))?;
+        Ok((rows, descriptor_column_names(descriptor)))
+    }
+
     /// Runs a query and returns its rows.
     ///
     /// The returned descriptor names the columns, in the order the values are
@@ -190,12 +221,7 @@ impl Client {
 
         let descriptor = &response.rowset_descriptor;
         let rows = decode_rowset_attachments(&attachments, Some(descriptor))?;
-        let columns = descriptor
-            .name_table_entries
-            .iter()
-            .map(|entry| entry.name.clone().unwrap_or_default())
-            .collect();
-        Ok((rows, columns))
+        Ok((rows, descriptor_column_names(descriptor)))
     }
 }
 
@@ -375,6 +401,30 @@ impl Transaction<'_> {
         self.client.lookup_rows(path, columns, keys, options).await
     }
 
+    /// Looks rows up as of this transaction, with the reply's column names.
+    pub async fn lookup_rows_with_columns(
+        &self,
+        path: &str,
+        columns: &[&str],
+        keys: &[Row],
+        mut options: LookupOptions<'_>,
+    ) -> Result<(Vec<MaybeRow>, Vec<String>)> {
+        options.timestamp = Some(self.start_timestamp);
+        self.client
+            .lookup_rows_with_columns(path, columns, keys, options)
+            .await
+    }
+
+    /// Runs a query as of this transaction, with the reply's column names.
+    pub async fn select_rows_with_columns(
+        &self,
+        query: &str,
+        mut options: SelectOptions,
+    ) -> Result<(Vec<MaybeRow>, Vec<String>)> {
+        options.timestamp = Some(self.start_timestamp);
+        self.client.select_rows_with_columns(query, options).await
+    }
+
     /// Runs a query as of this transaction's start timestamp.
     pub async fn select_rows(
         &self,
@@ -497,6 +547,15 @@ fn modify_request(
         row_modification_types: vec![modification as i32; row_count],
         ..Default::default()
     }
+}
+
+/// The column names a reply's descriptor carries, in id order.
+fn descriptor_column_names(descriptor: &proto::api::TRowsetDescriptor) -> Vec<String> {
+    descriptor
+        .name_table_entries
+        .iter()
+        .map(|entry| entry.name.clone().unwrap_or_default())
+        .collect()
 }
 
 /// Builds the descriptor that names the columns a rowset's value ids refer to.

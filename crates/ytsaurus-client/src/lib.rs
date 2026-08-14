@@ -202,6 +202,99 @@
 use std::time::{Duration, Instant};
 
 mod batch;
+mod dynamic;
+
+// ---------------------------------------------------------------------------
+// One interface, two transports
+// ---------------------------------------------------------------------------
+
+/// Connects over **HTTP API v4**.
+///
+/// The counterpart of `CreateClient` in the C++ client, and returns the same
+/// interface [`create_rpc_client`] does — so which transport a program uses is
+/// one line, and nothing below it changes.
+///
+/// ```no_run
+/// # fn main() -> Result<(), ytsaurus_api::Error> {
+/// use ytsaurus_api::{LookupOptions, Row, TableClient};
+///
+/// let client = ytsaurus_client::create_client("localhost:8000")?;
+/// let key = Row::new().with("key", 1i64);
+/// let rows = client.lookup_rows("//tmp/table", &[key], &LookupOptions::default())?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// HTTP is the right default. It reaches everything, it is what the rest of
+/// this crate speaks, and it carries none of the pre-release gates the RPC
+/// crate does. Reach for [`create_rpc_client`] when per-request latency under
+/// concurrency is measurably the bottleneck — and read
+/// `docs/rpc-compatibility.md` first.
+pub fn create_client(
+    proxy: &str,
+) -> std::result::Result<Box<dyn ytsaurus_api::TableClient>, ytsaurus_api::Error> {
+    Ok(Box::new(Client::new(proxy)))
+}
+
+/// Connects over HTTP with a token.
+pub fn create_client_with_token(
+    proxy: &str,
+    token: impl Into<String>,
+) -> std::result::Result<Box<dyn ytsaurus_api::TableClient>, ytsaurus_api::Error> {
+    Ok(Box::new(Client::with_token(proxy, token)))
+}
+
+/// Connects to an **RPC proxy**, returning the same interface as
+/// [`create_client`].
+///
+/// The counterpart of `CreateRpcClient` in the C++ client. Needs the `rpc`
+/// feature, which is off by default: it pulls in tokio and prost, and this
+/// crate is a dev-dependency of `ytsaurus-job`, whose examples are the static
+/// musl worker binaries.
+///
+/// ```no_run
+/// # #[cfg(feature = "rpc")]
+/// # fn main() -> Result<(), ytsaurus_api::Error> {
+/// use ytsaurus_api::{LookupOptions, Row, TableClient};
+///
+/// // The only line that differs from the HTTP example.
+/// let client = ytsaurus_client::create_rpc_client("localhost:8011")?;
+///
+/// let key = Row::new().with("key", 1i64);
+/// let rows = client.lookup_rows("//tmp/table", &[key], &LookupOptions::default())?;
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "rpc"))]
+/// # fn main() {}
+/// ```
+///
+/// The address is an RPC proxy's, which is not the HTTP proxy's: ask the
+/// cluster for one with the `discover_proxies` command, or read
+/// `crates/ytsaurus-rpc/README.md`.
+///
+/// **This gives up the multiplexing.** The facade drives one call at a time on
+/// a private runtime; the concurrency the RPC proxy exists for needs
+/// `ytsaurus_rpc::Client` directly, and an async caller.
+#[cfg(feature = "rpc")]
+pub fn create_rpc_client(
+    address: &str,
+) -> std::result::Result<Box<dyn ytsaurus_api::TableClient>, ytsaurus_api::Error> {
+    Ok(Box::new(ytsaurus_rpc::blocking::Client::connect(address)?))
+}
+
+/// Connects to an RPC proxy with a token.
+#[cfg(feature = "rpc")]
+pub fn create_rpc_client_with_token(
+    address: &str,
+    token: impl Into<String>,
+) -> std::result::Result<Box<dyn ytsaurus_api::TableClient>, ytsaurus_api::Error> {
+    Ok(Box::new(
+        ytsaurus_rpc::blocking::Client::builder(address)
+            .token(token)
+            .connect()?,
+    ))
+}
+
 /// Errors.
 pub mod error;
 mod http;

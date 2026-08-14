@@ -57,6 +57,7 @@
 //! left out and what has actually been run against a cluster are listed in
 //! `docs/rpc-compatibility.md`.
 
+pub mod blocking;
 pub mod bus;
 pub mod client;
 pub mod connection;
