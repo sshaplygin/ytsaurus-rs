@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Dynamic tables, and a second transport
+
+- **Added** typed dynamic-table commands: `lookup_rows_dynamic`,
+  `select_rows_dynamic`, `insert_rows_dynamic` and `delete_rows_dynamic`. They
+  were reachable through `Client::raw_command` before and are now first-class,
+  with the request shapes taken from the driver's own registration table rather
+  than guessed: insert and delete carry a tabular input stream, select produces
+  one, lookup does both, and all four are heavy.
+- **Added** `create_client` and `create_rpc_client`, which return the same
+  `ytsaurus_api::TableClient` — the arrangement the C++ client has, where
+  choosing a transport is one line and nothing below it changes.
+- **Added** the `rpc` feature, **off by default and required to stay off**: it
+  reaches tokio and prost, and this crate is a dev-dependency of
+  `ytsaurus-job`, whose examples are the static musl workers. CI asserts the
+  worker graph carries neither.
+- **Note**: tablet transactions are not available over HTTP, and the client now
+  says so with `Error::Unsupported` instead of failing on the second call. They
+  are sticky to the proxy that created them, and an HTTP client routes each
+  request independently — the cluster's own message recommends the RPC API.
+
 ## 0.2.6 - 2026-08-10
 
 No changes to this crate beyond the version, which tracks the workspace.

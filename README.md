@@ -17,6 +17,7 @@ the workspace's, so they move as one.
 | [`ytsaurus-helpers`](crates/ytsaurus-helpers/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-helpers.svg)](https://crates.io/crates/ytsaurus-helpers) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-helpers)](https://docs.rs/ytsaurus-helpers) | `#[derive(TableRow)]` for schemas |
 | [`ytsaurus-skiff`](crates/ytsaurus-skiff/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-skiff.svg)](https://crates.io/crates/ytsaurus-skiff) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-skiff)](https://docs.rs/ytsaurus-skiff) | Skiff schema and codec. **Pre-release** — [gates still open](docs/skiff-compatibility.md) |
 | [`ytsaurus-format`](crates/ytsaurus-format/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-format.svg)](https://crates.io/crates/ytsaurus-format) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-format)](https://docs.rs/ytsaurus-format) | `DataFormat`, shared by launcher and worker. Pre-release with the above |
+| [`ytsaurus-api`](crates/ytsaurus-api/) | — | — | The transport-independent client interface: one API, HTTP or RPC. Unpublished |
 | [`ytsaurus-rpc`](crates/ytsaurus-rpc/) | — | — | RPC proxy client: bus, the RPC envelope and the dynamic-table row wire format. **Pre-release and unpublished** — [gates still open](docs/rpc-compatibility.md) |
 | [`ytsaurus-proto`](crates/ytsaurus-proto/) | — | — | Generated protobuf for the RPC proxy, built from the upstream `.proto` files. Unpublished |
 
@@ -43,6 +44,7 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-job/](crates/ytsaurus-job/) | Job runtime: streaming row reader, control records, multi-table output. Its [examples/](crates/ytsaurus-job/examples/) are the nine runnable worker binaries. |
 | [crates/ytsaurus-client/](crates/ytsaurus-client/) | HTTP API v4 launcher: run an operation without the Python SDK. |
 | [crates/ytsaurus-helpers/](crates/ytsaurus-helpers/) | Derive macros: a table schema read off the struct the rows have. |
+| [crates/ytsaurus-api/](crates/ytsaurus-api/) | One interface over both transports, so `create_client` and `create_rpc_client` return the same thing. |
 | [crates/ytsaurus-rpc/](crates/ytsaurus-rpc/) | The RPC proxy, for dynamic tables under concurrency. Async on tokio, unlike everything above. |
 | [crates/ytsaurus-proto/](crates/ytsaurus-proto/) | Protobuf bindings, generated from the `third_party/ytsaurus` submodule. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, and how this compares to the official C++ and Go clients. |

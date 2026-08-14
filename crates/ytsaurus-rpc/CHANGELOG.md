@@ -132,6 +132,18 @@ signature or the credentials field number kept the suite green. Both are closed,
 and the fourteen reported survivors were re-run afterwards — all fourteen now
 fail.
 
+### Added later in the same cycle
+
+- **A blocking facade** (`ytsaurus_rpc::blocking`), in the shape
+  `reqwest::blocking` uses: a private current-thread runtime, one call at a
+  time. It implements `ytsaurus_api::TableClient`, which is what lets
+  `ytsaurus_client::create_rpc_client` return the same interface as
+  `create_client`. It gives up the multiplexing — anything that wants concurrent
+  in-flight requests should keep using the async `Client`, which is unchanged.
+- `lookup_rows_with_columns` and the transaction's `select_rows_with_columns`,
+  which hand back the reply's column names alongside its rows. A value carries a
+  numeric id, not a name, and the descriptor is what resolves them.
+
 ### Not implemented
 
 TLS, compression codecs, versioned rowsets, streaming reads and writes, retry

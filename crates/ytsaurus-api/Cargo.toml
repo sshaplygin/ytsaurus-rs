@@ -1,0 +1,24 @@
+[package]
+name = "ytsaurus-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "The transport-independent YTsaurus client interface, implemented over HTTP and over the RPC proxy"
+keywords = ["ytsaurus", "client", "api"]
+categories = ["api-bindings", "database"]
+readme = "README.md"
+
+# Not published until the interface has settled; it is the one thing here that
+# is expensive to change afterwards.
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0"
