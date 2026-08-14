@@ -1,0 +1,37 @@
+[package]
+name = "ytsaurus-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "YTsaurus RPC proxy client: bus framing, RPC envelope and the dynamic-table row wire format"
+keywords = ["ytsaurus", "rpc", "bus", "protobuf"]
+categories = ["network-programming", "database"]
+readme = "README.md"
+
+# Not published without the human approval Hard rule 1 requires, and not before
+# the ship gates in docs/rpc-compatibility.md are green.
+publish = false
+
+[dependencies]
+ytsaurus-proto.workspace = true
+
+bytes = "1.10"
+prost = "0.14"
+thiserror.workspace = true
+rand = { version = "0.9", default-features = false, features = ["thread_rng"] }
+tokio = { version = "1", default-features = false, features = [
+    "net",
+    "rt",
+    "sync",
+    "time",
+    "macros",
+    "io-util",
+] }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

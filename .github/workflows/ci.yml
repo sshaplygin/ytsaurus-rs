@@ -23,11 +23,39 @@ jobs:
         working-directory: tests/skiff-go-interop
         run: go test ./...
 
+  go-rpc-reference:
+    name: pinned Go RPC wire-format reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+
+      # Regenerates the byte vectors the Rust tests consume, and fails if the
+      # Go SDK's own encoder and decoder disagree. `git diff --exit-code`
+      # afterwards is what catches a vector that has silently changed: the
+      # checked-in files must be exactly what the pinned SDK produces.
+      - name: Go SDK v0.0.33 RPC vectors
+        working-directory: tests/rpc-go-interop
+        run: go test ./...
+
+      - name: The checked-in vectors are the ones the Go SDK produces
+        run: git diff --exit-code -- tests/rpc-go-interop
+
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # `ytsaurus-proto` generates its bindings from the upstream `.proto`
+      # files, so the submodule has to be there before any cargo command. Not
+      # `submodules: true` on the checkout above: that clones the whole
+      # YTsaurus monorepo, and the script takes the shallow, sparse path that
+      # fetches only `yt/yt_proto/`.
+      - name: Check out the YTsaurus protos
+        run: ./scripts/init-protos.sh
 
       # rust-toolchain.toml pins the channel, components and targets.
       - name: Install toolchain
@@ -88,6 +116,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      - name: Check out the YTsaurus protos
+        run: ./scripts/init-protos.sh
 
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
