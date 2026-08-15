@@ -26,12 +26,33 @@ env:
 
 jobs:
   compare:
-    name: "Criterion: main vs PR"
+    name: "${{ matrix.name }}: main vs PR"
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: yson
+            name: YSON codec
+            package: ytsaurus-yson
+            bench: yson_benchmark
+          - suite: skiff
+            name: Skiff codec
+            package: ytsaurus-skiff
+            bench: codec_throughput
+          - suite: job
+            name: job path
+            package: ytsaurus-job
+            bench: job_throughput
+          - suite: client
+            name: HTTP client
+            package: ytsaurus-client
+            bench: rows
     steps:
-      # The two revisions intentionally share one VM and one toolchain. This
-      # makes the PR-vs-main delta meaningful; GitHub-hosted runners are still
-      # noisy, so the report is advisory rather than a merge gate.
+      # The four suites run in parallel, but the two revisions of each suite
+      # intentionally share one VM and one toolchain. This makes each
+      # PR-vs-main delta meaningful; GitHub-hosted runners are still noisy, so
+      # the report is advisory rather than a merge gate.
       - name: Check out the PR base
         uses: actions/checkout@v5
         with:
@@ -60,28 +81,56 @@ jobs:
         working-directory: base
         run: |
           set -o pipefail
-          {
-            cargo bench --locked -p ytsaurus-yson --bench yson_benchmark -- --noplot
-            cargo bench --locked -p ytsaurus-skiff --bench codec_throughput -- --noplot
-            cargo bench --locked -p ytsaurus-job --bench job_throughput -- --noplot
-            cargo bench --locked -p ytsaurus-client --bench rows -- --noplot
-          } 2>&1 | tee benchmarks.txt
+          cargo bench --locked -p "${{ matrix.package }}" \
+            --bench "${{ matrix.bench }}" -- --noplot 2>&1 | tee benchmarks.txt
 
       - name: Benchmark pull request
         working-directory: pr
         run: |
           set -o pipefail
-          {
-            cargo bench --locked -p ytsaurus-yson --bench yson_benchmark -- --noplot
-            cargo bench --locked -p ytsaurus-skiff --bench codec_throughput -- --noplot
-            cargo bench --locked -p ytsaurus-job --bench job_throughput -- --noplot
-            cargo bench --locked -p ytsaurus-client --bench rows -- --noplot
-          } 2>&1 | tee benchmarks.txt
+          cargo bench --locked -p "${{ matrix.package }}" \
+            --bench "${{ matrix.bench }}" -- --noplot 2>&1 | tee benchmarks.txt
+
+      - name: Upload benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-main-vs-pr-${{ matrix.suite }}
+          path: |
+            base/benchmarks.txt
+            pr/benchmarks.txt
+          retention-days: 14
+
+  report:
+    name: "Criterion: aggregate PR comparison"
+    needs: compare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Download benchmark logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: criterion-main-vs-pr-*
+          path: benchmark-logs
+
+      - name: Assemble benchmark output
+        run: |
+          set -euo pipefail
+          for suite in yson skiff job client; do
+            cat "benchmark-logs/criterion-main-vs-pr-${suite}/base/benchmarks.txt"
+          done > main-benchmarks.txt
+          for suite in yson skiff job client; do
+            cat "benchmark-logs/criterion-main-vs-pr-${suite}/pr/benchmarks.txt"
+          done > pr-benchmarks.txt
 
       - name: Render comparison
         run: |
-          node pr/scripts/compare-criterion.mjs \
-            base/benchmarks.txt pr/benchmarks.txt \
+          node scripts/compare-criterion.mjs \
+            main-benchmarks.txt pr-benchmarks.txt \
             "${{ github.event.pull_request.base.sha }}" \
             "${{ github.event.pull_request.head.sha }}" \
             > benchmark-report.md
@@ -118,12 +167,9 @@ jobs:
               });
             }
 
-      - name: Upload benchmark logs
+      - name: Upload benchmark report
         uses: actions/upload-artifact@v4
         with:
-          name: criterion-main-vs-pr
-          path: |
-            base/benchmarks.txt
-            pr/benchmarks.txt
-            benchmark-report.md
+          name: criterion-main-vs-pr-report
+          path: benchmark-report.md
           retention-days: 14

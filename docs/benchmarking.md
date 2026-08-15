@@ -4,12 +4,13 @@
 
 Every pull request that changes Rust code runs the four Criterion suites twice:
 once at the pull request's current `main` base commit and once at the PR head.
-The two runs use the PR's pinned Rust toolchain on the same GitHub-hosted VM, so
-the report isolates the source change rather than a compiler update or a
-different runner image. The workflow keeps its raw logs as an artifact for 14
-days and updates one comment on same-repository PRs with every benchmark's
-middle time estimate and relative change. Fork PRs receive the same result in
-the job summary, where the read-only token cannot post a comment.
+The suites run in parallel, but each `main`/PR pair runs sequentially on one
+GitHub-hosted VM with the PR's pinned Rust toolchain. That preserves a useful
+per-suite delta without making the overall report wait for all four suites in
+series. The workflow keeps its raw logs as an artifact for 14 days and updates
+one comment on same-repository PRs with every benchmark's middle time estimate
+and relative change. Fork PRs receive the same result in the job summary, where
+the read-only token cannot post a comment.
 
 Time is lower-is-better. A change of 20% or more is called out as an improvement
 or regression, but does not fail the PR: shared GitHub runners are noisy and a
