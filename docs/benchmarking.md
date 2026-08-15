@@ -1,5 +1,22 @@
 # Benchmarking and the Skiff decision
 
+## Pull-request comparison
+
+Every pull request that changes Rust code runs the four Criterion suites twice:
+once at the pull request's current `main` base commit and once at the PR head.
+The two runs use the PR's pinned Rust toolchain on the same GitHub-hosted VM, so
+the report isolates the source change rather than a compiler update or a
+different runner image. The workflow keeps its raw logs as an artifact for 14
+days and updates one comment on same-repository PRs with every benchmark's
+middle time estimate and relative change. Fork PRs receive the same result in
+the job summary, where the read-only token cannot post a comment.
+
+Time is lower-is-better. A change of 20% or more is called out as an improvement
+or regression, but does not fail the PR: shared GitHub runners are noisy and a
+performance result is evidence to review, not a replacement for a controlled
+measurement. Re-run the workflow before drawing a conclusion from a borderline
+result.
+
 This document answers one question:
 
 > Is YSON parsing enough of the job's CPU (> ~30 %) to justify implementing

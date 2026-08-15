@@ -1,0 +1,129 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/benchmarks.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "rust-toolchain.toml"
+      - "scripts/compare-criterion.mjs"
+
+# A pull request from a fork still receives a read-only token, so its benchmark
+# result is available in the job summary but cannot be posted as a comment.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  compare:
+    name: "Criterion: main vs PR"
+    runs-on: ubuntu-24.04
+    steps:
+      # The two revisions intentionally share one VM and one toolchain. This
+      # makes the PR-vs-main delta meaningful; GitHub-hosted runners are still
+      # noisy, so the report is advisory rather than a merge gate.
+      - name: Check out the PR base
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Check out the PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+
+      # Use the PR's pinned compiler for both revisions. A toolchain change is
+      # then not mistaken for a source-level performance change.
+      - name: Install toolchain
+        working-directory: pr
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            base -> target
+            pr -> target
+
+      - name: Benchmark main
+        working-directory: base
+        run: |
+          set -o pipefail
+          {
+            cargo bench --locked -p ytsaurus-yson --bench yson_benchmark -- --noplot
+            cargo bench --locked -p ytsaurus-skiff --bench codec_throughput -- --noplot
+            cargo bench --locked -p ytsaurus-job --bench job_throughput -- --noplot
+            cargo bench --locked -p ytsaurus-client --bench rows -- --noplot
+          } 2>&1 | tee benchmarks.txt
+
+      - name: Benchmark pull request
+        working-directory: pr
+        run: |
+          set -o pipefail
+          {
+            cargo bench --locked -p ytsaurus-yson --bench yson_benchmark -- --noplot
+            cargo bench --locked -p ytsaurus-skiff --bench codec_throughput -- --noplot
+            cargo bench --locked -p ytsaurus-job --bench job_throughput -- --noplot
+            cargo bench --locked -p ytsaurus-client --bench rows -- --noplot
+          } 2>&1 | tee benchmarks.txt
+
+      - name: Render comparison
+        run: |
+          node pr/scripts/compare-criterion.mjs \
+            base/benchmarks.txt pr/benchmarks.txt \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            > benchmark-report.md
+          cat benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post comparison on the pull request
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- ytsaurus-rs:criterion-benchmark-comparison -->";
+            const body = fs.readFileSync("benchmark-report.md", "utf8");
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const previous = comments.find((comment) => comment.body.includes(marker));
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload benchmark logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-main-vs-pr
+          path: |
+            base/benchmarks.txt
+            pr/benchmarks.txt
+            benchmark-report.md
+          retention-days: 14
