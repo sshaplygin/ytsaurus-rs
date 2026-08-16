@@ -61,12 +61,7 @@ ok "$CLEAN events kept, $BAD rejected"
 
 say "Reject reasons"
 yt read-table --format json "$BASE/rejects" \
-  | python3 -c "
-import json, sys, collections
-reasons = collections.Counter(json.loads(l)['reason'] for l in sys.stdin if l.strip())
-for reason, n in sorted(reasons.items()):
-    print(f'   {n:>4}  {reason}')
-"
+  | python3 "$ROOT/tests/cluster-e2e/summarize_rejects.py"
 
 say "Sort by the reduce key"
 yt sort --src "$BASE/events" --dst "$BASE/events_sorted" --sort-by user_id --sort-by timestamp

@@ -20,9 +20,12 @@ The output is committed, so regenerating it should produce no diff unless the
 payload is being changed on purpose.
 """
 
+from __future__ import annotations
+
 import math
 import pathlib
 import struct
+from collections.abc import Iterable
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -74,7 +77,7 @@ def yson_bool(value: bool) -> bytes:
 ENTITY = b"#"
 
 
-def yson_map(pairs) -> bytes:
+def yson_map(pairs: Iterable[tuple[bytes, bytes]]) -> bytes:
     out = bytearray(b"{")
     for i, (key, value) in enumerate(pairs):
         if i:
@@ -84,7 +87,7 @@ def yson_map(pairs) -> bytes:
     return bytes(out)
 
 
-def yson_list(items) -> bytes:
+def yson_list(items: Iterable[bytes]) -> bytes:
     out = bytearray(b"[")
     for i, item in enumerate(items):
         if i:
@@ -102,7 +105,7 @@ def control(key: bytes, value: bytes) -> bytes:
 # ------------------------------------------------------------------ data
 
 
-def rows_table_0():
+def rows_table_0() -> list[bytes]:
     """Every scalar type the YSON spec defines, plus the awkward cases."""
     return [
         # Integer boundaries.
@@ -201,7 +204,7 @@ def rows_table_0():
     ]
 
 
-def rows_table_1():
+def rows_table_1() -> list[bytes]:
     return [
         yson_map(
             [

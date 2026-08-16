@@ -104,28 +104,7 @@ done
 
 say "Wordcount map-reduce"
 yt remove "$BASE/lines" --force
-python3 - "$WORK/lines.yson" <<'PY'
-import struct, sys
-
-def uvarint(v):
-    out = bytearray()
-    while v >= 0x80:
-        out.append((v & 0x7F) | 0x80); v >>= 7
-    out.append(v); return bytes(out)
-
-def zz(v):
-    return uvarint(((v << 1) ^ (v >> 63)) & 0xFFFFFFFFFFFFFFFF)
-
-def s(b):
-    return b"\x01" + zz(len(b)) + b
-
-LINES = [b"the quick brown fox", b"jumps over the lazy dog",
-         b"the fox and the dog", b"quick quick fox"]
-out = bytearray()
-for line in LINES:
-    out += b"{" + s(b"text") + b"=" + s(line) + b"};"
-open(sys.argv[1], "wb").write(bytes(out))
-PY
+python3 "$ROOT/tests/cluster-e2e/generate_wordcount_input.py" "$WORK/lines.yson"
 yt write-table --format "$YSON" "$BASE/lines" < "$WORK/lines.yson"
 
 yt map-reduce \
@@ -137,24 +116,8 @@ yt map-reduce \
   --reduce-local-file "$BINDIR/wordcount" \
   --spec '{mapper={memory_limit=536870912};reducer={memory_limit=536870912};reduce_job_io={control_attributes={enable_key_switch=%true}}}'
 
-yt read-table --format json "$BASE/counts" | python3 -c "
-import json, sys
-counts = {}
-for line in sys.stdin:
-    if not line.strip():
-        continue
-    row = json.loads(line)
-    counts[row['word']] = row['count']
-
-expected = {'the': 4, 'quick': 3, 'brown': 1, 'fox': 3, 'jumps': 1,
-            'over': 1, 'lazy': 1, 'dog': 2, 'and': 1}
-if counts != expected:
-    print('   FAIL wordcount mismatch', file=sys.stderr)
-    print(f'     got      {sorted(counts.items())}', file=sys.stderr)
-    print(f'     expected {sorted(expected.items())}', file=sys.stderr)
-    sys.exit(1)
-print(f'   ok wordcount matches the reference ({len(counts)} words)')
-"
+yt read-table --format json "$BASE/counts" \
+  | python3 "$ROOT/tests/cluster-e2e/check_wordcount_output.py"
 
 say "All end-to-end checks passed"
 echo "Cypress tree left at $BASE; remove it with: yt --proxy $PROXY remove $BASE --recursive"

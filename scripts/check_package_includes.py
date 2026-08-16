@@ -18,8 +18,14 @@ and missed
         "../../../tests/…"
     ))
 
-— the same macro with a newline in it. Hence the real parse below rather than a
-pattern, and hence this running in CI rather than being remembered.
+— the same macro with a newline in it. Hence a pattern written to span newlines,
+and hence this running in CI rather than being remembered.
+
+It is a regex, not a Rust parser, and so has known edges: it matches an
+`include_str!` inside a comment, and it does not see a path built with
+`concat!(env!("CARGO_MANIFEST_DIR"), …)`. The first is a false positive an
+`exclude` silences; the second is a real gap, and nothing in this workspace
+uses that form today.
 
 The fix for a violation is an `exclude` entry in that crate's Cargo.toml, the
 way `ytsaurus-skiff` and `ytsaurus-job` already carry one.
@@ -36,6 +42,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -48,7 +55,7 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, cwd=REPO)
 
 
-def publishable_packages() -> list[dict]:
+def publishable_packages() -> list[dict[str, Any]]:
     """Every workspace member cargo would upload, so `publish = false` is skipped."""
     proc = run("cargo", "metadata", "--no-deps", "--format-version", "1")
     if proc.returncode != 0:
@@ -56,12 +63,17 @@ def publishable_packages() -> list[dict]:
     return [pkg for pkg in json.loads(proc.stdout)["packages"] if pkg.get("publish") != []]
 
 
-def shipped_files(name: str) -> list[str] | None:
-    """What actually goes in the tarball, so an `exclude`d file is not reported."""
+def shipped_files(name: str) -> list[str]:
+    """What actually goes in the tarball, so an `exclude`d file is not reported.
+
+    A failure here is **fatal**, not a warning. Skipping a package cargo could
+    not list would report zero violations for it, which is the failure mode this
+    repository has already been bitten by twice — a guard whose *absence* of
+    output is indistinguishable from a pass.
+    """
     proc = run("cargo", "package", "--list", "--allow-dirty", "-p", name)
     if proc.returncode != 0:
-        print(f"warning: could not list package {name}", file=sys.stderr)
-        return None
+        sys.exit(f"cargo package --list failed for {name}:\n{proc.stderr}")
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
@@ -87,11 +99,7 @@ def main() -> int:
 
     for pkg in publishable_packages():
         crate_root = Path(pkg["manifest_path"]).parent.resolve()
-        listed = shipped_files(pkg["name"])
-        if listed is None:
-            continue
-
-        for rel in sorted(listed):
+        for rel in sorted(shipped_files(pkg["name"])):
             if not rel.endswith(".rs"):
                 continue
             rust_file = crate_root / rel

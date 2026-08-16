@@ -43,7 +43,8 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Worker builds | `x86_64-unknown-linux-musl`, fully static; `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — the last **only** for worker binaries, never for library crates |
 | Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
-| Python tooling | **ruff** lints and formats; **uv** runs. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` is ruff configuration and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
+| Python tooling | **ruff** lints and formats; **mypy --strict** type-checks; **uv** runs. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` configures ruff and mypy and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
+| **Language for automation** | **Python** for everything that computes, parses or asserts. **bash** for glue only — sequencing external commands, with **no source of another language embedded in it**, and none of it inlined into a workflow. **Rust** (`xtask`) only where it is genuinely required: `generate-protos` is there because `prost-build` is a Rust library API, and nothing else qualifies. **Go** only in `tests/*-go-interop/`, where the whole point is an oracle this project did not write. `tests/skiff-cpp-interop/cpp_reference.py` is permanently Python — `yt_yson_bindings` is a compiled C extension over upstream's own Skiff. **No new language without a human**, and JavaScript is not coming back. |
 
 ## Hard rules
 
@@ -1331,7 +1332,8 @@ Three layers:
    through the official Python client and so checks the worker's output against
    a **different implementation** rather than against ourselves. Keep both — the
    second is the only place anything here is read by code we did not write.
-   Neither is in CI (needs a multi-GB image). See
+   `run_pilot.sh` is not in CI (needs a multi-GB image); `run_e2e.sh` is, on
+   every push to main, through `.github/workflows/cluster-e2e.yml`. See
    [`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md).
 
 Fuzzing: `cargo +nightly fuzz run fuzz_target_{1,2}` from `crates/ytsaurus-yson/`.
