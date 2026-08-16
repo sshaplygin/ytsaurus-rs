@@ -24,7 +24,7 @@ categories = ["encoding"]
 # outside this package and so are not in the tarball. `include_str!` resolves at
 # compile time, so shipping either hands anyone who unpacks the crate a build
 # error they cannot fix. The vectors and the tests both live in the repository,
-# where they run. `scripts/check-package-includes.sh` is what keeps this list
+# where they run. `scripts/check_package_includes.py` is what keeps this list
 # honest.
 exclude = ["tests/cpp_interop.rs", "tests/wire.rs"]
 

@@ -1,8 +1,9 @@
 # Python tooling for this workspace.
 #
 # There is no Python package here and there never will be — this repository is
-# a Rust workspace. The four `.py` files are test helpers: three that drive the
-# local-cluster end-to-end run and one that regenerates the C++ Skiff vectors.
+# a Rust workspace. The five `.py` files are tooling: three that drive the
+# local-cluster end-to-end run, one that regenerates the C++ Skiff vectors, and
+# one that checks no published file reaches outside its own crate.
 # This file exists only so `ruff` lints and formats them the same way for
 # everyone, instead of each file drifting to whatever its author's editor did.
 #

@@ -14,7 +14,7 @@
 
   `tests/cat_e2e.rs` was excluded in 0.3.0 for exactly this reason and this one
   was missed: the search was a line-based grep, and here the macro has a
-  newline in it. `scripts/check-package-includes.sh` now parses instead of
+  newline in it. `scripts/check_package_includes.py` now parses instead of
   matching, and runs in CI.
 
 ## 0.3.0 - 2026-08-16

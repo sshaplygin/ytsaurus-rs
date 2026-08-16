@@ -92,6 +92,9 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ./scripts/init-protos.sh          # only to regenerate protos: the submodule, shallow and sparse
 cargo xtask generate-protos       # rewrite crates/ytsaurus-proto/src/generated/ from it
 
+python3 scripts/check_package_includes.py   # no published file may include_str!
+                                            # data from outside its own crate
+
 cargo test --workspace            # 941 tests: 863 unit and integration, 78 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -102,7 +105,7 @@ cargo fmt --all
 cargo bench -p ytsaurus-yson      # codec microbenchmark
 cargo bench -p ytsaurus-job       # job-path throughput
 
-uvx ruff check .                  # the four Python test helpers
+uvx ruff check .                  # the five Python scripts
 uvx ruff format --check .         # drop --check to rewrite
 
 cd tests/rpc-go-interop && go test ./...   # regenerate the RPC wire-format vectors
@@ -1383,7 +1386,7 @@ iterations without a crash.
   not compile from the 0.3.0 tarball. Consumers were unaffected — cargo does not
   build a dependency's tests — but `cargo test` inside an unpacked crate failed.
   Four files of the kind were caught before 0.3.0 with a line-based grep, and
-  these two have a newline inside the macro. `scripts/check-package-includes.sh`
+  these two have a newline inside the macro. `scripts/check_package_includes.py`
   parses instead of matching and runs in CI.
 
   **0.2.6 was never released.** The version was bumped and the CHANGELOGs

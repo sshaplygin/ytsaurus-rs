@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The four `.py` files here are test helpers, not a package, so there is
+      # The five `.py` files here are tooling, not a package, so there is
       # nothing to install — `uvx` fetches ruff and runs it. Configuration lives
       # in the repository's pyproject.toml.
       - uses: astral-sh/setup-uv@v5
@@ -93,7 +93,7 @@ jobs:
       # check for them was a line-based grep and the macros had newlines in
       # them. This parses instead.
       - name: No published file reaches outside its own crate
-        run: ./scripts/check-package-includes.sh
+        run: python3 scripts/check_package_includes.py
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
