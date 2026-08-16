@@ -10,6 +10,12 @@ has not settled, and it is the one thing in this workspace that is expensive to
 change afterwards — the version is 0.x and the API may change in a patch
 release.
 
+## 0.3.1 - 2026-08-16
+
+No changes to this crate beyond the version, which tracks the workspace.
+`ytsaurus-skiff` and `ytsaurus-job` shipped a test file each that could not
+compile from their tarballs; this crate had no such file.
+
 ## 0.3.0 - 2026-08-16
 
 First release of the crate: the **transport-independent** YTsaurus client

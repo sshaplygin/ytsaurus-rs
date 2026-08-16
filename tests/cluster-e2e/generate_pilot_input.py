@@ -14,6 +14,7 @@ tests.
 import random
 import struct
 import sys
+from collections.abc import Sequence
 
 # 2026-01-01T00:00:00Z in epoch microseconds.
 BASE_US = 1_767_225_600 * 1_000_000
@@ -62,7 +63,7 @@ def y_bool(v: bool) -> bytes:
 ENTITY = b"#"
 
 
-def row(pairs) -> bytes:
+def row(pairs: Sequence[tuple[bytes, bytes]]) -> bytes:
     out = bytearray(b"{")
     for i, (k, v) in enumerate(pairs):
         if i:
@@ -94,7 +95,7 @@ AGENTS = [
 ]
 
 
-def good_event(rng, user: bytes, ts: int) -> bytes:
+def good_event(rng: random.Random, user: bytes, ts: int) -> bytes:
     status = rng.choices([200, 200, 200, 301, 404, 500], k=1)[0]
     return row(
         [
@@ -111,7 +112,7 @@ def good_event(rng, user: bytes, ts: int) -> bytes:
     )
 
 
-def corrupt_rows() -> list:
+def corrupt_rows() -> list[bytes]:
     """One row per validation rule, plus structural damage."""
     base = [
         (b"user_id", y_bytes(b"corrupt")),
@@ -124,7 +125,9 @@ def corrupt_rows() -> list:
         (b"latency_ms", y_double(1.0)),
     ]
 
-    def variant(**overrides):
+    # Keyword names are `str`, the column names in `base` are `bytes`; hence the
+    # `decode()` on every lookup, and hence `overrides` being keyed by `str`.
+    def variant(**overrides: bytes) -> bytes:
         return row([(k, overrides.get(k.decode(), v)) for k, v in base])
 
     return [

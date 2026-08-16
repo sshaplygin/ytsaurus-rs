@@ -8,6 +8,12 @@ this crate follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This crate is **pre-release**, a status it inherits from
 [`ytsaurus-skiff`](../ytsaurus-skiff/), which it re-exports.
 
+## 0.3.1 - 2026-08-16
+
+No changes to this crate beyond the version, which tracks the workspace.
+`ytsaurus-skiff` and `ytsaurus-job` shipped a test file each that could not
+compile from their tarballs; this crate had no such file.
+
 ## 0.3.0 - 2026-08-16
 
 No changes to this crate beyond the version, which tracks the workspace.

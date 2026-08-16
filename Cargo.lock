@@ -1633,7 +1633,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "prost-build",
  "protoc-bin-vendored",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "flate2",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-format"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ytsaurus-skiff",
  "ytsaurus-yson",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-helpers"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-job"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "serde",
@@ -1705,14 +1705,14 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "ytsaurus-rpc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "proptest",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-skiff"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "thiserror 2.0.19",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "ytsaurus-yson"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "criterion",
  "itoa",

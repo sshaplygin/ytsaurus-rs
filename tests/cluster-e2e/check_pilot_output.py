@@ -14,8 +14,9 @@ import json
 import math
 import sys
 from collections import defaultdict
+from typing import Any, cast
 
-from yt import yson
+from yt import yson  # ty: ignore[unresolved-import]
 
 SESSION_GAP_US = 30 * 60 * 1_000_000
 
@@ -40,7 +41,7 @@ def ok(message: str) -> None:
     print(f"   \033[32mok\033[0m {message}")
 
 
-def is_boolean(v) -> bool:
+def is_boolean(v: object) -> bool:
     """True for a YSON boolean.
 
     `bool` cannot be subclassed in Python, so the YSON bindings model booleans
@@ -50,12 +51,12 @@ def is_boolean(v) -> bool:
     return isinstance(v, (bool, yson.YsonBoolean))
 
 
-def is_integer(v) -> bool:
+def is_integer(v: object) -> bool:
     """True for a YSON int64/uint64, excluding booleans."""
     return isinstance(v, int) and not is_boolean(v)
 
 
-def is_null(v) -> bool:
+def is_null(v: object) -> bool:
     """True for a YSON entity (`#`), which models null.
 
     It does not compare `is None`: the parser returns a `YsonEntity` instance,
@@ -64,7 +65,7 @@ def is_null(v) -> bool:
     return v is None or isinstance(v, yson.YsonEntity)
 
 
-def is_valid(event: dict) -> bool:
+def is_valid(event: dict[str, Any]) -> bool:
     """Mirrors `validate` in sessionize.rs, plus the parse step."""
     for column in REQUIRED:
         if column not in event or is_null(event[column]):
@@ -94,7 +95,7 @@ def is_valid(event: dict) -> bool:
     return True
 
 
-def as_bytes(v) -> bytes:
+def as_bytes(v: object) -> bytes:
     """Normalises a YSON string to bytes.
 
     A UTF-8 string arrives as `YsonUnicode` (a `str`), a non-UTF-8 one as a
@@ -105,7 +106,9 @@ def as_bytes(v) -> bytes:
     if yson.is_unicode(v):
         return str(v).encode()
     try:
-        return yson.get_bytes(v)
+        # `cast` and not `bytes(...)`: this is the untyped client's own accessor,
+        # documented to hand back the raw bytes, and re-wrapping it would copy.
+        return cast(bytes, yson.get_bytes(v))
     except (TypeError, AttributeError):
         return str(v).encode()
 

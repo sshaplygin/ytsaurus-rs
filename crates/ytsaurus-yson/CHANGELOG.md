@@ -6,6 +6,12 @@ All notable changes to this fork are recorded here.
 Recording modifications is a condition of the Apache-2.0 licence (section 4b), and the
 list below is that record: everything that differs from upstream `ba2044c`.
 
+## 0.3.1 - 2026-08-16
+
+No changes to this crate beyond the version, which tracks the workspace.
+`ytsaurus-skiff` and `ytsaurus-job` shipped a test file each that could not
+compile from their tarballs; this crate had no such file.
+
 ## 0.3.0 - 2026-08-16
 
 No changes to this crate beyond the version, which tracks the workspace.

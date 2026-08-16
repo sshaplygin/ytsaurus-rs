@@ -63,13 +63,8 @@ yt map 'printf "{capture=\""; base64 | tr -d "\n"; printf "\"}"' \
   || die "expected exactly one capture row; the input was split across jobs"
 
 yt read-table --format json "$BASE/capture" > "$WORK/capture.json" 2>/dev/null
-python3 - "$WORK/capture.json" "$FIXTURES/cat_input.bin" <<'PY'
-import base64, json, sys
-row = json.loads(open(sys.argv[1]).read().strip().split("\n")[0])
-data = base64.b64decode(row["capture"])
-open(sys.argv[2], "wb").write(data)
-print(f"   captured {len(data)} bytes")
-PY
+python3 "$ROOT/tests/cluster-e2e/decode_job_input.py" \
+  "$WORK/capture.json" "$FIXTURES/cat_input.bin"
 ok "cat_input.bin"
 
 say "Capturing the expected outputs"
@@ -81,16 +76,7 @@ cat "$FIXTURES/cat_expected_table_0.bin" "$FIXTURES/cat_expected_table_1.bin" \
 # The rows a job is handed must be byte-identical to the rows the table returns;
 # if that ever stops holding, the fixtures are inconsistent and the offline test
 # would be checking the wrong thing.
-python3 - "$FIXTURES" <<'PY'
-import pathlib, sys
-f = pathlib.Path(sys.argv[1])
-job_input = (f / "cat_input.bin").read_bytes()
-for i in (0, 1):
-    rows = (f / f"cat_expected_table_{i}.bin").read_bytes()
-    if job_input.find(rows) < 0:
-        sys.exit(f"table {i} rows are not a verbatim substring of the job input")
-print("   consistency check passed: table rows appear verbatim in the job input")
-PY
+python3 "$ROOT/tests/cluster-e2e/check_fixture_consistency.py" "$FIXTURES"
 ok "cat_expected_table_0.bin, cat_expected_table_1.bin, cat_expected_single.bin"
 
 say "Verifying the offline test against the fresh fixtures"

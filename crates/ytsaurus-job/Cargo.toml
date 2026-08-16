@@ -24,7 +24,7 @@ categories = ["encoding"]
 # time, so shipping that file gives anyone who unpacks the crate and runs
 # `cargo test` a build error and no way to fix it. The other e2e tests build the
 # example workers, which *are* published, and are left in.
-exclude = ["examples/selfrun.rs", "tests/cat_e2e.rs"]
+exclude = ["examples/selfrun.rs", "tests/cat_e2e.rs", "tests/skiff_reader_tests.rs"]
 
 [dependencies]
 ytsaurus-yson.workspace = true

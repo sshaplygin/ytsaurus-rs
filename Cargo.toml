@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -23,15 +23,15 @@ homepage = "https://github.com/sshaplygin/ytsaurus-rs"
 authors = ["Sam Shaplygin <semyuon@gmail.com>"]
 
 [workspace.dependencies]
-ytsaurus-yson = { path = "crates/ytsaurus-yson", version = "0.3.0" }
-ytsaurus-skiff = { path = "crates/ytsaurus-skiff", version = "0.3.0" }
-ytsaurus-format = { path = "crates/ytsaurus-format", version = "0.3.0" }
-ytsaurus-job = { path = "crates/ytsaurus-job", version = "0.3.0" }
-ytsaurus-client = { path = "crates/ytsaurus-client", version = "0.3.0" }
-ytsaurus-helpers = { path = "crates/ytsaurus-helpers", version = "0.3.0" }
-ytsaurus-api = { path = "crates/ytsaurus-api", version = "0.3.0" }
-ytsaurus-proto = { path = "crates/ytsaurus-proto", version = "0.3.0" }
-ytsaurus-rpc = { path = "crates/ytsaurus-rpc", version = "0.3.0" }
+ytsaurus-yson = { path = "crates/ytsaurus-yson", version = "0.3.1" }
+ytsaurus-skiff = { path = "crates/ytsaurus-skiff", version = "0.3.1" }
+ytsaurus-format = { path = "crates/ytsaurus-format", version = "0.3.1" }
+ytsaurus-job = { path = "crates/ytsaurus-job", version = "0.3.1" }
+ytsaurus-client = { path = "crates/ytsaurus-client", version = "0.3.1" }
+ytsaurus-helpers = { path = "crates/ytsaurus-helpers", version = "0.3.1" }
+ytsaurus-api = { path = "crates/ytsaurus-api", version = "0.3.1" }
+ytsaurus-proto = { path = "crates/ytsaurus-proto", version = "0.3.1" }
+ytsaurus-rpc = { path = "crates/ytsaurus-rpc", version = "0.3.1" }
 
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"

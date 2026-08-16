@@ -10,6 +10,23 @@ This crate is **pre-release**. It is on crates.io because `ytsaurus-job` and
 gates in [docs/skiff-compatibility.md](../../docs/skiff-compatibility.md) are
 still not all green, and the API may change in a patch release.
 
+## 0.3.1 - 2026-08-16
+
+### Fixed
+
+- **`tests/wire.rs` is no longer published.** It `include_str!`s reference
+  vectors from `tests/skiff-go-interop/`, which is outside this crate, and
+  `include_str!` resolves at compile time — so the file compiled in the
+  repository and could not compile from the 0.3.0 tarball, where the fixtures
+  are not and cannot be. `cargo test` inside an unpacked `ytsaurus-skiff`
+  0.3.0 fails for this reason; anyone merely *depending* on the crate was
+  unaffected, since cargo does not build a dependency's tests.
+
+  `tests/cpp_interop.rs` was excluded in 0.3.0 for exactly this reason and this
+  one was missed: the search was a line-based grep, and here the macro has a
+  newline in it. `scripts/check_package_includes.py` now parses instead of
+  matching, and runs in CI.
+
 ## 0.3.0 - 2026-08-16
 
 No change to what this crate encodes or decodes — **not one byte moved**, and no

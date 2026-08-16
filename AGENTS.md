@@ -43,7 +43,8 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Worker builds | `x86_64-unknown-linux-musl`, fully static; `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — the last **only** for worker binaries, never for library crates |
 | Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
-| Python tooling | **ruff** lints and formats; **uv** runs. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` is ruff configuration and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
+| Python tooling | **ruff** lints and formats; **ty** type-checks; **uv** runs — all three astral, one family. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` configures ruff and ty and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
+| **Language for automation** | **Python** for everything that computes, parses or asserts. **bash** for glue only — sequencing external commands, with **no source of another language embedded in it**, and none of it inlined into a workflow. **Rust** (`xtask`) only where it is genuinely required: `generate-protos` is there because `prost-build` is a Rust library API, and nothing else qualifies. **Go** only in `tests/*-go-interop/`, where the whole point is an oracle this project did not write. `tests/skiff-cpp-interop/cpp_reference.py` is permanently Python — `yt_yson_bindings` is a compiled C extension over upstream's own Skiff. **No new language without a human**, and JavaScript is not coming back. |
 
 ## Hard rules
 
@@ -92,6 +93,9 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ./scripts/init-protos.sh          # only to regenerate protos: the submodule, shallow and sparse
 cargo xtask generate-protos       # rewrite crates/ytsaurus-proto/src/generated/ from it
 
+python3 scripts/check_package_includes.py   # no published file may include_str!
+                                            # data from outside its own crate
+
 cargo test --workspace            # 941 tests: 863 unit and integration, 78 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -102,7 +106,7 @@ cargo fmt --all
 cargo bench -p ytsaurus-yson      # codec microbenchmark
 cargo bench -p ytsaurus-job       # job-path throughput
 
-uvx ruff check .                  # the four Python test helpers
+uvx ruff check .                  # the five Python scripts
 uvx ruff format --check .         # drop --check to rewrite
 
 cd tests/rpc-go-interop && go test ./...   # regenerate the RPC wire-format vectors
@@ -1328,7 +1332,8 @@ Three layers:
    through the official Python client and so checks the worker's output against
    a **different implementation** rather than against ourselves. Keep both — the
    second is the only place anything here is read by code we did not write.
-   Neither is in CI (needs a multi-GB image). See
+   `run_pilot.sh` is not in CI (needs a multi-GB image); `run_e2e.sh` is, on
+   every push to main, through `.github/workflows/cluster-e2e.yml`. See
    [`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md).
 
 Fuzzing: `cargo +nightly fuzz run fuzz_target_{1,2}` from `crates/ytsaurus-yson/`.
@@ -1354,8 +1359,8 @@ iterations without a crash.
 ### Shipped
 
 - **GitHub**: [sshaplygin/ytsaurus-rs](https://github.com/sshaplygin/ytsaurus-rs),
-  public, CI green, tagged `v0.3.0`.
-- **crates.io**: all **nine** crates at **0.3.0**, released together —
+  public, CI green, tagged `v0.3.1`.
+- **crates.io**: all **nine** crates at **0.3.1**, released together —
   [`ytsaurus-yson`](https://crates.io/crates/ytsaurus-yson),
   [`ytsaurus-skiff`](https://crates.io/crates/ytsaurus-skiff),
   [`ytsaurus-format`](https://crates.io/crates/ytsaurus-format),
@@ -1376,6 +1381,15 @@ iterations without a crash.
 
   `ytsaurus-yson` and `ytsaurus-job` were on crates.io at 0.1.0 and 0.2.0
   before this, and `ytsaurus-client` at 0.2.0.
+
+  **0.3.1 is a packaging fix.** `ytsaurus-skiff` and `ytsaurus-job` shipped a
+  test file each that `include_str!`s a fixture from outside its own crate.
+  Those macros resolve at compile time, so both files compiled here and could
+  not compile from the 0.3.0 tarball. Consumers were unaffected — cargo does not
+  build a dependency's tests — but `cargo test` inside an unpacked crate failed.
+  Four files of the kind were caught before 0.3.0 with a line-based grep, and
+  these two have a newline inside the macro. `scripts/check_package_includes.py`
+  parses instead of matching and runs in CI.
 
   **0.2.6 was never released.** The version was bumped and the CHANGELOGs
   written, and the tag was never cut; what it contained — the worker examples

@@ -19,12 +19,14 @@ readme = "README.md"
 keywords = ["ytsaurus", "skiff", "serialization", "mapreduce"]
 categories = ["encoding"]
 
-# `tests/cpp_interop.rs` `include_str!`s the C++ reference vectors from
-# `tests/skiff-cpp-interop/`, which is outside this package and so is not in the
-# tarball. `include_str!` resolves at compile time, so shipping the file would
-# hand anyone who unpacks the crate a build error they cannot fix. The vectors
-# and the test both live in the repository, where they run.
-exclude = ["tests/cpp_interop.rs"]
+# `tests/cpp_interop.rs` and `tests/wire.rs` `include_str!` reference vectors
+# from `tests/skiff-cpp-interop/` and `tests/skiff-go-interop/`, which are
+# outside this package and so are not in the tarball. `include_str!` resolves at
+# compile time, so shipping either hands anyone who unpacks the crate a build
+# error they cannot fix. The vectors and the tests both live in the repository,
+# where they run. `scripts/check_package_includes.py` is what keeps this list
+# honest.
+exclude = ["tests/cpp_interop.rs", "tests/wire.rs"]
 
 [dependencies]
 ytsaurus-yson.workspace = true

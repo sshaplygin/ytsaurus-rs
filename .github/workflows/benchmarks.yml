@@ -9,7 +9,7 @@ on:
       - "Cargo.toml"
       - "crates/**"
       - "rust-toolchain.toml"
-      - "scripts/compare-criterion.mjs"
+      - "scripts/compare_criterion.py"
 
 # A pull request from a fork still receives a read-only token, so its benchmark
 # result is available in the job summary but cannot be posted as a comment.
@@ -118,55 +118,29 @@ jobs:
           pattern: criterion-main-vs-pr-*
           path: benchmark-logs
 
-      - name: Assemble benchmark output
-        run: |
-          set -euo pipefail
-          for suite in yson skiff job client; do
-            cat "benchmark-logs/criterion-main-vs-pr-${suite}/base/benchmarks.txt"
-          done > main-benchmarks.txt
-          for suite in yson skiff job client; do
-            cat "benchmark-logs/criterion-main-vs-pr-${suite}/pr/benchmarks.txt"
-          done > pr-benchmarks.txt
-
+      # The per-suite concatenation used to be a shell loop here; the script
+      # takes the download directory and does it itself, so this is one command.
       - name: Render comparison
         run: |
-          node scripts/compare-criterion.mjs \
-            main-benchmarks.txt pr-benchmarks.txt \
+          python3 scripts/compare_criterion.py --logs benchmark-logs \
             "${{ github.event.pull_request.base.sha }}" \
             "${{ github.event.pull_request.head.sha }}" \
             > benchmark-report.md
           cat benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
 
+      # `gh` is authenticated from GH_TOKEN exactly as actions/github-script's
+      # client was; the matching is on the report's HTML marker rather than on
+      # the comment's author, which is what `gh pr comment --edit-last` would
+      # do and why that is not used. See the script.
       - name: Post comparison on the pull request
         if: github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const fs = require("fs");
-            const marker = "<!-- ytsaurus-rs:criterion-benchmark-comparison -->";
-            const body = fs.readFileSync("benchmark-report.md", "utf8");
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const previous = comments.find((comment) => comment.body.includes(marker));
-
-            if (previous) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: previous.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/post_benchmark_comment.py \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}" \
+            --body-file benchmark-report.md
 
       - name: Upload benchmark report
         uses: actions/upload-artifact@v4

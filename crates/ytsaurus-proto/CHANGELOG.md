@@ -9,6 +9,12 @@ This crate is **pre-release**, and its contents are generated: what changes here
 is which upstream `.proto` files are compiled and which submodule commit they
 are taken from.
 
+## 0.3.1 - 2026-08-16
+
+No changes to this crate beyond the version, which tracks the workspace.
+`ytsaurus-skiff` and `ytsaurus-job` shipped a test file each that could not
+compile from their tarballs; this crate had no such file.
+
 ## 0.3.0 - 2026-08-16
 
 First release of the crate: `prost`-generated bindings for the transitive import
