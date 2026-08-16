@@ -11,6 +11,21 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  python-lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The four `.py` files here are test helpers, not a package, so there is
+      # nothing to install — `uvx` fetches ruff and runs it. Configuration lives
+      # in the repository's pyproject.toml.
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff check
+        run: uvx ruff check .
+      - name: ruff format
+        run: uvx ruff format --check .
+
   go-skiff-reference:
     name: pinned Go Skiff reference
     runs-on: ubuntu-latest
