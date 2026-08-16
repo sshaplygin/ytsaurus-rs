@@ -31,7 +31,7 @@ module version is available.
 | `SkiffJobWriter` | **Implemented for dynamic rows** | one single-table Skiff stream per descriptor; input-only system fields rejected; real `skiff_cat` worker e2e |
 | Shared worker/client format selection | **Implemented** | non-exhaustive `DataFormat` enum drives worker I/O, operation specs, and direct table I/O; YSON and Skiff remain explicit row representations |
 | Map / map-reduce / reduce / vanilla Skiff operation formats | **Implemented** | rendered spec tests for map, mapper, reducer and vanilla task; a format whose table-schema count cannot describe the operation's tables is refused before the spec is sent; binary YSON remains the default |
-| Skiff table client I/O | **Implemented; the single-table map path is cluster-verified, now at nine-column width and 412 554 rows** | mock-proxy request-shape/truncation tests; `skiff_launch` against a managed multi-node cluster on 2026-08-09 — a Skiff stream written, mapped and read back, both rows compared element by element including non-UTF-8 `string32`; and `format_compare`'s `project` task on 2026-08-13/14 — a Skiff map over 412 554 rows / 48 MiB, nine mixed-type columns, a `Variant8` optional and a hand-written positional schema, its output diffed row for row, exactly and in order, against two independent YSON legs and a YQL query, once at the start of each of three nine-round runs and before any clock was read. Both are still **one** input table and **one** output descriptor; the multi-table shapes of required test 4 and the Go-against-the-cluster half are still required. |
+| Skiff table client I/O | **Implemented; the single-table map path is cluster-verified, now at nine-column width and 412 554 rows** | mock-proxy request-shape/truncation tests; `skiff_launch` against a managed multi-node cluster on 2026-08-09 — a Skiff stream written, mapped and read back, both rows compared element by element including non-UTF-8 `string32`; and `format_compare`'s `project` task on 2026-08-13/14 — a Skiff map over 412 554 rows / 48 MiB, nine mixed-type columns, a `Variant8` optional and a hand-written positional schema, its output diffed row for row against two independent YSON legs and a YQL query, once at the start of each of three nine-round runs and before any clock was read — exactly and in order as those runs were made, and as a sorted multiset in the harness as it now stands. Both are still **one** input table and **one** output descriptor; the multi-table shapes of required test 4 and the Go-against-the-cluster half are still required. |
 
 No typed row codec or inference API is claimed compatible until its ship gate is
 green. The implemented dynamic APIs remain pre-release until the real-cluster
@@ -51,12 +51,17 @@ cluster-verified", not "Skiff is cluster-verified".
 `skiff_launch` had: nine mixed-type columns rather than two, a `Variant8`
 optional column, `string32` columns that are deliberately not UTF-8, 412 554
 rows through one job, and a hand-written positional schema whose decoded output
-was diffed row for row, exactly and in order, against a typed-serde YSON leg, a
-`YsonValue` leg and a YQL query — once at the start of each of the three runs,
-before any clock was read, and all four agreed every time. Two things fell out
-of it that belong to this document rather than to the benchmark. First, **YQL's
-own job I/O is Skiff**, read from the operation spec, and its schema differs
-from the hand-written one only in carrying `$row_index` as
+was diffed row for row against a typed-serde YSON leg, a `YsonValue` leg and a
+YQL query — once at the start of each of the three runs, before any clock was
+read, and all four agreed every time. That diff was exact and order-sensitive
+when the runs were made; the harness has since sorted canonical binary-YSON
+encodings and compares the multiset, which is weaker on ordering only. **What
+the matrix row above rests on is the order-sensitive result**, and a re-run
+today would confirm presence, absence and multiplicity rather than order.
+
+Two things fell out of it that belong to this document rather than to the
+benchmark. First, **YQL's own job I/O is Skiff**, read from the operation spec,
+and its schema differs from the hand-written one only in carrying `$row_index` as
 `variant8<nothing;int64>` and writing the derived boolean as optional — an
 independently written schema agreeing with the engine's to within its system
 columns. Second, two costs in this crate that a benchmark found and a

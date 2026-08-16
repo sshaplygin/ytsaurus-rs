@@ -443,9 +443,17 @@ would have carried the wrong claims into `benchmarking.md`.
 
 **On the `project` task** — the pilot's map, 412 554 rows / 48 MiB, one job per
 leg (`data_weight_per_job` pinned), one output table, no shuffle, rounds
-interleaved, outputs diffed row for row, exactly and in order, once at the start
-of each run and before any clock was read, all four computing legs agreeing.
-**Three nine-round runs**, every ratio paired by round:
+interleaved, outputs diffed row for row once at the start of each run and before
+any clock was read, all four computing legs agreeing. **Three nine-round runs**,
+every ratio paired by round:
+
+*The diff these runs passed compared the rows exactly and in order. The harness
+now sorts canonical binary-YSON encodings and compares the multiset instead —
+strictly weaker on ordering, identical on presence, absence and multiplicity —
+because no leg here is required to preserve the input's order, and a check that
+demands it would fail a correct leg for a reason that is not about correctness.
+Re-running these numbers gets the weaker check; the numbers themselves were
+taken under the stronger one.*
 
 | paired by round | run 1 | run 2 | run 3 |
 | --- | ---: | ---: | ---: |

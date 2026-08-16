@@ -279,8 +279,16 @@ columns, five validation rules, one derived column, **one** output table, no
 shuffle — over one table of 412 554 rows / 48 MiB. `data_weight_per_job` is
 pinned so every leg runs in exactly one job, the rounds are interleaved so each
 round's legs met the same cluster, and every leg that produces rows is diffed
-against the first — exactly and in order, once at the start of each run, before
-any clock is read. All four computing legs agree row for row.
+against the first, once at the start of each run, before any clock is read. All
+four computing legs agree row for row.
+
+The diff is a **multiset** comparison: each row is re-encoded as canonical
+binary YSON and the encodings are sorted, so a leg may write its rows in a
+different order but cannot hide a missing, extra or duplicated one. The three
+runs below were made against an order-sensitive version of that check, which
+these legs also passed — the sort was added afterwards, because ordering is a
+property no leg here is required to preserve and a check that demands it would
+fail a correct leg for a reason that is not about correctness.
 
 | leg | reads | stops at |
 | --- | --- | --- |
