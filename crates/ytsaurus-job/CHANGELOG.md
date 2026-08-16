@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1 - 2026-08-16
+
+### Fixed
+
+- **`tests/skiff_reader_tests.rs` is no longer published.** It `include_str!`s a
+  control-row vector from `tests/skiff-go-interop/`, which is outside this
+  crate, and `include_str!` resolves at compile time — so the file compiled in
+  the repository and could not compile from the 0.3.0 tarball. `cargo test`
+  inside an unpacked `ytsaurus-job` 0.3.0 fails for this reason; anyone merely
+  *depending* on the crate was unaffected, since cargo does not build a
+  dependency's tests.
+
+  `tests/cat_e2e.rs` was excluded in 0.3.0 for exactly this reason and this one
+  was missed: the search was a line-based grep, and here the macro has a
+  newline in it. `scripts/check-package-includes.sh` now parses instead of
+  matching, and runs in CI.
+
 ## 0.3.0 - 2026-08-16
 
 No change to this crate's library — the runtime, the reader and the writers are

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-08-16
+
+No changes to this crate beyond the version, which tracks the workspace.
+`ytsaurus-skiff` and `ytsaurus-job` shipped a test file each that could not
+compile from their tarballs; this crate had no such file.
+
 ## 0.3.0 - 2026-08-16
 
 ### Dynamic tables, and a second transport

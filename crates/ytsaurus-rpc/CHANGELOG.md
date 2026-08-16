@@ -11,6 +11,12 @@ gate D, the HTTP `discover_proxies` bootstrap, is open — and the API may chang
 in a patch release. The scope is deliberately narrow: transactions,
 `lookup_rows`, `select_rows` and `modify_rows`, not the other 150 request types.
 
+## 0.3.1 - 2026-08-16
+
+No changes to this crate beyond the version, which tracks the workspace.
+`ytsaurus-skiff` and `ytsaurus-job` shipped a test file each that could not
+compile from their tarballs; this crate had no such file.
+
 ## 0.3.0 - 2026-08-16
 
 Published, as pre-release, by the human decision Hard rule 1 asks for.

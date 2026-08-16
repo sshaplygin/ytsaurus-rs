@@ -1354,8 +1354,8 @@ iterations without a crash.
 ### Shipped
 
 - **GitHub**: [sshaplygin/ytsaurus-rs](https://github.com/sshaplygin/ytsaurus-rs),
-  public, CI green, tagged `v0.3.0`.
-- **crates.io**: all **nine** crates at **0.3.0**, released together —
+  public, CI green, tagged `v0.3.1`.
+- **crates.io**: all **nine** crates at **0.3.1**, released together —
   [`ytsaurus-yson`](https://crates.io/crates/ytsaurus-yson),
   [`ytsaurus-skiff`](https://crates.io/crates/ytsaurus-skiff),
   [`ytsaurus-format`](https://crates.io/crates/ytsaurus-format),
@@ -1376,6 +1376,15 @@ iterations without a crash.
 
   `ytsaurus-yson` and `ytsaurus-job` were on crates.io at 0.1.0 and 0.2.0
   before this, and `ytsaurus-client` at 0.2.0.
+
+  **0.3.1 is a packaging fix.** `ytsaurus-skiff` and `ytsaurus-job` shipped a
+  test file each that `include_str!`s a fixture from outside its own crate.
+  Those macros resolve at compile time, so both files compiled here and could
+  not compile from the 0.3.0 tarball. Consumers were unaffected — cargo does not
+  build a dependency's tests — but `cargo test` inside an unpacked crate failed.
+  Four files of the kind were caught before 0.3.0 with a line-based grep, and
+  these two have a newline inside the macro. `scripts/check-package-includes.sh`
+  parses instead of matching and runs in CI.
 
   **0.2.6 was never released.** The version was bumped and the CHANGELOGs
   written, and the tag was never cut; what it contained — the worker examples
