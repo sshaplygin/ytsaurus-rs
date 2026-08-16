@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs the `sessionize` pilot as a real map-reduce on a live cluster.
 #
-#   tests/e2e/run_local_cluster.sh     # once
-#   tests/e2e/run_pilot.sh
+#   tests/cluster-e2e/run_local_cluster.sh     # once
+#   tests/cluster-e2e/run_pilot.sh
 #
 # The pilot is a production-shaped workload — wide mixed-type rows, non-UTF-8
 # byte columns, two output tables per phase, a reduce over a realistic key, and
@@ -42,7 +42,7 @@ ok "$(ls -lh "$BINDIR/sessionize" | awk '{print $5}') static binary"
 say "Generating input"
 yt remove "$BASE" --recursive --force
 yt create map_node "$BASE" --recursive >/dev/null
-python3 "$ROOT/tests/e2e/generate_pilot_input.py" "$WORK/events.yson"
+python3 "$ROOT/tests/cluster-e2e/generate_pilot_input.py" "$WORK/events.yson"
 yt write-table --format "$YSON" "$BASE/raw" < "$WORK/events.yson"
 ok "$(yt get "$BASE/raw/@row_count") raw events in $BASE/raw"
 
@@ -89,7 +89,7 @@ ok "$SESSIONS sessions across $USERS users"
 say "Checking the result against the input"
 yt read-table --format json "$BASE/users" > "$WORK/users.json"
 yt read-table --format json "$BASE/sessions" > "$WORK/sessions.json"
-python3 "$ROOT/tests/e2e/check_pilot_output.py" \
+python3 "$ROOT/tests/cluster-e2e/check_pilot_output.py" \
   "$WORK/events.yson" "$WORK/users.json" "$WORK/sessions.json" "$CLEAN"
 
 say "Pilot passed"

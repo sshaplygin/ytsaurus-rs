@@ -27,7 +27,7 @@
 //!
 //! ```sh
 //! scripts/build-worker.sh sessionize
-//! # see tests/e2e/run_pilot.sh for the full operation invocation
+//! # see tests/cluster-e2e/run_pilot.sh for the full operation invocation
 //! ```
 
 use std::collections::BTreeMap;

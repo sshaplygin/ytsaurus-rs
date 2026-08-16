@@ -4,13 +4,13 @@
 //! job input on fd 0, output table 0 on fd 1, output table 1 on fd 4.
 //!
 //! The fixtures are **captured from a real YTsaurus cluster** by
-//! `tests/e2e/capture_fixtures.sh` — `cat_input.bin` is literally the byte
+//! `tests/cluster-e2e/capture_fixtures.sh` — `cat_input.bin` is literally the byte
 //! stream a job was handed on fd 0, and the expected outputs are what the
 //! cluster returns for those tables. So this is not a test of our reading of
 //! the specification against itself; the bytes came from YTsaurus.
 //!
 //! What it still cannot cover is the operation plumbing — scheduling, retries,
-//! how a failing job is reported. `tests/e2e/run_e2e.sh` covers that against a
+//! how a failing job is reported. `tests/cluster-e2e/run_e2e.sh` covers that against a
 //! live cluster.
 
 use std::path::{Path, PathBuf};
@@ -18,15 +18,18 @@ use std::process::Command;
 
 mod common;
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/e2e/fixtures");
+const FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/cluster-e2e/fixtures"
+);
 
-const INPUT: &[u8] = include_bytes!("../../../tests/e2e/fixtures/cat_input.bin");
+const INPUT: &[u8] = include_bytes!("../../../tests/cluster-e2e/fixtures/cat_input.bin");
 const EXPECTED_TABLE_0: &[u8] =
-    include_bytes!("../../../tests/e2e/fixtures/cat_expected_table_0.bin");
+    include_bytes!("../../../tests/cluster-e2e/fixtures/cat_expected_table_0.bin");
 const EXPECTED_TABLE_1: &[u8] =
-    include_bytes!("../../../tests/e2e/fixtures/cat_expected_table_1.bin");
+    include_bytes!("../../../tests/cluster-e2e/fixtures/cat_expected_table_1.bin");
 const EXPECTED_SINGLE: &[u8] =
-    include_bytes!("../../../tests/e2e/fixtures/cat_expected_single.bin");
+    include_bytes!("../../../tests/cluster-e2e/fixtures/cat_expected_single.bin");
 
 /// A scratch directory that cleans up after itself.
 struct TempDir(PathBuf);

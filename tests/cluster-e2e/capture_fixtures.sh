@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Captures the offline test's golden fixtures from a **real** YTsaurus cluster.
 #
-#   tests/e2e/run_local_cluster.sh     # once
-#   tests/e2e/capture_fixtures.sh
+#   tests/cluster-e2e/run_local_cluster.sh     # once
+#   tests/cluster-e2e/capture_fixtures.sh
 #
-# Writes, into tests/e2e/fixtures/:
+# Writes, into tests/cluster-e2e/fixtures/:
 #
 #   cat_input.bin             exactly the bytes a job receives on fd 0, with
 #                             every control attribute enabled
@@ -26,7 +26,7 @@ set -euo pipefail
 
 PROXY="${YT_PROXY:-localhost:8000}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-FIXTURES="$ROOT/tests/e2e/fixtures"
+FIXTURES="$ROOT/tests/cluster-e2e/fixtures"
 BASE="${YT_E2E_BASE:-//tmp/ytsaurus_rs_capture}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -42,7 +42,7 @@ command -v yt >/dev/null || die "the 'yt' CLI is not installed (pip install ytsa
 yt list / >/dev/null 2>&1 || die "cannot reach the cluster at $PROXY"
 
 say "Regenerating table payloads"
-python3 "$ROOT/tests/e2e/generate_fixtures.py"
+python3 "$ROOT/tests/cluster-e2e/generate_fixtures.py"
 
 say "Uploading to $BASE"
 yt remove "$BASE" --recursive --force

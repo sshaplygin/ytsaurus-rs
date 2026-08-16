@@ -1,6 +1,6 @@
 //! `launch` — runs a whole operation with no Python on the machine.
 //!
-//! Does end to end what `tests/e2e/run_e2e.sh` does through the `yt` CLI:
+//! Does end to end what `tests/cluster-e2e/run_e2e.sh` does through the `yt` CLI:
 //! creates tables, uploads the worker, writes input, starts a map, waits for
 //! it, and reads the result back. The point is that the only executable
 //! involved is this one and the worker it uploads.

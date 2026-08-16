@@ -49,7 +49,7 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-rpc/](crates/ytsaurus-rpc/) | The RPC proxy, for dynamic tables under concurrency. Async on tokio, unlike everything above. |
 | [crates/ytsaurus-proto/](crates/ytsaurus-proto/) | Protobuf bindings, generated from the `third_party/ytsaurus` submodule. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, and how this compares to the official C++ and Go clients. |
-| [tests/e2e/](tests/e2e/) | End-to-end scripts against a local YTsaurus cluster. |
+| [tests/cluster-e2e/](tests/cluster-e2e/) | End-to-end scripts against a local YTsaurus cluster. |
 
 ## A job in full
 
@@ -121,7 +121,7 @@ toolchain; the musl worker carries no TLS either way. It is spelled
 
 **Against a cluster that is not a local one** — a private CA, heavy proxies in
 another domain, a shared file cache — see [the runbook in
-tests/e2e/README.md](tests/e2e/README.md#against-a-cluster-that-is-not-the-local-one).
+tests/cluster-e2e/README.md](tests/cluster-e2e/README.md#against-a-cluster-that-is-not-the-local-one).
 
 ## Environment
 
@@ -165,8 +165,8 @@ run can be made bigger without editing code:
 | `YT_PROFILE_MIB` / `YT_PROFILE_ROUNDS` | 48 / 5 | `profile`. Raise the rounds on a busy cluster; at 3 it could not separate the phases at all |
 | `YT_STREAM_MIB` | 64 | `streaming` |
 | `YT_APPEND_ROWS` / `YT_APPEND_CHUNKS` | 60000 / 12 | `append` |
-| `YT_LOCAL_DIR` | `~/yt-local` | `tests/e2e/run_local_cluster.sh` |
-| `YT_PILOT_BASE` | `//tmp/ytsaurus_rs_pilot` | `tests/e2e/run_pilot.sh` |
+| `YT_LOCAL_DIR` | `~/yt-local` | `tests/cluster-e2e/run_local_cluster.sh` |
+| `YT_PILOT_BASE` | `//tmp/ytsaurus_rs_pilot` | `tests/cluster-e2e/run_pilot.sh` |
 
 ## Build and test
 
@@ -193,7 +193,7 @@ reduce and sort, retries, the worker cache, custom statistics, schemas derived
 from a struct, transactions, the rest of Cypress with locks, `alter_table`,
 streaming table I/O, and the whole operation lifecycle — pause, resume, reprice,
 finish early, look one up by alias, and reattach to one after a restart. Every
-item ends with an example that checks itself on a cluster — [`tests/e2e/README.md`](tests/e2e/README.md) is the list of what has
+item ends with an example that checks itself on a cluster — [`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md) is the list of what has
 actually been run, with its output.
 
 **Measured against the official clients.** There is no official Rust SDK, but
@@ -228,7 +228,7 @@ two-output run exercising table switching, and a `wordcount` map-reduce matching
 hand-computed result. The offline test's golden fixtures are **captured from that
 cluster** — `cat_input.bin` is literally the stream a job was handed on fd 0 — so
 CI keeps a meaningful signal without Docker. See
-[`tests/e2e/README.md`](tests/e2e/README.md).
+[`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md).
 
 Running it for real caught four things no offline test could: `--spec` is YSON and
 not JSON, `map-reduce` needs `--map-local-file`/`--reduce-local-file`, a column

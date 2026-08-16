@@ -117,7 +117,7 @@ A job is a program that reads a pipe:
 
 See [`crates/ytsaurus-job/tests/cat_e2e.rs`](../../crates/ytsaurus-job/tests/cat_e2e.rs) for that
 pattern applied to a real binary, and
-[`tests/e2e/README.md`](../../tests/e2e/README.md) for the cluster test.
+[`tests/cluster-e2e/README.md`](../../tests/cluster-e2e/README.md) for the cluster test.
 
 ## Benchmarks
 

@@ -46,7 +46,7 @@
 //! where the formats differ; `docs/benchmarking.md` §5 is what its runs said.
 //!
 //! ```sh
-//! tests/e2e/run_local_cluster.sh
+//! tests/cluster-e2e/run_local_cluster.sh
 //! export YT_PROXY=http://localhost:8000
 //!
 //! scripts/build-worker.sh wordcount

@@ -14,7 +14,7 @@ it emits is not something to guess at.
 
 Run from the repository root:
 
-    python3 tests/e2e/generate_fixtures.py
+    python3 tests/cluster-e2e/generate_fixtures.py
 
 The output is committed, so regenerating it should produce no diff unless the
 payload is being changed on purpose.

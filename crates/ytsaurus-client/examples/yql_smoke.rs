@@ -15,7 +15,7 @@
 //!    operations it spawns**?
 //!
 //! ```sh
-//! tests/e2e/run_local_cluster.sh
+//! tests/cluster-e2e/run_local_cluster.sh
 //! export YT_PROXY=http://localhost:8000
 //! cargo run -p ytsaurus-client --example yql_smoke
 //!
