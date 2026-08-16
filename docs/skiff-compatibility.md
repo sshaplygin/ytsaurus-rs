@@ -15,14 +15,24 @@ Changing it requires an intentional change to this document, the Go vectors and
 the bidirectional test results. It must never advance merely because a newer
 module version is available.
 
+**Go is the executable reference; C++ is the normative one.** `library/cpp/skiff`
+is what a cluster links and what the job proxy writes with, and Go implements a
+subset of it — no `int128`/`int256` codec, no `$sparse_columns`, no
+`$other_columns`. So a green Go gate is necessary and not sufficient, and where
+the two disagree C++ decides. A one-off comparison against the C++ library was
+run on 2026-08-16 and is recorded in
+[the full-support plan](./skiff-full-support-plan.md); the standing gate against
+C++ is the cluster fixtures of required test 4.
+
 ## Compatibility matrix
 
 | Surface in Go v0.0.33 | Current Rust state | Ship gate |
 | --- | --- | --- |
 | `WireType`: all twenty values | **Schema model implemented** | Rust enum/YSON tests plus Go reference test |
 | `Schema`, inline table schema and registry reference | **Implemented and structurally validated** | table roots must be named-field tuples; format parses/renders against Go-shaped values |
-| Dynamic encoder/decoder for the primitives Go codes, variants, repeated variants and tuples | **Implemented** | Go v0.0.33 vector, Rust round trips, one-byte reads, malformed tag, truncation, blob-limit and row-limit tests |
-| `int128` and `int256` | **Implemented, Rust-only** | Go v0.0.33 has no codec for either: `decodeStruct`/`decodeSimpleTypeGeneric` answer "unexpected wire type" and the encoder matches, so the shared corpus cannot contain them. Byte order is asserted against Rust alone until a cluster fixture or a newer Go SDK can settle it. |
+| Dynamic encoder/decoder for the primitives Go codes, variants, repeated variants and tuples | **Implemented** | Go v0.0.33 vector, Rust round trips, one-byte reads, malformed tag, truncation, blob-limit and row-limit tests. The 2026-08-16 C++ audit found these bytes identical to C++'s for scalars, optionals, sparse columns, other-columns, control columns and multiplexed tables. |
+| `int128` and `int256` | **Implemented, Rust-only** | Go v0.0.33 has no codec for either: `decodeStruct`/`decodeSimpleTypeGeneric` answer "unexpected wire type" and the encoder matches, so the shared corpus cannot contain them. Byte order is asserted against Rust alone until a cluster fixture can settle it. |
+| `uint128` and `uint256` | **Missing** | C++ `EWireType` has both and this crate has neither, so a `uuid` column — carried as `uint128` — cannot be described at all. Go has neither either, so no Go gate will ever surface this. Phase 1 of [the full-support plan](./skiff-full-support-plan.md). |
 | Typed rows and schema inference | Planned | Go → Rust and Rust → Go byte vectors |
 | `Format`, `InferFormat`, `MustInferFormat` | Format model only; inference planned | generated YSON compared structurally |
 | Dynamic decoder, indexes and key switch | **Implemented** | one-byte reads, Go vector, row/range/key-switch extraction tests |
