@@ -31,10 +31,17 @@ jobs:
         with:
           python-version: '3.11'
 
+      - uses: astral-sh/setup-uv@v5
+
       # run_e2e.sh deliberately reads tables through the official client: the
       # worker output must agree with an independent YSON implementation.
+      #
+      # Installed into the interpreter set up above rather than into a virtual
+      # environment, because `run_e2e.sh` and `run_local_cluster.sh` call bare
+      # `python3` and `yt`, and are run by hand as often as by CI. `uv pip` is
+      # here for the resolver's speed, not to change where things land.
       - name: Install the YTsaurus CLI and binary YSON bindings
-        run: python -m pip install ytsaurus-client ytsaurus-yson
+        run: uv pip install --system ytsaurus-client ytsaurus-yson
 
       - name: Start a local YTsaurus cluster
         run: tests/e2e/run_local_cluster.sh

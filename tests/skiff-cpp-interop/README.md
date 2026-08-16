@@ -17,9 +17,15 @@ uses. No part of the format is reimplemented in Python, and nothing here builds
 Arcadia — it is a wheel and a `pip install`.
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python cpp_reference.py
+uv run --no-project --with-requirements requirements.txt python cpp_reference.py
 ```
+
+`uv` resolves the pinned wheels into a throwaway environment for that one
+command — no `.venv` to create, activate or forget to delete, and no packages
+installed into whatever interpreter happens to be first on `PATH`.
+`--no-project` because the `pyproject.toml` at the repository root configures
+`ruff` and declares no Python package; without the flag `uv` looks for one and
+stops.
 
 That rewrites every `*.hex`, and fails if the C++ writer and the C++ parser
 disagree about any vector.

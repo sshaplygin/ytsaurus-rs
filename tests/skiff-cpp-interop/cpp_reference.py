@@ -26,14 +26,14 @@ parser disagree about any vector.
 from __future__ import annotations
 
 import sys
-import typing
 from io import BytesIO
 from pathlib import Path
+
+import yt.wrapper.schema as typed_schema
 
 # The bindings resolve `yt.yson.yson_types` lazily from inside C++. Importing it
 # here is load-bearing, not tidiness.
 import yt.yson.yson_types  # noqa: F401
-import yt.wrapper.schema as typed_schema
 from yt.wrapper.format import StructuredSkiffFormat
 from yt.wrapper.schema import yt_dataclass
 from yt_yson_bindings import SkiffSchema, dump_skiff, load_skiff
@@ -83,7 +83,16 @@ RECORD_VECTORS = [
         ],
         "rows": [
             (0, {"i": -9223372036854775808, "u": 0, "b": False, "d": -0.0, "s": b"\xff\x61"}),
-            (0, {"i": 9223372036854775807, "u": 18446744073709551614, "b": True, "d": 1.5, "s": b""}),
+            (
+                0,
+                {
+                    "i": 9223372036854775807,
+                    "u": 18446744073709551614,
+                    "b": True,
+                    "d": 1.5,
+                    "s": b"",
+                },
+            ),
         ],
     },
     {
@@ -262,7 +271,10 @@ def verify_record(vector: dict, encoded: bytes) -> None:
         raise SystemExit(
             f"{vector['file']}: the C++ parser read {len(decoded)} rows, expected {len(expected)}"
         )
-    for index, (record, (_, fields)) in enumerate(zip(decoded, expected)):
+    # `strict` is redundant after the length check above, and it is here anyway:
+    # the check is the thing that could be edited away, and a silent truncation
+    # would turn a missing row into a passing run.
+    for index, (record, (_, fields)) in enumerate(zip(decoded, expected, strict=True)):
         for name, want in fields.items():
             got = record[name]
             if normalize(got) != normalize(want):
@@ -293,9 +305,9 @@ class Composite:
     """
 
     id: typed_schema.Int64
-    tags: typing.List[str]
+    tags: list[str]
     nested: Inner
-    maybe: typing.Optional[typed_schema.Int64]
+    maybe: typed_schema.Int64 | None
 
 
 STRUCTURED_VECTORS = [
@@ -326,17 +338,13 @@ def structured_format(dataclass, for_reading: bool) -> StructuredSkiffFormat:
 
 def encode_structured(vector: dict) -> bytes:
     stream = BytesIO()
-    structured_format(vector["dataclass"], for_reading=False)._dump_rows(
-        vector["rows"], stream
-    )
+    structured_format(vector["dataclass"], for_reading=False)._dump_rows(vector["rows"], stream)
     return stream.getvalue()
 
 
 def verify_structured(vector: dict, encoded: bytes) -> None:
     decoded = list(
-        structured_format(vector["dataclass"], for_reading=True).load_rows(
-            BytesIO(encoded)
-        )
+        structured_format(vector["dataclass"], for_reading=True).load_rows(BytesIO(encoded))
     )
     if decoded != vector["rows"]:
         raise SystemExit(
@@ -376,9 +384,7 @@ def render(doc: list[str], rows: list[tuple[str, bytes]], width: int | None = No
     lines += [f"# {line}".rstrip() for line in doc]
     for label, row in rows:
         lines.append(f"# {label}")
-        chunks = (
-            [row[at : at + width] for at in range(0, len(row), width)] if width else [row]
-        )
+        chunks = [row[at : at + width] for at in range(0, len(row), width)] if width else [row]
         lines += [" ".join(f"{byte:02x}" for byte in chunk) for chunk in chunks]
     return "\n".join(lines) + "\n"
 

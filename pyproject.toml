@@ -1,0 +1,24 @@
+# Python tooling for this workspace.
+#
+# There is no Python package here and there never will be — this repository is
+# a Rust workspace. The four `.py` files are test helpers: three that drive the
+# local-cluster end-to-end run and one that regenerates the C++ Skiff vectors.
+# This file exists only so `ruff` lints and formats them the same way for
+# everyone, instead of each file drifting to whatever its author's editor did.
+#
+# Run it through uv, so nothing has to be installed first:
+#
+#     uvx ruff check .
+#     uvx ruff format .
+
+[tool.ruff]
+# Matches `actions/setup-python` in cluster-e2e.yml. The Skiff vector script
+# needs 3.10 or newer for `int | None` in a signature; 3.11 is what CI has.
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Beyond the default `E4,E7,E9,F`: import order, bugbears, comprehensions,
+# pyupgrade and the pytest-style asserts these scripts use. Nothing here is
+# a library, so the docstring and annotation rule sets would be noise.
+select = ["E", "F", "W", "I", "B", "C4", "UP", "RUF"]
