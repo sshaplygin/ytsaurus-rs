@@ -1,0 +1,16 @@
+# The C++ Skiff implementation, reachable without building it.
+#
+# `ytsaurus-yson` ships `yt_yson_bindings`, a compiled extension built from
+# `library/cpp/skiff` and `yt/yt/python/yson/skiff`. `dump_skiff` runs
+# `TUncheckedSkiffWriter` and `load_skiff` runs `TCheckedSkiffParser`, so the
+# vectors here come from the same code a cluster runs. Nothing about the format
+# is reimplemented in Python, and nothing here builds Arcadia.
+#
+# `ytsaurus-client` supplies `yt.yson.yson_types`, which the bindings resolve at
+# call time, and the typed-dataclass layer the structured vectors go through.
+#
+# Both are pinned. Moving either version is an intentional change to
+# docs/skiff-compatibility.md, the vectors here, and the Rust test that reads
+# them — never a drive-by upgrade.
+ytsaurus-yson==0.4.10
+ytsaurus-client==0.13.53
