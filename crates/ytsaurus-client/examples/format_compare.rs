@@ -778,6 +778,31 @@ fn project_query(input: &str, output: &str) -> String {
     )
 }
 
+/// Why a query that did not complete did not complete, in one line.
+///
+/// The crate's own flattening, not a third copy of it: this example carried one
+/// that kept the innermost cause and threw the category away — `Memory limit
+/// exceeded` with no clue which stage exceeded it. It was worse than terse. Its
+/// `.last()` took the final leaf of the **last** sibling branch of a
+/// depth-first walk, which on a tree with more than one branch is not the
+/// cause at all, so a two-branch failure was reported by the wrong branch.
+///
+/// The `code == 0` guard is [`operation.rs`](crate::Operation)'s, and it is
+/// here for the reason recorded there: a document that succeeded still carries
+/// `{code=0;message=""}`, which `error_summary` summarises to `Some("")` rather
+/// than to nothing. Without the guard this reads `the query aborted: ` with a
+/// dangling colon. Reaching it needs a non-`completed` state whose error
+/// carries code 0, which is believed not to happen — but a guard the crate
+/// applies at its own call site is not one an example should drop in the
+/// copying.
+fn query_failure(state: &str, answer: &YsonValue) -> String {
+    let cause = field_ref(answer, "error")
+        .filter(|error| field_ref(error, "code").and_then(YsonValue::as_i64) != Some(0))
+        .and_then(error_summary)
+        .unwrap_or_else(|| "no message".to_owned());
+    format!("the query {state}: {cause}")
+}
+
 fn run_query(client: &Client, query: &str) -> Result<Measure, ClientError> {
     assert!(
         query.contains("INSERT INTO"),
@@ -824,17 +849,7 @@ fn run_query(client: &Client, query: &str) -> Result<Measure, ClientError> {
         if TERMINAL.contains(&state.as_str()) {
             let wall = started.elapsed();
             if state != "completed" {
-                // The crate's own flattening, not a third copy of it. This
-                // example carried one that kept the innermost cause and threw
-                // the category away — `Memory limit exceeded` with no clue
-                // which stage exceeded it — which is the same half-a-message
-                // mistake, from the other end, that made `error_summary`
-                // public in the first place.
-                let cause = field(&answer, "error")
-                    .as_ref()
-                    .and_then(error_summary)
-                    .unwrap_or_else(|| "no message".to_owned());
-                return Err(ClientError::Config(format!("the query {state}: {cause}")));
+                return Err(ClientError::Config(query_failure(&state, &answer)));
             }
             // YQL's operations are titled `YQL operation (<query id> by <user>)`
             // and the cluster's own filter matches that, so the modelled

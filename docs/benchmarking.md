@@ -625,8 +625,8 @@ The part that really settles it, because it needs a cluster:
 - the same job in **C++** (`yt/cpp/mapreduce`) and **Python** for comparison.
   *Partly supplied, 2026-08-14*: [`format-comparison.md`](format-comparison.md)
   runs the pilot's map as a YQL query, whose jobs are YQL's own C++ runtime, on
-  the same table and agreeing row for row — the first outside opinion this
-  document has had. It is **not** the C++ SDK job asked for here: it has an
+  the same table and agreeing with the workers row for row (§5 states what that
+  diff checks) — the first outside opinion this document has had. It is **not** the C++ SDK job asked for here: it has an
   optimizer, a vectorized runtime and Skiff job I/O of its own. Python remains
   entirely unmeasured.
 - **job cpu time**, **operation wall time** and **RSS** as YTsaurus reports them.
@@ -725,7 +725,8 @@ Implement `ytsaurus-skiff` if **both** hold:
    the legs interleaved so each round meets the same cluster.
    [`format-comparison.md`](format-comparison.md) is the first evidence this
    criterion has ever had — a YQL query whose jobs run YQL's C++ runtime, on the
-   pilot's map, agreeing row for row with the workers. What it says is that the
+   pilot's map, agreeing row for row with the workers under the diff §5
+   describes. What it says is that the
    typed YSON path is ahead of YQL's vectorized runtime on this task, on per-job
    wall time on one local cluster, by something between 1.24× and 1.31× derived
    from medians of different pairs rather than from a measured pairing — with
