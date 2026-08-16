@@ -1,9 +1,19 @@
-//! `format_compare` — a Rust worker against a YQL query, on one task.
+//! `format_compare` — YSON, Skiff and a YQL query, on one task.
 //!
-//! Phases 1 and 2 of `docs/format-comparison.md`. Three legs of its four:
-//! **leg 1** twice — the `wordcount` worker on binary YSON, once summing within
-//! a row and once summing within the job — and **leg 4**, the same computation
-//! as a plain YQL query. The dynamic-YSON control and Skiff are not here yet.
+//! Phases 1 and 2 of `docs/format-comparison.md`, and **two tasks** selected by
+//! `YT_COMPARE_TASK`:
+//!
+//! - `project` (what the comparison is for) — eight legs over one nine-column
+//!   table: the pilot's map at three depths on binary YSON through a typed
+//!   serde struct, two of those depths again through `YsonValue`, two on Skiff,
+//!   and the same computation as a YQL query. No shuffle and one output table,
+//!   so plan shape cannot enter the numbers.
+//! - `wordcount` (the default, and the one that found the harness's own
+//!   defects) — the `wordcount` worker on binary YSON twice, once summing
+//!   within a row and once within the job, against the query. It shuffles, so
+//!   plan shape gets into everything it produces; the rest of these module docs
+//!   is about that task and is kept because the lesson is what chose the other
+//!   one.
 //!
 //! It is worth being exact about what this compares, because "YQL versus YSON"
 //! is not a comparison that exists: YQL is a query engine and YSON is a wire
@@ -11,12 +21,12 @@
 //! to be YSON, against what an engineer who writes no code would run instead* —
 //! and any difference decomposes into the runtime, the plan, and the format.
 //!
-//! The second worker leg exists because the first version of this comparison
-//! could not make that decomposition and reported the sum. It found YQL ~1.8×
-//! faster on summed job exec time, and the largest single cause was plan
-//! shape: YQL's planner combines in the map stage, so 3 750 rows crossed its
-//! shuffle where the worker's 3 114 964 did. `map-combine` is the worker doing
-//! the same.
+//! On `wordcount`, the second worker leg exists because the first version of
+//! this comparison could not make that decomposition and reported the sum. It
+//! found YQL ~1.8× faster on summed job exec time, and the largest single cause
+//! was plan shape: YQL's planner combines in the map stage, so 3 750 rows
+//! crossed its shuffle where the worker's 3 114 964 did. `map-combine` is the
+//! worker doing the same.
 //!
 //! **What the difference between the two worker legs is not.** It is not
 //! "runtime and format, once plan is subtracted". Adversarial review of the
@@ -29,28 +39,44 @@
 //! becomes 3396 against 2787 — 1.22×, not 1.67×. On the stage that touches
 //! every row the two are within a few per cent per byte.
 //!
-//! So the honest reading of a run of this harness is: **a job-level combiner
-//! is worth about 3× on this workload, and the rest is plan shape and job
-//! startup.** Nothing here is evidence about wire formats — the format is the
-//! one thing held constant across all three legs.
+//! So the honest reading of a `wordcount` run is: **a job-level combiner is
+//! worth about 3× on this workload, and the rest is plan shape and job
+//! startup.** Nothing in that task is evidence about wire formats — the format
+//! is the one thing held constant across its three legs. The `project` task is
+//! where the formats differ; `docs/benchmarking.md` §5 is what its runs said.
 //!
 //! ```sh
 //! tests/e2e/run_local_cluster.sh
-//! scripts/build-worker.sh wordcount
 //! export YT_PROXY=http://localhost:8000
+//!
+//! scripts/build-worker.sh wordcount
 //! cargo run --release -p ytsaurus-client --example format_compare
+//!
+//! scripts/build-worker.sh sessionize
+//! YT_COMPARE_TASK=project YT_COMPARE_MIB=48 YT_COMPARE_ROUNDS=9 \
+//!     cargo run --release -p ytsaurus-client --example format_compare
 //! ```
 //!
 //! `YT_COMPARE_MIB` sets the input size (default 16) and `YT_COMPARE_ROUNDS`
-//! how many timed rounds to run (default 5, of which the **fastest** counts —
-//! a slow round is interference, a fast one cannot be). One warm-up round is
-//! run first and discarded.
+//! how many timed rounds to run (default 5). One warm-up round is run first and
+//! discarded.
+//!
+//! The **fastest** round is what the absolute columns report — a slow round is
+//! interference, a fast one cannot be. Ratios are not read off those minima:
+//! two legs' fastest rounds can fall minutes apart and carry different weather,
+//! so `paired_ratios` reports the ratio each round gave and calls a pair
+//! inseparable when the sign flips between rounds. Read that block, not the
+//! `vs first` columns.
 //!
 //! ## What it will and will not tell you
 //!
-//! **Correctness before timing.** Both sides run once and their output tables
-//! are compared word by word. A benchmark of two computations that disagree is
-//! noise, so a disagreement stops the run.
+//! **Correctness before timing.** Every leg that produces rows runs once and is
+//! diffed against the first of them before any clock is read. A benchmark of
+//! two computations that disagree is noise, so a disagreement stops the run.
+//! What "the same answer" means is the task's: `wordcount` compares the
+//! word-to-count map, and `project` compares the rows as a **multiset** —
+//! canonical binary-YSON encodings, sorted — so a leg may order its output
+//! differently but cannot hide a missing, extra or duplicated row.
 //!
 //! **Wall clock, not CPU.** A local cluster reports nothing under
 //! `user_job/cpu`, so `time/exec` — which includes process start and the pipe —
@@ -64,21 +90,33 @@
 //! throughput claim.
 //!
 //! **The fairness rules, enforced rather than remembered:** one input table for
-//! both sides; the same columns read, which here is automatic since the table
-//! has one column; the query must contain an `INSERT`, so YQL pays the full
-//! output cost rather than Query Tracker's first 10 000 rows; the query cache
-//! is disabled, without which a repeated query completes having spawned no
-//! operations at all; and both memory limits are printed — the query is given
-//! 640 MB against the worker's 512 MB, a 1.25× asymmetry in the query's favour
-//! that exists because 576 MB is where YQL fails on this cluster (`yql_smoke.rs`
-//! measured it) and 512 MB is what every other example here gives a worker.
+//! every leg; every leg reads every column, which `wordcount` gets for free
+//! from a one-column table and `project` gets by asking each leg for all nine —
+//! so the query's usual projection advantage is off the table; the query must
+//! contain an `INSERT`, so YQL pays the full output cost rather than Query
+//! Tracker's first 10 000 rows; the query cache is disabled, without which a
+//! repeated query completes having spawned no operations at all; the rounds are
+//! interleaved, so whatever the cluster is doing to one leg it is doing to the
+//! others at the same time; and both memory limits are printed — the query is
+//! given 640 MB against the worker's 512 MB, a 1.25× asymmetry in the query's
+//! favour that exists because 576 MB is where YQL fails on this cluster
+//! (`yql_smoke.rs` measured it) and 512 MB is what every other example here
+//! gives a worker.
 //!
-//! **Rules it does not enforce, and should before anything is published:** the
-//! two sides run different numbers of jobs (see above), the corpus's vocabulary
-//! is capped at 3 750 words and does not grow with the input, which flatters a
-//! combiner without bound, and the query tokenises with `Re2` where this
-//! space-separated corpus would let it use the cheaper `String::SplitToList` —
-//! and that sits in exactly the stage where the per-row work happens.
+//! On `project`, `data_weight_per_job` is pinned as well, so no leg is compared
+//! on how it was scheduled: `time/exec` sums over jobs and a job start is ~640
+//! ms here.
+//!
+//! **Rules it does not enforce, and should before anything is published.** On
+//! `wordcount`: the two sides run different numbers of jobs (see above), the
+//! corpus's vocabulary is capped at 3 750 words and does not grow with the
+//! input, which flatters a combiner without bound, and the query tokenises with
+//! `Re2` where this space-separated corpus would let it use the cheaper
+//! `String::SplitToList` — and that sits in exactly the stage where the per-row
+//! work happens. On `project`: the Skiff legs are a *dynamic* API against a
+//! *typed* YSON one, because Skiff has no typed rows yet, so no ratio between
+//! them is a format ratio; `docs/benchmarking.md` §5 states how much of each
+//! measured gap turned out to be the representation rather than the format.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -88,7 +126,7 @@ use std::time::{Duration, Instant};
 use ytsaurus_client::{
     Client, ClientError, Column, ColumnType, DataFormat, MapReduceSpec, MapSpec, Method,
     OperationFilter, Repeatable, SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType,
-    TableSchema, yson_build,
+    TableSchema, error_summary, yson_build,
 };
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice, to_vec};
 
@@ -786,9 +824,15 @@ fn run_query(client: &Client, query: &str) -> Result<Measure, ClientError> {
         if TERMINAL.contains(&state.as_str()) {
             let wall = started.elapsed();
             if state != "completed" {
+                // The crate's own flattening, not a third copy of it. This
+                // example carried one that kept the innermost cause and threw
+                // the category away — `Memory limit exceeded` with no clue
+                // which stage exceeded it — which is the same half-a-message
+                // mistake, from the other end, that made `error_summary`
+                // public in the first place.
                 let cause = field(&answer, "error")
-                    .map(|e| error_messages(&e))
-                    .and_then(|messages| messages.last().cloned())
+                    .as_ref()
+                    .and_then(error_summary)
                     .unwrap_or_else(|| "no message".to_owned());
                 return Err(ClientError::Config(format!("the query {state}: {cause}")));
             }
@@ -905,9 +949,15 @@ fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
                 match path {
                     "time/exec" => {
                         stage.exec_ms += sum;
-                        // Every leaf carries the same job count; taking it from
-                        // one of them keeps it from being counted three times.
-                        stage.jobs = count;
+                        // Added, not assigned, and only under this one path.
+                        // The three leaves of a single operation each carry the
+                        // same job count, so summing all three would treble it —
+                        // but a leg is one or two *operations*, and assigning
+                        // reported the last operation's count beside an
+                        // `exec_ms` summed over both. Routing it through the
+                        // one arm gives each operation exactly one vote, which
+                        // is what the other fields already get.
+                        stage.jobs += count;
                     }
                     "data/input/row_count" => stage.input_rows += sum,
                     _ => stage.input_bytes += sum,
@@ -1541,35 +1591,6 @@ fn disagreement(left: &BTreeMap<String, i64>, right: &BTreeMap<String, i64>) -> 
 }
 
 // ------------------------------------------------------------------ plumbing
-
-fn error_messages(error: &YsonValue) -> Vec<String> {
-    let mut found = Vec::new();
-    collect_messages(error, &mut found);
-    found
-}
-
-fn collect_messages(value: &YsonValue, found: &mut Vec<String>) {
-    match &value.node {
-        YsonNode::Map(entries) => {
-            if let Some(message) = entries.get(b"message".as_slice()).and_then(text_of)
-                && !message.is_empty()
-            {
-                found.push(message);
-            }
-            for (key, child) in entries {
-                if key.as_slice() != b"attributes" {
-                    collect_messages(child, found);
-                }
-            }
-        }
-        YsonNode::List(items) => {
-            for child in items {
-                collect_messages(child, found);
-            }
-        }
-        _ => {}
-    }
-}
 
 fn decode(body: &[u8], command: &str) -> Result<YsonValue, ClientError> {
     from_slice(body, YsonFormat::Text).map_err(|e| ClientError::Decode {
