@@ -1,0 +1,9 @@
+ytsaurus-api
+Copyright 2026 The ytsaurus-rs Authors
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file distributed
+alongside this one.
+
+This crate is original work. It is the transport-independent client interface;
+its shape mirrors the YTsaurus C++ client's yt/yt/client/api, but no upstream
+source is redistributed here.

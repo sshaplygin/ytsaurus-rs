@@ -1,0 +1,33 @@
+ytsaurus-proto
+Copyright 2026 The ytsaurus-rs Authors
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file distributed
+alongside this one.
+
+--------------------------------------------------------------------------------
+Generated from third-party interface definitions
+--------------------------------------------------------------------------------
+
+src/generated/
+
+    The Rust modules under src/generated/ are produced by prost-build from the
+    Protocol Buffers interface definitions of YTsaurus, and are therefore a
+    derivative work of them.
+
+        Source:   https://github.com/ytsaurus/ytsaurus
+        Revision: c91fcbe2cd0b9bf8a2fbae078885b9d423f22b62 (branch stable/25.4)
+        Files:    yt/yt_proto/yt/**  (20 .proto files and their imports)
+        Owner:    YANDEX LLC
+
+    YTsaurus is licensed under the Apache License, Version 2.0 —
+    Copyright 2023 Yandex LLC — which is the same licence this project is
+    distributed under, and section 4 of which governs this redistribution.
+
+    The .proto files themselves are NOT redistributed here and no copy of them
+    is kept in this repository: they are read from the ytsaurus/ytsaurus
+    submodule pinned at the revision above, and only the generated Rust is
+    committed. Regenerate with `cargo xtask generate-protos`.
+
+    The generated code is a mechanical translation. The message and field
+    names, numbers and types are upstream's; the surrounding module layout and
+    the aliases in src/lib.rs are this project's.

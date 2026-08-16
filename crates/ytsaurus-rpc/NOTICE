@@ -1,0 +1,13 @@
+ytsaurus-rpc
+Copyright 2026 The ytsaurus-rs Authors
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file distributed
+alongside this one.
+
+This crate is original work: an independent implementation of the YTsaurus RPC
+proxy protocol, written against the official documentation and the upstream C++
+and Go clients, and checked against byte vectors produced by them. No upstream
+source is redistributed here.
+
+It depends on ytsaurus-proto, whose contents are generated from YTsaurus's own
+.proto files; see that crate's NOTICE.
