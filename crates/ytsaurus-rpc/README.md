@@ -108,6 +108,6 @@ the same arrangement `tests/skiff-go-interop/` uses, because a binary format
 checked only against our own reading of the specification is checked against
 itself.
 
-The `rpc_e2e` example needs a cluster with an RPC proxy, which the stock Docker
-local cluster does not have: it runs with `--rpc-proxy-count 0`. The example's
-own documentation gives the `docker run` that does.
+The repository's local-cluster script starts an RPC proxy on `localhost:8011`,
+so run `tests/cluster-e2e/run_local_cluster.sh` before `rpc_e2e`. The example
+also runs in the post-merge `Cluster E2E` workflow.

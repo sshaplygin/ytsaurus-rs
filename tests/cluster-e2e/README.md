@@ -1,13 +1,14 @@
 # End-to-end tests
 
-Two layers. The lightweight fixture check runs in every CI invocation; the
-Docker-backed check runs after a push to `main` (including a merged pull
+Three layers. The lightweight fixture check runs in every CI invocation; the
+Docker-backed checks run after a push to `main` (including a merged pull
 request).
 
 | | Runs in CI | Needs a cluster | What it proves |
 | --- | --- | --- | --- |
 | [`crates/ytsaurus-job/tests/cat_e2e.rs`](../../crates/ytsaurus-job/tests/cat_e2e.rs) | every invocation | no | the compiled worker handles the real byte stream correctly |
 | [`run_e2e.sh`](run_e2e.sh) | after a push to `main` | yes | the above, plus the scheduler, operation spec and re-encoding |
+| [`rpc_e2e`](../../crates/ytsaurus-rpc/examples/rpc_e2e.rs) | after a push to `main` | yes | RPC proxy transactions, dynamic-table reads and writes |
 
 The important point: the offline test's fixtures are **captured from a real
 cluster**, not written by hand. `cat_input.bin` is literally the stream a job was
@@ -29,8 +30,9 @@ data, empty input, and that a truncated stream fails the job.
 
 ```sh
 pip install ytsaurus-client ytsaurus-yson   # both: binary YSON needs the bindings
-tests/cluster-e2e/run_local_cluster.sh              # localhost:8000, UI on :8001
+tests/cluster-e2e/run_local_cluster.sh              # HTTP :8000, RPC :8011, UI :8001
 tests/cluster-e2e/run_e2e.sh
+cargo run -p ytsaurus-rpc --example rpc_e2e
 tests/cluster-e2e/run_local_cluster.sh --stop
 ```
 

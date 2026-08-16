@@ -49,14 +49,22 @@ jobs:
       - name: Run the local-cluster end-to-end tests
         run: tests/cluster-e2e/run_e2e.sh
 
+      - name: Run the RPC-proxy end-to-end test
+        run: cargo run -p ytsaurus-rpc --example rpc_e2e
+
       # The containers are ephemeral runners, but their logs make a failed
-      # scheduler operation diagnosable directly from the Actions run.
+      # scheduler operation or RPC call diagnosable directly from the Actions
+      # run. The RPC proxy runs inside yt.backend, with its own files under
+      # the local cluster's log directory.
       - name: Show local-cluster logs after a failure
         if: failure()
         run: |
           docker ps -a
           docker logs yt.backend || true
           docker logs yt.frontend || true
+          docker exec yt.backend sh -c \
+            'find /tmp/locasaurus/logs -type f -iname "*rpc*proxy*" -print -exec tail -n 500 {} \\;' \
+            || true
 
       - name: Stop the local YTsaurus cluster
         if: always()

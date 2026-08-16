@@ -4,21 +4,11 @@
 //!
 //! This is the check that the four layers actually work — everything below it
 //! is verified against golden vectors and stubs, and this is where a real proxy
-//! gets a vote. It needs a cluster whose RPC proxy is reachable, which the
-//! stock Docker local cluster does **not** provide: it runs with
-//! `--rpc-proxy-count 0`. Start one that does:
+//! gets a vote. Start the repository's local cluster script, which enables an
+//! RPC proxy on port 8011, then run:
 //!
 //! ```sh
-//! docker run -d --name yt.rpc -p 8010:80 -p 8011:8011 \
-//!     ghcr.io/ytsaurus/local:stable \
-//!     --proxy-config '{coordinator={public_fqdn="localhost:8010"};}' \
-//!     --rpc-proxy-count 1 --rpc-proxy-port 8011 \
-//!     --node-count 1 --id rpcsaurus
-//! ```
-//!
-//! Then:
-//!
-//! ```sh
+//! tests/cluster-e2e/run_local_cluster.sh
 //! cargo run -p ytsaurus-rpc --example rpc_e2e
 //! ```
 //!

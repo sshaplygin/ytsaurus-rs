@@ -25,7 +25,7 @@ false`.
 | --- | --- | --- |
 | `.proto` files | ytsaurus/ytsaurus `stable/25.4` @ `c91fcbe2cd0b9bf8a2fbae078885b9d423f22b62` | `third_party/ytsaurus` submodule |
 | Reference implementation for vectors | Go SDK `yt/go` v0.0.33 | `tests/rpc-go-interop/go.mod` |
-| Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server `25.4.260522002` | recorded here; the run is `crates/ytsaurus-rpc/examples/rpc_e2e.rs`, which is not in CI |
+| Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server `25.4.260522002` | [`rpc_e2e.rs`](../crates/ytsaurus-rpc/examples/rpc_e2e.rs) runs in the post-merge `Cluster E2E` workflow against the local cluster's RPC proxy |
 
 The protos are a **submodule, not a copy**. A submodule records an exact
 upstream commit, so the definitions are pinned the way protocol work needs
@@ -156,8 +156,8 @@ not the upload. Nothing below has been relaxed to match.
   real proxy and keeping them as fixtures.
 - **B — a live proxy accepts what this writes and this reads what it sends.**
   *Green.* `cargo run -p ytsaurus-rpc --example rpc_e2e` writes, looks up, selects
-  and deletes on a real cluster. Not in CI: it needs a multi-GB image and an
-  RPC-enabled cluster.
+  and deletes on a real cluster. It runs in the post-merge `Cluster E2E`
+  workflow, which starts the local cluster with an RPC proxy.
 - **C — a differential test against the reference driver.** *Not started.* The
   Go and C++ sources were read closely, but no test yet performs the same
   operation through `ytsaurus-rpc-driver` and compares row for row. Until this
