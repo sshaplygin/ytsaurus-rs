@@ -323,7 +323,7 @@ pub mod yson_build;
 pub use crate::batch::BatchRequest;
 pub use crate::error::{ClientError, RedirectRefusal, Result};
 pub use crate::http::Method;
-pub use crate::jobs::{JobFailure, JobInfo};
+pub use crate::jobs::{JobFailure, JobInfo, error_summary};
 pub use crate::lock::{Lock, LockMode};
 pub use crate::operation::{
     Operation, OperationEvent, OperationFilter, OperationInfo, OperationList, OperationParameters,
@@ -5166,7 +5166,7 @@ mod tests {
     fn an_answer_that_does_not_fit_the_type_is_an_error_rather_than_a_default() {
         #[derive(serde::Deserialize)]
         struct Node {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             account: String,
         }
 

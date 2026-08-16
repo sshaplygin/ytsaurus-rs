@@ -30,10 +30,13 @@
 //! # see tests/e2e/run_pilot.sh for the full operation invocation
 //! ```
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use ytsaurus_job::yson::{YsonNode, YsonValue};
+use ytsaurus_job::{DataFormat, WorkerEvent, WorkerReader, WorkerRow, WorkerWriter};
 use ytsaurus_job::{Event, JobError, JobReader, JobWriter, Row, TableId};
+use ytsaurus_skiff::{Format, Schema, SchemaRef, Value, WireType};
 
 /// Inactivity gap that starts a new session, in microseconds.
 const SESSION_GAP_US: i64 = 30 * 60 * 1_000_000;
@@ -132,8 +135,16 @@ fn main() {
         // worth.
         "map-frames" => ytsaurus_job::run(map_frames),
         "map-parse" => ytsaurus_job::run(map_parse),
+        "map-one" => ytsaurus_job::run(map_one),
+        "map-parse-dynamic" => ytsaurus_job::run(map_parse_dynamic),
+        "map-one-dynamic" => ytsaurus_job::run(map_one_dynamic),
+        "map-parse-skiff" => ytsaurus_job::run(map_parse_skiff),
+        "map-one-skiff" => ytsaurus_job::run(map_one_skiff),
         other => {
-            eprintln!("usage: sessionize <map|reduce|map-frames|map-parse>   (got {other:?})");
+            eprintln!(
+                "usage: sessionize <map|map-one|map-one-dynamic|map-one-skiff|reduce|\
+                 map-frames|map-parse|map-parse-dynamic|map-parse-skiff>   (got {other:?})"
+            );
             std::process::exit(2);
         }
     }
@@ -149,7 +160,11 @@ fn map_frames() -> Result<(), JobError> {
 
     while let Some(event) = reader.next_event()? {
         if let Event::Row(row) = event {
-            // Touch the bytes, so nothing here can be optimised away.
+            // Reads the slice's length, not its contents — and that is enough,
+            // because `next_event` reads stdin and cannot be elided. An earlier
+            // comment here claimed this "touches the bytes"; it does not, and
+            // saying so mattered: this leg is the denominator's first bucket in
+            // every decode-share number the harness prints.
             rows += row.raw().len() as u64 & 1;
         }
     }
@@ -178,6 +193,406 @@ fn map_parse() -> Result<(), JobError> {
 
     eprintln!("sessionize map-parse: {kept}");
     Ok(())
+}
+
+/// The mapper with one output instead of two.
+///
+/// The comparison task of `docs/format-comparison.md`: read nine mixed-type
+/// columns, validate, derive one, write the survivors — and **no shuffle**, so
+/// nothing about plan shape can get into the measurement. That was the lesson
+/// of the wordcount comparison, where the whole of a 1.8× gap turned out to be
+/// a combiner.
+///
+/// One output rather than two for the same reason as the reduce is absent: a
+/// second output descriptor is outside the single shape Skiff is
+/// cluster-verified in (`docs/skiff-compatibility.md`, required test 4), and
+/// the Skiff leg has to run the same job as this one or the legs are not
+/// comparable. Bad rows are counted and dropped instead of quarantined — the
+/// count goes to stderr, which the operation shows.
+///
+/// Together with [`map_frames`] and [`map_parse`] this is the deepest of three
+/// stops over one table: frames, then decode, then the work. The differences
+/// are what each layer costs.
+fn map_one() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut writer = JobWriter::descriptors(1)?;
+
+    let mut kept = 0u64;
+    let mut rejected = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+
+        let clean = match row.parse::<RawEvent>() {
+            Err(e) if !e.is_row_local() => return Err(e),
+            Err(_) => {
+                rejected += 1;
+                continue;
+            }
+            Ok(event) => {
+                if validate(&event).is_err() {
+                    rejected += 1;
+                    continue;
+                }
+                CleanEvent {
+                    is_external: event
+                        .referer
+                        .is_some_and(|r| !r.is_empty() && !r.starts_with('/')),
+                    user_id: event.user_id,
+                    timestamp: event.timestamp,
+                    url: event.url,
+                    user_agent: event.user_agent,
+                    status: event.status,
+                    bytes_sent: event.bytes_sent,
+                    is_mobile: event.is_mobile,
+                    latency_ms: event.latency_ms,
+                }
+            }
+        };
+
+        writer.write(0, &clean)?;
+        kept += 1;
+    }
+
+    eprintln!("sessionize map-one: kept {kept}, dropped {rejected}");
+    writer.finish()
+}
+
+// ------------------------------------------------------------ the Skiff legs
+//
+// The same job again, on a positional wire format. Written out by hand because
+// Skiff has no schema inference yet (`docs/skiff-compatibility.md` lists it as
+// planned), and positionally because that is what the format is: there are no
+// field names on the wire, so a column is wherever the schema says it is and
+// nowhere else. Get the order wrong and the job reads a timestamp as a status
+// without complaining — which is the trade this leg exists to price.
+//
+// There is deliberately no `map-frames-skiff`. A Skiff stream has no
+// self-describing record boundaries: finding the end of a row *is* decoding it
+// against the schema, so the frames-only stop that the YSON legs subtract
+// cannot exist here. That asymmetry is a fact about the formats, not a gap in
+// this file, and it is why the Skiff comparison is stop-to-stop against the
+// dynamic YSON legs rather than a subtraction of its own.
+
+/// The nine columns of the input table, in the order the schema fixes them.
+///
+/// `referer` is `optional`, which on the wire is `variant8<nothing; string32>`
+/// — one tag byte on every row, present or not.
+fn input_format() -> DataFormat {
+    DataFormat::skiff(
+        Format::new(vec![SchemaRef::Inline(Schema::tuple([
+            Schema::named("user_id", WireType::String32),
+            Schema::named("timestamp", WireType::Int64),
+            Schema::named("url", WireType::String32),
+            Schema::named("referer", WireType::String32).optional(),
+            Schema::named("user_agent", WireType::String32),
+            Schema::named("status", WireType::Int64),
+            Schema::named("bytes_sent", WireType::Uint64),
+            Schema::named("is_mobile", WireType::Boolean),
+            Schema::named("latency_ms", WireType::Double),
+        ]))])
+        .expect("the input schema is a valid Skiff format"),
+    )
+}
+
+/// What the mapper writes: the input's nine less `referer`, plus `is_external`.
+fn output_format() -> DataFormat {
+    DataFormat::skiff(
+        Format::new(vec![SchemaRef::Inline(Schema::tuple([
+            Schema::named("user_id", WireType::String32),
+            Schema::named("timestamp", WireType::Int64),
+            Schema::named("url", WireType::String32),
+            Schema::named("user_agent", WireType::String32),
+            Schema::named("status", WireType::Int64),
+            Schema::named("bytes_sent", WireType::Uint64),
+            Schema::named("is_mobile", WireType::Boolean),
+            Schema::named("latency_ms", WireType::Double),
+            Schema::named("is_external", WireType::Boolean),
+        ]))])
+        .expect("the output schema is a valid Skiff format"),
+    )
+}
+
+/// Field positions in [`input_format`]. Named so the job reads like the others.
+mod at {
+    pub const USER_ID: usize = 0;
+    pub const TIMESTAMP: usize = 1;
+    pub const URL: usize = 2;
+    pub const REFERER: usize = 3;
+    pub const STATUS: usize = 5;
+    pub const LATENCY_MS: usize = 8;
+    // `user_agent`, `bytes_sent` and `is_mobile` are not named because nothing
+    // reads them: they are validated by the schema on the way in and moved to
+    // the output without being looked at, which is what a positional format
+    // buys when a column only has to survive the trip.
+}
+
+/// [`map_parse_dynamic`]'s stop, on Skiff.
+///
+/// Decoding is not optional here — see the note above — so this measures the
+/// whole read path against the dynamic YSON leg's, which is the comparison the
+/// Skiff question actually needs.
+fn map_parse_skiff() -> Result<(), JobError> {
+    let mut reader = WorkerReader::from_stdin(input_format())?;
+    let mut kept = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let WorkerEvent::Skiff(row) = event else {
+            unreachable!("the reader was configured for Skiff");
+        };
+        if let Value::Tuple(fields) = row.value()
+            && let Some(Value::Int64(timestamp)) = fields.get(at::TIMESTAMP)
+        {
+            kept += *timestamp as u64 & 1;
+        }
+    }
+
+    eprintln!("sessionize map-parse-skiff: {kept}");
+    Ok(())
+}
+
+/// [`map_one`] on Skiff: same five rules, same derived column, positional.
+fn map_one_skiff() -> Result<(), JobError> {
+    let mut reader = WorkerReader::from_stdin(input_format())?;
+    let mut writer = WorkerWriter::descriptors(output_format(), 1)?;
+
+    let mut kept = 0u64;
+    let mut rejected = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let WorkerEvent::Skiff(row) = event else {
+            unreachable!("the reader was configured for Skiff");
+        };
+        // `into_value` rather than `value`: the row is already owned, and
+        // taking it lets the output tuple be built by moving the fields
+        // instead of cloning eight of them. Measured off-cluster, the clones
+        // this replaces were 3 allocations a row and 12 % of the leg — a
+        // self-inflicted handicap that made Skiff look worse than it is.
+        let Value::Tuple(mut fields) = row.into_value() else {
+            rejected += 1;
+            continue;
+        };
+
+        let (
+            Some(Value::Bytes(user_id)),
+            Some(Value::Int64(timestamp)),
+            Some(Value::Bytes(url)),
+            Some(Value::Int64(status)),
+            Some(Value::Double(latency_ms)),
+        ) = (
+            fields.get(at::USER_ID),
+            fields.get(at::TIMESTAMP),
+            fields.get(at::URL),
+            fields.get(at::STATUS),
+            fields.get(at::LATENCY_MS),
+        )
+        else {
+            rejected += 1;
+            continue;
+        };
+
+        if user_id.is_empty()
+            || *timestamp <= 0
+            || !(100..=599).contains(status)
+            || !latency_ms.is_finite()
+            || *latency_ms < 0.0
+            || url.is_empty()
+        {
+            rejected += 1;
+            continue;
+        }
+
+        // An absent optional arrives as the nothing arm of the variant.
+        let is_external = match fields.get(at::REFERER) {
+            Some(Value::Variant { value, .. }) => match value.as_ref() {
+                Value::Bytes(referer) => !referer.is_empty() && !referer.starts_with(b"/"),
+                _ => false,
+            },
+            _ => false,
+        };
+
+        // The output schema is the input's less `referer`, plus `is_external`
+        // — which is exactly this: drop the optional, append the derived. A
+        // `remove` shifts five elements and allocates nothing.
+        fields.remove(at::REFERER);
+        fields.push(Value::Boolean(is_external));
+        let clean = Value::Tuple(fields);
+
+        writer.write(0, WorkerRow::Skiff(&clean))?;
+        kept += 1;
+    }
+
+    eprintln!("sessionize map-one-skiff: kept {kept}, dropped {rejected}");
+    writer.finish()
+}
+
+// ------------------------------------------------- the dynamic control legs
+//
+// The same two stops again, through `YsonValue` instead of a typed struct.
+//
+// They exist to make a format comparison mean something. Skiff's job API has no
+// typed rows yet — `docs/skiff-compatibility.md` lists them as planned — so a
+// Skiff leg can only be dynamic, and putting it against the typed YSON legs
+// would compare two APIs while calling it a comparison of two formats. These
+// are the control: same format as the typed legs, same API level as the Skiff
+// one. `docs/benchmarking.md` already warns not to compare Skiff's dynamic
+// result with YSON's borrowed-serde one; this is how that warning is obeyed on
+// a cluster rather than in a benchmark harness.
+
+/// A dynamic value carrying no attributes.
+///
+/// There is no builder for these, which is part of what the control measures:
+/// the dynamic path costs a `BTreeMap` per row and this much ceremony per
+/// field, against a `#[derive(Serialize)]` on the typed side.
+fn node(node: YsonNode) -> YsonValue {
+    YsonValue {
+        attributes: None,
+        node,
+    }
+}
+
+/// A field of a dynamic row, without the panic `Index` gives on a missing key.
+fn field<'row>(row: &'row YsonValue, key: &str) -> Option<&'row YsonValue> {
+    match &row.node {
+        YsonNode::Map(fields) => fields.get(key.as_bytes()),
+        _ => None,
+    }
+}
+
+fn bytes_of<'row>(row: &'row YsonValue, key: &str) -> Option<&'row [u8]> {
+    match &field(row, key)?.node {
+        YsonNode::String(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+fn int_of(row: &YsonValue, key: &str) -> Option<i64> {
+    match &field(row, key)?.node {
+        YsonNode::Int64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// [`map_parse`], decoding into a `YsonValue` DOM instead of a struct.
+fn map_parse_dynamic() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut kept = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+        let value: YsonValue = row.value()?;
+        // Touch one field, so the DOM cannot be built and discarded unread.
+        kept += int_of(&value, "timestamp").unwrap_or(0) as u64 & 1;
+    }
+
+    eprintln!("sessionize map-parse-dynamic: {kept}");
+    Ok(())
+}
+
+/// The eight input columns the output carries, or `None` if a row is short one.
+///
+/// A function rather than the loop it replaces, because that loop's `continue`
+/// skipped the **column** and not the row: a row missing `user_agent` counted
+/// itself rejected and was then written anyway, eight columns wide, while
+/// [`map_one`]'s serde parse rejects the same row outright. Two legs disagreeing
+/// on a row is exactly what `format_compare`'s diff exists to catch, so the
+/// control leg must not be the one manufacturing the disagreement. `?` on a
+/// missing field is what makes the whole row the unit again.
+///
+/// Never triggered by the comparison's own fixture, whose rows all have nine
+/// columns — which is why it survived a review and three cluster runs.
+fn carried(value: &YsonValue) -> Option<BTreeMap<Vec<u8>, YsonValue>> {
+    const COLUMNS: [&str; 8] = [
+        "user_id",
+        "timestamp",
+        "url",
+        "user_agent",
+        "status",
+        "bytes_sent",
+        "is_mobile",
+        "latency_ms",
+    ];
+
+    let mut out = BTreeMap::new();
+    for key in COLUMNS {
+        out.insert(key.as_bytes().to_vec(), field(value, key)?.clone());
+    }
+    Some(out)
+}
+
+/// [`map_one`] through the dynamic value type, start to finish.
+///
+/// Reads a DOM, validates by walking it, and builds another DOM to write. No
+/// serde on either side — which is the point: this is what a job author writes
+/// when the format has no typed rows.
+fn map_one_dynamic() -> Result<(), JobError> {
+    let mut reader = JobReader::from_stdin();
+    let mut writer = JobWriter::descriptors(1)?;
+
+    let mut kept = 0u64;
+    let mut rejected = 0u64;
+
+    while let Some(event) = reader.next_event()? {
+        let Event::Row(row) = event else { continue };
+
+        let value: YsonValue = match row.value() {
+            Ok(value) => value,
+            Err(e) if e.is_row_local() => {
+                rejected += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let (Some(user_id), Some(timestamp), Some(url), Some(status)) = (
+            bytes_of(&value, "user_id"),
+            int_of(&value, "timestamp"),
+            bytes_of(&value, "url"),
+            int_of(&value, "status"),
+        ) else {
+            rejected += 1;
+            continue;
+        };
+        let latency = match &field(&value, "latency_ms").map(|v| &v.node) {
+            Some(YsonNode::Double(latency)) => *latency,
+            _ => {
+                rejected += 1;
+                continue;
+            }
+        };
+
+        // The same five rules as `validate`, spelled against the DOM.
+        if user_id.is_empty()
+            || timestamp <= 0
+            || !(100..=599).contains(&status)
+            || !latency.is_finite()
+            || latency < 0.0
+            || url.is_empty()
+        {
+            rejected += 1;
+            continue;
+        }
+
+        let is_external = match bytes_of(&value, "referer") {
+            Some(referer) => !referer.is_empty() && !referer.starts_with(b"/"),
+            None => false,
+        };
+
+        let Some(mut out) = carried(&value) else {
+            rejected += 1;
+            continue;
+        };
+        out.insert(
+            b"is_external".to_vec(),
+            node(YsonNode::Boolean(is_external)),
+        );
+
+        writer.write(0, &node(YsonNode::Map(out)))?;
+        kept += 1;
+    }
+
+    eprintln!("sessionize map-one-dynamic: kept {kept}, dropped {rejected}");
+    writer.finish()
 }
 
 /// Why a row is unusable. Returning a reason rather than a bool means the
@@ -399,11 +814,6 @@ impl SessionAcc {
     }
 }
 
-/// Unused today, but the shape a per-user cache would take. Kept out of the hot
-/// path deliberately: see FRICTION 3 in the friction log.
-#[allow(dead_code)]
-type UserCache = HashMap<Vec<u8>, u64>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +937,49 @@ mod tests {
             bytes_sent: 1,
             is_mobile: false,
             latency_ms: 1.0,
+        }
+    }
+
+    /// A row short one column is a rejected row, not a row written short.
+    ///
+    /// The regression this pins: the loop [`carried`] replaced skipped the
+    /// missing *column* and wrote the other eight, so the dynamic leg emitted a
+    /// row the typed leg had rejected outright — a disagreement between two
+    /// legs of a format comparison, manufactured by the comparison itself.
+    #[test]
+    fn a_row_missing_a_carried_column_is_rejected_whole() {
+        let string = |text: &str| YsonValue {
+            attributes: None,
+            node: YsonNode::String(text.as_bytes().to_vec()),
+        };
+        let row = |columns: &[&str]| YsonValue {
+            attributes: None,
+            node: YsonNode::Map(
+                columns
+                    .iter()
+                    .map(|key| (key.as_bytes().to_vec(), string("v")))
+                    .collect(),
+            ),
+        };
+
+        const ALL: [&str; 8] = [
+            "user_id",
+            "timestamp",
+            "url",
+            "user_agent",
+            "status",
+            "bytes_sent",
+            "is_mobile",
+            "latency_ms",
+        ];
+
+        assert_eq!(carried(&row(&ALL)).map(|out| out.len()), Some(8));
+        for missing in ALL {
+            let present: Vec<&str> = ALL.into_iter().filter(|key| *key != missing).collect();
+            assert!(
+                carried(&row(&present)).is_none(),
+                "a row without {missing} must be rejected, not written eight columns wide"
+            );
         }
     }
 }

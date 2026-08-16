@@ -229,7 +229,14 @@ pub fn example(name: &str) -> std::path::PathBuf {
         .lock()
         .expect("the build set is only ever locked here");
 
-    if !path.is_file() && built.insert(name.to_owned()) {
+    // Once per name per process, and **not** only when the binary is missing.
+    // An integration test does not depend on an example target, so cargo will
+    // not rebuild one for it; guarding this on `!path.is_file()` meant that
+    // after the first run every later run drove whatever binary happened to be
+    // on disk. Editing a worker and re-running its e2e test then reported on
+    // the previous edit — which is worse than no test, because it is a green
+    // one. Cargo is a no-op when nothing changed, so the guard bought nothing.
+    if built.insert(name.to_owned()) {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
         let mut command = std::process::Command::new(cargo);
         command.args(["build", "-p", "ytsaurus-job", "--example", name]);

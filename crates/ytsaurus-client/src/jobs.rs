@@ -80,10 +80,41 @@ pub(crate) fn parse_job(job: &YsonValue) -> Option<JobInfo> {
 
 /// Flattens a YTsaurus error document to one line.
 ///
-/// The outer message is a category ("User job failed"); the cause is at the
-/// bottom of `inner_errors` ("Process exited with code 1"). Both are useful, so
-/// both are kept.
-pub(crate) fn error_summary(error: &YsonValue) -> Option<String> {
+/// The outer message is a category — `User job failed`, `Failed to run query` —
+/// and the cause is at the bottom of `inner_errors`. Both are useful, so both
+/// are kept, and everything between them is dropped along with the attributes:
+/// a cluster error tree is mostly pids, thread names and trace ids, and the one
+/// thing a reader needs is the sentence at the bottom of it.
+///
+/// This is what [`JobInfo::error`](crate::JobInfo::error) and the operation
+/// errors are built from. It is public because a caller using
+/// [`Client::raw_command`](crate::Client::raw_command) gets the same shape of
+/// answer from any command the crate does not model, and had no way to read it
+/// — every escape-hatch caller was reinventing this, worse. Printing the tree
+/// instead is how a failed command costs an hour.
+///
+/// `None` when the document has no `message` at all, which is not the same as
+/// an empty one: a successful query answers `{code=0;message=""}`, and that
+/// summarises to `Some("")` rather than to nothing.
+///
+/// # Examples
+///
+/// ```
+/// use ytsaurus_client::error_summary;
+/// use ytsaurus_yson::{YsonFormat, from_slice};
+///
+/// let answer = br#"{code=1;message="Failed to run query";
+///     attributes={host=localhost;pid=693};
+///     inner_errors=[{code=1;message="Execution";
+///         inner_errors=[{code=1205;message="Memory limit exceeded"}]}]}"#;
+/// let error = from_slice(answer, YsonFormat::Text).expect("the fixture parses");
+///
+/// assert_eq!(
+///     error_summary(&error).as_deref(),
+///     Some("Failed to run query: Memory limit exceeded"),
+/// );
+/// ```
+pub fn error_summary(error: &YsonValue) -> Option<String> {
     let top = text(field(error, "message")?)?;
     match innermost_message(error) {
         Some(inner) if inner != top => Some(format!("{top}: {inner}")),
