@@ -168,6 +168,18 @@ impl Drop for TempDir {
 
 /// Runs one phase with the real descriptor layout, returning (table0, table1).
 fn run_phase(mode: &str, input: &[u8], tag: &str) -> (Vec<u8>, Vec<u8>) {
+    let (table0, table1, _) = run_phase_logged(mode, input, tag);
+    (table0, table1)
+}
+
+/// As [`run_phase`], and the mode's stderr besides.
+///
+/// The depth modes of the format comparison report what they kept and dropped
+/// there and nowhere else: they write one output table, so a rejected row leaves
+/// no trace in the tables at all. A test that cannot read the counters cannot
+/// tell "rejected the row" from "rejected the row and wrote it anyway", which is
+/// exactly the difference `carried` exists to make.
+fn run_phase_logged(mode: &str, input: &[u8], tag: &str) -> (Vec<u8>, Vec<u8>, String) {
     let dir = TempDir::new(tag);
     let stdin_path = dir.join("in.bin");
     let t0 = dir.join("t0.bin");
@@ -198,6 +210,7 @@ fn run_phase(mode: &str, input: &[u8], tag: &str) -> (Vec<u8>, Vec<u8>) {
     (
         std::fs::read(&t0).unwrap_or_default(),
         std::fs::read(&t1).unwrap_or_default(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
 
@@ -470,4 +483,88 @@ fn many_sessions_for_one_user() {
     assert_eq!(users.len(), 1);
     let v: YsonValue = from_slice(&users[0], YsonFormat::Binary).expect("parses");
     assert_eq!(field(&v, "sessions").as_i64(), Some(SESSIONS));
+}
+
+/// A row short one column is rejected whole by both `map-one` legs.
+///
+/// Through the binaries rather than through `carried`, for two reasons the
+/// helper-level test cannot reach. `map_one_dynamic` validates five of the
+/// eight carried columns *before* it copies any, so only `user_agent`,
+/// `bytes_sent` and `is_mobile` can reach the copying step missing — a unit
+/// test of the helper cannot know which of its eight cases are vacuous. And the
+/// defect this pins lived at the **call site**: a mutant that keeps `carried`
+/// correct and reintroduces the short write one line below passes every
+/// helper-level test there is.
+///
+/// The last assertion is the invariant the whole comparison rests on — that the
+/// typed and dynamic legs accept the same rows — checked here offline, on a
+/// fixture built to break it, rather than only on a cluster and only on rows
+/// that are all nine columns wide.
+#[test]
+fn a_short_row_is_rejected_whole_by_both_map_one_legs() {
+    // Everything checked before the copying step is present and valid, so this
+    // row reaches it. Only `user_agent` is absent.
+    let short = row(&[
+        (b"user_id", V::Bytes(b"u2")),
+        (b"timestamp", V::Int(BASE_US + MINUTE_US)),
+        (b"url", V::Bytes(b"/short")),
+        (b"referer", V::Bytes(b"https://example.org/")),
+        (b"status", V::Int(200)),
+        (b"bytes_sent", V::Uint(2048)),
+        (b"is_mobile", V::Bool(true)),
+        (b"latency_ms", V::Double(9.5)),
+    ]);
+    let input = fragment(&[event(b"u1", 0, b"/home", 200), short]);
+
+    let (typed, _, typed_log) = run_phase_logged("map-one", &input, "one-typed");
+    let (dynamic, _, dynamic_log) = run_phase_logged("map-one-dynamic", &input, "one-dynamic");
+
+    // A row is the unit: two rows in, and the counters account for two.
+    assert!(
+        typed_log.contains("kept 1, dropped 1"),
+        "typed leg said {typed_log:?}"
+    );
+    assert!(
+        dynamic_log.contains("kept 1, dropped 1"),
+        "the dynamic leg counted a row rejected and kept it too: {dynamic_log:?}"
+    );
+
+    // And nothing short reached the table, whatever the counters say.
+    for record in split_records(&dynamic) {
+        let value: YsonValue = from_slice(&record, YsonFormat::Binary).expect("row parses");
+        let YsonNode::Map(columns) = &value.node else {
+            panic!("the dynamic leg wrote something that is not a map");
+        };
+        let names: Vec<String> = columns
+            .keys()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            9,
+            "the dynamic leg wrote a row {} columns wide: {names:?}",
+            names.len()
+        );
+    }
+
+    assert_eq!(
+        canonical(&typed),
+        canonical(&dynamic),
+        "the typed and dynamic legs of the format comparison disagree"
+    );
+}
+
+/// `format_compare`'s own diff, offline: re-encode each row as canonical binary
+/// YSON and sort, so neither key order nor row order carries anything.
+fn canonical(table: &[u8]) -> Vec<Vec<u8>> {
+    let mut rows: Vec<Vec<u8>> = split_records(table)
+        .iter()
+        .map(|record| {
+            let value: YsonValue =
+                from_slice(record, YsonFormat::Binary).expect("the worker wrote valid YSON");
+            ytsaurus_yson::to_vec(&value, YsonFormat::Binary).expect("a decoded row re-encodes")
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
 }

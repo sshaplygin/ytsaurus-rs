@@ -937,49 +937,10 @@ fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
         sum
     };
 
-    let mut stages: BTreeMap<String, Stage> = BTreeMap::new();
-    for id in ids {
-        let Ok(statistics) = client.job_statistics(id) else {
-            continue;
-        };
-        for (path, values) in [
-            ("time/exec", by_job_type(&statistics, "time/exec")),
-            (
-                "data/input/row_count",
-                by_job_type(&statistics, "data/input/row_count"),
-            ),
-            (
-                "data/input/data_weight",
-                by_job_type(&statistics, "data/input/data_weight"),
-            ),
-        ] {
-            for (job_type, (sum, count)) in values {
-                let stage = stages.entry(job_type.clone()).or_insert_with(|| Stage {
-                    job_type,
-                    jobs: 0,
-                    exec_ms: 0,
-                    input_rows: 0,
-                    input_bytes: 0,
-                });
-                match path {
-                    "time/exec" => {
-                        stage.exec_ms += sum;
-                        // Added, not assigned, and only under this one path.
-                        // The three leaves of a single operation each carry the
-                        // same job count, so summing all three would treble it —
-                        // but a leg is one or two *operations*, and assigning
-                        // reported the last operation's count beside an
-                        // `exec_ms` summed over both. Routing it through the
-                        // one arm gives each operation exactly one vote, which
-                        // is what the other fields already get.
-                        stage.jobs += count;
-                    }
-                    "data/input/row_count" => stage.input_rows += sum,
-                    _ => stage.input_bytes += sum,
-                }
-            }
-        }
-    }
+    let documents: Vec<YsonValue> = ids
+        .iter()
+        .filter_map(|id| client.job_statistics(id).ok())
+        .collect();
 
     Measure {
         wall,
@@ -997,8 +958,60 @@ fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
         // what legs 2 and 3 will be compared on.
         pipe_in_bytes: total("user_job/pipes/input/bytes"),
         pipe_out_bytes: per_table("user_job/pipes/output", "bytes"),
-        stages: stages.into_values().collect(),
+        stages: fold_stages(&documents),
     }
+}
+
+/// A leg's operations folded into one row per job type.
+///
+/// Split out of [`measure`] because everything else there needs a `Client` and
+/// this does not: it is the arithmetic, and the arithmetic is what has been
+/// wrong three times. The comments in this file record two published wrong
+/// numbers from these same statistics — the `total` sibling that doubled every
+/// pipe figure, and the flat `data/output` path that printed a blank column for
+/// two runs — and a third, `jobs` assigned where its siblings are summed, that
+/// no cluster run happened to expose. A fifteen-line fixture tests all of it.
+///
+/// `jobs` is added under `time/exec` alone. Every one of the three statistics
+/// carries the same job count for one operation, so adding all three would
+/// treble it; adding under one gives each **operation** exactly one vote, which
+/// is what the other three fields already got.
+fn fold_stages(documents: &[YsonValue]) -> Vec<Stage> {
+    let mut stages: BTreeMap<String, Stage> = BTreeMap::new();
+
+    for statistics in documents {
+        for (path, values) in [
+            ("time/exec", by_job_type(statistics, "time/exec")),
+            (
+                "data/input/row_count",
+                by_job_type(statistics, "data/input/row_count"),
+            ),
+            (
+                "data/input/data_weight",
+                by_job_type(statistics, "data/input/data_weight"),
+            ),
+        ] {
+            for (job_type, (sum, count)) in values {
+                let stage = stages.entry(job_type.clone()).or_insert_with(|| Stage {
+                    job_type,
+                    jobs: 0,
+                    exec_ms: 0,
+                    input_rows: 0,
+                    input_bytes: 0,
+                });
+                match path {
+                    "time/exec" => {
+                        stage.exec_ms += sum;
+                        stage.jobs += count;
+                    }
+                    "data/input/row_count" => stage.input_rows += sum,
+                    _ => stage.input_bytes += sum,
+                }
+            }
+        }
+    }
+
+    stages.into_values().collect()
 }
 
 /// One built-in statistic, split by job type: `(sum, job count)` apiece.
@@ -1645,9 +1658,108 @@ fn step(what: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, canonical_rows, corpus, disagreement};
+    use super::{Answer, canonical_rows, corpus, disagreement, fold_stages, query_failure};
     use std::collections::BTreeMap;
-    use ytsaurus_yson::{YsonNode, YsonValue};
+    use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
+
+    fn parse(text: &str) -> YsonValue {
+        from_slice(text.as_bytes(), YsonFormat::Text).expect("the fixture parses")
+    }
+
+    /// One operation's statistics, in the shape the scheduler answers with: the
+    /// path nests, then `$$` for a built-in, then the job state, then the job
+    /// type, then the aggregate.
+    fn statistics(job_type: &str, jobs: i64, exec_ms: i64, rows: i64, bytes: i64) -> YsonValue {
+        let leaf = |sum: i64| {
+            format!("{{\"$$\"={{completed={{{job_type}={{sum={sum};count={jobs}}}}}}}}}")
+        };
+        parse(&format!(
+            "{{time={{exec={}}};data={{input={{row_count={};data_weight={}}}}}}}",
+            leaf(exec_ms),
+            leaf(rows),
+            leaf(bytes)
+        ))
+    }
+
+    /// A leg's job count is every operation's, not the last one's.
+    ///
+    /// Assignment is not wrong for a single operation, which is why three
+    /// nine-round cluster runs of the one-operation `project` task never showed
+    /// it. The counts differ so that `=` cannot pass by coincidence.
+    #[test]
+    fn a_legs_job_count_is_every_operations() {
+        let stages = fold_stages(&[
+            statistics("map", 3, 900, 300_000, 30_000_000),
+            statistics("map", 2, 500, 100_000, 10_000_000),
+        ]);
+
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].exec_ms, 1_400);
+        assert_eq!(stages[0].input_rows, 400_000);
+        assert_eq!(
+            stages[0].jobs, 5,
+            "five jobs ran; a leg's job count must not be one operation's"
+        );
+    }
+
+    /// And why `jobs` is added under one statistic rather than all three: each
+    /// of the three carries the same count for one operation.
+    #[test]
+    fn one_operations_three_statistics_vote_once_between_them() {
+        let stages = fold_stages(&[statistics("map", 3, 900, 300_000, 30_000_000)]);
+        assert_eq!(stages[0].jobs, 3, "one operation of three jobs is 3, not 9");
+    }
+
+    /// Operations with different job types stay different rows.
+    #[test]
+    fn distinct_job_types_are_not_merged() {
+        let stages = fold_stages(&[
+            statistics("partition_map", 1, 2_100, 10, 20),
+            statistics("sorted_reduce", 2, 3_396, 30, 40),
+        ]);
+
+        let names: Vec<&str> = stages.iter().map(|s| s.job_type.as_str()).collect();
+        assert_eq!(names, ["partition_map", "sorted_reduce"]);
+        assert_eq!((stages[0].jobs, stages[1].jobs), (1, 2));
+    }
+
+    /// A failed query is reported with its category as well as its cause.
+    ///
+    /// The example's own flattener kept only the innermost message, so this
+    /// read `Memory limit exceeded` with no clue which stage exceeded it.
+    #[test]
+    fn a_failed_query_is_reported_with_its_category_and_its_cause() {
+        let answer = parse(
+            r#"{state="failed";error={code=1;message="Failed to run query";
+                attributes={host=localhost;pid=693};
+                inner_errors=[{code=1;message="Execution";
+                    inner_errors=[{code=1205;message="Memory limit exceeded"}]}]}}"#,
+        );
+
+        assert_eq!(
+            query_failure("failed", &answer),
+            "the query failed: Failed to run query: Memory limit exceeded"
+        );
+    }
+
+    /// A success document is not a message. `{code=0;message=""}` summarises to
+    /// `Some("")`, which without the guard reads `the query aborted: `.
+    #[test]
+    fn a_zero_code_error_document_is_not_reported_as_a_cause() {
+        let answer = parse(r#"{state="aborted";error={code=0;message="";attributes={}}}"#);
+        assert_eq!(
+            query_failure("aborted", &answer),
+            "the query aborted: no message"
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_error_document_says_so() {
+        assert_eq!(
+            query_failure("aborted", &parse(r#"{state="aborted"}"#)),
+            "the query aborted: no message"
+        );
+    }
 
     #[test]
     fn corpus_is_deterministic_and_roughly_the_size_asked_for() {

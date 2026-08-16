@@ -95,3 +95,26 @@ all-features = true
 [[example]]
 name = "both_transports"
 required-features = ["rpc"]
+
+# Three examples carry unit tests of functions that are private to them and have
+# no business being public API — `append`'s visibility arithmetic,
+# `format_compare`'s statistics folding and answer comparison, `yql_smoke`'s
+# error-tree digging.
+#
+# **`test = true` is what keeps them running.** Cargo's default for an example
+# target is `test = false`, so `cargo test --workspace` skips them silently; CI
+# happens to catch them because it passes `--all-targets`, which is a thin thread
+# to hang seventeen tests on, and it means a developer running `cargo test` sees
+# green where CI would not. `crates/ytsaurus-job/Cargo.toml` learned this by
+# losing sixteen tests the same way.
+[[example]]
+name = "append"
+test = true
+
+[[example]]
+name = "format_compare"
+test = true
+
+[[example]]
+name = "yql_smoke"
+test = true
