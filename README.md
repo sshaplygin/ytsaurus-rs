@@ -51,7 +51,8 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-api/](crates/ytsaurus-api/) | One interface over both transports, so `create_client` and `create_rpc_client` return the same thing. |
 | [crates/ytsaurus-rpc/](crates/ytsaurus-rpc/) | The RPC proxy, for dynamic tables under concurrency. Async on tokio, unlike everything above. |
 | [crates/ytsaurus-proto/](crates/ytsaurus-proto/) | Protobuf bindings, generated from the `third_party/ytsaurus` submodule and committed. Regenerate with `cargo xtask generate-protos`. |
-| [xtask/](xtask/) | Repository tasks. Never published. |
+| [xtask/](xtask/) | `cargo xtask generate-protos`, the one task that has to be Rust — `prost-build` is a Rust library. Never published. |
+| [scripts/](scripts/) | The rest of the automation, in Python: the CI checks above and the benchmark comparison posted on pull requests. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, and how this compares to the official C++ and Go clients. |
 | [tests/cluster-e2e/](tests/cluster-e2e/) | End-to-end scripts against a local YTsaurus cluster. |
 
@@ -175,10 +176,28 @@ run can be made bigger without editing code:
 ## Build and test
 
 ```sh
-./scripts/init-protos.sh        # only to regenerate protos: the .proto submodule
 cargo test --workspace          # 941 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
+```
+
+Nothing needs the `.proto` submodule to build: `ytsaurus-proto` ships its
+generated bindings. It is needed only to regenerate them, which is
+`./scripts/init-protos.sh` once and then `cargo xtask generate-protos`; CI
+regenerates and fails on a diff, so the committed code cannot drift from the
+pin.
+
+The checks CI runs beyond the test suite are scripts you can run yourself:
+
+```sh
+python3 scripts/check_package_includes.py   # no published file may include_str!
+                                            # data from outside its own crate
+python3 scripts/check_worker_graph.py       # no tracing, TLS, tokio or prost
+                                            # reaches the musl worker build
+python3 scripts/check_worker_binaries.py    # after build-worker.sh: every worker
+                                            # is statically linked (needs ldd,
+                                            # so Linux — the workers themselves
+                                            # cross-compile fine from macOS)
 ```
 
 `build-worker.sh` produces `target/x86_64-unknown-linux-musl/release-worker/<name>`,
