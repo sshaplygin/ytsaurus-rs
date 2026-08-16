@@ -89,7 +89,7 @@ const rows = names.map((name) => {
     const relativeChange = Number(
         ((candidate.nanoseconds / base.nanoseconds - 1) * 100).toFixed(1),
     );
-    let signal = "within runner noise";
+    let signal = "ℹ️ within runner noise";
     if (relativeChange >= REGRESSION_THRESHOLD) {
         signal = "⚠️ regression";
         regressions += 1;
@@ -102,22 +102,22 @@ const rows = names.map((name) => {
 });
 
 const summary = [
-    `${names.length} benchmark(s) compared`,
-    `${regressions} regression(s) at ≥${REGRESSION_THRESHOLD}%`,
-    `${improvements} improvement(s) at ≥${REGRESSION_THRESHOLD}%`,
+    `📊 ${names.length} benchmark(s) compared`,
+    `⚠️ ${regressions} regression(s) at ≥${REGRESSION_THRESHOLD}%`,
+    `✅ ${improvements} improvement(s) at ≥${REGRESSION_THRESHOLD}%`,
 ];
 if (unavailable > 0) {
-    summary.push(`${unavailable} not comparable`);
+    summary.push(`➖ ${unavailable} not comparable`);
 }
 
 console.log("<!-- ytsaurus-rs:criterion-benchmark-comparison -->");
-console.log("## Criterion benchmarks: main vs PR");
+console.log("## 📊 Criterion benchmarks: main vs PR");
 console.log("");
-console.log(`Main \`${revision(baseRevision)}\` · PR \`${revision(candidateRevision)}\``);
+console.log(`🔍 Main \`${revision(baseRevision)}\` → PR \`${revision(candidateRevision)}\``);
 console.log("");
 console.log(`**${summary.join(" · ")}**`);
 console.log("");
-console.log("Time is lower-is-better. Both revisions ran on the same GitHub-hosted VM; ±20% is an advisory marker, not a merge gate.");
+console.log("ℹ️ Time is lower-is-better. Both revisions ran on the same GitHub-hosted VM; ±20% is an advisory marker, not a merge gate.");
 console.log("");
 console.log("| Benchmark | main | PR | change | signal |");
 console.log("| --- | ---: | ---: | ---: | --- |");

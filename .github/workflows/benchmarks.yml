@@ -26,7 +26,7 @@ env:
 
 jobs:
   compare:
-    name: "${{ matrix.name }}: main vs PR"
+    name: "📊 ${{ matrix.name }}: main vs PR"
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -53,13 +53,13 @@ jobs:
       # intentionally share one VM and one toolchain. This makes each
       # PR-vs-main delta meaningful; GitHub-hosted runners are still noisy, so
       # the report is advisory rather than a merge gate.
-      - name: Check out the PR base
+      - name: "📦 Check out the PR base"
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
 
-      - name: Check out the PR head
+      - name: "🔀 Check out the PR head"
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -67,31 +67,32 @@ jobs:
 
       # Use the PR's pinned compiler for both revisions. A toolchain change is
       # then not mistaken for a source-level performance change.
-      - name: Install toolchain
+      - name: "🛠️ Install toolchain"
         working-directory: pr
         run: rustup show active-toolchain || rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - name: "⚡ Restore Rust cache"
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             base -> target
             pr -> target
 
-      - name: Benchmark main
+      - name: "📍 Benchmark main"
         working-directory: base
         run: |
           set -o pipefail
           cargo bench --locked -p "${{ matrix.package }}" \
             --bench "${{ matrix.bench }}" -- --noplot 2>&1 | tee benchmarks.txt
 
-      - name: Benchmark pull request
+      - name: "🚀 Benchmark pull request"
         working-directory: pr
         run: |
           set -o pipefail
           cargo bench --locked -p "${{ matrix.package }}" \
             --bench "${{ matrix.bench }}" -- --noplot 2>&1 | tee benchmarks.txt
 
-      - name: Upload benchmark logs
+      - name: "📤 Upload benchmark logs"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -102,22 +103,22 @@ jobs:
           retention-days: 14
 
   report:
-    name: "Criterion: aggregate PR comparison"
+    name: "🧾 Criterion: aggregate PR comparison"
     needs: compare
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out the PR head
+      - name: "📦 Check out the PR head"
         uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Download benchmark logs
+      - name: "📥 Download benchmark logs"
         uses: actions/download-artifact@v4
         with:
           pattern: criterion-main-vs-pr-*
           path: benchmark-logs
 
-      - name: Assemble benchmark output
+      - name: "🧩 Assemble benchmark output"
         run: |
           set -euo pipefail
           for suite in yson skiff job client; do
@@ -127,7 +128,7 @@ jobs:
             cat "benchmark-logs/criterion-main-vs-pr-${suite}/pr/benchmarks.txt"
           done > pr-benchmarks.txt
 
-      - name: Render comparison
+      - name: "📊 Render comparison"
         run: |
           node scripts/compare-criterion.mjs \
             main-benchmarks.txt pr-benchmarks.txt \
@@ -136,7 +137,7 @@ jobs:
             > benchmark-report.md
           cat benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Post comparison on the pull request
+      - name: "💬 Post comparison on the pull request"
         if: github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v8
         with:
@@ -167,7 +168,7 @@ jobs:
               });
             }
 
-      - name: Upload benchmark report
+      - name: "📤 Upload benchmark report"
         uses: actions/upload-artifact@v4
         with:
           name: criterion-main-vs-pr-report
