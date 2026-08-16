@@ -16,7 +16,7 @@ import sys
 from collections import defaultdict
 from typing import Any, cast
 
-from yt import yson
+from yt import yson  # ty: ignore[unresolved-import]
 
 SESSION_GAP_US = 30 * 60 * 1_000_000
 

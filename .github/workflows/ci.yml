@@ -12,7 +12,7 @@ env:
 
 jobs:
   python-checks:
-    name: ruff + mypy
+    name: ruff + ty
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -27,9 +27,9 @@ jobs:
         run: uvx ruff format --check .
 
       # Python is where this repository's automation lives, so it is checked
-      # like the Rust is. `--strict` comes from pyproject.toml.
-      - name: mypy
-        run: uvx mypy scripts tests
+      # like the Rust is. `ty` is astral's, like ruff and uv above.
+      - name: ty
+        run: uvx ty check scripts tests
 
   go-skiff-reference:
     name: pinned Go Skiff reference

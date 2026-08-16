@@ -1,17 +1,18 @@
 # Python tooling for this workspace.
 #
 # There is no Python package here and there never will be — this repository is
-# a Rust workspace. The 13 `.py` files are its automation: the checks CI runs,
+# a Rust workspace. The 14 `.py` files are its automation: the checks CI runs,
 # the benchmark comparison it posts, the helpers that drive the local-cluster
 # end-to-end run, and the one that regenerates the C++ Skiff vectors.
-# This file exists only so `ruff` lints and formats them the same way for
-# everyone, instead of each file drifting to whatever its author's editor did.
+# This file configures the tools that keep them honest — `ruff` for lint and
+# format, `ty` for types — so they are checked the same way for everyone,
+# instead of each file drifting to whatever its author's editor did.
 #
 # Run it through uv, so nothing has to be installed first:
 #
 #     uvx ruff check .
 #     uvx ruff format .
-#     uvx mypy scripts tests
+#     uvx ty check scripts tests
 
 [tool.ruff]
 # Matches `actions/setup-python` in cluster-e2e.yml. The Skiff vector script
@@ -36,23 +37,19 @@ extend-exclude = [".claude", "third_party"]
 # a library, so the docstring and annotation rule sets would be noise.
 select = ["E", "F", "W", "I", "B", "C4", "UP", "RUF"]
 
-# Type checking. `mypy --strict` rather than a laxer default, and rather than
-# `ty`: ty is astral's, like ruff and uv, and would keep the toolchain to one
-# vendor — but it is still preview, and a checker whose diagnostics can move
-# under you between releases is a poor thing to gate CI on. It was tried, and on
-# the same two files `mypy --strict` found a real gap (`list[dict]` with no
-# parameters) that ty did not. Revisit when ty is stable.
+# Type checking, with **ty** — astral's, like ruff and uv, so the whole Python
+# toolchain is one family and one binary each. `mypy --strict` was used first
+# and was equally clean; the switch is for that consistency, not because either
+# found something the other missed.
 #
-#     uvx mypy --strict scripts tests
-[tool.mypy]
-python_version = "3.11"
-strict = true
-
-# Two third-party imports have no type information and never will:
-# `yt_yson_bindings` is a compiled C extension over upstream's
-# `library/cpp/skiff`, and `yt` is the official YTsaurus Python client. Silencing
-# the missing-stub error is the honest option; writing stubs for someone else's
-# compiled extension would be inventing a contract we do not own.
-[[tool.mypy.overrides]]
-module = ["yt.*", "yt_yson_bindings.*"]
-ignore_missing_imports = true
+#     uvx ty check scripts tests
+#
+# There is deliberately no rule configuration here. The two untyped third-party
+# imports — `yt`, the official YTsaurus Python client, and `yt_yson_bindings`, a
+# compiled C extension over upstream's `library/cpp/skiff` — are suppressed with
+# a `# ty: ignore[unresolved-import]` on each import line instead. Turning
+# `unresolved-import` off project-wide would have been one line, and would also
+# have hidden a typo in a first-party import: a check that cannot fail is the
+# failure mode this repository has already shipped.
+[tool.ty.environment]
+python-version = "3.11"

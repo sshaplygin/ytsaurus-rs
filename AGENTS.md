@@ -43,7 +43,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Worker builds | `x86_64-unknown-linux-musl`, fully static; `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — the last **only** for worker binaries, never for library crates |
 | Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
-| Python tooling | **ruff** lints and formats; **mypy --strict** type-checks; **uv** runs. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` configures ruff and mypy and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
+| Python tooling | **ruff** lints and formats; **ty** type-checks; **uv** runs — all three astral, one family. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` configures ruff and ty and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
 | **Language for automation** | **Python** for everything that computes, parses or asserts. **bash** for glue only — sequencing external commands, with **no source of another language embedded in it**, and none of it inlined into a workflow. **Rust** (`xtask`) only where it is genuinely required: `generate-protos` is there because `prost-build` is a Rust library API, and nothing else qualifies. **Go** only in `tests/*-go-interop/`, where the whole point is an oracle this project did not write. `tests/skiff-cpp-interop/cpp_reference.py` is permanently Python — `yt_yson_bindings` is a compiled C extension over upstream's own Skiff. **No new language without a human**, and JavaScript is not coming back. |
 
 ## Hard rules
