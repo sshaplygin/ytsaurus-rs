@@ -42,6 +42,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | Worker builds | `x86_64-unknown-linux-musl`, fully static; `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` — the last **only** for worker binaries, never for library crates |
 | Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
+| Python tooling | **ruff** lints and formats; **uv** runs. No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` is ruff configuration and declares no package — pass `--no-project` to `uv run` so it stops looking for one. |
 
 ## Hard rules
 
@@ -99,7 +100,13 @@ cargo fmt --all
 cargo bench -p ytsaurus-yson      # codec microbenchmark
 cargo bench -p ytsaurus-job       # job-path throughput
 
+uvx ruff check .                  # the four Python test helpers
+uvx ruff format --check .         # drop --check to rewrite
+
 cd tests/rpc-go-interop && go test ./...   # regenerate the RPC wire-format vectors
+cd tests/skiff-cpp-interop && uv run --no-project \
+    --with-requirements requirements.txt python cpp_reference.py
+                                           # regenerate the C++ Skiff vectors
 cargo run -p ytsaurus-rpc --example rpc_e2e # RPC client against a live RPC proxy
 cargo run -p ytsaurus-client --features rpc --example both_transports
                                            # the same code over HTTP and over RPC, compared
@@ -1158,8 +1165,10 @@ These cost time once. They are recorded so they do not cost it again.
   `;` and `%true`. A JSON spec fails with `Unexpected token ":"`.
 - **`map-reduce` uses `--map-local-file` / `--reduce-local-file`**, not
   `--local-file`.
-- **Binary YSON needs two pip packages**: `ytsaurus-client` *and* `ytsaurus-yson`.
-  Without the second: `YSON bindings required`.
+- **Binary YSON needs two packages**: `ytsaurus-client` *and* `ytsaurus-yson`.
+  Without the second: `YSON bindings required`. `ytsaurus-yson` is also the
+  compiled `library/cpp/skiff`, which is how `tests/skiff-cpp-interop/` compares
+  against the C++ implementation without building Arcadia.
 - **A duplicate mutation must admit to being one.** Re-sending a `mutation_id`
   without `retry=%true` is refused with `Duplicate request is not marked as
   "retry"`, not deduplicated. The flag is not inferred from the ID being known.

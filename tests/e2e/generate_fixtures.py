@@ -29,6 +29,7 @@ FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------- encoding
 
+
 def uvarint(value: int) -> bytes:
     out = bytearray()
     while value >= 0x80:
@@ -100,61 +101,85 @@ def control(key: bytes, value: bytes) -> bytes:
 
 # ------------------------------------------------------------------ data
 
+
 def rows_table_0():
     """Every scalar type the YSON spec defines, plus the awkward cases."""
     return [
         # Integer boundaries.
-        yson_map([
-            (b"name", yson_string(b"integers")),
-            (b"int_min", yson_int64(-(2 ** 63))),
-            (b"int_max", yson_int64(2 ** 63 - 1)),
-            (b"int_zero", yson_int64(0)),
-            (b"int_neg", yson_int64(-1)),
-            (b"uint_max", yson_uint64(2 ** 64 - 1)),
-            (b"uint_zero", yson_uint64(0)),
-        ]),
+        yson_map(
+            [
+                (b"name", yson_string(b"integers")),
+                (b"int_min", yson_int64(-(2**63))),
+                (b"int_max", yson_int64(2**63 - 1)),
+                (b"int_zero", yson_int64(0)),
+                (b"int_neg", yson_int64(-1)),
+                (b"uint_max", yson_uint64(2**64 - 1)),
+                (b"uint_zero", yson_uint64(0)),
+            ]
+        ),
         # Floating point, including the values that do not survive text format.
-        yson_map([
-            (b"name", yson_string(b"doubles")),
-            (b"pi", yson_double(math.pi)),
-            (b"zero", yson_double(0.0)),
-            (b"neg_zero", yson_double(-0.0)),
-            (b"inf", yson_double(math.inf)),
-            (b"neg_inf", yson_double(-math.inf)),
-            (b"nan", yson_double(math.nan)),
-            (b"tiny", yson_double(5e-324)),
-            (b"huge", yson_double(1.7976931348623157e308)),
-        ]),
+        yson_map(
+            [
+                (b"name", yson_string(b"doubles")),
+                (b"pi", yson_double(math.pi)),
+                (b"zero", yson_double(0.0)),
+                (b"neg_zero", yson_double(-0.0)),
+                (b"inf", yson_double(math.inf)),
+                (b"neg_inf", yson_double(-math.inf)),
+                (b"nan", yson_double(math.nan)),
+                (b"tiny", yson_double(5e-324)),
+                (b"huge", yson_double(1.7976931348623157e308)),
+            ]
+        ),
         # Booleans and entity (null).
-        yson_map([
-            (b"name", yson_string(b"booleans_and_entity")),
-            (b"yes", yson_bool(True)),
-            (b"no", yson_bool(False)),
-            (b"nothing", ENTITY),
-        ]),
+        yson_map(
+            [
+                (b"name", yson_string(b"booleans_and_entity")),
+                (b"yes", yson_bool(True)),
+                (b"no", yson_bool(False)),
+                (b"nothing", ENTITY),
+            ]
+        ),
         # Strings, including bytes that are not valid UTF-8.
-        yson_map([
-            (b"name", yson_string(b"strings")),
-            (b"empty", yson_string(b"")),
-            (b"ascii", yson_string(b"hello world")),
-            (b"utf8", yson_string("привет мир 🎉".encode("utf-8"))),
-            (b"not_utf8", yson_string(bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF]))),
-            (b"lone_surrogate", yson_string(bytes([0xED, 0xA0, 0x80]))),
-            (b"embedded_nul", yson_string(b"a\x00b")),
-            (b"yson_punctuation", yson_string(b"{};[]<>=#")),
-            (b"newlines", yson_string(b"line1\nline2\ttab")),
-        ]),
+        yson_map(
+            [
+                (b"name", yson_string(b"strings")),
+                (b"empty", yson_string(b"")),
+                (b"ascii", yson_string(b"hello world")),
+                (b"utf8", yson_string("привет мир 🎉".encode())),
+                (b"not_utf8", yson_string(bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF]))),
+                (b"lone_surrogate", yson_string(bytes([0xED, 0xA0, 0x80]))),
+                (b"embedded_nul", yson_string(b"a\x00b")),
+                (b"yson_punctuation", yson_string(b"{};[]<>=#")),
+                (b"newlines", yson_string(b"line1\nline2\ttab")),
+            ]
+        ),
         # Composite values.
-        yson_map([
-            (b"name", yson_string(b"composites")),
-            (b"empty_list", yson_list([])),
-            (b"empty_map", yson_map([])),
-            (b"numbers", yson_list([yson_int64(i) for i in range(1, 6)])),
-            (b"nested", yson_map([
-                (b"inner", yson_list([yson_string(b"a"), yson_map([(b"deep", yson_int64(1))])])),
-            ])),
-            (b"mixed", yson_list([yson_int64(1), yson_string(b"two"), yson_bool(True), ENTITY])),
-        ]),
+        yson_map(
+            [
+                (b"name", yson_string(b"composites")),
+                (b"empty_list", yson_list([])),
+                (b"empty_map", yson_map([])),
+                (b"numbers", yson_list([yson_int64(i) for i in range(1, 6)])),
+                (
+                    b"nested",
+                    yson_map(
+                        [
+                            (
+                                b"inner",
+                                yson_list(
+                                    [yson_string(b"a"), yson_map([(b"deep", yson_int64(1))])]
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
+                (
+                    b"mixed",
+                    yson_list([yson_int64(1), yson_string(b"two"), yson_bool(True), ENTITY]),
+                ),
+            ]
+        ),
         # NOTE: a column value carrying attributes is deliberately absent.
         # YTsaurus rejects it at write time with "Table values cannot have
         # top-level attributes", so a job can never receive one and a fixture
@@ -167,19 +192,23 @@ def rows_table_0():
             [(b"name", yson_string(b"wide"))]
             + [(f"column_{i:04}".encode(), yson_int64(i)) for i in range(500)]
         ),
-        yson_map([
-            (b"name", yson_string(b"large")),
-            (b"blob", yson_string(b"x" * 300_000)),
-        ]),
+        yson_map(
+            [
+                (b"name", yson_string(b"large")),
+                (b"blob", yson_string(b"x" * 300_000)),
+            ]
+        ),
     ]
 
 
 def rows_table_1():
     return [
-        yson_map([
-            (b"name", yson_string(b"second_table")),
-            (b"index", yson_int64(i)),
-        ])
+        yson_map(
+            [
+                (b"name", yson_string(b"second_table")),
+                (b"index", yson_int64(i)),
+            ]
+        )
         for i in range(5)
     ]
 

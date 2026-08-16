@@ -25,6 +25,7 @@ SEED = 20260804
 
 # ------------------------------------------------------------ binary YSON
 
+
 def uvarint(v: int) -> bytes:
     out = bytearray()
     while v >= 0x80:
@@ -73,8 +74,16 @@ def row(pairs) -> bytes:
 
 # ------------------------------------------------------------------- data
 
-URLS = [b"/", b"/search", b"/item/42", b"/cart", b"/checkout", b"/help",
-        b"/api/v1/items", b"/static/app.js"]
+URLS = [
+    b"/",
+    b"/search",
+    b"/item/42",
+    b"/cart",
+    b"/checkout",
+    b"/help",
+    b"/api/v1/items",
+    b"/static/app.js",
+]
 
 # Real user agents are frequently not valid UTF-8; one here deliberately is not.
 AGENTS = [
@@ -87,17 +96,19 @@ AGENTS = [
 
 def good_event(rng, user: bytes, ts: int) -> bytes:
     status = rng.choices([200, 200, 200, 301, 404, 500], k=1)[0]
-    return row([
-        (b"user_id", y_bytes(user)),
-        (b"timestamp", y_int(ts)),
-        (b"url", y_bytes(rng.choice(URLS))),
-        (b"referer", y_bytes(b"https://example.org/") if rng.random() < 0.6 else ENTITY),
-        (b"user_agent", y_bytes(rng.choice(AGENTS))),
-        (b"status", y_int(status)),
-        (b"bytes_sent", y_uint(rng.randrange(200, 200_000))),
-        (b"is_mobile", y_bool(rng.random() < 0.4)),
-        (b"latency_ms", y_double(round(rng.uniform(1.0, 900.0), 3))),
-    ])
+    return row(
+        [
+            (b"user_id", y_bytes(user)),
+            (b"timestamp", y_int(ts)),
+            (b"url", y_bytes(rng.choice(URLS))),
+            (b"referer", y_bytes(b"https://example.org/") if rng.random() < 0.6 else ENTITY),
+            (b"user_agent", y_bytes(rng.choice(AGENTS))),
+            (b"status", y_int(status)),
+            (b"bytes_sent", y_uint(rng.randrange(200, 200_000))),
+            (b"is_mobile", y_bool(rng.random() < 0.4)),
+            (b"latency_ms", y_double(round(rng.uniform(1.0, 900.0), 3))),
+        ]
+    )
 
 
 def corrupt_rows() -> list:
@@ -117,17 +128,17 @@ def corrupt_rows() -> list:
         return row([(k, overrides.get(k.decode(), v)) for k, v in base])
 
     return [
-        variant(user_id=y_bytes(b"")),              # empty user_id
-        variant(user_id=ENTITY),                    # null user_id
-        variant(timestamp=y_int(0)),                # non-positive timestamp
-        variant(timestamp=y_int(-1)),               # negative timestamp
-        variant(status=y_int(9999)),                # status out of range
-        variant(status=y_int(0)),                   # status out of range
-        variant(latency_ms=y_double(float("nan"))), # NaN latency
-        variant(latency_ms=y_double(-5.0)),         # negative latency
-        variant(url=y_bytes(b"")),                  # empty url
-        variant(timestamp=y_bytes(b"not-a-number")),# wrong type
-        row(base[:2]),                              # missing columns
+        variant(user_id=y_bytes(b"")),  # empty user_id
+        variant(user_id=ENTITY),  # null user_id
+        variant(timestamp=y_int(0)),  # non-positive timestamp
+        variant(timestamp=y_int(-1)),  # negative timestamp
+        variant(status=y_int(9999)),  # status out of range
+        variant(status=y_int(0)),  # status out of range
+        variant(latency_ms=y_double(float("nan"))),  # NaN latency
+        variant(latency_ms=y_double(-5.0)),  # negative latency
+        variant(url=y_bytes(b"")),  # empty url
+        variant(timestamp=y_bytes(b"not-a-number")),  # wrong type
+        row(base[:2]),  # missing columns
     ]
 
 
@@ -143,7 +154,7 @@ def main() -> None:
             for _ in range(rng.randrange(1, 12)):
                 out += good_event(rng, user, cursor) + b";"
                 cursor += rng.randrange(1, 20) * MINUTE_US // 2  # < 30 min
-            cursor += rng.randrange(31, 180) * MINUTE_US        # session break
+            cursor += rng.randrange(31, 180) * MINUTE_US  # session break
 
     for bad in corrupt_rows():
         out += bad + b";"
@@ -151,8 +162,10 @@ def main() -> None:
     with open(sys.argv[1], "wb") as f:
         f.write(bytes(out))
 
-    print(f"   wrote {sys.argv[1]}: {len(out)} bytes, {USERS} users, "
-          f"{len(corrupt_rows())} corrupt rows")
+    print(
+        f"   wrote {sys.argv[1]}: {len(out)} bytes, {USERS} users, "
+        f"{len(corrupt_rows())} corrupt rows"
+    )
 
 
 if __name__ == "__main__":

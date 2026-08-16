@@ -20,8 +20,14 @@ from yt import yson
 SESSION_GAP_US = 30 * 60 * 1_000_000
 
 REQUIRED = (
-    "user_id", "timestamp", "url", "user_agent",
-    "status", "bytes_sent", "is_mobile", "latency_ms",
+    "user_id",
+    "timestamp",
+    "url",
+    "user_agent",
+    "status",
+    "bytes_sent",
+    "is_mobile",
+    "latency_ms",
 )
 
 
@@ -138,8 +144,11 @@ def main() -> None:
                 current = None
             if current is None:
                 current = {
-                    "started_at": e["timestamp"], "ended_at": e["timestamp"],
-                    "hits": 0, "bytes_sent": 0, "errors": 0,
+                    "started_at": e["timestamp"],
+                    "ended_at": e["timestamp"],
+                    "hits": 0,
+                    "bytes_sent": 0,
+                    "errors": 0,
                 }
             current["ended_at"] = max(current["ended_at"], e["timestamp"])
             current["hits"] += 1
