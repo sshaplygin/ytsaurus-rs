@@ -1464,8 +1464,9 @@ needs a human — see below.
   38.5 MiB of output Skiff does not push through the pipe; the headline
   **1.85–1.93× against the `YsonValue` leg is 79–88 % a representation
   difference**, not a format one, and must not be quoted as a format ratio; wire
-  volume is the one solid result — 54.6/47.2 MiB against 91.1/85.7, reproduced
-  byte for byte off-cluster, though column names are 71 bytes of a ~122-byte
+  volume is the one solid result — 54.6/47.2 MiB against 91.1/85.7 on the
+  cluster, reproduced off-cluster at 54.6/47.2 and 90.7/85.7, the 0.4 MiB gap on
+  the YSON input being control records rather than row bytes, though column names are 71 bytes of a ~122-byte
   payload on *this* row and that does not generalise; and the comparison that
   would actually decide the default — typed YSON against typed Skiff — **cannot
   be run by anyone**, because Skiff has no typed rows. So this adds no third

@@ -84,17 +84,17 @@
 //! got, because on a cluster that reports it the same run answers the better
 //! question.
 //!
-//! **Fixed costs dominate here.** `docs/benchmarking.md` §3 measured 2225 ms
-//! merely to be handed rows on this kind of cluster against 474 ms on a real
-//! one. Under emulation, on one CPU, a local result is a direction, not a
+//! **Fixed costs dominate here.** `docs/benchmarking.md` measured 2225 ms merely
+//! to be handed rows on this kind of cluster (§3) against 474 ms on a real one
+//! (§4). Under emulation, on one CPU, a local result is a direction, not a
 //! throughput claim.
 //!
 //! **The fairness rules, enforced rather than remembered:** one input table for
 //! every leg; every leg reads every column, which `wordcount` gets for free
 //! from a one-column table and `project` gets by asking each leg for all nine —
 //! so the query's usual projection advantage is off the table; the query must
-//! contain an `INSERT`, so YQL pays the full output cost rather than Query
-//! Tracker's first 10 000 rows; the query cache is disabled, without which a
+//! contain an `INSERT`, so YQL pays the full output cost rather than whatever
+//! Query Tracker caps a bare `SELECT`'s result rows at; the query cache is disabled, without which a
 //! repeated query completes having spawned no operations at all; the rounds are
 //! interleaved, so whatever the cluster is doing to one leg it is doing to the
 //! others at the same time; and both memory limits are printed — the query is
@@ -465,8 +465,8 @@ struct EventRow {
 /// Deterministic events, the same shape `profile.rs` measures the pilot on.
 ///
 /// About 122 bytes of data weight a row, measured rather than guessed — the
-/// first version of this assumed 190 and produced a table two fifths the size
-/// asked for. The actual weight is still read back off the cluster and printed,
+/// first version of this assumed 190 and produced a table about two fifths
+/// short of the size asked for. The actual weight is still read back off the cluster and printed,
 /// because an estimate that drifts is exactly how a benchmark ends up
 /// comparing two different amounts of work.
 fn events(mib: usize) -> Vec<EventRow> {
@@ -1336,7 +1336,14 @@ fn row(label: &str, cells: impl IntoIterator<Item = String>) {
     println!("{line}");
 }
 
-/// Each leg against the first, which is the one the repository already ships.
+/// Each leg against the first, off the minima.
+///
+/// Which leg that is depends on the task, and on `project` it is `typed:
+/// frames` — a stop that writes nothing and ships nowhere, so the column
+/// normalises against the framing floor rather than against anything a job
+/// author would run. `paired_ratios` below is the estimator to read; this block
+/// is kept because the absolute row above it is, and a reader comparing two
+/// legs should use neither.
 fn ratios(legs: &[Leg], of: impl Fn(&Measure) -> Option<i64> + Copy) -> Vec<String> {
     let base = fastest(&legs[0].runs, of);
     legs.iter()

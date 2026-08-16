@@ -156,7 +156,7 @@ Every premise re-checked against the tree:
 | Rich-path `columns` for projection fairness | **holds** | `TablePath::columns` |
 | `job_statistics` / `statistic_sum` for metrics | **holds as API, fails as metric** — §3.1 | `Client::job_statistics`, `job_statistic_sum` |
 | Operations findable by filter | **holds, with a catch** — `OperationFilter::with_archive` needs an archive, *which a local cluster does not have* | `OperationFilter` |
-| "A third column in `docs/benchmarking.md`" | **there is no column to be third of** — four narrative sections, no comparison table | phase 3 |
+| "A third column in `docs/benchmarking.md`" | **there was no column to be third of** — four narrative sections, no comparison table. Phase 3 added a fifth section with tables of its own rather than a column to an existing one | phase 3 |
 
 Two shapes to copy rather than reinvent:
 [`examples/profile.rs`](../crates/ytsaurus-client/examples/profile.rs) — generate
@@ -283,8 +283,9 @@ What the escape hatch actually made awkward is smaller and more specific, and
 it is the list a modelled surface would have to get right: a terminal-state
 predicate kept separate from "the wait ran out" (conflating them made this
 example report a successful query as a failure); the crate's
-outer-plus-innermost error flattening, which is `pub(crate)` in `jobs.rs` and
-which every raw caller otherwise reinvents worse; and a poll interval and
+outer-plus-innermost error flattening, which **was** `pub(crate)` in `jobs.rs`
+and which every raw caller otherwise reinvented worse — it is `error_summary` on
+the crate root as of this branch; and a poll interval and
 timeout as parameters rather than constants. Four commands and a state enum,
 none of it urgent.
 
@@ -366,9 +367,16 @@ they are what phase 1 uses to prove semantic agreement cheaply.
 - **`COUNT(*)` is `Uint64`; the workers emit `Int64`.** Cast in the query, or
   the diff fails on type rather than on value.
 - **Float sums will not be bit-identical.** `latency_ms` accumulates in stream
-  order in the worker and in whatever order YQL chooses. The diff needs a
+  order in the worker and in whatever order YQL chooses. The diff would need a
   relative tolerance (`1e-9`) on float columns and exact equality elsewhere.
   v1.0's "byte-comparable" is the wrong requirement for exactly one column.
+
+  **Not built, and not needed by the task that ran.** `canonical_rows` compares
+  the byte-exact encoding of every column. The `project` task passes
+  `latency_ms` through unchanged rather than summing it, so no leg ever
+  accumulates a float and the four agreed exactly — the tolerance was designed
+  for the session aggregation of §5's table, which no leg computes. Anything
+  that does sum a float has to add it before it can be compared.
 
 ### 3.5 The estimator and the layout the repo already uses
 
@@ -377,6 +385,14 @@ they are what phase 1 uses to prove semantic agreement cheaply.
   `profile.rs`, whose default moved from 3 to 5 because 3 did not survive a
   shared cluster. **Report the spread as well as the minimum**: two readings
   that disagree by 2× are what §3 and §4 of `benchmarking.md` are about.
+
+  **Superseded by what the runs found.** The fastest-of-N survives only in the
+  absolute columns. Every ratio the harness publishes is paired *within* its
+  round, because two legs' fastest rounds can fall minutes apart and carry
+  different weather while the two legs of one round cannot; a run whose minima
+  said "no pair is separable" gave ratios that held their sign in all nine
+  rounds. `format_compare`'s module docs tell a reader to quote that block and
+  not the `vs first` columns.
 - v1.0 proposes `tests/yql-comparison/`. The repo's habit is cluster-driving
   code as a Rust example under `crates/ytsaurus-client/examples/`, fixtures and
   shell under `tests/e2e/`, and every item ending in a cluster example that
@@ -474,7 +490,8 @@ pairing, and it is the direction every number here would move if the metric
 included the whole job.
 
 **Run 3 is not a third weather sample for any Skiff row.** It ran after
-`2debf16` removed eight `Value` clones a row from the Skiff mapper, so 1.93×,
+*stop the Skiff leg handicapping itself* removed eight `Value` clones a row
+from the Skiff mapper, so 1.93×,
 1.20× and 1.49× are all partly that fix rather than run-to-run variation, and
 the drift across the three columns is not a spread. The only row here that is
 three measurements of one program is `typed YSON against the dynamic leg`. The
@@ -489,7 +506,8 @@ came out in order, and dropping the out-of-order ones can only remove rounds
 where noise made the difference small or negative. The 1.20× is the 1.16×
 measurement with a handicap removed: the Skiff leg had been cloning eight
 `Value`s a row where `SkiffRow::into_value` exists — three allocations a row,
-12 % of the leg, fixed in `2debf16` — so every earlier Skiff figure was a floor
+12 % of the leg, fixed in *stop the Skiff leg handicapping itself* — so every
+earlier Skiff figure was a floor
 for the Skiff side rather than an estimate of it.
 
 **What survives as a measurement, and what does not.** The adversarial pass
@@ -500,7 +518,7 @@ reproduced all of it off-cluster and left the table meaning less than it looks:
   ((989 − 328) / (989 − 315) on the medians below), sits **between the two YSON
   legs** — same format, same bytes, same reader, same serializer (§1).
 - **The three legs do not do the same work.** Per row: allocations 0.00 typed /
-  11.67 Skiff (8.67 after `2debf16`) / 26.67 dynamic; clones 0 / 8 / 8;
+  11.67 Skiff (8.67 after the clone fix) / 26.67 dynamic; clones 0 / 8 / 8;
   byte-slice key comparisons ~9–18 / 0 / ~87; and 12 `str::from_utf8` scans a
   row on the dynamic *write* path, all of them wasted — `ByteString::serialize`
   validates every key and every byte-string value so that text output can use
@@ -645,14 +663,16 @@ the worker, all of which must be checked rather than assumed:
 | `entry_url` = the row that opened the session | `MIN_BY(url, timestamp)` — check the tie-break; the worker takes stream order |
 | `errors` = count of `status >= 400` | `SUM(IF(status >= 400, 1, 0))` |
 | `is_mobile` = OR over the session | `BOOL_OR(is_mobile)` |
-| `mean_latency_ms` = `sum / hits` | `SUM(latency_ms) / COUNT(*)`, with §3.4's tolerance |
+| `mean_latency_ms` = `sum / hits` | `SUM(latency_ms) / COUNT(*)`, needing §3.4's tolerance, which does not exist yet |
 | `users` table | a second `INSERT` from the sessions relation |
 
 **Before any timing**, every leg runs on the same input and every output is
 diffed against leg 1's, row order normalized. Legs 2 and 3 must agree with leg 1
 **exactly** — they are the same computation in a different representation, and
 any difference there is a bug in this crate, which is a better find than a
-benchmark. Leg 4 agrees within §3.4's float tolerance.
+benchmark. Leg 4 would agree only within §3.4's float tolerance, on a task that
+sums a float; the `project` task the harness runs does not, so all four legs are
+compared exactly and do agree.
 
 The e2e corpus — four lines of text, 60 synthetic users — is right for the diff
 and useless for timing.
@@ -679,9 +699,11 @@ print the spread, discard one warm-up per leg.
 Fairness enforced by the harness rather than by discipline:
 
 - one input table, one schema, one sorted state, all four legs;
-- the worker legs read **only the columns the query reads** — `TablePath::columns`
-  for YSON, the format's schema for Skiff — otherwise YQL wins on projection
-  alone and the number means nothing;
+- every leg reads the same columns, otherwise YQL wins on projection alone and
+  the number means nothing. *Built the other way round*: rather than narrowing
+  the workers with `TablePath::columns`, the query was written to name all nine,
+  so every leg reads the whole row. Same fairness, and nothing to keep in step —
+  but it is a property of the query text, not something the harness checks;
 - **refuse any query text without an `INSERT`**: a stray `SELECT` is silently
   capped at Query Tracker's result rows and would under-measure output cost,
   which is the failure this design exists to prevent;
@@ -693,10 +715,16 @@ Fairness enforced by the harness rather than by discipline:
   its own 545 MB default, so the worker legs' 512 MB is already comparable —
   print both rather than assuming, and do not raise either to a round number
   that flatters one side;
-- refuse a Skiff leg whose schema does not match the input table's schema,
-  rather than letting a mismatch be measured as slowness;
-- print the pinned versions — cluster image tag, crate versions, a hash of the
-  query texts.
+- ~~refuse a Skiff leg whose schema does not match the input table's schema,
+  rather than letting a mismatch be measured as slowness~~ — **not built**. The
+  schema is written out by hand in two places that have to agree with each
+  other, and a mismatch surfaces as a decode failure rather than as slowness,
+  so this bought less than it looked like it would;
+- ~~print the pinned versions — cluster image tag, crate versions, a hash of the
+  query texts~~ — **not built**. It prints the two memory limits and nothing
+  else, so a run's provenance lives in whoever ran it. Still worth having: the
+  three runs recorded in §1 are distinguished in prose rather than by anything
+  the output carries.
 
 **DoD**: one command, one table of numbers, reproducible across two consecutive
 runs within the spread it reports.
@@ -783,11 +811,10 @@ with Docker reproduces the local half.
 | | |
 | --- | --- |
 | [`crates/ytsaurus-client/examples/yql_smoke.rs`](../crates/ytsaurus-client/examples/yql_smoke.rs) | **done** — phase 0's gate and the four answers, plus `YT_YQL_QUERY` for running one query verbatim |
-| `crates/ytsaurus-job/examples/sessionize.rs` | three single-output map modes: `map-one`, `map-one-dynamic`, `map-one-skiff` |
-| `tests/e2e/yql/{project_filter,wordcount,sessionize}.sql` | the query texts, versioned next to the workers they mirror |
 | [`crates/ytsaurus-client/examples/format_compare.rs`](../crates/ytsaurus-client/examples/format_compare.rs) | **done, all four legs**, on two tasks: `wordcount` (which shuffles, and whose numbers turned out to be about plan shape) and `project` — the pilot's map at three depths, plus the dynamic-YSON control, plus Skiff, plus the query. Phase 1's diff and phase 2's timings |
 | [`crates/ytsaurus-job/examples/sessionize.rs`](../crates/ytsaurus-job/examples/sessionize.rs) | **done**: `map-one`, `map-one-dynamic`, `map-parse-dynamic`, `map-one-skiff`, `map-parse-skiff` beside the `map-frames` / `map-parse` stops that already existed |
-| [`tests/e2e/README.md`](../tests/e2e/README.md) | **still owed** — `format_compare` appears nowhere in it, so the one command that reproduces any of this is undocumented outside this file |
+| the query texts | **not built as files.** v1.0 wanted `tests/e2e/yql/*.sql` versioned beside the workers they mirror; they are `format!` strings in `format_compare.rs` instead, which keeps a query and the leg that checks it in one place and puts them out of reach of anything but Rust |
+| [`tests/e2e/README.md`](../tests/e2e/README.md) | **still owed** — it gained a `yql_smoke` section, but `format_compare` appears nowhere in it, so the one command that reproduces any of this is undocumented outside this file |
 | [`docs/benchmarking.md`](benchmarking.md) | §5 and the four edits in phase 3 |
 | this file | kept current as the phases land |
 
@@ -801,11 +828,11 @@ with Docker reproduces the local half.
 | **Task** | wordcount + full sessionize → *project-and-filter* (the pilot's map, one output) for the four-way comparison; the other two stay YSON-versus-YQL, inside phase 1 |
 | **Constraint** | one input, one output, no key switch — the only Skiff shape verified on a cluster |
 | **Metric** | job CPU → `time/exec` locally, `user_job/cpu/*` only where the cluster reports it |
-| **Estimator** | median of 5 → fastest of 5 plus the spread, matching `profile.rs` |
+| **Estimator** | median of 5 → fastest of 5 plus the spread, matching `profile.rs` → **paired by round**, which is what the runs showed was needed; the fastest-of-N survives only in the absolute columns (§3.5) |
 | **Sessionize scope** | whole pilot → clean path; the rejects table is not expressible in stock YQL, recorded as a capability difference |
 | **Correctness bar** | "byte-comparable" → exact between legs 1–3, float tolerance against leg 4 |
 | **Report target** | "a third column" → §5 plus named edits to both decision criteria, the not-measured list, the parked entry, and required test 4 |
-| **Layout** | `tests/yql-comparison/` → queries in `tests/e2e/yql/`, harness as a `ytsaurus-client` example |
+| **Layout** | `tests/yql-comparison/` → queries in `tests/e2e/yql/`, harness as a `ytsaurus-client` example. Shipped as the example; the queries stayed inside it (§7) |
 | **Worker paths** | repo root → `crates/ytsaurus-job/examples/`, after `16915ab` |
 | **UDF rule** | "no UDFs" → no *custom* UDFs; which modules the agent loads is a phase 0 question |
 | **Phase 0** | added the cluster's YQL name, the loaded UDF modules, a `skiff_launch` run, and the note that the operation-id fallback must poll during the run |

@@ -325,10 +325,13 @@ an earlier version of this that compared minimum against minimum produced ratios
 the rounds themselves did not support.
 
 **Run 3 is not a third weather sample for any Skiff row.** It ran after
-`2debf16` removed eight `Value` clones a row from the Skiff mapper, so 1.93×,
+*stop the Skiff leg handicapping itself* removed eight `Value` clones a row
+from the Skiff mapper, so 1.93×,
 1.20× and 1.49× below are all partly that fix rather than run-to-run variation,
-and the drift across the three columns is not a spread. The only row here that
-is three measurements of one program is `typed YSON against the dynamic leg`.
+and the drift across the three columns is not a spread. Of the pairings
+[`format-comparison.md`](format-comparison.md) tabulates, the only one that is
+three measurements of a single program is typed YSON against the dynamic leg,
+and this section quotes it from two runs rather than three.
 
 #### What the wire carries
 
@@ -459,8 +462,10 @@ say how much they differ:
 | clones | 0 | 8 | 8 |
 | byte-slice key comparisons | ~9–18 | 0 | ~87 |
 
-11.67 is what the review counted; the Skiff leg is at 8.67 since one clone came
-out (below). A fourth count belongs to the crate rather than to any leg: the
+11.67 is what the review counted, before the eight `Value` clones came out of
+the Skiff mapper; that fix took its allocations to 8.67 and its clones to 0, so
+read the `clones` row above as the state the counts were taken in rather than as
+the code that shipped. A fourth count belongs to the crate rather than to any leg: the
 dynamic write path runs **12 `str::from_utf8` scans a row, all of them wasted**.
 `ByteString::serialize` validates every key and every byte-string value so that
 *text* output can use the unquoted-identifier form, and in binary both branches
@@ -538,8 +543,9 @@ settle it, and it does not exist to be run.
 
 The outside opinion, on the same rounds:
 
-| Skiff against the query | 1.44× | 1.47× | 1.49× |
+| paired by round | run 1 | run 2 | run 3 |
 | --- | ---: | ---: | ---: |
+| Skiff against the query | 1.44× | 1.47× | 1.49× |
 
 The harness pairs every leg against every other, and the typed-worker-against-query
 pairing was printed in each run but not recorded here. What can be said from the
@@ -584,11 +590,20 @@ while both sides read the same format — bytes and rows are then proportional. 
 fails as soon as the comparison spans formats, and it now does: the first
 baseline this criterion has ever had is a YQL query whose **own job I/O is
 Skiff**, moving 55.0/47.6 MiB where the worker legs move 91.1/85.7 for the
-identical rows. Per byte the verbose format wins by being verbose — on these
-figures the YSON leg is 1.20× slower on the clock and *better* per byte
-(0.0132·T against 0.0183·T) — so the ranking inverts. The comparable unit is
-**the same logical rows through the same pipeline**: CPU per row where the
-cluster reports CPU, and per-job wall time paired by round where it does not.
+identical rows. Per byte the verbose format wins by being verbose. The pair
+that shows it is **Skiff against typed YSON**, both measured here: with Skiff at
+`T`, the YSON leg is 1.20× slower on the clock and *better* per input byte —
+1.20/91.1 = 0.0132·T against 1/54.6 = 0.0183·T — so the ranking inverts.
+
+Note which pair that is, because the YQL baseline does not invert: the worker is
+both faster on the clock (1.24–1.31×) and cheaper per byte (1/91.1 = 0.0110·T
+against 1.24/55.0 = 0.0226·T). One baseline reading a different format is enough
+to make the unit unsafe; it is not enough to make it wrong in every pair, and
+saying so would overstate the case.
+
+The comparable unit is **the same logical rows through the same pipeline**: CPU
+per row where the cluster reports CPU, and per-job wall time paired by round
+where it does not.
 Even then this section has no CPU to put in the numerator. What criterion 2 now
 has, for the first time, is any evidence at all, and it points **away** from
 spending the format budget: the typed YSON path is ahead of YQL's vectorized
@@ -717,10 +732,14 @@ Implement `ytsaurus-skiff` if **both** hold:
    as soon as the comparison spans formats, and it now does: the first baseline
    this criterion has ever had is a YQL query whose **own job I/O is Skiff**,
    moving 55.0/47.6 MiB where the worker legs move 91.1/85.7 for the identical
-   rows. Per byte the verbose format wins by being verbose — on these figures
-   the YSON leg is 1.20× slower on the clock and *better* per byte, 0.0132·T
-   against 0.0183·T — so the ranking inverts. The comparable unit is **the same
-   logical rows through the same pipeline**: CPU per row where the cluster
+   rows. Per byte the verbose format wins by being verbose, and the pair that
+   shows it is **Skiff against typed YSON**: with Skiff at `T`, the YSON leg is
+   1.20× slower on the clock and *better* per input byte, 1.20/91.1 = 0.0132·T
+   against 1/54.6 = 0.0183·T — so the ranking inverts. Against the YQL baseline
+   itself it does not: there the worker is both faster (1.24–1.31×) and cheaper
+   per byte (0.0110·T against 0.0226·T). One baseline reading a different format
+   makes the unit unsafe, not wrong in every pair. The comparable unit is **the
+   same logical rows through the same pipeline**: CPU per row where the cluster
    reports CPU, and per-job wall time paired by round where it does not, with
    the legs interleaved so each round meets the same cluster.
    [`format-comparison.md`](format-comparison.md) is the first evidence this
