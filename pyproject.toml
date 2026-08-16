@@ -17,6 +17,17 @@
 target-version = "py311"
 line-length = 100
 
+# `third_party/` is someone else's repository, checked out read-only; ruff would
+# otherwise reformat upstream's `conanfile.py` and leave the submodule dirty.
+# Agent worktrees under `.claude/` are whole copies of *this* repository, so
+# without excluding them every `.py` file is linted once per worktree, against
+# whatever revision that worktree happens to sit on.
+#
+# Neither directory exists in CI, which is exactly why both belong here: the
+# command in AGENTS.md must mean the same thing on a developer's machine as it
+# does in the workflow.
+extend-exclude = [".claude", "third_party"]
+
 [tool.ruff.lint]
 # Beyond the default `E4,E7,E9,F`: import order, bugbears, comprehensions,
 # pyupgrade and the pytest-style asserts these scripts use. Nothing here is
