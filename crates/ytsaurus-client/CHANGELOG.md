@@ -22,6 +22,21 @@
   are sticky to the proxy that created them, and an HTTP client routes each
   request independently — the cluster's own message recommends the RPC API.
 
+### The error flattening is public
+
+- **Added** `error_summary(&YsonValue) -> Option<String>`, which was
+  `pub(crate)` and is what `JobInfo::error` and the operation errors are already
+  built from. It keeps the outer message and the innermost cause — `Failed to
+  run query: Memory limit exceeded` — and drops the attributes between them.
+
+  The reason it is public now is `Client::raw_command`. A caller sending a
+  command the crate does not model gets back the same shape of error document
+  and had no way to read it: two examples written against Query Tracker each
+  grew their own version, and the first one clipped the front of the chain and
+  printed the category while discarding the cause, which is the one sentence
+  worth having. An escape hatch that hands back an error nobody can read is
+  half a door.
+
 ## 0.2.6 - 2026-08-10
 
 No changes to this crate beyond the version, which tracks the workspace.

@@ -252,11 +252,46 @@ decision](../AGENTS.md); the exceptions are marked.
 | Tablet transactions | native | **yes, first class** | non-goal |
 | Wait for a tablet state | **no** | `migrate.MountAndWait` | — |
 | Queues and consumers | native | yes | non-goal |
-| Query Tracker | native | yes | **undecided**, not excluded |
+| Query Tracker | native | yes | **undecided**, not excluded — driven through `raw_command` today, see below |
 | `WhoAmI`, `CheckPermission` | yes | yes | no |
 | Maintenance, users, tokens | native | yes | out of charter, open decision |
 | Test fixture | `TTestFixture` | `yttest`, dockertest | a shell script and self-checking examples |
 | Code generation | protobuf row classes | `yt-gen-client` emits ~8 000 lines | `#[derive(TableRow)]` |
+
+### Query Tracker: what the escape hatch settled
+
+The row above still says undecided, and this section is the evidence a decision
+would rest on rather than the decision itself — widening the charter is a human
+call under hard rule 5.
+
+`crates/ytsaurus-client/examples/yql_smoke.rs` drives Query Tracker end to end
+through `Client::raw_command` on a local cluster: `start_query` (POST,
+`Repeatable::Never`), `get_query` (GET, `Freely`), `abort_query` on a timeout,
+and `list_operations` to find what a query spawned. That is the whole surface a
+caller needs, and none of it required a new method.
+
+What it cost to do without modelled methods, in the order it hurt:
+
+- **A terminal-state predicate kept separate from "the wait ran out."**
+  Conflating them made the example report a completed query as a failure; any
+  `wait_for_query` would meet the same trap.
+- **The crate's error flattening was `pub(crate)`.** `jobs.rs` already knew the
+  outer message is a category and the cause is at the bottom of the tree; a raw
+  caller could not reuse it and reinvented it worse — the first attempt clipped
+  the front of the chain and printed the category while discarding the cause.
+  This was the one piece worth having whatever happens to Query Tracker, and it
+  is now `error_summary` on the crate root.
+- Poll interval and timeout as constants rather than parameters.
+
+What did **not** turn out to be a gap: identifying a query's operations. YQL
+titles each one `YQL operation (<query id> by <user>)` and the cluster's own
+`filter` matches it, so the modelled `Client::list_operations` with
+`OperationFilter::with_substring` does the lookup unchanged.
+
+The Go example this row compares against reads Query Tracker's state out of
+**dynamic tables**, which [go-parity.md](go-parity.md) excludes by recorded
+non-goal. Nothing here goes near that path: these are ordinary HTTP commands to
+the proxy, and the non-goal stays intact.
 
 ## Where this client sits
 

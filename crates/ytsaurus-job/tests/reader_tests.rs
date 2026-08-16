@@ -816,7 +816,7 @@ fn errors_classify_themselves_without_formatting() {
 
     #[derive(serde::Deserialize, Debug)]
     struct Mismatch {
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         missing_column: i64,
     }
     let err = row.parse::<Mismatch>().expect_err("must not parse");

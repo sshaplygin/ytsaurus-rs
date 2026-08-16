@@ -46,7 +46,7 @@ const INPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// A plausible table row: a few string columns, a few numeric ones.
 #[derive(Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct BorrowedRow<'a> {
     #[serde(borrow)]
     user_id: &'a str,
@@ -61,7 +61,7 @@ struct BorrowedRow<'a> {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct OwnedRow {
     user_id: String,
     url: String,

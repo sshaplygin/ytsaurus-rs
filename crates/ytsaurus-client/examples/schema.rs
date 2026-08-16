@@ -174,7 +174,7 @@ fn run() -> Result<(), ClientError> {
 /// `TableRow` is both the trait and the macro, and importing the macro from
 /// `ytsaurus-helpers` as well would be the same name twice.
 #[derive(ytsaurus_helpers::TableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Visit<'a> {
     /// A key column: the table comes out sorted by it.
     #[yt(key)]
@@ -189,7 +189,7 @@ struct Visit<'a> {
 /// Optional, because the rows already in the table do not have it — which is
 /// also the only kind of column a table with rows will accept.
 #[derive(ytsaurus_helpers::TableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct VisitV2<'a> {
     #[yt(key)]
     host: &'a str,
