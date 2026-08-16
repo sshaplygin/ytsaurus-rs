@@ -861,6 +861,17 @@ fn run_query(client: &Client, query: &str) -> Result<Measure, ClientError> {
         }
 
         if Instant::now() >= deadline {
+            // Aborted before giving up, as `yql_smoke` does. A lost round is
+            // survivable — the loop counts it and carries on — but a query left
+            // burning a whole emulated cluster is the next round's weather, and
+            // this harness interleaves its legs precisely so that every leg of a
+            // round meets the same one. Best effort: the caller is already
+            // handling a failure, and a failed abort must not replace the
+            // message that says what actually went wrong.
+            let params = yson_build::map([("query_id", yson_build::string(&id))]);
+            if let Err(e) = client.raw_command(Method::Post, "abort_query", &params, None) {
+                println!("   could not abort the timed-out query {id}: {e}");
+            }
             return Err(ClientError::Config(format!(
                 "the query was still {state} after {}s",
                 QUERY_TIMEOUT.as_secs()

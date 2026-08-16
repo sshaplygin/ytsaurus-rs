@@ -814,7 +814,7 @@ with Docker reproduces the local half.
 | [`crates/ytsaurus-client/examples/format_compare.rs`](../crates/ytsaurus-client/examples/format_compare.rs) | **done, all four legs**, on two tasks: `wordcount` (which shuffles, and whose numbers turned out to be about plan shape) and `project` — the pilot's map at three depths, plus the dynamic-YSON control, plus Skiff, plus the query. Phase 1's diff and phase 2's timings |
 | [`crates/ytsaurus-job/examples/sessionize.rs`](../crates/ytsaurus-job/examples/sessionize.rs) | **done**: `map-one`, `map-one-dynamic`, `map-parse-dynamic`, `map-one-skiff`, `map-parse-skiff` beside the `map-frames` / `map-parse` stops that already existed |
 | the query texts | **not built as files.** v1.0 wanted `tests/e2e/yql/*.sql` versioned beside the workers they mirror; they are `format!` strings in `format_compare.rs` instead, which keeps a query and the leg that checks it in one place and puts them out of reach of anything but Rust |
-| [`tests/e2e/README.md`](../tests/e2e/README.md) | **still owed** — it gained a `yql_smoke` section, but `format_compare` appears nowhere in it, so the one command that reproduces any of this is undocumented outside this file |
+| [`tests/e2e/README.md`](../tests/e2e/README.md) | **done** — a `yql_smoke` section and a `format_compare` one, so both commands that reproduce any of this are documented where a person looks for them rather than only here |
 | [`docs/benchmarking.md`](benchmarking.md) | §5 and the four edits in phase 3 |
 | this file | kept current as the phases land |
 

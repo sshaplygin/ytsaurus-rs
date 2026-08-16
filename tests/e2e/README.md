@@ -145,6 +145,39 @@ asserted in a comment. It reads that list back through the modelled
 `Client::list_operations` with `OperationFilter::with_substring(query_id)`,
 which the cluster matches against the title YQL gives each operation.
 
+### The format comparison
+
+[`examples/format_compare.rs`](../../crates/ytsaurus-client/examples/format_compare.rs)
+is phases 1 and 2 of the same document: one task over one input table, run as up
+to eight legs, with the cluster doing the timing. It is the command that
+reproduces every figure in [`docs/benchmarking.md`](../../docs/benchmarking.md)
+§5, and it needs a worker built first.
+
+```sh
+export YT_PROXY=http://localhost:8000
+
+# the comparison the document is about: nine mixed-type columns, no shuffle,
+# one output table, three formats and a query
+scripts/build-worker.sh sessionize
+YT_COMPARE_TASK=project YT_COMPARE_MIB=48 YT_COMPARE_ROUNDS=9 \
+    cargo run --release -p ytsaurus-client --example format_compare
+
+# the default task, which shuffles — kept because it is what found the
+# harness's own defects, not because its numbers are about formats
+scripts/build-worker.sh wordcount
+cargo run --release -p ytsaurus-client --example format_compare
+```
+
+It writes under `//tmp/ytsaurus_rs_compare` and leaves the tables behind;
+`yt remove //tmp/ytsaurus_rs_compare --recursive` clears them. Every leg that
+produces rows is diffed against the first **before any clock is read**, so a run
+that reports timings is a run whose legs agreed. Expect roughly a minute a round
+per leg on the local cluster at 48 MiB, and read the *paired by round* block
+rather than the `vs first` columns — the document explains why at length.
+
+The `project` task needs a YQL agent, so [the gate above](#yql-through-the-escape-hatch)
+is worth running first on a cluster that has just come up.
+
 ### Without the `yt` CLI
 
 Two examples drive a cluster through `ytsaurus-client` alone, with nothing
@@ -176,6 +209,7 @@ cargo run -p ytsaurus-client --example raw          # commands the crate does no
 cargo run -p ytsaurus-client --example yql_smoke    # does this cluster run YQL, and what does it answer
 cargo run --release -p ytsaurus-client --example streaming  # a table bigger than the program
 cargo run --release -p ytsaurus-client --example profile     # what the pilot spends on decoding
+cargo run --release -p ytsaurus-client --example format_compare  # YSON, Skiff and YQL on one task
 
 # One source, two build outputs: `cargo run` makes a host launcher on every
 # platform, so point it at the static musl worker built above.

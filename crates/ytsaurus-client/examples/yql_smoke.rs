@@ -284,16 +284,27 @@ fn run() -> Result<bool, ClientError> {
 
     // Read whether or not the query worked: a failed query that still spawned
     // operations answers the question either way.
-    let spawned = match operations_of(&client, &outcome.id) {
-        Ok(spawned) => spawned,
-        Err(e) => {
-            println!("   list_operations failed: {e}");
-            Vec::new()
+    // `Result` rather than a `Vec` flattened on failure. "The call failed" and
+    // "the query spawned none" are opposite answers to the one question this
+    // step exists to ask, and printing both as `operations per query: 0` would
+    // report a broken lookup as a finding about YQL — which is exactly how the
+    // three false claims this file records came to be written.
+    let spawned = operations_of(&client, &outcome.id);
+    match &spawned {
+        Ok(found) if found.is_empty() => {
+            println!("   list_operations found no operation for this query");
         }
-    };
-    if spawned.is_empty() {
-        println!("   list_operations found no operation for this query");
+        Ok(_) => {}
+        Err(e) => println!("   list_operations failed: {e}"),
     }
+    let answer = match &spawned {
+        Ok(found) => format!(
+            "{} — see the paths above for where the ids appear",
+            found.len()
+        ),
+        Err(e) => format!("unknown — list_operations failed: {e}"),
+    };
+    let spawned = spawned.unwrap_or_default();
     for operation in &spawned {
         println!("   spawned {} {} {}", operation.0, operation.1, operation.2);
         // The question is not "is there a key called operation" — an earlier
@@ -307,13 +318,7 @@ fn run() -> Result<bool, ClientError> {
             println!("     get_query {path} = {}", clip(value, 120));
         }
     }
-    answers.push((
-        "operations per query",
-        format!(
-            "{} — see the paths above for where the ids appear",
-            spawned.len()
-        ),
-    ));
+    answers.push(("operations per query", answer));
 
     if !outcome.completed() {
         println!("\n   The gate stops here: a table-to-table query does not run.");
