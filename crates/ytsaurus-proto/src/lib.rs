@@ -37,6 +37,11 @@
 //! ```
 
 #![allow(clippy::doc_overindented_list_items, clippy::enum_variant_names)]
+// The generated code carries upstream's own comments, and some of them contain
+// C++ types — `std::optional<std::vector<int>>`. rustdoc reads `<int>` as an
+// unclosed HTML tag. The comments are upstream's to write, not ours to edit,
+// and they are regenerated on every run.
+#![allow(rustdoc::invalid_html_tags)]
 
 /// Generated code, in modules mirroring the protobuf package names.
 pub mod nyt {

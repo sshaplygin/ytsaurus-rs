@@ -759,7 +759,7 @@ impl Limit {
 /// A key is a **list** of YSON values, compared component-wise — the same
 /// `[]any` the Go SDK's `ypath.Key(values …any)` takes. Single-component keys
 /// convert from the value itself; a composite or mixed-type key is spelled
-/// with [`yson_build`](crate::yson_build):
+/// with [`yson_build`]:
 ///
 /// ```
 /// # use ytsaurus_client::{Key, yson_build};

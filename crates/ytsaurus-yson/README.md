@@ -16,8 +16,9 @@ deserializer (text and binary) built on serde, for talking to
 > work. Everything this fork changed is listed in [CHANGELOG.md](CHANGELOG.md).
 >
 > The fork exists so that the job runtime can evolve the parser (streaming reads,
-> in particular) without waiting on upstream. It is **not** published to crates.io,
-> and the `yson-rs` name is not ours to claim.
+> in particular) without waiting on upstream. It is published to crates.io under
+> its own name, `ytsaurus-yson`; the `yson-rs` name belongs to its upstream
+> author and is not ours to claim.
 
 Licensed under [Apache-2.0](../../LICENSE).
 
@@ -83,7 +84,7 @@ The markers this crate implements, from the
 ## Testing
 
 ```sh
-cargo test -p ytsaurus-yson      # 78 tests
+cargo test -p ytsaurus-yson      # 99 tests
 cargo bench -p ytsaurus-yson     # see BENCHMARKS.md
 ```
 

@@ -87,15 +87,13 @@ body, and `ytsaurus-proto` has the generated type for all 158 of them.
 
 ## Building
 
-The protobuf bindings are generated from the upstream `.proto` files in the
-`third_party/ytsaurus` submodule, so check it out once:
+Nothing special: `cargo build`. The protobuf bindings come from
+[`ytsaurus-proto`](https://crates.io/crates/ytsaurus-proto), which ships them
+already generated, so building this crate needs neither the YTsaurus `.proto`
+submodule nor `protoc`.
 
-```sh
-./scripts/init-protos.sh
-```
-
-It clones shallow and sparse — about 23 MB, not the whole monorepo. `protoc` is
-not needed on `PATH`; a vendored one is used unless `PROTOC` is set.
+Regenerating those bindings is a task for a checkout of the repository, not for
+a consumer — `./scripts/init-protos.sh` then `cargo xtask generate-protos`.
 
 ## Tests
 

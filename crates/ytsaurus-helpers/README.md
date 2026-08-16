@@ -27,7 +27,7 @@ Reach for it through the client, which re-exports the derive:
 
 ```toml
 [dependencies]
-ytsaurus-client = { version = "0.2", features = ["derive"] }
+ytsaurus-client = { version = "0.3", features = ["derive"] }
 ```
 
 ## What the types mean

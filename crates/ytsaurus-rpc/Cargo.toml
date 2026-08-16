@@ -10,6 +10,12 @@ authors.workspace = true
 description = "YTsaurus RPC proxy client: bus framing, RPC envelope and the dynamic-table row wire format"
 keywords = ["ytsaurus", "rpc", "bus", "protobuf"]
 categories = ["network-programming", "database"]
+
+# `tests/go_interop.rs` reads the byte vectors in `tests/rpc-go-interop/`, which
+# is outside this package. Unlike the compile-time cases elsewhere in this
+# workspace the path is resolved at run time, so the test would ship, compile,
+# and then fail on a missing directory — which is worse than not shipping it.
+exclude = ["tests/go_interop.rs"]
 readme = "README.md"
 
 # Published from 0.3.0, by the human decision Hard rule 1 asks for. The ship

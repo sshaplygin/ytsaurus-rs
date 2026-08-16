@@ -24,7 +24,11 @@ No changes to this crate beyond the version, which tracks the workspace.
 No changes to this crate beyond the version, which tracks the workspace. The
 fork modifications below are unchanged and still apply.
 
-## [Unreleased]
+## 0.1.0 — the fork
+
+Everything below shipped in the crate's first release and still applies. It is
+the record Apache-2.0 section 4(b) requires: what differs from upstream
+`ba2044c`.
 
 ### Forked
 

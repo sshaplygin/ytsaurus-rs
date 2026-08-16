@@ -22,6 +22,13 @@
   are sticky to the proxy that created them, and an HTTP client routes each
   request independently — the cluster's own message recommends the RPC API.
 
+### Also
+
+- **Renamed** the end-to-end example from `e2e` to `client_e2e`. `ytsaurus-rpc`
+  has one too, and both packages emitted `target/.../examples/e2e`, so building
+  all examples had them overwrite each other. Its counterpart there is
+  `rpc_e2e`.
+
 ### The error flattening is public
 
 - **Added** `error_summary(&YsonValue) -> Option<String>`, which was

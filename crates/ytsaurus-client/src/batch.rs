@@ -211,7 +211,7 @@ pub(crate) struct BatchPart {
 /// (the [command reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)
 /// puts it as *light, with `null` or `structured` input and output*, which
 /// measurably over-states it — `get_job_spec` is heavy and is taken, and
-/// `write_table` has tabular input and is taken; see [`NOT_A_BATCH_PART`]),
+/// `write_table` has tabular input and is taken; see `NOT_A_BATCH_PART`),
 /// and — the half a slice cannot answer — the
 /// **retry** of the whole batch turns on what the parts are. A typed method
 /// knows its command is a master-side Cypress command, so the batch stays
@@ -582,7 +582,7 @@ impl BatchRequest {
     /// refused when its registered output type is `tabular` or `binary`, or its
     /// input type is `binary`, and the driver throws before any part runs, so
     /// the **whole** batch fails and every other part loses its answer. That is
-    /// the check [`NOT_A_BATCH_PART`] makes, whichever class is claimed for the
+    /// the check `NOT_A_BATCH_PART` makes, whichever class is claimed for the
     /// name — `select_rows` and `lookup_rows` are on it, and are the ones a
     /// caller is likeliest to try.
     ///

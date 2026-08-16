@@ -89,6 +89,8 @@ with a reserved number.
 
 ## Publishing
 
-`cargo package` does not include submodules, so this crate cannot be published
-as it stands: the generated bindings would have to be committed, or the protos
-vendored at package time. That is gate H in the compatibility document.
+`cargo package` does not include submodules, which is why the generated bindings
+are **committed** under `src/generated/` and there is no build script — see
+above. That is what makes this crate publishable, and it is published from
+0.3.0. The `.proto` files themselves are still not vendored: they stay in the
+submodule, and CI regenerates and fails on a diff.

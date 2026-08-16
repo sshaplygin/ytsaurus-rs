@@ -155,6 +155,12 @@ jobs:
       # `default-features = false` dev-dependency, for the `selfrun` example —
       # so this asserts the invariant rather than trusting it.
       #
+      # `tokio` and `prost` are here for the same reason and a newer one: the
+      # client's `rpc` feature reaches both, and that feature is off by default
+      # *and required to stay off* precisely because this graph is what a musl
+      # worker links. `ytsaurus-client`'s changelog promises this check exists,
+      # so it does.
+      #
       # Read **with** dev-dependencies, which is the whole point: cargo compiles
       # a package's dev-dependencies whenever it builds that package's examples,
       # and the workers are examples. That is also why criterion is pinned
@@ -185,7 +191,7 @@ jobs:
             echo "ERROR: the worker graph does not contain ytsaurus-client"
             echo "$graph"; exit 1; }
 
-          for crate in tracing rustls ring rustls-platform-verifier; do
+          for crate in tracing rustls ring rustls-platform-verifier tokio prost; do
             if echo "$graph" | grep -qx "$crate"; then
               echo "ERROR: $crate reached the worker build"
               cargo tree -p ytsaurus-job \

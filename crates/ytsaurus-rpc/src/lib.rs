@@ -53,9 +53,12 @@
 //!
 //! # Status
 //!
-//! Pre-release, and not published. What is implemented, what is deliberately
-//! left out and what has actually been run against a cluster are listed in
-//! `docs/rpc-compatibility.md`.
+//! **Pre-release**, and published from 0.3.0. The ship gates are not all green
+//! and the API may change in a patch release. What is implemented, what is
+//! deliberately left out and what has actually been run against a cluster are
+//! listed in [`docs/rpc-compatibility.md`][compat] in the repository.
+//!
+//! [compat]: https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/rpc-compatibility.md
 
 pub mod blocking;
 pub mod bus;
