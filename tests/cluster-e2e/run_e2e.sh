@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test against a real YTsaurus cluster.
 #
-#   tests/e2e/run_local_cluster.sh     # once
-#   tests/e2e/run_e2e.sh               # this script
+#   tests/cluster-e2e/run_local_cluster.sh     # once
+#   tests/cluster-e2e/run_e2e.sh               # this script
 #
 # Runs the `cat` worker as a real map operation and asserts the output table is
 # identical to the input, then repeats with two input and two output tables to
@@ -50,11 +50,11 @@ ok "$BASE"
 # ------------------------------------------------------- single-table identity
 
 say "Uploading fixtures"
-python3 "$ROOT/tests/e2e/generate_fixtures.py" >/dev/null
+python3 "$ROOT/tests/cluster-e2e/generate_fixtures.py" >/dev/null
 
 # A table holds data rows only, never control records. `table_rows_N.bin` is
 # exactly that: a list fragment of rows, which is what `write-table` wants.
-FIXTURES="$ROOT/tests/e2e/fixtures"
+FIXTURES="$ROOT/tests/cluster-e2e/fixtures"
 cp "$FIXTURES/table_rows_0.bin" "$WORK/rows.yson"
 cp "$FIXTURES/table_rows_1.bin" "$WORK/rows2.yson"
 

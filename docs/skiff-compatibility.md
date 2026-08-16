@@ -8,7 +8,7 @@ allowed to depend on it.
 
 - **Go module:** `go.ytsaurus.tech/yt/go` **v0.0.33** (published 2026-06-04).
 - **Protocol:** the [official Skiff format documentation](https://ytsaurus.tech/docs/en/user-guide/storage/skiff).
-- **Cluster:** the local Docker YTsaurus used by `tests/e2e/`.
+- **Cluster:** the local Docker YTsaurus used by `tests/cluster-e2e/`.
 
 The Go version is pinned in [`tests/skiff-go-interop/go.mod`](../tests/skiff-go-interop/go.mod).
 Changing it requires an intentional change to this document, the Go vectors and

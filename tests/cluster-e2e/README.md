@@ -29,9 +29,9 @@ data, empty input, and that a truncated stream fails the job.
 
 ```sh
 pip install ytsaurus-client ytsaurus-yson   # both: binary YSON needs the bindings
-tests/e2e/run_local_cluster.sh              # localhost:8000, UI on :8001
-tests/e2e/run_e2e.sh
-tests/e2e/run_local_cluster.sh --stop
+tests/cluster-e2e/run_local_cluster.sh              # localhost:8000, UI on :8001
+tests/cluster-e2e/run_e2e.sh
+tests/cluster-e2e/run_local_cluster.sh --stop
 ```
 
 `run_e2e.sh` uploads the table payloads, runs `cat` as a real map operation and
@@ -734,7 +734,7 @@ encoder — because that check asserts a set of counts, not a byte sequence.
 ## Refreshing the golden fixtures
 
 ```sh
-tests/e2e/capture_fixtures.sh
+tests/cluster-e2e/capture_fixtures.sh
 ```
 
 Runs a map operation whose *output* format is text YSON while its input stays

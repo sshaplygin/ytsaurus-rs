@@ -2,8 +2,8 @@
 # Starts a local YTsaurus cluster in Docker, following
 # https://ytsaurus.tech/docs/en/overview/try-yt
 #
-#   tests/e2e/run_local_cluster.sh          # start
-#   tests/e2e/run_local_cluster.sh --stop   # tear down
+#   tests/cluster-e2e/run_local_cluster.sh          # start
+#   tests/cluster-e2e/run_local_cluster.sh --stop   # tear down
 #
 # Leaves the proxy on localhost:8000 and the web UI on localhost:8001.
 set -euo pipefail
@@ -56,4 +56,4 @@ fi
 
 echo
 echo "Proxy: localhost:8000    UI: localhost:8001"
-echo "Now run: tests/e2e/run_e2e.sh"
+echo "Now run: tests/cluster-e2e/run_e2e.sh"

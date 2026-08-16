@@ -1,4 +1,4 @@
-//! `client_e2e` — everything `tests/e2e/run_e2e.sh` checks, with no Python involved.
+//! `client_e2e` — everything `tests/cluster-e2e/run_e2e.sh` checks, with no Python involved.
 //!
 //! The shell script needs the `yt` CLI, which means a Python installation, which
 //! is the one thing this stack exists to avoid. Every command it sends has a
@@ -18,7 +18,7 @@
 //!
 //! # Where the bytes come from, and why it matters
 //!
-//! The first two checks upload `tests/e2e/fixtures/table_rows_*.bin` **as
+//! The first two checks upload `tests/cluster-e2e/fixtures/table_rows_*.bin` **as
 //! bytes**, exactly as the script pipes them into `yt write-table`. Those
 //! fixtures are built by `generate_fixtures.py` straight from the binary YSON
 //! specification and *deliberately not* by this project's own encoder — a
@@ -53,7 +53,7 @@ const BASE: &str = "//tmp/ytsaurus_rs_e2e";
 const WORKER_DIR: &str = "target/x86_64-unknown-linux-musl/release-worker";
 
 /// Rows built from the YSON specification rather than by this project's codec.
-const FIXTURES: &str = "tests/e2e/fixtures";
+const FIXTURES: &str = "tests/cluster-e2e/fixtures";
 
 /// The sentences the map-reduce counts, and the counts they must produce.
 ///
@@ -292,7 +292,7 @@ fn fixture(name: &str) -> Result<Vec<u8>, ClientError> {
     std::fs::read(&path).map_err(|e| {
         ClientError::Config(format!(
             "cannot read {path}: {e}. Run from the repository root; the \
-             fixtures are committed, and `tests/e2e/generate_fixtures.py` \
+             fixtures are committed, and `tests/cluster-e2e/generate_fixtures.py` \
              rebuilds them."
         ))
     })

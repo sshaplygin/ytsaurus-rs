@@ -44,10 +44,10 @@ jobs:
         run: uv pip install --system ytsaurus-client ytsaurus-yson
 
       - name: Start a local YTsaurus cluster
-        run: tests/e2e/run_local_cluster.sh
+        run: tests/cluster-e2e/run_local_cluster.sh
 
       - name: Run the local-cluster end-to-end tests
-        run: tests/e2e/run_e2e.sh
+        run: tests/cluster-e2e/run_e2e.sh
 
       # The containers are ephemeral runners, but their logs make a failed
       # scheduler operation diagnosable directly from the Actions run.
@@ -60,4 +60,4 @@ jobs:
 
       - name: Stop the local YTsaurus cluster
         if: always()
-        run: tests/e2e/run_local_cluster.sh --stop
+        run: tests/cluster-e2e/run_local_cluster.sh --stop

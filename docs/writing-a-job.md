@@ -2,7 +2,7 @@
 
 From an empty file to a running operation. Assumes you can reach a cluster —
 `export YT_PROXY=http://localhost:8000` for the local one in
-[`tests/e2e/README.md`](../tests/e2e/README.md).
+[`tests/cluster-e2e/README.md`](../tests/cluster-e2e/README.md).
 
 The direct-static shape this guide builds towards is **one binary that is both
 the launcher and the job**: it uploads itself, starts the operation, and is
@@ -614,7 +614,7 @@ works, and it catches most protocol mistakes without a cluster. For the reduce
 path, [`crates/ytsaurus-job/tests/wordcount_e2e.rs`](../crates/ytsaurus-job/tests/wordcount_e2e.rs)
 simulates the shuffle by sorting the mapper output and inserting key switches.
 
-For a real cluster run, see [`tests/e2e/README.md`](../tests/e2e/README.md).
+For a real cluster run, see [`tests/cluster-e2e/README.md`](../tests/cluster-e2e/README.md).
 
 ## 12. When something goes wrong
 

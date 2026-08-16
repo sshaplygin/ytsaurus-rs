@@ -25,7 +25,7 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-proto/` | Generated protobuf bindings for the RPC proxy, built from the upstream `.proto` files in the `third_party/ytsaurus` submodule — not from a copy. Pre-release, unpublished. |
 | `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope and the dynamic-table row wire format. **Async on tokio**, unlike everything above it. Pre-release, unpublished; see [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one), [rpc-compatibility.md](docs/rpc-compatibility.md) (what the RPC client implements, every deliberate divergence from the reference clients, and the gates still open), [format-comparison.md](docs/format-comparison.md) (a plan **and now its results**: YSON, Skiff and YQL on one task, three nine-round cluster runs, a pre-registered prediction that came out refuted, and an adversarial pass that took most of the headline ratio away from the format). |
-| `tests/e2e/` | Cluster scripts and captured golden fixtures. |
+| `tests/cluster-e2e/` | Cluster scripts and captured golden fixtures. |
 | `tests/rpc-go-interop/` | Version-pinned Go program that *produces* byte vectors for the RPC row wire format and CRC-64, which the Rust tests consume. Same shape as `tests/skiff-go-interop/`. |
 | `third_party/ytsaurus` | Submodule: the YTsaurus monorepo, sparse-checked-out for its `.proto` files only. `./scripts/init-protos.sh`. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
@@ -1318,16 +1318,16 @@ Three layers:
    exercises every split point including mid-varint.
 2. **Offline e2e** — runs the real compiled worker with real fd 1 / fd 4
    redirection. Its golden fixtures are **captured from a live cluster**
-   (`tests/e2e/capture_fixtures.sh`), so it is not our reading of the spec checked
+   (`tests/cluster-e2e/capture_fixtures.sh`), so it is not our reading of the spec checked
    against itself.
 3. **Cluster e2e** — against a local YTsaurus in Docker, two readings of the
    same three checks. `cargo run -p ytsaurus-client --example client_e2e` drives them
-   through this crate and needs no Python; `tests/e2e/run_e2e.sh` drives them
+   through this crate and needs no Python; `tests/cluster-e2e/run_e2e.sh` drives them
    through the official Python client and so checks the worker's output against
    a **different implementation** rather than against ourselves. Keep both — the
    second is the only place anything here is read by code we did not write.
    Neither is in CI (needs a multi-GB image). See
-   [`tests/e2e/README.md`](tests/e2e/README.md).
+   [`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md).
 
 Fuzzing: `cargo +nightly fuzz run fuzz_target_{1,2}` from `crates/ytsaurus-yson/`.
 `tests/fuzz_smoke_tests.rs` gives CI a deterministic no-panic signal without
@@ -1389,7 +1389,7 @@ compares, with nothing Python on `PATH`. Run it with
 `cargo run -p ytsaurus-client --example launch`.
 
 **4. The ranked backlog — worked top to bottom, P0 through P3.** Each item ends
-with a cluster example that checks itself, so `tests/e2e/README.md` is the list
+with a cluster example that checks itself, so `tests/cluster-e2e/README.md` is the list
 of what has actually been run:
 
 | | | |

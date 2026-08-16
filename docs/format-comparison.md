@@ -395,7 +395,7 @@ they are what phase 1 uses to prove semantic agreement cheaply.
   not the `vs first` columns.
 - v1.0 proposes `tests/yql-comparison/`. The repo's habit is cluster-driving
   code as a Rust example under `crates/ytsaurus-client/examples/`, fixtures and
-  shell under `tests/e2e/`, and every item ending in a cluster example that
+  shell under `tests/cluster-e2e/`, and every item ending in a cluster example that
   checks itself. Follow it — §7.
 
 ## 4. Phases
@@ -813,8 +813,8 @@ with Docker reproduces the local half.
 | [`crates/ytsaurus-client/examples/yql_smoke.rs`](../crates/ytsaurus-client/examples/yql_smoke.rs) | **done** — phase 0's gate and the four answers, plus `YT_YQL_QUERY` for running one query verbatim |
 | [`crates/ytsaurus-client/examples/format_compare.rs`](../crates/ytsaurus-client/examples/format_compare.rs) | **done, all four legs**, on two tasks: `wordcount` (which shuffles, and whose numbers turned out to be about plan shape) and `project` — the pilot's map at three depths, plus the dynamic-YSON control, plus Skiff, plus the query. Phase 1's diff and phase 2's timings |
 | [`crates/ytsaurus-job/examples/sessionize.rs`](../crates/ytsaurus-job/examples/sessionize.rs) | **done**: `map-one`, `map-one-dynamic`, `map-parse-dynamic`, `map-one-skiff`, `map-parse-skiff` beside the `map-frames` / `map-parse` stops that already existed |
-| the query texts | **not built as files.** v1.0 wanted `tests/e2e/yql/*.sql` versioned beside the workers they mirror; they are `format!` strings in `format_compare.rs` instead, which keeps a query and the leg that checks it in one place and puts them out of reach of anything but Rust |
-| [`tests/e2e/README.md`](../tests/e2e/README.md) | **done** — a `yql_smoke` section and a `format_compare` one, so both commands that reproduce any of this are documented where a person looks for them rather than only here |
+| the query texts | **not built as files.** v1.0 wanted `tests/cluster-e2e/yql/*.sql` versioned beside the workers they mirror; they are `format!` strings in `format_compare.rs` instead, which keeps a query and the leg that checks it in one place and puts them out of reach of anything but Rust |
+| [`tests/cluster-e2e/README.md`](../tests/cluster-e2e/README.md) | **done** — a `yql_smoke` section and a `format_compare` one, so both commands that reproduce any of this are documented where a person looks for them rather than only here |
 | [`docs/benchmarking.md`](benchmarking.md) | §5 and the four edits in phase 3 |
 | this file | kept current as the phases land |
 
@@ -832,7 +832,7 @@ with Docker reproduces the local half.
 | **Sessionize scope** | whole pilot → clean path; the rejects table is not expressible in stock YQL, recorded as a capability difference |
 | **Correctness bar** | "byte-comparable" → exact between legs 1–3, float tolerance against leg 4 |
 | **Report target** | "a third column" → §5 plus named edits to both decision criteria, the not-measured list, the parked entry, and required test 4 |
-| **Layout** | `tests/yql-comparison/` → queries in `tests/e2e/yql/`, harness as a `ytsaurus-client` example. Shipped as the example; the queries stayed inside it (§7) |
+| **Layout** | `tests/yql-comparison/` → queries in `tests/cluster-e2e/yql/`, harness as a `ytsaurus-client` example. Shipped as the example; the queries stayed inside it (§7) |
 | **Worker paths** | repo root → `crates/ytsaurus-job/examples/`, after `16915ab` |
 | **UDF rule** | "no UDFs" → no *custom* UDFs; which modules the agent loads is a phase 0 question |
 | **Phase 0** | added the cluster's YQL name, the loaded UDF modules, a `skiff_launch` run, and the note that the operation-id fallback must poll during the run |
@@ -845,7 +845,7 @@ with Docker reproduces the local half.
 [Skiff](https://ytsaurus.tech/docs/en/user-guide/storage/skiff) ·
 [run_local_cluster.sh](https://github.com/ytsaurus/ytsaurus/blob/main/yt/docker/local/run_local_cluster.sh)
 · in-tree: [`benchmarking.md`](benchmarking.md),
-[`skiff-compatibility.md`](skiff-compatibility.md), [`tests/e2e/`](../tests/e2e/),
+[`skiff-compatibility.md`](skiff-compatibility.md), [`tests/cluster-e2e/`](../tests/cluster-e2e/),
 [`examples/profile.rs`](../crates/ytsaurus-client/examples/profile.rs),
 [`examples/raw.rs`](../crates/ytsaurus-client/examples/raw.rs),
 [`examples/skiff_launch.rs`](../crates/ytsaurus-client/examples/skiff_launch.rs)

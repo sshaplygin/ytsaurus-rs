@@ -188,7 +188,7 @@ test suite that happens to be readable:
 
 ```sh
 export YT_PROXY=http://localhost:8000
-tests/e2e/run_local_cluster.sh
+tests/cluster-e2e/run_local_cluster.sh
 scripts/build-worker.sh
 
 cargo run -p ytsaurus-client --example cluster_info
@@ -202,7 +202,7 @@ YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
     cargo run -p ytsaurus-job --example selfrun
 ```
 
-[`tests/e2e/README.md`](../tests/e2e/README.md) holds the output of each, from
+[`tests/cluster-e2e/README.md`](../tests/cluster-e2e/README.md) holds the output of each, from
 the runs that were actually made.
 
 ## Interop below the examples

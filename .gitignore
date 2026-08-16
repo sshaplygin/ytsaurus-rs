@@ -3,6 +3,6 @@
 *.pdb
 
 # Local e2e artifacts
-/tests/e2e/tmp/
+/tests/cluster-e2e/tmp/
 __pycache__/
 *.py[cod]

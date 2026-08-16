@@ -8,7 +8,7 @@ Mixed in with the well-formed events is a fixed set of corrupt rows, so the
 pilot exercises the quarantine path on a real cluster rather than only in unit
 tests.
 
-    python3 tests/e2e/generate_pilot_input.py out.yson
+    python3 tests/cluster-e2e/generate_pilot_input.py out.yson
 """
 
 import random
