@@ -5,7 +5,8 @@
 #   tests/cluster-e2e/run_local_cluster.sh          # start
 #   tests/cluster-e2e/run_local_cluster.sh --stop   # tear down
 #
-# Leaves the proxy on localhost:8000 and the web UI on localhost:8001.
+# Leaves the HTTP proxy on localhost:8000, the RPC proxy on localhost:8011,
+# and the web UI on localhost:8001.
 set -euo pipefail
 
 WORKDIR="${YT_LOCAL_DIR:-$HOME/yt-local}"
@@ -52,8 +53,9 @@ if [ ! -x run_local_cluster.sh ]; then
   chmod +x run_local_cluster.sh
 fi
 
-./run_local_cluster.sh
+./run_local_cluster.sh --rpc-proxy-count 1 --rpc-proxy-port 8011
 
 echo
-echo "Proxy: localhost:8000    UI: localhost:8001"
+echo "HTTP proxy: localhost:8000    RPC proxy: localhost:8011    UI: localhost:8001"
 echo "Now run: tests/cluster-e2e/run_e2e.sh"
+echo "Or:      cargo run -p ytsaurus-rpc --example rpc_e2e"
