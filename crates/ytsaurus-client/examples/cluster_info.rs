@@ -160,7 +160,7 @@ struct NodeInfo {
 /// Exists to be refused, so the error path is demonstrated rather than
 /// described.
 #[derive(serde::Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Impossible {
     creation_time: u64,
 }

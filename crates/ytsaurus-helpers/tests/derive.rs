@@ -24,7 +24,7 @@ fn render(schema: &TableSchema) -> String {
 }
 
 #[derive(DeriveTableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Visit<'a> {
     #[yt(key)]
     host: &'a str,
@@ -63,7 +63,7 @@ fn a_struct_becomes_the_schema_its_fields_describe() {
 
 #[derive(DeriveTableRow)]
 #[yt(unique_keys)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Session {
     #[yt(key)]
     user_id: i64,
@@ -97,7 +97,7 @@ fn keys_renames_and_skips_do_what_they_say() {
 
 #[derive(DeriveTableRow)]
 #[yt(non_strict)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Loose {
     id: i64,
 }
@@ -108,7 +108,7 @@ fn non_strict_lets_a_row_carry_more_than_the_schema() {
 }
 
 #[derive(DeriveTableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct EveryType<'a> {
     tiny: i8,
     small: i16,
@@ -172,7 +172,7 @@ fn every_supported_rust_type_maps_to_a_column() {
 }
 
 #[derive(DeriveTableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Escaped {
     #[yt(column_type = "any")]
     payload: [u32; 4],
@@ -192,7 +192,7 @@ fn the_escape_hatch_names_a_type_the_derive_would_not_guess() {
 /// A struct whose every field is skipped still has to compile: the generated
 /// `TableSchema::new([])` must infer its element type from nothing.
 #[derive(DeriveTableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct AllSkipped {
     #[yt(skip)]
     scratch: usize,
@@ -209,7 +209,7 @@ fn a_schema_with_no_columns_is_still_a_schema() {
 
 /// Generics and where clauses have to survive the impl.
 #[derive(DeriveTableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Generic<'a, T>
 where
     T: Clone,
@@ -231,7 +231,7 @@ fn a_generic_struct_gets_a_generic_impl() {
 /// A skipped field between two key fields must not break the key prefix: it is
 /// not a column, so it cannot come between two of them.
 #[derive(DeriveTableRow)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct SkipBetweenKeys {
     #[yt(key)]
     a: i64,

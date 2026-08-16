@@ -5166,7 +5166,7 @@ mod tests {
     fn an_answer_that_does_not_fit_the_type_is_an_error_rather_than_a_default() {
         #[derive(serde::Deserialize)]
         struct Node {
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             account: String,
         }
 
