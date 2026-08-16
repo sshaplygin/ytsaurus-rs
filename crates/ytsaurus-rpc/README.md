@@ -3,7 +3,8 @@
 A Rust client for the YTsaurus **RPC proxy**: bus framing, the RPC envelope,
 and the row wire format dynamic tables actually speak.
 
-**Pre-release and unpublished.** What works, what does not, and what has been
+**Pre-release, published from 0.3.0.** The ship gates are not all green and the
+API may change in a patch release. What works, what does not, and what has been
 run against a real cluster is [docs/rpc-compatibility.md](../../docs/rpc-compatibility.md).
 
 ## Why this exists
@@ -14,8 +15,8 @@ is **not** about capability. It is about latency and throughput under
 concurrency: one connection multiplexes many in-flight requests, where HTTP pays
 its per-request cost every time.
 
-If you are not bottlenecked on that, use the HTTP client. It is finished, it is
-published, and it has none of the gates listed in the compatibility document.
+If you are not bottlenecked on that, use the HTTP client. It is finished and it
+has none of the gates listed in the compatibility document.
 
 ## The protocol is four layers, and only the top one looks familiar
 
@@ -86,15 +87,13 @@ body, and `ytsaurus-proto` has the generated type for all 158 of them.
 
 ## Building
 
-The protobuf bindings are generated from the upstream `.proto` files in the
-`third_party/ytsaurus` submodule, so check it out once:
+Nothing special: `cargo build`. The protobuf bindings come from
+[`ytsaurus-proto`](https://crates.io/crates/ytsaurus-proto), which ships them
+already generated, so building this crate needs neither the YTsaurus `.proto`
+submodule nor `protoc`.
 
-```sh
-./scripts/init-protos.sh
-```
-
-It clones shallow and sparse — about 23 MB, not the whole monorepo. `protoc` is
-not needed on `PATH`; a vendored one is used unless `PROTOC` is set.
+Regenerating those bindings is a task for a checkout of the repository, not for
+a consumer — `./scripts/init-protos.sh` then `cargo xtask generate-protos`.
 
 ## Tests
 

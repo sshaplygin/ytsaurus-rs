@@ -28,6 +28,23 @@ crates/ytsaurus-yson/
     Apache License, every modification is recorded in
     crates/ytsaurus-yson/CHANGELOG.md.
 
+crates/ytsaurus-proto/
+
+    The Rust modules under crates/ytsaurus-proto/src/generated/ are produced by
+    prost-build from the Protocol Buffers interface definitions of YTsaurus, and
+    are therefore a derivative work of them.
+
+        Source:   https://github.com/ytsaurus/ytsaurus
+        Revision: c91fcbe2cd0b9bf8a2fbae078885b9d423f22b62 (branch stable/25.4)
+        Owner:    YANDEX LLC
+
+    YTsaurus is licensed under the Apache License, Version 2.0 — Copyright 2023
+    Yandex LLC — the same licence this project is distributed under.
+
+    The .proto files are **not** redistributed and no copy of them is kept here:
+    they are read from the `third_party/ytsaurus` submodule pinned at the
+    revision above, and only the generated Rust is committed.
+
 crates/ytsaurus-client/
 
     Original work. Depends on ureq and serde_json, which are fetched from

@@ -6,9 +6,14 @@ All notable changes to this fork are recorded here.
 Recording modifications is a condition of the Apache-2.0 licence (section 4b), and the
 list below is that record: everything that differs from upstream `ba2044c`.
 
-## 0.2.6 - 2026-08-10
+## 0.3.0 - 2026-08-16
 
 No changes to this crate beyond the version, which tracks the workspace.
+
+## 0.2.6
+
+Never released. The version was bumped in the workspace and the tag was never
+cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 ## 0.2.5 - 2026-08-10
 
@@ -19,7 +24,11 @@ No changes to this crate beyond the version, which tracks the workspace.
 No changes to this crate beyond the version, which tracks the workspace. The
 fork modifications below are unchanged and still apply.
 
-## [Unreleased]
+## 0.1.0 — the fork
+
+Everything below shipped in the crate's first release and still applies. It is
+the record Apache-2.0 section 4(b) requires: what differs from upstream
+`ba2044c`.
 
 ### Forked
 

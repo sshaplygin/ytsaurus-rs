@@ -17,7 +17,14 @@ categories = ["encoding"]
 # a `selfrun.rs` that shipped would be an example nobody could build from the
 # registry, failing on an import of a crate the manifest no longer names. The
 # other eight need only this crate's own dependencies and ship as they are.
-exclude = ["examples/selfrun.rs"]
+#
+# `tests/cat_e2e.rs` is excluded for a different reason: it `include_bytes!`s
+# golden fixtures from `tests/cluster-e2e/fixtures/`, which is outside this
+# package and so is not in the tarball. `include_bytes!` resolves at compile
+# time, so shipping that file gives anyone who unpacks the crate and runs
+# `cargo test` a build error and no way to fix it. The other e2e tests build the
+# example workers, which *are* published, and are left in.
+exclude = ["examples/selfrun.rs", "tests/cat_e2e.rs"]
 
 [dependencies]
 ytsaurus-yson.workspace = true
@@ -34,6 +41,13 @@ thiserror.workspace = true
 # not drag in `rustls`, which reaches `ring`, which wants a C cross-compiler.
 #
 #   cargo run -p ytsaurus-job --example selfrun --features example-tls
+#
+# **In the published crate this feature is empty and does nothing.** It turns on
+# a feature of `ytsaurus-client`, which is a version-less dev-dependency that
+# cargo drops on publish, and the example it serves is excluded from the package
+# too — so the registry manifest carries `example-tls = []`. It is kept because
+# the repository is where `selfrun` is built, and removing it would break the
+# documented command above.
 example-tls = ["ytsaurus-client/tls"]
 
 [dev-dependencies]

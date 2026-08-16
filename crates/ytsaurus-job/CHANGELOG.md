@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.2.6 - 2026-08-10
+## 0.3.0 - 2026-08-16
+
+No change to this crate's library — the runtime, the reader and the writers are
+what they were in 0.2.5. What reaches crates.io here is the example move below,
+which was prepared as 0.2.6 and never released, together with a rewritten
+throughput benchmark and the end-to-end tests that drive the example workers.
+
+- **Excluded** `tests/cat_e2e.rs` from the package. It `include_bytes!`s golden
+  fixtures that live outside this crate, and `include_bytes!` resolves at
+  compile time — so shipping it handed anyone who unpacked the crate a build
+  error with no way to fix it. It runs in the repository, where the fixtures
+  are. The other end-to-end tests build the published example workers and are
+  unaffected.
+
+## 0.2.6 — never released
+
+The version was bumped in the workspace and the tag was never cut, so nothing in
+this section reached crates.io until 0.3.0.
 
 ### The worker examples live here now
 
@@ -23,14 +40,17 @@
   library has no HTTP in it. Off by default, because the workers cross-compile
   to musl and `rustls` reaches `ring`, which wants a C cross-compiler.
 
+  It is a **repository-only** feature. It enables a feature of a version-less
+  dev-dependency, which publishing drops, and the example it serves is excluded
+  from the package — so on crates.io it reads `example-tls = []` and does
+  nothing.
+
 - **Changed** the criterion dev-dependency to `0.7`. Cargo compiles a package's
   dev-dependencies whenever it builds that package's examples, and criterion
   0.8 reaches `alloca`, whose build script wants the same cross-compiler.
   Nothing in the bench used a 0.8 feature.
 
 ## 0.2.5 - 2026-08-10
-
-No changes to this crate beyond the version, which tracks the workspace.
 
 ### An empty reduce group stays empty
 

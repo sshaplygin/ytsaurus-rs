@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-16
 
 ### Dynamic tables, and a second transport
 
@@ -22,6 +22,13 @@
   are sticky to the proxy that created them, and an HTTP client routes each
   request independently — the cluster's own message recommends the RPC API.
 
+### Also
+
+- **Renamed** the end-to-end example from `e2e` to `client_e2e`. `ytsaurus-rpc`
+  has one too, and both packages emitted `target/.../examples/e2e`, so building
+  all examples had them overwrite each other. Its counterpart there is
+  `rpc_e2e`.
+
 ### The error flattening is public
 
 - **Added** `error_summary(&YsonValue) -> Option<String>`, which was
@@ -37,9 +44,10 @@
   worth having. An escape hatch that hands back an error nobody can read is
   half a door.
 
-## 0.2.6 - 2026-08-10
+## 0.2.6
 
-No changes to this crate beyond the version, which tracks the workspace.
+Never released. The version was bumped in the workspace and the tag was never
+cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 ## 0.2.5 - 2026-08-10
 

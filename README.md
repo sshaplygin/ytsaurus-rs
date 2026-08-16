@@ -6,9 +6,12 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
 
-Six of the eight crates are on crates.io at **0.2.6**, released together — the
-two RPC crates are pre-release and unpublished. The version is
-the workspace's, so they move as one.
+All nine crates are on crates.io at **0.3.0**, released together. The version is
+the workspace's, so they move as one. Four of them — `ytsaurus-skiff`,
+`ytsaurus-format`, `ytsaurus-api` and `ytsaurus-rpc` — are **pre-release** in
+everything but their presence on the registry: the version is 0.x, their
+compatibility gates are not all green, and their APIs may change in a patch
+release.
 
 | Crate | Version | Docs | What it is |
 | --- | --- | --- | --- |
@@ -18,15 +21,15 @@ the workspace's, so they move as one.
 | [`ytsaurus-helpers`](crates/ytsaurus-helpers/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-helpers.svg)](https://crates.io/crates/ytsaurus-helpers) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-helpers)](https://docs.rs/ytsaurus-helpers) | `#[derive(TableRow)]` for schemas |
 | [`ytsaurus-skiff`](crates/ytsaurus-skiff/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-skiff.svg)](https://crates.io/crates/ytsaurus-skiff) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-skiff)](https://docs.rs/ytsaurus-skiff) | Skiff schema and codec. **Pre-release** — [gates still open](docs/skiff-compatibility.md) |
 | [`ytsaurus-format`](crates/ytsaurus-format/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-format.svg)](https://crates.io/crates/ytsaurus-format) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-format)](https://docs.rs/ytsaurus-format) | `DataFormat`, shared by launcher and worker. Pre-release with the above |
-| [`ytsaurus-api`](crates/ytsaurus-api/) | — | — | The transport-independent client interface: one API, HTTP or RPC. Unpublished |
-| [`ytsaurus-rpc`](crates/ytsaurus-rpc/) | — | — | RPC proxy client: bus, the RPC envelope and the dynamic-table row wire format. **Pre-release and unpublished** — [gates still open](docs/rpc-compatibility.md) |
-| [`ytsaurus-proto`](crates/ytsaurus-proto/) | — | — | Generated protobuf for the RPC proxy, built from the upstream `.proto` files. Unpublished |
+| [`ytsaurus-api`](crates/ytsaurus-api/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-api.svg)](https://crates.io/crates/ytsaurus-api) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-api)](https://docs.rs/ytsaurus-api) | The transport-independent client interface: one API, HTTP or RPC. **Pre-release** — the interface has not settled |
+| [`ytsaurus-rpc`](crates/ytsaurus-rpc/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-rpc.svg)](https://crates.io/crates/ytsaurus-rpc) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-rpc)](https://docs.rs/ytsaurus-rpc) | RPC proxy client: bus, the RPC envelope and the dynamic-table row wire format. **Pre-release** — [gates still open](docs/rpc-compatibility.md) |
+| [`ytsaurus-proto`](crates/ytsaurus-proto/) | [![crates.io](https://img.shields.io/crates/v/ytsaurus-proto.svg)](https://crates.io/crates/ytsaurus-proto) | [![docs.rs](https://img.shields.io/docsrs/ytsaurus-proto)](https://docs.rs/ytsaurus-proto) | Generated protobuf for the RPC proxy, generated from the upstream `.proto` files and committed |
 
 Write [YTsaurus](https://ytsaurus.tech) MapReduce workers in Rust instead of C++.
 
 ```toml
 [dependencies]
-ytsaurus-job = "0.2"
+ytsaurus-job = "0.3"
 ```
 
 A YTsaurus job is just an executable: it reads input rows from fd 0 and writes output
@@ -47,7 +50,8 @@ a YSON codec and a job runtime — plus example workers that build as fully stat
 | [crates/ytsaurus-helpers/](crates/ytsaurus-helpers/) | Derive macros: a table schema read off the struct the rows have. |
 | [crates/ytsaurus-api/](crates/ytsaurus-api/) | One interface over both transports, so `create_client` and `create_rpc_client` return the same thing. |
 | [crates/ytsaurus-rpc/](crates/ytsaurus-rpc/) | The RPC proxy, for dynamic tables under concurrency. Async on tokio, unlike everything above. |
-| [crates/ytsaurus-proto/](crates/ytsaurus-proto/) | Protobuf bindings, generated from the `third_party/ytsaurus` submodule. |
+| [crates/ytsaurus-proto/](crates/ytsaurus-proto/) | Protobuf bindings, generated from the `third_party/ytsaurus` submodule and committed. Regenerate with `cargo xtask generate-protos`. |
+| [xtask/](xtask/) | Repository tasks. Never published. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, and how this compares to the official C++ and Go clients. |
 | [tests/cluster-e2e/](tests/cluster-e2e/) | End-to-end scripts against a local YTsaurus cluster. |
 
@@ -171,8 +175,8 @@ run can be made bigger without editing code:
 ## Build and test
 
 ```sh
-./scripts/init-protos.sh        # once after cloning: the .proto submodule
-cargo test --workspace          # 892 tests
+./scripts/init-protos.sh        # only to regenerate protos: the .proto submodule
+cargo test --workspace          # 941 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```
@@ -250,7 +254,7 @@ across both YSON formats without a crash.
 Vendoring `yson-rs` turned up three real bugs, including an input that hangs the
 text parser forever — see [the changelog](crates/ytsaurus-yson/CHANGELOG.md).
 
-All six crates are on crates.io at 0.2.6, and **no further release happens
+All nine crates are on crates.io at 0.3.0, and **no further release happens
 without explicit human approval** — versions, yanks and new crates alike. In
 particular the `yson-rs` name belongs to its upstream author and will never be
 claimed here.

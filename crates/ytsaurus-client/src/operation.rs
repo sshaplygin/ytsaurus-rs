@@ -93,7 +93,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn get(&self, attributes: &[&str]) -> Result<YsonValue> {
         self.client.get_operation(&self.id, attributes)
     }
@@ -106,7 +106,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn state(&self) -> Result<String> {
         self.client.operation_state(&self.id)
     }
@@ -115,7 +115,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn suspended(&self) -> Result<bool> {
         self.client.operation_suspended(&self.id)
     }
@@ -127,7 +127,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn status(&self) -> Result<OperationStatus> {
         self.client.operation_status(&self.id)
     }
@@ -136,7 +136,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::OperationFailed`](crate::ClientError::OperationFailed)
+    /// Returns [`ClientError::OperationFailed`]
     /// if it ends as anything other than `completed`.
     pub fn wait(&self) -> Result<()> {
         self.client.wait_for_operation(&self.id)
@@ -146,7 +146,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn abort(&self, reason: Option<&str>) -> Result<()> {
         self.client.abort_operation(&self.id, reason)
     }
@@ -155,7 +155,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn suspend(&self, abort_running_jobs: bool) -> Result<()> {
         self.client.suspend_operation(&self.id, abort_running_jobs)
     }
@@ -164,7 +164,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails,
+    /// Returns [`ClientError`] if the request fails,
     /// including when the operation was not suspended.
     pub fn resume(&self) -> Result<()> {
         self.client.resume_operation(&self.id)
@@ -175,7 +175,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn complete(&self) -> Result<()> {
         self.client.complete_operation(&self.id)
     }
@@ -185,8 +185,8 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails, or
-    /// [`ClientError::Config`](crate::ClientError::Config) if `parameters` is
+    /// Returns [`ClientError`] if the request fails, or
+    /// [`ClientError::Config`] if `parameters` is
     /// empty.
     pub fn update_parameters(&self, parameters: &OperationParameters) -> Result<()> {
         self.client
@@ -198,7 +198,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn error(&self) -> Result<Option<String>> {
         self.client.operation_result_error(&self.id)
     }
@@ -207,7 +207,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn jobs(&self, state: Option<&str>, limit: u32) -> Result<Vec<JobInfo>> {
         self.client.list_jobs(&self.id, state, limit)
     }
@@ -216,7 +216,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn job(&self, job_id: &str) -> Result<JobInfo> {
         self.client.get_job(&self.id, job_id)
     }
@@ -225,7 +225,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn job_input(&self, job_id: &str) -> Result<ResponseReader> {
         self.client.get_job_input(&self.id, job_id)
     }
@@ -234,7 +234,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn job_stderr(&self, job_id: &str) -> Result<Vec<u8>> {
         self.client.get_job_stderr(&self.id, job_id)
     }
@@ -243,7 +243,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn events(&self) -> Result<Vec<OperationEvent>> {
         self.client.list_operation_events(&self.id)
     }
@@ -253,7 +253,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn statistics(&self) -> Result<YsonValue> {
         self.client.job_statistics(&self.id)
     }
@@ -263,7 +263,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn custom_statistics(&self) -> Result<YsonValue> {
         self.client.custom_statistics(&self.id)
     }
@@ -272,7 +272,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn statistic_sum(&self, name: &str) -> Result<Option<i64>> {
         self.client.statistic_sum(&self.id, name)
     }
@@ -282,7 +282,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`](crate::ClientError) if the request fails.
+    /// Returns [`ClientError`] if the request fails.
     pub fn job_statistic_sum(&self, path: &str) -> Result<Option<i64>> {
         self.client.job_statistic_sum(&self.id, path)
     }

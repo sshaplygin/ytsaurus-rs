@@ -21,13 +21,14 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 | `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by the launcher and the worker, so the two cannot drift. Pre-release, and published from 0.2.5 with `ytsaurus-skiff`, whose status it inherits. |
 | `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, and say why it failed. No Python needed. |
 | `crates/ytsaurus-helpers/` | Derive macros for the client: `#[derive(TableRow)]` infers a table schema from a struct. Proc-macro crate, so it can hold nothing else. |
-| `crates/ytsaurus-api/` | The transport-independent client interface — `TableClient`, and the row model both transports speak. Mirrors `yt/yt/client/api` in the C++, and is what lets `create_client` (HTTP) and `create_rpc_client` (RPC) return the same thing. Unpublished. |
-| `crates/ytsaurus-proto/` | Generated protobuf bindings for the RPC proxy, built from the upstream `.proto` files in the `third_party/ytsaurus` submodule — not from a copy. Pre-release, unpublished. |
-| `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope and the dynamic-table row wire format. **Async on tokio**, unlike everything above it. Pre-release, unpublished; see [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
+| `crates/ytsaurus-api/` | The transport-independent client interface — `TableClient`, and the row model both transports speak. Mirrors `yt/yt/client/api` in the C++, and is what lets `create_client` (HTTP) and `create_rpc_client` (RPC) return the same thing. **Published from 0.3.0 and pre-release**: the interface has not settled, and it is the one thing here expensive to change afterwards. |
+| `crates/ytsaurus-proto/` | Generated protobuf bindings for the RPC proxy, generated from the upstream `.proto` files in the `third_party/ytsaurus` submodule — not from a copy. **The generated Rust is committed and there is no build script**, which is what makes the crate publishable: `cargo package` does not walk into a submodule. Regenerate with `cargo xtask generate-protos`; CI fails on a diff. Published from 0.3.0. |
+| `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope and the dynamic-table row wire format. **Async on tokio**, unlike everything above it. **Published from 0.3.0 and pre-release** — the ship gates are not all green; see [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
 | `docs/` | [writing-a-job.md](docs/writing-a-job.md) (the user guide), [benchmarking.md](docs/benchmarking.md) (measurements + the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (what "compatible with the Go SDK" means, and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients side by side with this one), [rpc-compatibility.md](docs/rpc-compatibility.md) (what the RPC client implements, every deliberate divergence from the reference clients, and the gates still open), [format-comparison.md](docs/format-comparison.md) (a plan **and now its results**: YSON, Skiff and YQL on one task, three nine-round cluster runs, a pre-registered prediction that came out refuted, and an adversarial pass that took most of the headline ratio away from the format). |
 | `tests/cluster-e2e/` | Cluster scripts and captured golden fixtures. |
 | `tests/rpc-go-interop/` | Version-pinned Go program that *produces* byte vectors for the RPC row wire format and CRC-64, which the Rust tests consume. Same shape as `tests/skiff-go-interop/`. |
-| `third_party/ytsaurus` | Submodule: the YTsaurus monorepo, sparse-checked-out for its `.proto` files only. `./scripts/init-protos.sh`. |
+| `third_party/ytsaurus` | Submodule: the YTsaurus monorepo, sparse-checked-out for its `.proto` files only. `./scripts/init-protos.sh`. Needed only to **regenerate** `ytsaurus-proto`, never to build it. |
+| `xtask/` | Repository tasks, `cargo xtask <task>`. Holds `generate-protos`. Never published. |
 | `scripts/build-worker.sh` | Static musl worker builds. |
 
 ## Fixed decisions — do not revisit without a human
@@ -88,9 +89,10 @@ repository builds the minimal stack — a YSON codec and a job runtime.
 ## Commands
 
 ```sh
-./scripts/init-protos.sh          # once after cloning: the .proto submodule, shallow and sparse
+./scripts/init-protos.sh          # only to regenerate protos: the submodule, shallow and sparse
+cargo xtask generate-protos       # rewrite crates/ytsaurus-proto/src/generated/ from it
 
-cargo test --workspace            # 892 tests: 813 unit and integration, 79 doc
+cargo test --workspace            # 941 tests: 863 unit and integration, 78 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
@@ -1352,19 +1354,32 @@ iterations without a crash.
 ### Shipped
 
 - **GitHub**: [sshaplygin/ytsaurus-rs](https://github.com/sshaplygin/ytsaurus-rs),
-  public, CI green, tagged `v0.2.6`.
-- **crates.io**: all six crates at **0.2.6**, released together —
+  public, CI green, tagged `v0.3.0`.
+- **crates.io**: all **nine** crates at **0.3.0**, released together —
   [`ytsaurus-yson`](https://crates.io/crates/ytsaurus-yson),
   [`ytsaurus-skiff`](https://crates.io/crates/ytsaurus-skiff),
   [`ytsaurus-format`](https://crates.io/crates/ytsaurus-format),
   [`ytsaurus-helpers`](https://crates.io/crates/ytsaurus-helpers),
-  [`ytsaurus-job`](https://crates.io/crates/ytsaurus-job) and
-  [`ytsaurus-client`](https://crates.io/crates/ytsaurus-client). The version is
-  the workspace's, so they move as one. `ytsaurus-skiff` and `ytsaurus-format`
-  were `publish = false` until 0.2.5 and are **still pre-release**; they are on
-  the registry only because the two crates above them depend on them.
+  [`ytsaurus-job`](https://crates.io/crates/ytsaurus-job),
+  [`ytsaurus-client`](https://crates.io/crates/ytsaurus-client),
+  [`ytsaurus-api`](https://crates.io/crates/ytsaurus-api),
+  [`ytsaurus-proto`](https://crates.io/crates/ytsaurus-proto) and
+  [`ytsaurus-rpc`](https://crates.io/crates/ytsaurus-rpc). The version is the
+  workspace's, so they move as one.
+
+  Four are **pre-release** in everything but their presence on the registry —
+  `ytsaurus-skiff` and `ytsaurus-format` since 0.2.5, `ytsaurus-api` and
+  `ytsaurus-rpc` since 0.3.0. Their versions are 0.x, their compatibility gates
+  are not all green, and their APIs may change in a patch release. Each is on
+  the registry because something above it depends on it and could not be
+  published otherwise.
+
   `ytsaurus-yson` and `ytsaurus-job` were on crates.io at 0.1.0 and 0.2.0
   before this, and `ytsaurus-client` at 0.2.0.
+
+  **0.2.6 was never released.** The version was bumped and the CHANGELOGs
+  written, and the tag was never cut; what it contained — the worker examples
+  moving into `ytsaurus-job` — reached crates.io in 0.3.0.
 - **Upstream courtesy**: the fork and the three fixed defects are filed as
   [ss123she/yson-rs#1](https://github.com/ss123she/yson-rs/issues/1). The fork
   is licence-compliant on its own, so nothing waits on a reply.
@@ -1497,8 +1512,9 @@ were here until a human asked for them; `ytsaurus-rpc` implements a deliberately
 narrow slice of all three and is pre-release. Streaming table I/O over RPC, the
 gRPC proxy, chaos/replication, queues and Query Tracker remain non-goals.)* *(Custom job statistics were on this list until the backlog
 ranked them P1 #7 — a human decision, and they ship now as `JobStatistics`.
-Publishing to crates.io was on it too, and is now done, at 0.2.5, by the same
-kind of decision; Hard rule 1 still governs every release after it.)*
+Publishing to crates.io was on it too, and is now done — the first six at
+0.2.5, and `ytsaurus-api`, `ytsaurus-proto` and `ytsaurus-rpc` at 0.3.0, by the
+same kind of decision; Hard rule 1 still governs every release after it.)*
 
 ## Reference
 

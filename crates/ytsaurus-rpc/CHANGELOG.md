@@ -5,7 +5,15 @@ All notable changes to `ytsaurus-rpc` are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this crate follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+This crate is **pre-release**. The ship gates in
+[docs/rpc-compatibility.md](../../docs/rpc-compatibility.md) are not all green —
+gate D, the HTTP `discover_proxies` bootstrap, is open — and the API may change
+in a patch release. The scope is deliberately narrow: transactions,
+`lookup_rows`, `select_rows` and `modify_rows`, not the other 150 request types.
+
+## 0.3.0 - 2026-08-16
+
+Published, as pre-release, by the human decision Hard rule 1 asks for.
 
 ### Fixed
 

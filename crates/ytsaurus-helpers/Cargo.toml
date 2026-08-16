@@ -12,6 +12,13 @@ readme = "README.md"
 keywords = ["ytsaurus", "schema", "derive", "macro"]
 categories = ["development-tools::procedural-macro-helpers"]
 
+# `tests/derive.rs` checks the macro's expansion against `ytsaurus-client`'s real
+# types, so it needs that crate — which is a **version-less** dev-dependency
+# below, to keep two published crates from becoming cyclic. Cargo drops such a
+# dependency from the published manifest, so the test would ship importing a
+# crate the manifest no longer names. It runs in the repository.
+exclude = ["tests/derive.rs"]
+
 [lib]
 proc-macro = true
 

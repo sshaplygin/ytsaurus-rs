@@ -10,7 +10,7 @@ worker **without a Python installation**.
 
 ```toml
 [dependencies]
-ytsaurus-client = "0.2"
+ytsaurus-client = "0.3"
 ```
 
 ```rust
@@ -411,6 +411,16 @@ and the `yt` CLI reach it. Off by default because it costs
 default for a client that may be running outside the network it is talking to.
 `YT_CA_BUNDLE` covers the same ground with no dependency at all and is checked
 first.
+
+`rpc` (off) adds the RPC proxy as a second transport, so `create_rpc_client`
+exists beside `create_client` and both return the same
+[`ytsaurus_api::TableClient`](https://docs.rs/ytsaurus-api). It is for latency
+and throughput under concurrency — one connection multiplexes many in-flight
+requests — not for capability: HTTP v4 already reaches the dynamic-table
+commands. **Off by default and required to stay off** for worker builds: it
+reaches `tokio` and `prost`, and this crate is a dev-dependency of
+`ytsaurus-job`, whose examples are the static musl workers. CI asserts the
+worker graph carries neither.
 
 `tracing` (off) adds the spans above. Off for the same reason: a worker binary
 should carry only what it runs on, and `examples/` — what `build-worker.sh`

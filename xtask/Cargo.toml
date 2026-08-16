@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Repository tasks. Not a library, and never published."
+
+# Never published: it is this repository's tooling, and it reads paths that only
+# exist in a checkout.
+publish = false
+
+[dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3.1"

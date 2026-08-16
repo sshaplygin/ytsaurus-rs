@@ -64,11 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # `ytsaurus-proto` generates its bindings from the upstream `.proto`
-      # files, so the submodule has to be there before any cargo command. Not
-      # `submodules: true` on the checkout above: that clones the whole
-      # YTsaurus monorepo, and the script takes the shallow, sparse path that
-      # fetches only `yt/yt_proto/`.
+      # `ytsaurus-proto`'s bindings are committed, so the build no longer needs
+      # this — the drift check below does. Not `submodules: true` on the
+      # checkout above: that clones the whole YTsaurus monorepo, and the script
+      # takes the shallow, sparse path that fetches only `yt/yt_proto/`.
       - name: Check out the YTsaurus protos
         run: ./scripts/init-protos.sh
 
@@ -77,6 +76,15 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+
+      # The committed bindings must be exactly what the pinned submodule
+      # produces. Same shape as the Go RPC vector check above, and for the same
+      # reason: generated code that is committed can drift from its source, and
+      # the only thing that catches it is regenerating and diffing.
+      - name: The committed protobuf bindings are the ones the submodule produces
+        run: |
+          cargo xtask generate-protos
+          git diff --exit-code -- crates/ytsaurus-proto/src/generated
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -132,9 +140,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check out the YTsaurus protos
-        run: ./scripts/init-protos.sh
-
+      # No `init-protos.sh` here: the worker graph does not reach
+      # `ytsaurus-proto`, and since its bindings are committed nothing in this
+      # workspace needs the submodule to *build* at all.
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
@@ -146,6 +154,12 @@ jobs:
       # is off by accident — `ytsaurus-job` takes the client as a
       # `default-features = false` dev-dependency, for the `selfrun` example —
       # so this asserts the invariant rather than trusting it.
+      #
+      # `tokio` and `prost` are here for the same reason and a newer one: the
+      # client's `rpc` feature reaches both, and that feature is off by default
+      # *and required to stay off* precisely because this graph is what a musl
+      # worker links. `ytsaurus-client`'s changelog promises this check exists,
+      # so it does.
       #
       # Read **with** dev-dependencies, which is the whole point: cargo compiles
       # a package's dev-dependencies whenever it builds that package's examples,
@@ -177,7 +191,7 @@ jobs:
             echo "ERROR: the worker graph does not contain ytsaurus-client"
             echo "$graph"; exit 1; }
 
-          for crate in tracing rustls ring rustls-platform-verifier; do
+          for crate in tracing rustls ring rustls-platform-verifier tokio prost; do
             if echo "$graph" | grep -qx "$crate"; then
               echo "ERROR: $crate reached the worker build"
               cargo tree -p ytsaurus-job \

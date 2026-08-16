@@ -10,11 +10,22 @@ authors.workspace = true
 description = "YTsaurus RPC proxy client: bus framing, RPC envelope and the dynamic-table row wire format"
 keywords = ["ytsaurus", "rpc", "bus", "protobuf"]
 categories = ["network-programming", "database"]
+
+# `tests/go_interop.rs` reads the byte vectors in `tests/rpc-go-interop/`, which
+# is outside this package. Unlike the compile-time cases elsewhere in this
+# workspace the path is resolved at run time, so the test would ship, compile,
+# and then fail on a missing directory — which is worse than not shipping it.
+exclude = ["tests/go_interop.rs"]
 readme = "README.md"
 
-# Not published without the human approval Hard rule 1 requires, and not before
-# the ship gates in docs/rpc-compatibility.md are green.
-publish = false
+# Published from 0.3.0, by the human decision Hard rule 1 asks for. The ship
+# gates in docs/rpc-compatibility.md are **not all green** — gate D, the HTTP
+# `discover_proxies` bootstrap, is open — and this crate is **pre-release** in
+# everything but its presence on crates.io: the version is 0.x, the README and
+# the compatibility document say what is unimplemented, and the API may change
+# in a patch release. The scope is deliberately narrow: transactions,
+# `lookup_rows`, `select_rows` and `modify_rows`, not the other 150 request
+# types.
 
 [dependencies]
 ytsaurus-api.workspace = true
