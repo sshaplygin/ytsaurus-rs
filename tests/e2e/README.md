@@ -1,12 +1,13 @@
 # End-to-end tests
 
-Two layers. Both have been run; the second needs Docker, so only the first
-runs in CI.
+Two layers. The lightweight fixture check runs in every CI invocation; the
+Docker-backed check runs after a push to `main` (including a merged pull
+request).
 
 | | Runs in CI | Needs a cluster | What it proves |
 | --- | --- | --- | --- |
-| [`crates/ytsaurus-job/tests/cat_e2e.rs`](../../crates/ytsaurus-job/tests/cat_e2e.rs) | yes | no | the compiled worker handles the real byte stream correctly |
-| [`run_e2e.sh`](run_e2e.sh) | no | yes | the above, plus the scheduler, operation spec and re-encoding |
+| [`crates/ytsaurus-job/tests/cat_e2e.rs`](../../crates/ytsaurus-job/tests/cat_e2e.rs) | every invocation | no | the compiled worker handles the real byte stream correctly |
+| [`run_e2e.sh`](run_e2e.sh) | after a push to `main` | yes | the above, plus the scheduler, operation spec and re-encoding |
 
 The important point: the offline test's fixtures are **captured from a real
 cluster**, not written by hand. `cat_input.bin` is literally the stream a job was

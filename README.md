@@ -1,6 +1,7 @@
 # ytsaurus-rs
 
 [![CI](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/ci.yml)
+[![cluster-e2e](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/cluster-e2e.yml/badge.svg?branch=main)](https://github.com/sshaplygin/ytsaurus-rs/actions/workflows/cluster-e2e.yml?query=branch%3Amain)
 [![release](https://img.shields.io/github/v/tag/sshaplygin/ytsaurus-rs?label=release&sort=semver)](https://github.com/sshaplygin/ytsaurus-rs/releases)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
