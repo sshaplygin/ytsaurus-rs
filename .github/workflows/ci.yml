@@ -86,6 +86,15 @@ jobs:
           cargo xtask generate-protos
           git diff --exit-code -- crates/ytsaurus-proto/src/generated
 
+      # `include_str!`/`include_bytes!` resolve at compile time, so a published
+      # file reaching outside its own crate builds here and cannot build from a
+      # tarball. `cargo package` does not catch it — it verifies by building the
+      # library, not the tests — and 0.3.0 shipped two such files because the
+      # check for them was a line-based grep and the macros had newlines in
+      # them. This parses instead.
+      - name: No published file reaches outside its own crate
+        run: ./scripts/check-package-includes.sh
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
