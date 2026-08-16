@@ -2,8 +2,12 @@
 
 The transport-independent YTsaurus client interface: one API, two transports.
 
-**Pre-release and unpublished.** The interface is the one thing here that is
-expensive to change later, so it stays unpublished until it has settled.
+**Pre-release, published from 0.3.0.** The interface is the one thing here that
+is expensive to change later and it has **not** settled: the version is 0.x and
+it may change in a patch release. It is on crates.io because
+[`ytsaurus-rpc`](../ytsaurus-rpc) and `ytsaurus-client`'s `create_client` /
+`create_rpc_client` return this crate's `TableClient` and could not be published
+otherwise.
 
 ## Why
 

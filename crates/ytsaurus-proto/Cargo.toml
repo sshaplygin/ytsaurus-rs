@@ -12,14 +12,12 @@ keywords = ["ytsaurus", "protobuf", "prost", "rpc"]
 categories = ["network-programming", "encoding"]
 readme = "README.md"
 
-# Not published. `cargo package` does not include submodules, so publishing
-# this crate needs the generated code committed first — see the ship gates in
-# docs/rpc-compatibility.md.
-publish = false
+# The generated Rust under `src/generated/` is committed, and there is no build
+# script: `cargo package` does not walk into a submodule, so generating at build
+# time produces a crate that builds from this repository and fails from the
+# registry. Regeneration is `cargo xtask generate-protos`, and CI fails on a
+# diff. The submodule remains the only source of `.proto` files — no copy of
+# them is kept here.
 
 [dependencies]
 prost = "0.14"
-
-[build-dependencies]
-prost-build = "0.14"
-protoc-bin-vendored = "3.1"

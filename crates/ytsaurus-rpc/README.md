@@ -3,7 +3,8 @@
 A Rust client for the YTsaurus **RPC proxy**: bus framing, the RPC envelope,
 and the row wire format dynamic tables actually speak.
 
-**Pre-release and unpublished.** What works, what does not, and what has been
+**Pre-release, published from 0.3.0.** The ship gates are not all green and the
+API may change in a patch release. What works, what does not, and what has been
 run against a real cluster is [docs/rpc-compatibility.md](../../docs/rpc-compatibility.md).
 
 ## Why this exists
@@ -14,8 +15,8 @@ is **not** about capability. It is about latency and throughput under
 concurrency: one connection multiplexes many in-flight requests, where HTTP pays
 its per-request cost every time.
 
-If you are not bottlenecked on that, use the HTTP client. It is finished, it is
-published, and it has none of the gates listed in the compatibility document.
+If you are not bottlenecked on that, use the HTTP client. It is finished and it
+has none of the gates listed in the compatibility document.
 
 ## The protocol is four layers, and only the top one looks familiar
 

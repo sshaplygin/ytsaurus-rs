@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.2.6 - 2026-08-10
+## 0.3.0 - 2026-08-16
+
+No change to this crate's library — the runtime, the reader and the writers are
+what they were in 0.2.5. What reaches crates.io here is the example move below,
+which was prepared as 0.2.6 and never released.
+
+## 0.2.6 — never released
+
+The version was bumped in the workspace and the tag was never cut, so nothing in
+this section reached crates.io until 0.3.0.
 
 ### The worker examples live here now
 

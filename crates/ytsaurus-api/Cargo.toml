@@ -12,9 +12,13 @@ keywords = ["ytsaurus", "client", "api"]
 categories = ["api-bindings", "database"]
 readme = "README.md"
 
-# Not published until the interface has settled; it is the one thing here that
-# is expensive to change afterwards.
-publish = false
+# Published from 0.3.0, by the human decision Hard rule 1 asks for, and
+# **pre-release**: this is the interface both transports implement, it has not
+# settled, and it is the one thing here that is expensive to change afterwards.
+# The version is 0.x and the API may change in a patch release. What the publish
+# buys is `ytsaurus-rpc` and `ytsaurus-client`'s `create_client` /
+# `create_rpc_client`, which return this crate's `TableClient` and could not
+# otherwise reach crates.io at all.
 
 [dependencies]
 thiserror.workspace = true

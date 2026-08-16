@@ -2,6 +2,10 @@
 **/*.rs.bk
 *.pdb
 
+# Agent worktrees: full copies of this repository, tens of gigabytes of them.
+# `a219a8c` had to teach ruff to skip them; this keeps git from ever seeing them.
+/.claude/worktrees/
+
 # Local e2e artifacts
 /tests/cluster-e2e/tmp/
 __pycache__/

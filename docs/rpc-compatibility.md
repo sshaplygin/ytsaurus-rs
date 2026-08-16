@@ -7,8 +7,17 @@ reason: a reverse-engineered binary protocol needs a contract naming every
 surface, its state and its ship gate, or "compatible" means whatever the reader
 hopes.
 
-**Status: pre-release.** Neither `ytsaurus-proto` nor `ytsaurus-rpc` is
-published, and the gates below are not all green.
+**Status: published from 0.3.0, and pre-release.** Both `ytsaurus-proto` and
+`ytsaurus-rpc` are on crates.io, by the explicit human decision Hard rule 1
+asks for, and the gates below are **still not all green** — A is green for two
+of its four layers, and C, D and E are open. The publish changes nothing about
+that: the version is 0.x, the API may change in a patch release, and the scope
+stays deliberately narrow — transactions, `lookup_rows`, `select_rows` and
+`modify_rows`, not the other 150 request types. This is the same arrangement
+`ytsaurus-skiff` has had since 0.2.5, and for the same reason: `ytsaurus-client`
+gained `create_rpc_client`, which returns a `ytsaurus_api::TableClient` backed by
+this crate, and could not reach the registry while this one was `publish =
+false`.
 
 ## What it is pinned to
 
@@ -131,8 +140,10 @@ be wrong, not merely extra.
 
 ## Ship gates
 
-Each must be green before this is published or described as anything but
-pre-release.
+Each must be green before this is described as anything but pre-release. They
+were written as gates on *publishing* as well, and publishing happened first, at
+0.3.0, by a human decision recorded above — so what they now gate is the claim,
+not the upload. Nothing below has been relaxed to match.
 
 - **A — the sans-io layers are checked against a reference, not against
   themselves.** *Green for two of the four.* The row wire format has rowset

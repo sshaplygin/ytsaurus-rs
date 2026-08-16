@@ -1,0 +1,4 @@
+[alias]
+# `cargo xtask generate-protos` regenerates ytsaurus-proto's committed bindings
+# from the pinned `third_party/ytsaurus` submodule.
+xtask = "run --package xtask --"
