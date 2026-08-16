@@ -30,6 +30,8 @@
 //! # see tests/e2e/run_pilot.sh for the full operation invocation
 //! ```
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use ytsaurus_job::yson::{YsonNode, YsonValue};
 use ytsaurus_job::{DataFormat, WorkerEvent, WorkerReader, WorkerRow, WorkerWriter};
@@ -487,6 +489,37 @@ fn map_parse_dynamic() -> Result<(), JobError> {
     Ok(())
 }
 
+/// The eight input columns the output carries, or `None` if a row is short one.
+///
+/// A function rather than the loop it replaces, because that loop's `continue`
+/// skipped the **column** and not the row: a row missing `user_agent` counted
+/// itself rejected and was then written anyway, eight columns wide, while
+/// [`map_one`]'s serde parse rejects the same row outright. Two legs disagreeing
+/// on a row is exactly what `format_compare`'s diff exists to catch, so the
+/// control leg must not be the one manufacturing the disagreement. `?` on a
+/// missing field is what makes the whole row the unit again.
+///
+/// Never triggered by the comparison's own fixture, whose rows all have nine
+/// columns — which is why it survived a review and three cluster runs.
+fn carried(value: &YsonValue) -> Option<BTreeMap<Vec<u8>, YsonValue>> {
+    const COLUMNS: [&str; 8] = [
+        "user_id",
+        "timestamp",
+        "url",
+        "user_agent",
+        "status",
+        "bytes_sent",
+        "is_mobile",
+        "latency_ms",
+    ];
+
+    let mut out = BTreeMap::new();
+    for key in COLUMNS {
+        out.insert(key.as_bytes().to_vec(), field(value, key)?.clone());
+    }
+    Some(out)
+}
+
 /// [`map_one`] through the dynamic value type, start to finish.
 ///
 /// Reads a DOM, validates by walking it, and builds another DOM to write. No
@@ -545,23 +578,10 @@ fn map_one_dynamic() -> Result<(), JobError> {
             None => false,
         };
 
-        let mut out = std::collections::BTreeMap::new();
-        for key in [
-            "user_id",
-            "timestamp",
-            "url",
-            "user_agent",
-            "status",
-            "bytes_sent",
-            "is_mobile",
-            "latency_ms",
-        ] {
-            let Some(field) = field(&value, key) else {
-                rejected += 1;
-                continue;
-            };
-            out.insert(key.as_bytes().to_vec(), field.clone());
-        }
+        let Some(mut out) = carried(&value) else {
+            rejected += 1;
+            continue;
+        };
         out.insert(
             b"is_external".to_vec(),
             node(YsonNode::Boolean(is_external)),
@@ -794,9 +814,6 @@ impl SessionAcc {
     }
 }
 
-/// Unused today, but the shape a per-user cache would take. Kept out of the hot
-/// path deliberately: see FRICTION 3 in the friction log.
-#[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +937,49 @@ mod tests {
             bytes_sent: 1,
             is_mobile: false,
             latency_ms: 1.0,
+        }
+    }
+
+    /// A row short one column is a rejected row, not a row written short.
+    ///
+    /// The regression this pins: the loop [`carried`] replaced skipped the
+    /// missing *column* and wrote the other eight, so the dynamic leg emitted a
+    /// row the typed leg had rejected outright — a disagreement between two
+    /// legs of a format comparison, manufactured by the comparison itself.
+    #[test]
+    fn a_row_missing_a_carried_column_is_rejected_whole() {
+        let string = |text: &str| YsonValue {
+            attributes: None,
+            node: YsonNode::String(text.as_bytes().to_vec()),
+        };
+        let row = |columns: &[&str]| YsonValue {
+            attributes: None,
+            node: YsonNode::Map(
+                columns
+                    .iter()
+                    .map(|key| (key.as_bytes().to_vec(), string("v")))
+                    .collect(),
+            ),
+        };
+
+        const ALL: [&str; 8] = [
+            "user_id",
+            "timestamp",
+            "url",
+            "user_agent",
+            "status",
+            "bytes_sent",
+            "is_mobile",
+            "latency_ms",
+        ];
+
+        assert_eq!(carried(&row(&ALL)).map(|out| out.len()), Some(8));
+        for missing in ALL {
+            let present: Vec<&str> = ALL.into_iter().filter(|key| *key != missing).collect();
+            assert!(
+                carried(&row(&present)).is_none(),
+                "a row without {missing} must be rejected, not written eight columns wide"
+            );
         }
     }
 }
