@@ -30,7 +30,7 @@ const COLUMNS: &[&str] = &["key", "value"];
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = std::env::var("YT_RPC_PROXY").unwrap_or_else(|_| "localhost:8011".to_owned());
-    let http = std::env::var("YT_PROXY").unwrap_or_else(|_| "localhost:8010".to_owned());
+    let http = std::env::var("YT_PROXY").unwrap_or_else(|_| "localhost:8000".to_owned());
     let token = std::env::var("YT_TOKEN").ok();
 
     println!("== preparing {TABLE} over HTTP at {http}");
@@ -234,6 +234,15 @@ fn command(
     }
 
     let output = request.output()?;
+    if !output.status.success() {
+        // curl itself failing (connection refused, wrong address) must not be
+        // mistaken for a slow mount: fail immediately and say what happened.
+        return Err(format!(
+            "curl to http://{http}/api/v4/{name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
     let body = String::from_utf8_lossy(&output.stdout).into_owned();
     if body.contains("\"code\"") && body.contains("message") && !body.contains("mounted") {
         // `remove` of a missing node is expected to fail; everything else is

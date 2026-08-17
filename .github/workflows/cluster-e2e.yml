@@ -63,7 +63,7 @@ jobs:
           docker logs yt.backend || true
           docker logs yt.frontend || true
           docker exec yt.backend sh -c \
-            'find /tmp/locasaurus/logs -type f -iname "*rpc*proxy*" -print -exec tail -n 500 {} \\;' \
+            'find /tmp/locasaurus/logs -type f -iname "*rpc*proxy*" -print -exec tail -n 500 {} +' \
             || true
 
       - name: Stop the local YTsaurus cluster
