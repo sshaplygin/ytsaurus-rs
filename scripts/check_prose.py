@@ -40,8 +40,8 @@ BANNED = re.compile(
     r"|this branch cannot",
     re.I,
 )
-# `#40`, `(#38)`, `[#30]`; not `[#0:#10]`, `[0#9]` or `PKCS#7`.
-ISSUE_REF = re.compile(r"(?<![\w#/&:])#\d+\b(?!:)")
+# `#40`, `(#38)`, `[#30]`, `#36:`; not `[#0:#10]`, `[0#9]` or `PKCS#7`.
+ISSUE_REF = re.compile(r"(?<![\w#/&:])#\d+\b(?!:#)")
 # "this used to be", "was used to"; not "is used to decode".
 HISTORY = re.compile(
     r"(?<!\bis )(?<!\bare )(?<!\bbe )(?<!\bbeen )(?<!\bbeing )\bused to\b|\bwhat it did until\b",
@@ -122,8 +122,9 @@ def over_floor(counts: Counts, keep: Counts | None = None) -> Counts:
 def tighten(files: dict[str, Counts], budget: Budget) -> Budget:
     new = {}
     for path in sorted(budget):
-        if path in files and (entry := over_floor(files[path], budget[path])):
-            new[path] = entry
+        # An empty entry still holds the file to the floor, not the defaults.
+        if path in files:
+            new[path] = over_floor(files[path], budget[path])
     return new
 
 
@@ -159,8 +160,14 @@ def self_test() -> list[str]:
     expect("bad markdown", flagged(bad_md, {}), {"em_dash", "bold", "banned"})
     expect("clean markdown", flagged({"a.md": markdown_counts("One — dash.")}, {}), set())
 
-    bad_rs = "/// This used to be a String (#40), see [#30].\n" + "/// x\n" * 30 + "fn f() {}\n"
-    expect("bad rust", rust_counts(bad_rs)["issue_refs"], 2)
+    bad_rs = (
+        "/// This used to be a String (#40), see [#30].\n"
+        "// From #36: it was used to hold ids; examples used to build rows.\n"
+        + "/// x\n" * 30
+        + "fn f() {}\n"
+    )
+    expect("issue refs", rust_counts(bad_rs)["issue_refs"], 3)
+    expect("history", rust_counts(bad_rs)["history"], 3)
     expect(
         "bad rust flags",
         flagged({"a.rs": rust_counts(bad_rs)}, {}),
@@ -171,7 +178,11 @@ def self_test() -> list[str]:
 
     # --tighten never raises and never adds a file.
     expect("tighten skips new file", tighten(bad_md, {}), {})
-    expect("tighten caps growth", tighten(bad_md, {"a.md": {"em_dash": 3}}), {})
+    expect("tighten caps growth", tighten(bad_md, {"a.md": {"em_dash": 3}}), {"a.md": {}})
+    cleaned = {"a.md": {"words": 4000, "em_dash": 0, "bold": 3, "banned": 0}}
+    kept = tighten(cleaned, {"a.md": {"bold": 4}})
+    cleaned["a.md"]["em_dash"] = 4
+    expect("cleaned file stays at the floor", flagged(cleaned, kept), {"em_dash"})
     grown = {"a.md": {"words": 100, "em_dash": 9, "bold": 5, "banned": 0}}
     expect(
         "tighten lowers only",

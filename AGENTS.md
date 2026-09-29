@@ -115,8 +115,9 @@ the countable part in CI; the rest is on review.
    the rest belongs in `docs/`. Bold marks a warning, not emphasis.
 
 `scripts/prose_budget.json` holds the counts for files still over the
-defaults. Budgets only go down: `--tighten` lowers them after a cleanup, and
-raising one is a hand edit that a reviewer has to accept.
+defaults. Budgets only go down: `--tighten` lowers them after a cleanup.
+Raising one, by hand or with `--bootstrap`, shows in the diff of that file
+and is for a reviewer to accept.
 
 ## Commands
 
