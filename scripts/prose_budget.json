@@ -6,8 +6,7 @@
   },
   "README.md": {
     "em_dash": 38,
-    "bold": 21,
-    "banned": 0
+    "bold": 21
   },
   "crates/ytsaurus-api/CHANGELOG.md": {
     "bold": 6
@@ -23,6 +22,9 @@
   "crates/ytsaurus-client/README.md": {
     "em_dash": 94,
     "bold": 55
+  },
+  "crates/ytsaurus-client/benches/rows.rs": {
+    "history": 1
   },
   "crates/ytsaurus-client/examples/abort.rs": {
     "history": 1
@@ -44,6 +46,9 @@
   "crates/ytsaurus-client/examples/rich_path.rs": {
     "history": 1
   },
+  "crates/ytsaurus-client/examples/table_usage.rs": {
+    "history": 1
+  },
   "crates/ytsaurus-client/src/batch.rs": {
     "longest_doc": 101
   },
@@ -51,7 +56,7 @@
     "longest_doc": 32
   },
   "crates/ytsaurus-client/src/http.rs": {
-    "issue_refs": 18,
+    "issue_refs": 21,
     "history": 6,
     "longest_doc": 85
   },
@@ -59,6 +64,7 @@
     "longest_doc": 36
   },
   "crates/ytsaurus-client/src/lib.rs": {
+    "issue_refs": 2,
     "history": 3,
     "longest_doc": 186
   },
@@ -99,7 +105,7 @@
     "history": 1
   },
   "crates/ytsaurus-client/tests/request_shape.rs": {
-    "issue_refs": 8,
+    "issue_refs": 6,
     "history": 6
   },
   "crates/ytsaurus-client/tests/transaction_lifecycle.rs": {
@@ -161,6 +167,9 @@
   "crates/ytsaurus-skiff/CHANGELOG.md": {
     "em_dash": 4,
     "bold": 7
+  },
+  "crates/ytsaurus-skiff/src/schema.rs": {
+    "history": 1
   },
   "crates/ytsaurus-yson/BENCHMARKS.md": {
     "em_dash": 5,
@@ -225,7 +234,8 @@
     "bold": 23
   },
   "docs/writing-a-job.md": {
-    "em_dash": 40
+    "em_dash": 40,
+    "bold": 19
   },
   "tests/cluster-e2e/README.md": {
     "em_dash": 150,
