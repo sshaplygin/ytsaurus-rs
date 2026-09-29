@@ -1,0 +1,238 @@
+{
+  "AGENTS.md": {
+    "em_dash": 201,
+    "bold": 278,
+    "banned": 2
+  },
+  "README.md": {
+    "em_dash": 38,
+    "bold": 21,
+    "banned": 0
+  },
+  "crates/ytsaurus-api/CHANGELOG.md": {
+    "bold": 6
+  },
+  "crates/ytsaurus-api/README.md": {
+    "em_dash": 11,
+    "bold": 6
+  },
+  "crates/ytsaurus-client/CHANGELOG.md": {
+    "em_dash": 289,
+    "bold": 259
+  },
+  "crates/ytsaurus-client/README.md": {
+    "em_dash": 94,
+    "bold": 55
+  },
+  "crates/ytsaurus-client/examples/abort.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-client/examples/append.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-client/examples/lifecycle.rs": {
+    "history": 3
+  },
+  "crates/ytsaurus-client/examples/profile.rs": {
+    "history": 1,
+    "longest_doc": 26
+  },
+  "crates/ytsaurus-client/examples/raw.rs": {
+    "issue_refs": 2,
+    "history": 1
+  },
+  "crates/ytsaurus-client/examples/rich_path.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-client/src/batch.rs": {
+    "longest_doc": 101
+  },
+  "crates/ytsaurus-client/src/error.rs": {
+    "longest_doc": 32
+  },
+  "crates/ytsaurus-client/src/http.rs": {
+    "issue_refs": 18,
+    "history": 6,
+    "longest_doc": 85
+  },
+  "crates/ytsaurus-client/src/jobs.rs": {
+    "longest_doc": 36
+  },
+  "crates/ytsaurus-client/src/lib.rs": {
+    "history": 3,
+    "longest_doc": 186
+  },
+  "crates/ytsaurus-client/src/observe.rs": {
+    "history": 3,
+    "longest_doc": 33
+  },
+  "crates/ytsaurus-client/src/operation.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-client/src/path.rs": {
+    "history": 2,
+    "longest_doc": 49
+  },
+  "crates/ytsaurus-client/src/retry.rs": {
+    "banned": 2,
+    "issue_refs": 9,
+    "history": 1,
+    "longest_doc": 46
+  },
+  "crates/ytsaurus-client/src/spec.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-client/src/trace.rs": {
+    "longest_doc": 30
+  },
+  "crates/ytsaurus-client/src/transaction.rs": {
+    "longest_doc": 42
+  },
+  "crates/ytsaurus-client/tests/combination.rs": {
+    "issue_refs": 20,
+    "history": 1
+  },
+  "crates/ytsaurus-client/tests/read_file.rs": {
+    "banned": 1
+  },
+  "crates/ytsaurus-client/tests/redirect_credentials.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-client/tests/request_shape.rs": {
+    "issue_refs": 8,
+    "history": 6
+  },
+  "crates/ytsaurus-client/tests/transaction_lifecycle.rs": {
+    "history": 3
+  },
+  "crates/ytsaurus-helpers/CHANGELOG.md": {
+    "em_dash": 5
+  },
+  "crates/ytsaurus-helpers/README.md": {
+    "em_dash": 7,
+    "bold": 5
+  },
+  "crates/ytsaurus-helpers/src/lib.rs": {
+    "longest_doc": 57
+  },
+  "crates/ytsaurus-job/CHANGELOG.md": {
+    "em_dash": 24,
+    "bold": 25
+  },
+  "crates/ytsaurus-job/README.md": {
+    "em_dash": 6,
+    "bold": 12
+  },
+  "crates/ytsaurus-job/src/lib.rs": {
+    "longest_doc": 26
+  },
+  "crates/ytsaurus-job/src/writer.rs": {
+    "history": 1,
+    "longest_doc": 26
+  },
+  "crates/ytsaurus-job/tests/common/mod.rs": {
+    "longest_doc": 36
+  },
+  "crates/ytsaurus-job/tests/reader_tests.rs": {
+    "issue_refs": 2
+  },
+  "crates/ytsaurus-job/tests/writer_tests.rs": {
+    "issue_refs": 1,
+    "history": 1
+  },
+  "crates/ytsaurus-proto/CHANGELOG.md": {
+    "em_dash": 6
+  },
+  "crates/ytsaurus-proto/README.md": {
+    "em_dash": 9,
+    "bold": 5
+  },
+  "crates/ytsaurus-rpc/CHANGELOG.md": {
+    "em_dash": 14,
+    "bold": 27
+  },
+  "crates/ytsaurus-rpc/README.md": {
+    "em_dash": 11,
+    "bold": 10
+  },
+  "crates/ytsaurus-rpc/src/connection.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-skiff/CHANGELOG.md": {
+    "em_dash": 4,
+    "bold": 7
+  },
+  "crates/ytsaurus-yson/BENCHMARKS.md": {
+    "em_dash": 5,
+    "bold": 8
+  },
+  "crates/ytsaurus-yson/CHANGELOG.md": {
+    "em_dash": 18,
+    "bold": 13
+  },
+  "crates/ytsaurus-yson/README.md": {
+    "em_dash": 7,
+    "bold": 10
+  },
+  "crates/ytsaurus-yson/src/de.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-yson/src/lib.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-yson/src/scan.rs": {
+    "longest_doc": 26
+  },
+  "crates/ytsaurus-yson/src/varint.rs": {
+    "history": 2
+  },
+  "crates/ytsaurus-yson/tests/attribute_tests.rs": {
+    "history": 2
+  },
+  "crates/ytsaurus-yson/tests/coverage_tests.rs": {
+    "history": 1
+  },
+  "crates/ytsaurus-yson/tests/ytsaurus_protocol_tests.rs": {
+    "history": 1
+  },
+  "docs/benchmarking.md": {
+    "em_dash": 115,
+    "bold": 101
+  },
+  "docs/format-comparison.md": {
+    "em_dash": 137,
+    "bold": 169,
+    "banned": 2
+  },
+  "docs/go-parity.md": {
+    "em_dash": 36,
+    "bold": 24
+  },
+  "docs/rpc-compatibility.md": {
+    "em_dash": 39,
+    "bold": 27
+  },
+  "docs/sdk-comparison.md": {
+    "em_dash": 60,
+    "bold": 58
+  },
+  "docs/skiff-compatibility.md": {
+    "em_dash": 17,
+    "bold": 30
+  },
+  "docs/skiff-full-support-plan.md": {
+    "em_dash": 19,
+    "bold": 23
+  },
+  "docs/writing-a-job.md": {
+    "em_dash": 40
+  },
+  "tests/cluster-e2e/README.md": {
+    "em_dash": 150,
+    "bold": 38
+  },
+  "tests/skiff-cpp-interop/README.md": {
+    "em_dash": 7,
+    "bold": 6
+  }
+}
