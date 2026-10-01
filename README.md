@@ -242,7 +242,7 @@ workers; the existing format-specific methods remain convenience APIs.
 What is still needed to match the official clients, in the order it matters for
 production use, is tracked in the pinned parity issue. What remains open needs a
 human: publishing, an API review, and upstreaming. All are described in
-[AGENTS.md](AGENTS.md), which is also the project context for contributors and
+[AGENTS.md, *Status*](AGENTS.md#status), which is also the project context for contributors and
 coding agents.
 
 **Verified against a real cluster.** A local YTsaurus in Docker ran the identity

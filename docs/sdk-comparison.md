@@ -244,7 +244,7 @@ visible — but a holder has to ask.
 ## Dynamic tables, administration, the rest
 
 Absent from the Rust client entirely. Most of it by [recorded
-decision](../AGENTS.md); the exceptions are marked.
+decision](../AGENTS.md#non-goals); the exceptions are marked.
 
 | | C++ | Go | Rust |
 | --- | --- | --- | --- |

@@ -88,7 +88,7 @@ Two facts about that, both established against a cluster rather than assumed:
 ## What is deliberately absent
 
 Each of these is a decision already recorded in
-[AGENTS.md](../AGENTS.md); none is an oversight.
+[AGENTS.md, *Non-goals*](../AGENTS.md#non-goals); none is an oversight.
 
 **Dynamic tables over HTTP** — `dynamic-table`, `ordered-dynamic-table`, and the
 data path of `query-tracker`. These were excluded outright while the RPC proxy,

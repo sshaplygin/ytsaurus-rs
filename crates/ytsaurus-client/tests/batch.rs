@@ -136,9 +136,9 @@ fn serve(
 /// chunked body silently arrive empty and be answered early — the failure the
 /// type-level comment says closes the connection under `ureq` and reports a
 /// broken pipe instead of the request under test. The proxy takes a chunked
-/// body (see the streaming rule in AGENTS.md), so this is the shape a future
-/// batch could grow, and a stub that could not read it would fail confusingly
-/// rather than usefully.
+/// body (see *Streaming table I/O* in docs/protocol-reference.md), so this is
+/// the shape a future batch could grow, and a stub that could not read it
+/// would fail confusingly rather than usefully.
 fn read_body(head: &str, reader: &mut impl BufRead) -> Option<Vec<u8>> {
     if header(head, "transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
@@ -884,7 +884,7 @@ fn an_empty_batch_is_refused_before_anything_is_sent() {
 
 #[test]
 fn an_answer_shaped_like_nothing_known_fails_the_call_loudly() {
-    // The envelope traps documented in AGENTS.md — `exists` under `value`,
+    // The envelope traps documented in docs/protocol-reference.md — `exists` under `value`,
     // the file cache answering a bare string — earn the batch parser its
     // paranoia: a shape it does not recognise is refused, not read as an
     // empty success.
