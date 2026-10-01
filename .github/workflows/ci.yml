@@ -31,6 +31,12 @@ jobs:
       - name: ty
         run: uvx ty check scripts tests
 
+      # The countable part of the Writing rules in AGENTS.md.
+      - name: prose check
+        run: |
+          python3 scripts/check_prose.py --self-test
+          python3 scripts/check_prose.py
+
   go-skiff-reference:
     name: pinned Go Skiff reference
     runs-on: ubuntu-latest

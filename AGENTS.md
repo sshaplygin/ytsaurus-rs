@@ -87,6 +87,38 @@ repository builds the minimal stack — a YSON codec and a job runtime.
    150 request types. What is in and what is out is
    [docs/rpc-compatibility.md](docs/rpc-compatibility.md).)*
 
+## Writing
+
+Applies to everything committed or published: docs, rustdoc, comments,
+CHANGELOGs, commit messages and PR bodies. `scripts/check_prose.py` enforces
+the countable part in CI; the rest is on review.
+
+1. One home per fact. Protocol and cluster behaviour: *Protocol reference*
+   below. Measurements and method: `docs/benchmarking.md` and
+   `docs/format-comparison.md`. What changed for a caller: the crate's
+   CHANGELOG. An item's contract: its rustdoc. History: git. Anywhere else,
+   link to the home instead of restating it.
+2. State results as they are. A null or negative result is written as one:
+   "X did not decide Y; Z is still needed (#70)." Do not present it as a
+   finding, a success, or a question that is still "not lost".
+3. A reversal is one line: what was believed, what is true, the evidence. No
+   defence of the earlier position.
+4. No narration of the process ("this cost two rounds", "the first measurement
+   did not…") and no aphorisms or morals. If a rule matters, write the rule.
+5. Evidence once, attached to the fact: "observed on a local cluster",
+   "measured: 611 522 bytes". Not as rhetoric, and never when it was not done.
+6. Code comments describe the code as it is: no issue numbers, no "used to",
+   no pull-request history, nothing addressed to a reviewer. A known gap goes
+   into an issue.
+7. Length. A CHANGELOG entry is at most four lines. An item's rustdoc is its
+   contract (what it does, `# Errors`, `# Panics`, an example); past 25 lines
+   the rest belongs in `docs/`. Bold marks a warning, not emphasis.
+
+`scripts/prose_budget.json` holds the counts for files still over the
+defaults. Budgets only go down: `--tighten` lowers them after a cleanup.
+Raising one, by hand or with `--bootstrap`, shows in the diff of that file
+and is for a reviewer to accept.
+
 ## Commands
 
 ```sh
@@ -95,6 +127,8 @@ cargo xtask generate-protos       # rewrite crates/ytsaurus-proto/src/generated/
 
 python3 scripts/check_package_includes.py   # no published file may include_str!
                                             # data from outside its own crate
+python3 scripts/check_prose.py              # the Writing rules' countable part;
+                                            # --tighten after a cleanup
 
 cargo test --workspace            # 941 tests: 863 unit and integration, 78 doc
 cargo clippy --workspace --all-targets -- -D warnings
