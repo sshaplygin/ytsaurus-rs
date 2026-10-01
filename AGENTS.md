@@ -161,8 +161,7 @@ cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocaptur
   for `selfrun`, which contains the whole client. The dependency is spelled out
   in `crates/ytsaurus-job/Cargo.toml` because cargo does not let an inherited
   dependency disable default features.
-- **Anything in `ytsaurus-job`'s `[dev-dependencies]` lands in the musl
-  build**: cargo compiles dev-dependencies when it builds examples, and the
+- Anything in `ytsaurus-job`'s `[dev-dependencies]` lands in the musl build: cargo compiles dev-dependencies when it builds examples, and the
   workers are examples of `ytsaurus-job`. So `ytsaurus-client` is there with `default-features = false`
   and a path with no version (a version makes it cyclic with the client, which
   dev-depends on `ytsaurus-job`, and deadlocks both releases), and the
@@ -177,11 +176,11 @@ cargo test -p ytsaurus-job --release --test memory_tests -- --ignored --nocaptur
   retry reporting mutes itself inside a job.
 - CI's musl job lists the worker graph with `cargo tree -p ytsaurus-job
   --target x86_64-unknown-linux-musl --prefix none` and fails if `tracing`,
-  `rustls`, `ring` or `rustls-platform-verifier` is in it. **Do not switch to
-  `cargo tree -i <crate>`**: `-i` exits non-zero both when the crate is absent
-  and when cargo fails (it resolves `-i` before `-p`, so a misspelled package
-  prints the same "did not match any packages"), so a failed run reads as a
-  pass.
+  `rustls`, `ring` or `rustls-platform-verifier` is in it.
+  **Do not switch to `cargo tree -i <crate>`**: `-i` exits non-zero both when
+  the crate is absent and when cargo fails (it resolves `-i` before `-p`, so a
+  misspelled package prints the same "did not match any packages"), so a failed
+  run reads as a pass.
 
 ## Protocol reference
 
@@ -215,7 +214,7 @@ what lets an input larger than memory be streamed.
 - Unknown control records are skipped, not surfaced as rows. YTsaurus may add
   attributes this version has not seen, and handing one to the job as a row
   would corrupt the output table.
-- **Output descriptors are never closed** (`ManuallyDrop<File>`). Table 0 is
+- Output descriptors are never closed (`ManuallyDrop<File>`). Table 0 is
   fd 1, which `std::io::stdout()` also refers to; closing it would leave later
   `println!` writing to a closed or recycled descriptor.
 - `finish()` is explicit. Output is buffered and unflushed rows are lost.
