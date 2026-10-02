@@ -323,9 +323,9 @@ PRAGMA yt.QueryCacheMode = "disable";   -- or a repeat is free and spawns nothin
 PRAGMA yt.DefaultMemoryLimit = "640M";  -- or the map_reduce stage dies
 ```
 
-**Without the first, the same `INSERT` run twice completes the second time
-having started no operations at all, and a benchmark would report a cache hit
-as a fast runtime.** For the second, YQL's own default is
+**Without the first, a benchmark reports a cache hit as a fast runtime.** The
+same `INSERT` run twice completes the second time having started no operations
+at all. For the second, YQL's own default is
 `reducer.memory_limit = 545523360` (512 MB plus overhead), and the stage fails
 just above it: 576M fails, 640M passes. The 512 MB the other examples give a
 worker is therefore comparable. 2G, the figure in an earlier draft, would have

@@ -98,8 +98,8 @@ keyed by the same column names, with format, codec and wire bytes unchanged,
 brings it to 1.66×
 ([format-comparison.md](format-comparison.md#off-cluster-reproduction)). The
 3.19× has not been re-measured under that change, which bounds it rather than
-replacing it. **Quote this pair as "keyed DOM against positional tuple", never
-as "YSON against Skiff".**
+replacing it.
+**Quote this pair as "keyed DOM against positional tuple", not "YSON against Skiff".**
 
 #### Binary YSON, by decoding depth
 
