@@ -417,7 +417,11 @@ payloads (`table_rows_*.bin`) from the specification, and a test checks they
 stay reproducible. Only the job-input framing is captured, because it is the
 cluster's to define.
 
-Prefer a captured fixture over a hand-built one.
+YTsaurus writes `<table_index=0;>#` with a trailing `;` inside the attribute
+block. The reader accepts it either way (`reader_tests.rs` feeds it control
+records without the `;`), and `cat_e2e.rs` asserts the captured input carries
+it. A column value cannot carry attributes (`Table values cannot have top-level
+attributes`), so `generate_fixtures.py` builds none.
 
 ## Environment notes
 
