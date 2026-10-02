@@ -92,10 +92,9 @@ Everything below shipped in 0.1.0 and still applies.
   followed by any byte other than `/` or `*` entered the comment branch and hit
   `continue` without advancing the cursor, so `/a` never returned. A `/` that
   opens no comment now ends the skip so the tokenizer rejects the byte, and an
-  unterminated `/*` consumes to end-of-input. Found by
-  `tests/fuzz_smoke_tests.rs`; regression tests
-  `stray_slash_in_text_input_errors_instead_of_hanging` (thread-guarded
-  against hanging) and `text_comments_are_still_skipped`.
+  unterminated `/*` consumes to end-of-input instead of leaving a stray byte
+  behind. Regression tests: `stray_slash_in_text_input_errors_instead_of_hanging`
+  (thread-guarded) and `text_comments_are_still_skipped`.
   Binary mode (`<format=binary>yson`) never calls `skip_ignored` and was not
   exposed.
 
