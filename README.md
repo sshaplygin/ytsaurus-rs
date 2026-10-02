@@ -95,7 +95,7 @@ do.
 
 | Path | What it is |
 | --- | --- |
-| [crates/](crates/) | The nine crates above. [`ytsaurus-yson`](crates/ytsaurus-yson/) is a fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`; `ytsaurus-job` is a streaming row reader, control records and multi-table output, and [its examples](crates/ytsaurus-job/examples/) are the nine runnable worker binaries; `ytsaurus-rpc`, for dynamic tables under concurrency, is async on tokio, unlike the rest; `ytsaurus-proto` is generated from the `third_party/ytsaurus` submodule. |
+| [crates/](crates/) | The nine crates above. [`ytsaurus-yson`](crates/ytsaurus-yson/) is a fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`; `ytsaurus-job` is a streaming row reader, control records and multi-table output, and [its examples](crates/ytsaurus-job/examples/) are the nine runnable worker binaries; `ytsaurus-rpc`, for dynamic tables under concurrency, is async on tokio, unlike the rest; `ytsaurus-proto` is generated from the `third_party/ytsaurus` submodule and committed. |
 | [xtask/](xtask/) | `cargo xtask generate-protos`, the one task that has to be Rust (`prost-build` is a Rust library). Never published. |
 | [scripts/](scripts/) | The rest of the automation, in Python: the CI checks below and the benchmark comparison posted on pull requests. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, the protocol reference, and comparisons with the official C++ and Go clients. |
