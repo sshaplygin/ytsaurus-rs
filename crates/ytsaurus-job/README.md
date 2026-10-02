@@ -87,8 +87,8 @@ compiler points at the spot.
 
 **`finish()` is not optional.** Output is buffered; rows never flushed are
 rows missing from the table. `Drop` makes a last-ditch attempt and complains on
-stderr, but cannot fail the job, which is why `run()` calls `finish()` through
-you.
+stderr, but cannot fail the job. Return `writer.finish()` from the function
+passed to `run()`, so a failed flush fails the job.
 
 Output descriptors are never closed. Table 0 is fd 1, which `std::io::stdout()`
 also refers to; closing it would leave later `println!` calls writing to a
