@@ -266,8 +266,8 @@ Three nine-round runs, every ratio paired within its round:
   that the Skiff mapper made where `SkiffRow::into_value` exists and the row
   already owns them (three allocations a row, 12 % of the leg). So 1.93×, 1.20×
   and 1.49× are partly that fix, the drift across runs is not a spread, and the
-  run 1 and 2 Skiff figures are a floor. The one row measuring an unchanged
-  program, typed YSON against the dynamic leg, has values for two runs only.
+  run 1 and 2 Skiff figures are a floor. Of the ratio rows, the one measuring
+  an unchanged program, typed YSON against the dynamic leg, has two runs only.
 - The `—` cells are blanks in the harness's output, of an unrecorded kind:
   `paired_ratios` prints nothing for a pair whose sign flips between rounds,
   which would make a blank a result, and the run output was not kept. The sign
