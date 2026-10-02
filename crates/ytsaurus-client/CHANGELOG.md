@@ -8,47 +8,29 @@ compile from their tarballs; this crate had no such file.
 
 ## 0.3.0 - 2026-08-16
 
-### Dynamic tables, and a second transport
-
-- **Added** typed dynamic-table commands: `lookup_rows_dynamic`,
-  `select_rows_dynamic`, `insert_rows_dynamic` and `delete_rows_dynamic`. They
-  were reachable through `Client::raw_command` before and are now first-class,
-  with the request shapes taken from the driver's own registration table rather
-  than guessed: insert and delete carry a tabular input stream, select produces
-  one, lookup does both, and all four are heavy.
-- **Added** `create_client` and `create_rpc_client`, which return the same
-  `ytsaurus_api::TableClient` — the arrangement the C++ client has, where
-  choosing a transport is one line and nothing below it changes.
-- **Added** the `rpc` feature, **off by default and required to stay off**: it
-  reaches tokio and prost, and this crate is a dev-dependency of
-  `ytsaurus-job`, whose examples are the static musl workers. CI asserts the
-  worker graph carries neither.
-- **Note**: tablet transactions are not available over HTTP, and the client now
-  says so with `Error::Unsupported` instead of failing on the second call. They
-  are sticky to the proxy that created them, and an HTTP client routes each
-  request independently — the cluster's own message recommends the RPC API.
-
-### Also
-
-- **Renamed** the end-to-end example from `e2e` to `client_e2e`. `ytsaurus-rpc`
-  has one too, and both packages emitted `target/.../examples/e2e`, so building
-  all examples had them overwrite each other. Its counterpart there is
-  `rpc_e2e`.
-
-### The error flattening is public
-
-- **Added** `error_summary(&YsonValue) -> Option<String>`, which was
-  `pub(crate)` and is what `JobInfo::error` and the operation errors are already
-  built from. It keeps the outer message and the innermost cause — `Failed to
-  run query: Memory limit exceeded` — and drops the attributes between them.
-
-  The reason it is public now is `Client::raw_command`. A caller sending a
-  command the crate does not model gets back the same shape of error document
-  and had no way to read it: two examples written against Query Tracker each
-  grew their own version, and the first one clipped the front of the chain and
-  printed the category while discarding the cause, which is the one sentence
-  worth having. An escape hatch that hands back an error nobody can read is
-  half a door.
+- Added typed dynamic-table commands `lookup_rows_dynamic`,
+  `select_rows_dynamic`, `insert_rows_dynamic` and `delete_rows_dynamic`,
+  previously reachable only through `Client::raw_command`. Insert and delete
+  send a tabular input stream, select returns one, lookup does both; all four
+  are heavy.
+- Added `create_client` and `create_rpc_client`, which return the same
+  `ytsaurus_api::TableClient`, so choosing a transport is one line.
+- Added the `rpc` feature, **off by default and required to stay off**: it pulls
+  in tokio and prost, and this crate is a dev-dependency of `ytsaurus-job`,
+  whose examples are the static musl workers. CI asserts the worker graph has
+  neither.
+- Tablet transactions are not available over HTTP: the client returns
+  `Error::Unsupported` instead of failing on the second call. They are sticky
+  to the proxy that created them, and HTTP routes each request independently;
+  the cluster's own message recommends the RPC API.
+- Renamed the end-to-end example from `e2e` to `client_e2e`; both packages
+  built `target/.../examples/e2e` and overwrote each other. The `ytsaurus-rpc`
+  counterpart is `rpc_e2e`.
+- Added `error_summary(&YsonValue) -> Option<String>`, previously `pub(crate)`,
+  which `JobInfo::error` and the operation errors are built from: the outer
+  message and the innermost cause (`Failed to run query: Memory limit
+  exceeded`), without the attributes between. Use it on the error documents
+  `Client::raw_command` returns.
 
 ## 0.2.6
 
