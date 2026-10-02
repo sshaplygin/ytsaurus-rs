@@ -1,7 +1,7 @@
 # ytsaurus-rpc
 
-A Rust client for the YTsaurus **RPC proxy**: bus framing, the RPC envelope,
-and the row wire format dynamic tables actually speak.
+A Rust client for the YTsaurus RPC proxy: bus framing, the RPC envelope, and
+the row wire format dynamic tables speak.
 
 **Pre-release, published from 0.3.0.** The ship gates are not all green and the
 API may change in a patch release. What works, what does not, and what has been
@@ -9,47 +9,44 @@ run against a real cluster is [docs/rpc-compatibility.md](../../docs/rpc-compati
 
 ## Why this exists
 
-HTTP API v4 — which [`ytsaurus-client`](../ytsaurus-client) speaks — can already
-reach `select_rows`, `lookup_rows`, `insert_rows` and `delete_rows`. This crate
-is **not** about capability. It is about latency and throughput under
-concurrency: one connection multiplexes many in-flight requests, where HTTP pays
-its per-request cost every time.
+HTTP API v4, which [`ytsaurus-client`](../ytsaurus-client) speaks, already
+reaches `select_rows`, `lookup_rows`, `insert_rows` and `delete_rows`. This
+crate is for latency and throughput under concurrency: one connection
+multiplexes many in-flight requests, where HTTP pays its per-request cost every
+time. Tablet transactions are RPC-only.
 
-If you are not bottlenecked on that, use the HTTP client. It is finished and it
-has none of the gates listed in the compatibility document.
+If that is not your bottleneck, use the HTTP client, which has none of the
+gates in the compatibility document.
 
-## The protocol is four layers, and only the top one looks familiar
+## The protocol is four layers
 
 | Layer | What it is | Module |
 | --- | --- | --- |
-| 1 | **Bus** — framed, CRC-64-checksummed packets over TCP | `bus` |
-| 2 | **RPC envelope** — request and response headers, `TError` | `rpc` |
-| 3 | **API surface** — generated protobuf | `ytsaurus-proto` |
-| 4 | **Row wire format** — rows in attachments, not protobuf fields | `wire` |
+| 1 | Bus: framed, CRC-64-checksummed packets over TCP | `bus` |
+| 2 | RPC envelope: request and response headers, `TError` | `rpc` |
+| 3 | API surface: generated protobuf | `ytsaurus-proto` |
+| 4 | Row wire format: rows in attachments, not protobuf fields | `wire` |
 
-Layer 4 is the one that surprises people. Rows do not travel as protobuf:
-`api_service.proto` says outright that "actual data is passed via attachments in
-the wire protocol", and the request carries only a descriptor naming the
-columns. That format is neither YSON nor Skiff — it is a third one, mandatory
-for every dynamic-table read and write.
+Rows do not travel as protobuf: `api_service.proto` says "actual data is
+passed via attachments in the wire protocol", and the request carries only a
+descriptor naming the columns. That format is neither YSON nor Skiff; it is a
+third one, mandatory for every dynamic-table read and write.
 
 ## Shape
 
-The parsers are **sans-io**: `crc64`, `bus::packet`, `rpc` and `wire` are pure
-functions from bytes to values with no `async` anywhere, so each is tested
-without a runtime. That also makes them fuzzable, which they are not yet — see
-gate E. `async` appears only at the I/O edges, `bus::Bus` and
-`connection::Connection`.
+The parsers are sans-io: `crc64`, `bus::packet`, `rpc` and `wire` are pure
+functions from bytes to values with no `async`, so each is tested without a
+runtime. That also makes them fuzzable; they are not fuzzed yet (gate E).
+`async` appears only at the I/O edges, `bus::Bus` and `connection::Connection`.
 
-A connection is an **actor**: a writer task drains a bounded channel and at
-most 256 calls may be in flight, so backpressure is real. A reader task routes
-each response to the `oneshot` waiting on it. Cancellation is protocol-level —
-a timed-out call sends the protocol's cancellation message, because a
-client-side-only timeout leaves the proxy working on a result nobody will read.
+A connection is an actor: a writer task drains a bounded channel with at most
+256 calls in flight, which gives backpressure, and a reader task routes each
+response to the `oneshot` waiting on it. A timed-out call sends the protocol's
+cancellation message, because a client-side-only timeout leaves the proxy
+working on a result nobody will read.
 
-Unlike the rest of this workspace, which is synchronous, this crate is async on
-tokio. Multiplexed in-flight requests are the entire justification for speaking
-this protocol, and they map onto a runtime naturally.
+Unlike the rest of this workspace, this crate is async, on tokio: multiplexed
+in-flight requests are the reason to speak this protocol.
 
 ## Use
 
@@ -87,13 +84,11 @@ body, and `ytsaurus-proto` has the generated type for all 158 of them.
 
 ## Building
 
-Nothing special: `cargo build`. The protobuf bindings come from
+`cargo build`. The protobuf bindings come from
 [`ytsaurus-proto`](https://crates.io/crates/ytsaurus-proto), which ships them
-already generated, so building this crate needs neither the YTsaurus `.proto`
-submodule nor `protoc`.
-
-Regenerating those bindings is a task for a checkout of the repository, not for
-a consumer — `./scripts/init-protos.sh` then `cargo xtask generate-protos`.
+generated, so building needs neither the YTsaurus `.proto` submodule nor
+`protoc`. Regenerating them is done in a repository checkout:
+`./scripts/init-protos.sh`, then `cargo xtask generate-protos`.
 
 ## Tests
 
@@ -103,11 +98,10 @@ cd tests/rpc-go-interop && go test ./...       # regenerate the vectors
 cargo run -p ytsaurus-rpc --example rpc_e2e    # against a live RPC proxy
 ```
 
-The golden vectors are **produced by the pinned Go SDK**, not written by hand —
-the same arrangement `tests/skiff-go-interop/` uses, because a binary format
-checked only against our own reading of the specification is checked against
-itself.
+The golden vectors are produced by the pinned Go SDK, not written by hand, as
+in `tests/skiff-go-interop/`, so the format is not checked only against this
+crate's own reading of the specification.
 
-The repository's local-cluster script starts an RPC proxy on `localhost:8011`,
-so run `tests/cluster-e2e/run_local_cluster.sh` before `rpc_e2e`. The example
-also runs in the post-merge `Cluster E2E` workflow.
+`tests/cluster-e2e/run_local_cluster.sh` starts a local cluster with an RPC
+proxy on `localhost:8011`; run it before `rpc_e2e`. The example also runs in
+the post-merge `Cluster E2E` workflow.
