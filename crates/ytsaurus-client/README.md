@@ -136,8 +136,9 @@ export YT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 Each certificate in the bundle is a root; other PEM sections are skipped. A
 bundle is refused, naming the file, if it yields no certificates, cannot be
 read, is not a regular file, or is larger than 16 MB. **One `BEGIN CERTIFICATE`
-block that is not X.509 refuses the whole file**: a PKCS#7 `.p7b` under that
-label is the usual case, and `openssl pkcs7 -print_certs` converts it.
+block that is not X.509 refuses the whole file**, naming it and counting the bad
+blocks: a PKCS#7 `.p7b` under that label is the usual case, and
+`openssl pkcs7 -print_certs` converts it.
 
 An unknown issuer or a certificate that does not cover the requested host is
 reported at once and not retried, since neither changes between attempts.
@@ -506,7 +507,8 @@ the C++ and Go clients: [docs/sdk-comparison.md](../../docs/sdk-comparison.md).
 that reports a mid-stream failure. `read_table` checks the response is a
 complete YSON list fragment, which catches truncation but not a failure that
 still yields well-formed output. `read_file` compares the bytes with the node's
-`@uncompressed_data_size`; `read_file_streaming` cannot, so compare its
+`@uncompressed_data_size`, one light `get` after the read; `read_file_streaming`
+cannot, so compare its
 `bytes_read()` with that attribute yourself.
 
 **A buffered response is capped at 512 MiB of decoded bytes** (`read_table`,
@@ -546,9 +548,9 @@ command name with `/` or `?` is refused, since it goes into `/api/v4/{command}`.
 
 ## Why not JSON
 
-Parameters and specs are encoded with this project's own codec,
-[`ytsaurus-yson`](../ytsaurus-yson/). That keeps the dependency list short, and
-every request exercises the codec against a real cluster.
+Parameters and specs are encoded by this project's
+[`ytsaurus-yson`](../ytsaurus-yson/): a shorter dependency list, and every
+request exercises the codec against a real cluster.
 
 ## Licence
 
