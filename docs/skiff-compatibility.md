@@ -26,7 +26,7 @@ compares against C++ through a wheel; its limits are in its README and
 | `WireType`: all twenty values | Schema model implemented | Rust enum/YSON tests plus Go reference test |
 | `Schema`, inline table schema and registry reference | Implemented and structurally validated | table roots must be named-field tuples; format parses/renders against Go-shaped values |
 | Dynamic encoder/decoder for the primitives Go codes, variants, repeated variants and tuples | Implemented | Go v0.0.33 vector, Rust round trips, one-byte reads, malformed tag, truncation, blob-limit and row-limit tests. The C++ corpus finds these bytes identical to C++'s for scalars, optionals, list and struct shapes, sparse columns, other-columns, control columns and multiplexed tables. |
-| `int128` and `int256` | Implemented, Rust-only | Go v0.0.33 has no codec for either (`decodeStruct`/`decodeSimpleTypeGeneric` answer "unexpected wire type"; the encoder matches), and the C++ bindings expose no 128- or 256-bit type. Byte order is asserted against Rust alone until a cluster fixture or a newer Go SDK settles it. |
+| `int128` and `int256` | Implemented, Rust-only | Go v0.0.33 has no codec for either (`decodeStruct`/`decodeSimpleTypeGeneric` answer "unexpected wire type"; the encoder matches), so the shared corpus cannot contain them, and the C++ bindings expose no 128- or 256-bit type. Byte order is asserted against Rust alone until a cluster fixture or a newer Go SDK settles it. |
 | `uint128` and `uint256` | Missing | C++ `EWireType` has both, so a `uuid` column, carried as `uint128`, cannot be described. Go has neither, so no Go gate will surface this. Phase 1 of [the full-support plan](./skiff-full-support-plan.md). |
 | Typed rows and schema inference | Planned | Go → Rust and Rust → Go byte vectors. This also blocks the format decision: [format-comparison.md](format-comparison.md) can compare typed YSON only against dynamic Skiff, and typed YSON against typed Skiff cannot be measured until this ships. |
 | `Format`, `InferFormat`, `MustInferFormat` | Format model only; inference planned | generated YSON compared structurally |
@@ -88,7 +88,8 @@ required test 5.
    deterministic 10,000-stream fuzz smoke test of nested variants and blobs
    under both limits. No input may panic or allocate past the configured row
    limit: `max_blob_bytes` bounds one payload and `max_row_bytes` the decoded
-   row, since a repeated variant costs far more in memory than on the wire.
+   row, since a repeated variant costs far more in memory than on the wire;
+   the first bound alone does not imply the second.
 4. Bidirectional differential tests. The checked-in scalar corpus is encoded
    and decoded independently by Go and Rust. Extend it to Go's optional,
    complex and registry forms; compare bytes when the format is canonical and
