@@ -250,10 +250,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   once. A client bound to a transaction stamps each part, not the envelope,
   whose `transaction_id` the cluster drops; a part naming its own transaction
   keeps it, and a command with no transaction is left alone.
-- A batch sends its parameters in the POST body, not `X-YT-Parameters`; the
-  proxy merges the two (`TContext::CaptureParameters`; measured: `requests` in
-  the body and `mutation_id` in the header arrive as one set). A cross-origin
-  redirect on a batch is therefore refused with `RedirectRefusal::Payload` even
+- A batch sends its parameters in the POST body (the proxy merges them with
+  `X-YT-Parameters`, `TContext::CaptureParameters`). As a request with a body,
+  a cross-origin redirect on it is refused with `RedirectRefusal::Payload` even
   without a token, where the same commands sent singly would follow it.
 - Parts run in parallel, so a part and its consequence belong in two batches.
   A part naming an unknown command fails the whole request with HTTP 400 after
