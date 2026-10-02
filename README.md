@@ -70,8 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !table.trim().is_empty() {
         let tables = ytsaurus_client::create_client(std::env::var("YT_PROXY")?.trim())?;
         // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
-        let found =
-            tables.select_rows(&format!("* from [{table}] limit 10"), &Default::default())?;
+        let found = tables.select_rows(
+            &format!("* from [{}] limit 10", table.trim()),
+            &Default::default(),
+        )?;
         println!("{} rows", found.len());
     }
     Ok(())
@@ -86,8 +88,8 @@ cargo run -p ytsaurus-client --example quickstart
 ```
 
 The dynamic read needs `YT_DYNAMIC_TABLE` to name a mounted table; mounting
-takes `Client::raw_command`, as in
-[both_transports.rs](crates/ytsaurus-client/examples/both_transports.rs).
+takes `Client::raw_command`
+([both_transports.rs](crates/ytsaurus-client/examples/both_transports.rs)).
 `create_client` and `create_rpc_client` send no token, not even the one
 `from_env` found; `create_client_with_token` and `create_rpc_client_with_token`
 do.

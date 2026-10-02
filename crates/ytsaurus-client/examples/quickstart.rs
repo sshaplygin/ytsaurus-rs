@@ -20,10 +20,9 @@
 //! it, but without `YT_PROXY_SUFFIX`: `Client` has no accessor for the address
 //! `from_env` resolved. Spell the address out in full to use both halves.
 //!
-//! The dynamic half goes over HTTP only. The RPC constructor is a comment in
-//! it, because the README quotes this block and a `cfg(feature = "rpc")` there
-//! would name the reader's crate's feature, not this one's;
-//! `both_transports.rs` runs the same calls over both.
+//! The dynamic half goes over HTTP only; keep `cfg` out of the quoted block,
+//! where it would name the reader's crate's feature. `both_transports.rs` runs
+//! the same calls over both transports.
 
 // README-START
 use serde::{Deserialize, Serialize};
@@ -54,8 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !table.trim().is_empty() {
         let tables = ytsaurus_client::create_client(std::env::var("YT_PROXY")?.trim())?;
         // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
-        let found =
-            tables.select_rows(&format!("* from [{table}] limit 10"), &Default::default())?;
+        let found = tables.select_rows(
+            &format!("* from [{}] limit 10", table.trim()),
+            &Default::default(),
+        )?;
         println!("{} rows", found.len());
     }
     Ok(())
