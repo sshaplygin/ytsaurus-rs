@@ -206,7 +206,9 @@ Rows and bytes are exact everywhere.
 | operation wall time | `time/total`, `time/exec` | the metric that exists locally |
 | job CPU | `user_job/cpu/user`, `user_job/cpu/system` | `None` locally; the harness prints which was obtained |
 | rows and bytes in/out | `data/input/*`, `data/output/*` | where projection and format size show up |
-| operations spawned | count them | one or two for a worker; for YQL, summed across all operations a query spawned |
+| operations spawned | count them | one or two for a worker, unknown for YQL |
+
+For YQL, every figure is summed across all operations the query spawned.
 
 ### The estimator, and three rules
 
