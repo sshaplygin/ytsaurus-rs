@@ -461,21 +461,18 @@ spread it reports.
 - Decision criterion 2 (the Rust job beats the C++ baseline): leg 4 is its
   first evidence, entered whichever way it came out.
 - "What has *not* been measured": what YQL supplies and what it does not.
-- The Skiff entry under *Status* in [`AGENTS.md`](../AGENTS.md#status), which
-  says a spread from repeated production runs is still needed (#70). This plan
-  owes that spread too and adds no third single number.
-- [`skiff-compatibility.md`](skiff-compatibility.md) required test 5 (cluster fixtures): one input,
-  one output, no key switch, so the gate stays open.
+- The Skiff entry under *Status* in [`AGENTS.md`](../AGENTS.md#status): this
+  plan adds no third single number to it.
+- [`skiff-compatibility.md`](skiff-compatibility.md) required test 5
+  (cluster fixtures): one input, one output, no key switch, so it stays open.
 
 Any YQL advantage has to be decomposed into projection, runtime and stage
 structure: a query reading 3 of 9 columns and winning is not a runtime result.
 A single-node Docker cluster under emulation measures fixed costs with some
 computation attached.
 
-## Limits and what is still owed
+## Limits
 
-- The production run on the installation of `benchmarking.md` §4 is owed
-  (#70); the go/no-go is a human decision.
 - Skiff on a cluster is verified for one shape only; stepping outside it turns
   a benchmark into debugging.
 - Version drift: the YQL agent rides `ghcr.io/ytsaurus/local:stable`, and the

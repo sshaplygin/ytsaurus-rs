@@ -16,10 +16,9 @@ neither has been repeated enough to record a spread rather than a number. A
 spread from repeated production runs is still needed (#70). Do not quote the
 10 % alone.
 
-The format comparison (§5) did not decide it. The comparison that would, typed
-YSON against typed Skiff, cannot be run while Skiff has no typed rows.
-[`skiff-compatibility.md`](skiff-compatibility.md)'s required test 5 (cluster fixtures) is still
-open; see [Decision criteria](#decision-criteria).
+The format comparison (§5) did not decide it: the comparison that would, typed
+YSON against typed Skiff, cannot be run yet ([§5](#skiff-against-typed-yson)),
+and a Skiff gate is still [open](#what-5-does-not-close). See [Decision criteria](#decision-criteria).
 
 ## Pull-request comparison
 
@@ -241,8 +240,7 @@ Skiff has no frames-only stop: with no self-describing record boundaries,
 finding the end of a row is decoding it.
 
 Everything ran on a single-node local Docker cluster, x86-64 images under arm64
-emulation, one job per leg: the environment least like production. A
-production run is still owed (#70).
+emulation, one job per leg: the environment least like production.
 
 #### Results
 
@@ -382,7 +380,8 @@ output table and no key switch. Required test 5 (cluster fixtures) of
 - Job CPU time, operation wall time and RSS as YTsaurus reports them. Job CPU is
   missing wherever the format comparison ran: that cluster reports nothing
   under `user_job/cpu`.
-- A typed Skiff leg. Every Skiff figure on record is a dynamic-API figure.
+- A typed Skiff leg ([§5](#skiff-against-typed-yson)): every Skiff figure on
+  record is a dynamic-API figure.
 
 The local benchmark is a proxy, and an optimistic one: it reads from memory, not
 from a pipe fed by a node, and it runs on a full core rather than the fraction a
