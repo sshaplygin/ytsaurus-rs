@@ -381,9 +381,9 @@ must be read promptly; see the
 `Client::raw_command` and its three siblings. `get_supported_features` answered
 `{features=…}` with the nine keys listed in the
 [protocol reference](../../docs/protocol-reference.md#commands-and-verbs), 71
-compression codecs among them. A 4 000 000-byte file went up and came back byte
-for byte, the reader counting the same bytes, neither direction holding the
-file; that is the wire shape `Client::read_file` and
+compression codecs among them. A file of 4 000 000 bytes went up and came back
+byte for byte, the reader counting the same bytes, neither direction holding
+the file; that is the wire shape `Client::read_file` and
 `Client::read_file_streaming` are built on, re-verified through them with an
 empty file, a `compression_codec=zlib_6` node and a missing path. A node staged
 by a raw command was invisible to a second client until the commit, which would
