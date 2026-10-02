@@ -449,12 +449,13 @@ nothing else removes it.
 
 Light commands get five attempts by default, the delay doubling from one
 second to ten; `Client::with_retries(RetryPolicy::none())` turns that off.
-Mutating commands carry a `mutation_id`, so the cluster deduplicates a repeat.
+Mutating commands carry a `mutation_id`, which the cluster deduplicates.
 A replay must be marked: a known ID without the `retry` flag is refused with
 `Duplicate request is not marked as "retry"`, so a restarted process sends a
 persisted ID with `MutationId::as_retry()` through `Client::start_operation_with`.
-IDs are remembered for five to ten minutes. **Heavy commands are not retried**;
-use [a transaction](#all-at-once-or-not-at-all) to make an upload atomic.
+IDs are remembered for five to ten minutes. **Heavy commands are not retried**:
+the documentation says they cannot be. Use
+[a transaction](#all-at-once-or-not-at-all) to make an upload atomic.
 
 ## Where a heavy command goes
 
@@ -464,7 +465,7 @@ installation serves on separate proxies. The first heavy command asks `/hosts`;
 the answer becomes a pool, and each heavy command picks a member at random, as
 both official SDKs do. The pool is refreshed lazily when older than
 `Client::with_host_list_refresh_interval` (one minute by default); a failed
-refresh keeps the old one. Light commands stay on the configured address.
+refresh keeps the old one. Light commands use the configured address.
 
 A failure attributable to a host drops it from the pool until a refresh names
 it again. Only an empty pool falls back to the configured address, usually a
@@ -481,7 +482,7 @@ attempt and 800 ms, not the client's five attempts and two minutes;
 `n0132-sas.somewhere-else.net`; a bare `YT_PROXY=hume` matches as a label, so
 it follows `n0008-sas.hume.yt.example.net`. Scheme and port come from the
 configured address; a name with `://`, `/`, `@` or whitespace is rejected, and
-a declined answer is reported once, with what and why. It guards against typos,
+a declined answer is reported once, with the reason. It guards against typos,
 not token theft: whoever can steer `/hosts` already sees the token, and without a
 public-suffix list `yt-1234.us-east-1.elb.amazonaws.com` shares a domain with
 every load balancer in its region.
@@ -496,11 +497,9 @@ every load balancer in its region.
 Needing one shows as `cluster error 1: Control proxy may not serve heavy
 requests with input data` while `heavy_proxy()` names a proxy the client
 declined; the error names all three options. A named domain survives proxy
-rotation where a list of seventy-nine names does not. HTTP statuses and the
-balancer case:
-[protocol reference](../../docs/protocol-reference.md#where-a-heavy-command-goes).
-Comparison with the C++ and Go clients:
-[docs/sdk-comparison.md](../../docs/sdk-comparison.md).
+rotation where a list of seventy-nine names does not. Statuses and the balancer
+case: [protocol reference](../../docs/protocol-reference.md#where-a-heavy-command-goes);
+the C++ and Go clients: [docs/sdk-comparison.md](../../docs/sdk-comparison.md).
 
 ## Limits
 
