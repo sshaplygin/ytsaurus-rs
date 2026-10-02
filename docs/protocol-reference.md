@@ -17,7 +17,7 @@ Each fact names its evidence. "Observed" means on a local Docker cluster; "a rea
 
 ## Descriptors
 
-Output table `k` is fd `3k + 1`: table 0 is fd 1, table 1 is fd 4, table 2 is fd 7. A job's environment carries `YT_FIRST_OUTPUT_TABLE_FD=1`.
+Output table `k` is fd `3k + 1`: tables 0, 1 and 2 are fds 1, 4 and 7. A job's environment carries `YT_FIRST_OUTPUT_TABLE_FD=1`.
 
 ## The job environment
 
@@ -62,20 +62,17 @@ All observed:
 
 ### Changing a schema
 
-`alter_table` takes `schema` as a top-level parameter. On a table with rows, a change that asks more of existing rows fails with error 316, `Table schemas are incompatible`; the inner error names the column, so the client has no local rules. Observed:
+`alter_table` takes `schema` as a top-level parameter. On a table with rows, a change that asks more of existing rows fails with error 316, `Table schemas are incompatible`; the inner error names the column, so the client has no local rules. Observed on a table with rows:
 
-| Change | On a table with rows |
-| --- | --- |
-| add an optional column, at any position | allowed |
-| required → optional | allowed |
-| strict → non-strict | allowed |
-| add a required column | `Cannot insert a new required column "must" into a non-empty table` |
-| remove (or rename) a column | `Cannot remove column "size" from a strict schema` |
-| change a type | `Type of "" field is modified in non backward compatible manner` |
-| unsorted → sorted | `Cannot change schema from unsorted to sorted` |
-| non-strict → strict | `Changing "strict" from "false" to "true" is not allowed` |
+- allowed: adding an optional column at any position, required → optional, strict → non-strict;
+- add a required column: `Cannot insert a new required column "must" into a non-empty table`;
+- remove (or rename) a column: `Cannot remove column "size" from a strict schema`;
+- change a type: `Type of "" field is modified in non backward compatible manner`;
+- unsorted → sorted: `Cannot change schema from unsorted to sorted`;
+- non-strict → strict: `Changing "strict" from "false" to "true" is not allowed`.
 
-- An empty table accepts all of them.
+An empty table accepts all of them.
+
 - A non-strict schema can never gain a named column: `Cannot insert a new column "note" into non-strict schema`. Relaxing `strict` cannot be undone.
 - A failed `write_table` leaves its upload transaction briefly holding an exclusive lock; until it clears, the next command on that path fails with the concurrent-transaction error.
 
@@ -88,7 +85,7 @@ Observed:
 - A transaction expires 30 000 ms after its last ping (default `@timeout`; `Transaction` reads it to pick its ping interval). A 2 s timeout left for 4 s: `Transaction … has expired or was aborted`.
 - A commit is not idempotent: a second one fails with `No such transaction`, which reads as if the first had failed. Commits carry a mutation ID for that reason.
 - An abort of a committed or nonexistent transaction answers `{}`, so aborting from `Drop` is safe.
-- `get_operation`, `list_jobs`, `get_job_stderr` and the file-cache commands accept `transaction_id` and ignore it. The client omits it for the scheduler and job commands listed in `NO_TRANSACTION` (`http.rs`; no `TTransactionalOptions`), in case a version refuses unknown parameters: `Transaction` derefs to `Client`, so `wait_for_operation` runs inside one. `start_operation` is not listed, since an operation inside a transaction keeps its output invisible until commit. A command naming a transaction itself keeps its own.
+- `get_operation`, `list_jobs`, `get_job_stderr` and the file-cache commands accept `transaction_id` and ignore it. The client omits it for the scheduler and job commands in `NO_TRANSACTION` (`http.rs`; no `TTransactionalOptions`), in case a version refuses it: `Transaction` derefs to `Client`, so `wait_for_operation` runs inside one. `start_operation` is not listed, since an operation inside a transaction keeps its output invisible until commit. A command naming a transaction itself keeps its own.
 - `start_transaction` under a transaction makes a nested one.
 - An aborted or expired transaction fails with `No such transaction` nested inside `Error resolving path …`.
 - `ping_ancestor_transactions=%true` is accepted and not needed: each handle pings its own transaction.
@@ -99,13 +96,10 @@ Observed:
 
 - `@timeout` is in milliseconds and is `Int64`: `get #<id>/@timeout` on a 30 s transaction answers `{"value"=30000;}` in text YSON. `Transaction::attach` also accepts `Uint64`.
 - The attribute is the configured timeout, not the time remaining. `attach` pings before returning; otherwise a handoff longer than `timeout × 2/3` yields a handle whose first ping arrives after expiry.
-- Three absences, three errors. `transaction_is_gone` looks for both "gone" spellings in the whole document:
-
-  | Case | Error |
-  | --- | --- |
-  | garbage id (`1-2-3-4`) | `cluster error 1: Unknown cell tag 0`, rewritten by `attach_failed` |
-  | expired or aborted id, as an object | `Error resolving path #<id>/@timeout` wrapping `No such object <id>` |
-  | the same id, pinged | `No such transaction`, code 11000 |
+- Three absences, three errors; `transaction_is_gone` looks for both "gone" spellings in the whole document:
+  - a garbage id (`1-2-3-4`): `cluster error 1: Unknown cell tag 0`, rewritten by `attach_failed`;
+  - an expired or aborted id, as an object: `Error resolving path #<id>/@timeout` wrapping `No such object <id>`;
+  - the same id, pinged: `No such transaction`, code 11000.
 
 - A detached transaction differs from a held one only in the pings that stop. `crates/ytsaurus-client/tests/transaction_lifecycle.rs` checks that against an in-process stub, timing `detach`'s join.
 - `detach` waits out an in-flight ping only up to a 30 s timeout. Its join is bounded at five seconds; a ping's budget is `clamp(interval / 2, 1 s, 120 s)` with `interval` = `max(timeout / 3, 1 s)`. The master keeps the requested timeout verbatim (`#<id>/@timeout` read back `3600000`, `30000`, `20000`; budgets 120 s, 5 s, 3.3 s), so above the default a stalled ping can outlive `detach` and restart the cluster's clock. `transaction.rs` unit tests pin both directions; the one asserting the wait ends is the only test that fails on a `drop(alive)` in the ping thread.
@@ -115,7 +109,7 @@ Observed:
 - The proxy documents the verb rule: *"If the command has an input data stream, then PUT. If the command is mutating, then POST. Otherwise GET."* `yt/yt/client/driver/driver.cpp` declares both per command, `REGISTER_ALL(command, name, inDataType, outDataType, isVolatile, isHeavy)`: `write_table` (`Tabular` in, volatile) is PUT, `create` (volatile) POST, `get` and `read_table` GET.
 - `isVolatile` and `isHeavy` are the two bits `Repeatable` encodes; `Client::raw_command` defaults to `Repeatable::Never`.
 - `whoami` is not an API v4 command: Go's `WhoAmI` uses `newAuthCall`, not `/api/v4/`. The doctest and the `raw` example use `get_supported_features` (`Null` in, `Structured` out, non-volatile, non-heavy).
-- `check_permission` and `get_supported_features` are registered and not modelled. `list_operations` and `read_file` are modelled (`Client::read_file`, `Client::read_file_streaming`).
+- `check_permission` and `get_supported_features` are registered and not modelled.
 - `get_supported_features` answers `{features=…}`. Observed keys: `compression_codecs` (71 of them), `erasure_codecs`, `node_flavors`, `operation_statistics_descriptions`, `primitive_types`, `query_memory_limit_in_tablet_nodes`, `require_password_in_authentication_commands`, `structured_web_json`, `user_tokens_metadata`.
 
 ### Reading and writing files
@@ -142,15 +136,12 @@ Observed:
 
 - A heavy read through a control proxy gets a cross-host `307` to a data proxy ([Where a heavy command goes](#where-a-heavy-command-goes)). `ureq` drops `Authorization` on it (`RedirectAuthHeaders::Never`), giving `cluster error 111: Client is missing credentials`; `redirect_auth_headers(RedirectAuthHeaders::SameHost)` does not cover cross-host.
 - `ureq` follows nothing (`max_redirects(0)` on every transport); the client decides:
-
-  | Redirect | Result |
-  | --- | --- |
-  | same origin | followed, token included |
-  | other origin (scheme, host or port), with a token | refused: `ClientError::Redirected`, naming the target |
-  | other origin, no token, with data | refused: `RedirectRefusal::Payload` |
-  | other origin, no token, no data (`Content-Length: 0` included) | followed (a bodiless `POST` carries no data) |
-  | body not resendable (`Transport::upload`'s reader: `write_table_rows`, `raw_command_upload`) | refused anywhere; following would write no rows and return `Ok(())` |
-  | longer than `MAX_REDIRECTS` | refused as a loop |
+  - same origin: followed, token included;
+  - other origin (scheme, host or port), with a token: refused with `ClientError::Redirected`, naming the target;
+  - other origin, no token, with data: refused, `RedirectRefusal::Payload`;
+  - other origin, no token, no data (`Content-Length: 0` included): followed, since a bodiless `POST` carries no data;
+  - a body that cannot be resent (`Transport::upload`'s reader: `write_table_rows`, `raw_command_upload`): refused anywhere, since following would write no rows and return `Ok(())`;
+  - longer than `MAX_REDIRECTS`: refused as a loop.
 
 - Method and body are kept on every hop, whatever the status (307/308 require it; a v4 command's verb is fixed): a bodiless `POST create` follows a balancer's `301`, a same-origin `write_table` resends its rows.
 - The chain shares the command's one deadline. A fresh `timeout_global` per hop would allow `(MAX_REDIRECTS + 1)×` the requested time: 22 minutes at the default two, on an `exists`.
@@ -173,22 +164,18 @@ Observed:
 Observed:
 
 - `abort_operation` takes `operation_id` and an optional `abort_message` (added to the error document under `Operation aborted by user request`) and answers `{}` in ~350 ms, by which time the operation is `aborted`; `aborting` is never seen.
-- Abort is not idempotent: the scheduler drops the operation once the first abort is accepted, and then answers code 200, `No such operation`. The rule is "the scheduler has dropped it", not "it is terminal": an operation that finished by itself can be aborted for the short while it is kept.
+- Abort is not idempotent: the scheduler drops the operation once the first abort is accepted, and then answers code 200, `No such operation`. An operation that finished by itself can still be aborted while the scheduler keeps it.
 - Never send an abort under a mutation ID: the master's mutation cache does not cover scheduler commands, and a flagged retry is answered `No such operation`. `Repeatable::Never`.
 
 ### Suspend, resume, complete, update
 
 Observed:
 
-| Command | Repeat | Notes |
-| --- | --- | --- |
-| `suspend_operation` | idempotent, `{}`; retried on that basis, not under a mutation ID | state stays `running`; the cluster sets a separate `suspended` attribute, read by `Client::operation_suspended` |
-| `resume_operation` | refused when not suspended: code 201, `Operation is in "running" state` | |
-| `complete_operation` | second call: code 200, `No such operation` | ends as `completed`, so output is published and a waiting launcher sees success |
-| `update_operation_parameters` | assigns; repeated freely | parameters go in the header; answers with Content-Length: 0 |
-
-- Polling `operation_state` alone never shows a pause. Once the scheduler has let go, all four answer `No such operation`.
-- `update_operation_parameters`: the registry declares its input `null`; the command reference says "structured". A top-level `{weight=2.5}` lands in every pool tree, at `runtime_parameters/scheduling_options_per_pool_tree/<tree>/weight`. An empty `parameters={}` gets 200 and changes nothing; the client refuses it.
+- `suspend_operation` is idempotent (`{}` again) and retried on that basis, not under a mutation ID. The state stays `running`; the cluster sets a separate `suspended` attribute, read by `Client::operation_suspended`. Polling `operation_state` alone never shows a pause.
+- `resume_operation` when not suspended: code 201, `Operation is in "running" state`.
+- A second `complete_operation`: code 200, `No such operation`. It ends the operation as `completed`, so output is published and a waiting launcher sees success.
+- Once the scheduler has let go, all four answer `No such operation`.
+- `update_operation_parameters` assigns, so it is repeated freely. Its parameters go in the header (the registry declares its input `null`; the command reference says "structured"), and it answers with Content-Length: 0. A top-level `{weight=2.5}` lands in every pool tree, at `runtime_parameters/scheduling_options_per_pool_tree/<tree>/weight`. An empty `parameters={}` gets 200 and changes nothing; the client refuses it.
 
 ### Finding an operation again
 
@@ -198,7 +185,7 @@ Observed:
 - `attributes=[]` gets `{}`. Omitting it gets everything: 119 KB for a one-job vanilla operation, mostly spec and progress.
 - `list_operations` answers a flat multi-key document: `{operations=[…]; incomplete=%false; pool_tree_counts={}; …; failed_jobs_count=0}`. `progress` carries `job_statistics` beside `job_statistics_v2`.
 - `list_operation_events` answers a bare list, empty without an operations archive (as locally). Only the empty list has been seen; the parser also reads `{events=[…]}` and refuses other shapes.
-- A sorted merge needs no `merge_by`: two tables sorted by `host`, merged with `mode=sorted`, complete with output `sorted_by=[host]`. `start_merge` no longer refuses it.
+- A sorted merge needs no `merge_by`: two tables sorted by `host`, merged with `mode=sorted`, complete with output `sorted_by=[host]`.
 - `get_job` answers unwrapped with `job_id`; `list_jobs` wraps in `{jobs=[…]}` with `id`. One parser reads both.
 - `get_job_input` never answers for a vanilla job: 30 s, zero bytes.
 
@@ -221,8 +208,8 @@ Observed:
 
 - **A read selection on a write is ignored and the whole table replaced, with a 200**, in both spellings: `write_table_rows("//tmp/t[#0:#2]", rows)`, and `ranges` as a typed attribute (three rows replaced by one). `TablePath::write_refusal` refuses both.
 - An unknown name in `columns` gets 200 with the key absent from every row.
-- `columns=[]` gets 200 and one empty map per row, and composes with a range: `<columns=[];ranges=[{lower_limit={row_index=0}; upper_limit={row_index=2}}]>` gave two empty maps, the same range with `key` bounds three. It counts a range's rows with no column bytes, which `@row_count` cannot, so the client sends it. (Once refused by analogy with `update_operation_parameters({})`; that is a no-op mutation, this a correct read.)
-- A negative `row_index` is clamped to 0: `{lower_limit={row_index=-5}}` returned all five rows of a five-row table, `-5..2` rows 0 and 1, `{upper_limit={row_index=-2}}` none. ("`-5..0` is answered 200 and no rows", recorded earlier, was `upper_limit=0`.) The client refuses negative bounds anyway.
+- `columns=[]` gets 200 and one empty map per row, and composes with a range: `<columns=[];ranges=[{lower_limit={row_index=0}; upper_limit={row_index=2}}]>` gave two empty maps, the same range with `key` bounds three. It counts a range's rows with no column bytes, which `@row_count` cannot, so the client sends it.
+- A negative `row_index` is clamped to 0: `{lower_limit={row_index=-5}}` returned all five rows of a five-row table, `-5..2` rows 0 and 1, `-5..0` (clamped to `upper_limit=0`) and `{upper_limit={row_index=-2}}` none. The client refuses negative bounds anyway.
 - A backwards range gets 200 and no rows in either selector (`{lower_limit={row_index=5};upper_limit={row_index=3}}`, `{lower_limit={key=[3]};upper_limit={key=[1]}}`). The client refuses both.
 - The client sends `path` as a YSON string node with attributes outside, `<columns=[n]>"//tmp/t{k}"`. A JSON-parameter `curl` sends the flat text `<columns=[n]>//tmp/t{k}`, where the string's `{k}` wins instead of the attribute. Reproduce the client's shape with `-H 'X-YT-Header-Format: <format=text>yson'` and `{path=<columns=["n"]>"//tmp/t{k}";output_format=json}`.
 - When the attribute and the string spell the same kind of selection, the attribute wins silently, at 200; different kinds compose. On a table `k,n`, YSON shape:
@@ -237,7 +224,7 @@ Observed:
   | `"<columns=["n"]>//tmp/t"` | column `n` |
   | `<ranges=[…0:2]>"<columns=["n"]>//tmp/t"` | rows 0–1, only `n` |
 
-  No combination gets a 400. The client refuses a doubled kind, sends the pairing, and refuses a string opening with `<…>`, whose attribute it cannot parse. (A recorded "two blocks → 400, *does not start with a valid root-designator*" was flat text, which this client cannot send.)
+  No combination in the YSON shape gets a 400. The client refuses a doubled kind, sends the pairing, and refuses a string opening with `<…>`, whose attribute it cannot parse. Flat text with two `<…>` blocks gets 400, *does not start with a valid root-designator*.
 - A `uint64` key column takes `{exact={key=[42]}}` and `{exact={key=[42u]}}` alike. For ranges, `Key::from(i64)` stops at `i64::MAX`: the row keyed `18446744073709551615u` came back only via `yson_build::uint`.
 - `key` and `key_bound` compare a short key differently. `key` compares the row's whole key component-wise, shorter tuple smaller when equal so far. `key_bound` truncates the row's key to the bound's length, so every row sharing the prefix compares equal. On a table keyed `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
 
@@ -253,7 +240,7 @@ Observed:
 
 ## Tracing
 
-From the cluster's source (the HTTP reference does not mention it), then observed through the response's `X-YT-Trace-Id`, which carries the adopted trace id.
+Read from the cluster's source (the HTTP reference omits it) and observed through the response's `X-YT-Trace-Id`, which carries the adopted trace id.
 
 - The proxy joins a caller's trace through the W3C `traceparent` header, `00-<32 hex trace>-<16 hex span>-<2 hex flags>`, parsed by `TryParseTraceParent` in `yt/yt/core/http/helpers.cpp`. Flags: bit 0 sampled, bit 1 debug.
 - All three official clients send it: C++ `FormatTraceParentHeader` (hard-coded `00-…-01`), Go `injectTracing`, Python `generate_traceparent` (on every request, with its own id).
@@ -283,7 +270,7 @@ Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs
   | any of them with `X-YT-Suppress-Redirect` | served by the control proxy |
 
   The split is the registry's `inDataType` column.
-- This file recorded the refusal as an HTTP 200; the source says 503. Only the error string was observed: `ClientError::Cluster` renders `{command}: cluster error {code}: {message}`, without the status.
+- Only the error string was observed: `ClientError::Cluster` renders `{command}: cluster error {code}: {message}` without the status; the statuses come from the source.
 - The documentation gives each half: the [`/hosts` section](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts) says "When you try to execute a heavy command, light proxies return code 503"; the [return-code table](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes) says "307 — Redirecting heavy queries from light to heavy proxies".
 - Only the role `control` refuses: `TCoordinator::CanHandleHeavyRequests` is `Role != "control"`, so `default` serves heavy commands.
 - A balancer fronts the control proxies, so every upload through it reaches one; with `YT_PROXY` set to an address from `/hosts`, the same examples passed.
@@ -292,17 +279,17 @@ Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs
 
 - `/hosts` answers a JSON list of bare host names, `["n0008-sas.cluster-name", …]` ([HTTP proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)), "ordered by load … the very first proxy in the resulting list is the least loaded" ([reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)); `TCoordinator::ListProxies` shuffles the better half. No scheme and usually no port: both come from the configured address.
 - The `data` role default is undocumented: `default_role_filter`, a coordinator config parameter defaulted in `TCoordinatorConfig::Register` to `NApi::DefaultHttpProxyRole`, `"data"` in [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h). An operator can change it; the client validates what it gets. `?role=`, `/hosts/all` (the only form listing banned and dead proxies) and the plain-text form (exact `Accept: text/plain`) are also source-only.
-- The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first, lazily, when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too. This replaced the ask-once pin recorded in [sdk-comparison.md](sdk-comparison.md) (#40).
+- The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first, lazily, when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too.
 - A failed heavy command drops its host from the pool; with separate roles, falling back to the configured address would reach a control proxy (#30). Only an empty pool falls back, for `HOSTS_RETRY_AFTER`; a refresh restores dropped hosts. The drop uses `retry::attributable_to_the_host`, not `worth_asking_again`: they differ on a rejected certificate, and `NotValidForName` is about one host (#40). A proxy refusing heavy work for its role is also the host's fault, which `is_retriable` cannot express; hence three predicates.
-- An empty or absent list means the configured address serves everything. A loopback cluster is not asked, since it would publish an address behind the port mapping or tunnel (reasoning only; no local `/hosts` answer was captured).
+- An empty or absent list means the configured address serves everything. A loopback cluster is not asked: it would publish an address behind the port mapping or tunnel (reasoning; no local `/hosts` answer was captured).
 
 ### Which names from `/hosts` are used
 
 The documentation does not say which hosts may receive the token (`Authorization: OAuth`). The default rule: same domain as the configured address, its scheme and port, no `://`, `/`, `@` or whitespace, and brackets only around an IPv6 literal (`ureq` 3.3 passes `[not.an.ip]` to the resolver).
 
 - The domain rule is a typo guard: whoever can steer `/hosts` already sees the token, and with no public-suffix list it trusts every tenant of a hosting platform. `Client::with_heavy_proxies_in` is a boundary; `Client::with_heavy_proxies_anywhere` removes the rule.
-- A dotless configured name (`YT_PROXY=hume`) must appear as a non-leftmost label of the discovered name; before that, `["n0008-sas.hume.yt.example.net"]` was refused in full. It needs `YT_PROXY_SUFFIX`, since `https://hume` resolves only with a resolver search list.
-- `with_heavy_proxies_under` adds named domains to the configured one: a managed installation answered `/hosts` with 79 heavy proxies in another zone, and the default rule refused all of them (`Control proxy may not serve heavy requests with input data`).
+- A dotless configured name (`YT_PROXY=hume`) must appear as a non-leftmost label of the discovered name, as in `["n0008-sas.hume.yt.example.net"]`. It needs `YT_PROXY_SUFFIX`, since `https://hume` resolves only with a resolver search list.
+- `with_heavy_proxies_under` adds named domains to the configured one: a managed installation answered `/hosts` with 79 heavy proxies in another zone, and the default rule refused all of them.
 - The Go SDK does not filter `/hosts` (`listHeavyProxies` returns it verbatim, `proxy_set.go` adds every name); `with_heavy_proxies_anywhere` matches it.
 - The examples use only `Client::from_env`, so per-cluster settings have environment variables, inert when unset: `YT_PROXY_SUFFIX`, `YT_HEAVY_PROXY_DOMAINS`, `YT_HEAVY_PROXIES_ANYWHERE`, `YT_FILE_CACHE`.
 
@@ -358,13 +345,10 @@ Observed:
   | `concurrency=1`, 8 creates then `frobnicate` | all 8 exist |
 
   `Client::execute_batch` reports the prefix it was answered for; `ClientError::BatchInterrupted` does not call it "applied".
-- A batch refused while parsing parameters runs nothing; one that reaches execution runs everything. The message tells which:
-
-  | Probe (a `create` in each request that has parts) | Message | Applied |
-  | --- | --- | --- |
-  | `concurrency=0` | `Validation failed at /concurrency` | nothing |
-  | part missing `command`; part `parameters` not a dict; `requests` not a list | `Error loading parameter /requests` | nothing |
-  | `requests` missing | `Missing required parameter /requests` | n/a |
+- A batch refused while parsing parameters runs nothing; one that reaches execution runs everything. The message tells which. Probed with a `create` in each request that has parts:
+  - `concurrency=0`: `Validation failed at /concurrency`, nothing applied;
+  - a part missing `command`, a part whose `parameters` is not a dict, or `requests` not a list: `Error loading parameter /requests`, nothing applied;
+  - `requests` missing: `Missing required parameter /requests` (no parts, so n/a).
 
 - Parts run in parallel: `create` and `exists` on one node got `%false`. Put a dependent part in a second batch.
 - A replay under one mutation id is deduplicated per part. Part *k* gets the batch's id plus *k* (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`), and every volatile part gets the batch's `retry` flag. Measured with `BatchRequest::create_table` (no `ignore_existing`):
@@ -414,5 +398,5 @@ Enabled in the operation spec:
 - `stderr_size` from `list_jobs` is a hint: several hundred bytes of stderr reported as `1`. Never use it to decide whether there is stderr to fetch.
 - A Rust panic reaches the cluster as `Process terminated by signal 6` (`panic = "abort"`); the message is in the job's stderr, which `wait_for_operation` fetches.
 - A job error's outer message is a category (`User job failed`); the cause is at the bottom of `inner_errors`. Both `ClientError` paths flatten outer plus innermost.
-- A v4 answer is keyed by what it returns; for `exists` the key is `value`, not `exists` (the wrong key failed every call for two releases). Every command whose result is read needs a call site.
+- A v4 answer is keyed by what it returns; for `exists` the key is `value`, not `exists`. Every command whose result is read needs a call site.
 - Never assert on the rendered text of a generated value. The text YSON writer leaves a string unquoted when its first byte is a letter or `_` and the rest alphanumeric or `_-.` (`ser::is_safe_unquoted`), so a mutation ID goes bare (`ebd6e011-…`) or quoted (`3f2a1b-…`) by its first hex digit: 39.8 % unquoted over 100 000 IDs, and a test matching `mutation_id="…"` failed two runs in five. Decode `X-YT-Parameters` and compare values (`tests::sent_parameters`); a fixed literal like `transaction_id="3-5d231-…"` is safe. The cluster accepts both forms.
