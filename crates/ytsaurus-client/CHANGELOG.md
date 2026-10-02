@@ -523,9 +523,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   five attempts by default, the delay doubling from one second to ten;
   `RetryPolicy::none()` turns it off. Retried: transport errors, HTTP
   429/500/502/503/504, and YTsaurus codes 3, 100, 105, 108, 904 and 2100
-  anywhere in the error document (the outer error is often a `Request retries
-  failed` wrapper), as the Python client does; never 500 (resolve) or 501 (already exists).
-  Heavy commands are sent once.
+  anywhere in the error document (the outer error is often a
+  `Request retries failed` wrapper), as the Python client does; never 500
+  (resolve) or 501 (already exists). Heavy commands are sent once.
 - Added `MutationId` and `Client::start_operation_with`; every mutating command
   carries a `mutation_id`, and `MutationId::as_retry()` marks a replay of a
   persisted one.
