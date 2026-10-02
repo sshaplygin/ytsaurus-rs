@@ -78,10 +78,11 @@ MapReduce workers in Rust, is secondary to the clients.
    --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
 5. No scope creep. Non-Linux targets are out of scope until a human decides
    otherwise. A human added custom job statistics (`JobStatistics`). A human
-   also added the RPC proxy, its row wire format and dynamic tables, in
-   `ytsaurus-rpc`, for transactions, `lookup_rows`, `select_rows` and
-   `modify_rows` only, not the other 150 request types; see
-   [docs/rpc-compatibility.md](docs/rpc-compatibility.md).
+   also brought the RPC proxy, the protobuf row format and dynamic tables into
+   scope. `ytsaurus-rpc` implements transactions, `lookup_rows`, `select_rows`
+   and `modify_rows` only, not the other 150 request types; see
+   [docs/rpc-compatibility.md](docs/rpc-compatibility.md). Dynamic tables are
+   also served over HTTP. The protobuf row format is not implemented.
 
 ## Writing
 
@@ -296,8 +297,8 @@ threshold and what is still owed are in
 is enough for everything else.
 
 Open work is in the [issue tracker](https://github.com/sshaplygin/ytsaurus-rs/issues).
-Three things need a human decision. **Do not start them without one.**
-Upstreaming to [ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk),
+Three things need a human decision. **Do not start them without one.** They
+are: upstreaming to [ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk),
 whose maintainers have
 [said PRs are welcome](https://github.com/ytsaurus/ytsaurus/issues/6);
 convergence with the yson-rs author (co-ownership, publishing, the patches);
