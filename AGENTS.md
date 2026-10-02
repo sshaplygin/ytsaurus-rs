@@ -292,9 +292,9 @@ production one (`cargo run -p ytsaurus-client --example profile`), against a
 30 % threshold, and both readings scatter 2× across rounds. Do not quote the
 10 % alone. [docs/format-comparison.md](docs/format-comparison.md) did not
 decide it: typed YSON against typed Skiff cannot be measured while Skiff has no
-typed rows. A spread from repeated production runs is still needed (#70), on a
-test cluster with real data that only a human can provide; a local Docker
-cluster is enough for everything else.
+typed rows. A spread from repeated production runs is still needed (#70); the
+harness is in-tree and the access exists, so the run only has to be done. A
+local Docker cluster is enough for everything else.
 
 Open work is tracked in issues:
 
