@@ -122,9 +122,8 @@ been relaxed.
   Bus framing and the RPC envelope are checked only against this crate's own
   encoder and a live proxy. The Go packet encoder is unexported, so closing
   this means capturing bytes off a real proxy as fixtures.
-- B, a live proxy and this crate understand each other: green.
-  `cargo run -p ytsaurus-rpc --example rpc_e2e` writes, looks up, selects and
-  deletes in the post-merge `Cluster E2E` workflow.
+- B, a live proxy accepts what this writes and this reads what it sends:
+  green. `rpc_e2e` (pinned above) writes, looks up, selects and deletes.
 - C, a differential test against the reference driver: not started. No test
   runs the same operation through `ytsaurus-rpc-driver` and compares row for
   row; agreement with the reference is from reading the Go and C++ sources.
