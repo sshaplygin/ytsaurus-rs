@@ -325,12 +325,10 @@ the strongest evidence so far that the Skiff leg is right.
 The 1.85–1.93× is a representation difference, not a format one. 79–88 % of the
 gap on the cluster (88 %, 82 % and 79 % in the three runs, moving with the Skiff
 leg's fix) and 98 % of it off the cluster lies between the two YSON legs, which
-share format, bytes, reader and serializer; typed against dynamic YSON measured
-1.61× and 1.62×. With the representation equalised, the format accounts for at
+move identical streams through the same reader and serializer and still differ
+by 1.61× and 1.62×. With the representation equalised, the format accounts for at
 most 1.66×, and on this evidence less
-([format-comparison.md](format-comparison.md#off-cluster-reproduction)). Bytes
-cannot explain it: the two YSON legs move identical streams and differ by more
-than either differs from Skiff. The read-only row moves different bytes, 54.6
+([format-comparison.md](format-comparison.md#off-cluster-reproduction)). The read-only row moves different bytes, 54.6
 MiB against 91.1 in, so it is not a clean representation comparison either.
 
 #### Skiff against typed YSON
