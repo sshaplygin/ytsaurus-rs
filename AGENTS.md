@@ -6,12 +6,14 @@ anything.
 ## What this is
 
 Rust clients for [YTsaurus](https://ytsaurus.tech), which has no official Rust
-SDK. The main product is working with tables from Rust: `ytsaurus-client` over
-the HTTP API and `ytsaurus-rpc` over the RPC proxy, behind the one interface in
-`ytsaurus-api`. The HTTP client also covers Cypress, transactions, files and
-operations. The YSON and Skiff codecs are the HTTP client's wire formats; the
-RPC client speaks protobuf. `ytsaurus-job`, a runtime for writing MapReduce
-workers in Rust, is secondary to the clients.
+SDK. The main product is working with tables from Rust. `ytsaurus-client`
+speaks the HTTP API: static tables, Cypress, transactions, files, batched
+commands and operations. Dynamic tables are reachable over HTTP and over the
+RPC proxy (`ytsaurus-rpc`) through one interface, `ytsaurus-api`'s
+`TableClient`. The HTTP client's wire formats are YSON and Skiff; the RPC
+client wraps requests in protobuf and sends rows as attachments in the YTsaurus
+row wire format, which is neither. `ytsaurus-job`, a runtime for writing
+MapReduce workers in Rust, is secondary to the clients.
 
 ## Layout
 
@@ -76,7 +78,7 @@ workers in Rust, is secondary to the clients.
    --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
 5. No scope creep. Non-Linux targets are out of scope until a human decides
    otherwise. A human added custom job statistics (`JobStatistics`). A human
-   also added the RPC proxy, the protobuf row format and dynamic tables, in
+   also added the RPC proxy, its row wire format and dynamic tables, in
    `ytsaurus-rpc`, for transactions, `lookup_rows`, `select_rows` and
    `modify_rows` only, not the other 150 request types; see
    [docs/rpc-compatibility.md](docs/rpc-compatibility.md).
@@ -246,8 +248,8 @@ not text:
 Also added: `Serialize` for `YsonValue`/`YsonNode`, `Copy` on `YsonFormat`,
 `Serializer::with_buffer`/`into_output`, and the `scan` module.
 
-The fork and the three defects are reported upstream to
-[ss123she/yson-rs](https://github.com/ss123she/yson-rs). Known
+The fork and the three defects are
+[reported upstream](https://github.com/ss123she/yson-rs/issues/1). Known
 limitations are in [`crates/ytsaurus-yson/README.md`](crates/ytsaurus-yson/README.md);
 the two that matter most: maps round-trip as values not bytes, and decoding
 into `String` fails on non-UTF-8 columns (use `serde_bytes`).
@@ -294,10 +296,12 @@ threshold and what is still owed are in
 is enough for everything else.
 
 Open work is in the [issue tracker](https://github.com/sshaplygin/ytsaurus-rs/issues).
-Three things need a human decision; do not start them without one: upstreaming
-to [ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk), whose
-maintainers have said PRs are welcome; convergence with the yson-rs author
-(co-ownership, publishing, the patches); and a public write-up of 0.3.
+Three things need a human decision. **Do not start them without one.**
+Upstreaming to [ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk),
+whose maintainers have
+[said PRs are welcome](https://github.com/ytsaurus/ytsaurus/issues/6);
+convergence with the yson-rs author (co-ownership, publishing, the patches);
+and a public write-up of 0.3.
 
 ## Non-goals
 
