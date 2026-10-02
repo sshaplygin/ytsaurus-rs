@@ -57,7 +57,7 @@ fn a_file_comes_back_byte_for_byte_and_is_checked_against_the_recorded_size() {
     // Both requests on one connection. `ureq` pools a connection only when its
     // response body was consumed, so a second connection here would mean the
     // read left its body unread — the mistake that once put 11 623 sockets in
-    // TIME_WAIT (see AGENTS.md, *Connections*).
+    // TIME_WAIT (see docs/protocol-reference.md, *Connections*).
     assert_eq!(
         stub.connections(),
         1,

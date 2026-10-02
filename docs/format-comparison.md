@@ -295,9 +295,9 @@ none of it urgent.
 
 v1.0 collects "total job CPU time". This repository already knows better:
 
-> A local cluster reports **nothing under `user_job/cpu`**, so job-CPU
+> A local cluster reports nothing under `user_job/cpu`, so job-CPU
 > comparisons cannot be run here; `time/exec` is what it does report.
-> — [`AGENTS.md`](../AGENTS.md), *Built-in statistics*
+> — [`docs/protocol-reference.md`](protocol-reference.md), *Custom job statistics*
 
 So: locally the harness collects `time/exec` and `time/total` and the report
 says *wall clock under emulation*, never "CPU". `user_job/cpu/user` is collected
@@ -750,9 +750,9 @@ widening — into the parts of that document that decide things:
   if it is unwelcome.
 - **"What has *not* been measured"** lists a C++ and a Python baseline; say what
   YQL now supplies and what it still does not.
-- **The parked Skiff entry** in [`AGENTS.md`](../AGENTS.md), which currently ends
-  "what is owed is a spread from repeated production runs, not a third single
-  number" — this plan owes that spread too, and should not add a third single
+- **The Skiff entry** under *Status* in [`AGENTS.md`](../AGENTS.md#status), which says
+  "a spread from repeated production runs is still needed (#70)" — this plan
+  owes that spread too, and should not add a third single
   number to it.
 - **[`skiff-compatibility.md`](skiff-compatibility.md) required test 4** — note
   what the Skiff leg did and did not exercise. One input, one output, no key

@@ -437,7 +437,7 @@ fn a_skiff_read_refuses_a_second_column_selection() {
 fn a_write_with_a_read_selection_is_refused_before_anything_is_sent() {
     // The decision this crate makes about columns and ranges on a write:
     // refuse locally. The cluster's answer is to ignore them and replace the
-    // whole table with a 200 — measured, and recorded in AGENTS.md — so
+    // whole table with a 200 — measured, and recorded in docs/protocol-reference.md — so
     // sending them is silent data loss with nicer syntax. The client points
     // at an address that answers nothing: had a request been attempted, the
     // error would be Transport, not Config.
