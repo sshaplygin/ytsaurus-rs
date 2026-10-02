@@ -205,9 +205,9 @@ exits non-zero if the operation succeeds.
 
 ## Last run
 
-On `ghcr.io/ytsaurus/local:stable` (Docker on macOS/arm64, x86_64 image under
-emulation) unless another cluster is given. `run_e2e.sh` and `diagnose` ran on
-2026-08-04; other dates are given where known.
+On `ghcr.io/ytsaurus/local:stable` unless another cluster is given.
+`run_e2e.sh` and `diagnose` ran on 2026-08-04, Docker on macOS/arm64 with the
+x86_64 image under emulation; other dates are given where known.
 
 `run_e2e.sh`:
 
