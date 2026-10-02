@@ -12,13 +12,11 @@ The Go version is pinned in [`tests/skiff-go-interop/go.mod`](../tests/skiff-go-
 Moving it means changing this document, the Go vectors and the bidirectional
 test results together, never just because a newer module exists.
 
-Go is the executable reference; C++ is the normative one. `library/cpp/skiff`
-is what a cluster links and what the job proxy writes with, and Go implements
-a subset of it: no `int128`/`int256` codec, no `$sparse_columns`, no
+Go is the executable reference; C++ is the normative one. A cluster links
+`library/cpp/skiff` and its job proxy writes with it; Go implements a subset: no `int128`/`int256` codec, no `$sparse_columns`, no
 `$other_columns`. A green Go gate is necessary, not sufficient, and where the
 two disagree C++ decides. [`tests/skiff-cpp-interop/`](../tests/skiff-cpp-interop/)
-compares against C++ through a wheel, not an Arcadia build; its limits, and
-what only a cluster reaches, are in its README and
+compares against C++ through a wheel; its limits are in its README and
 [the full-support plan](./skiff-full-support-plan.md).
 
 ## Compatibility matrix
@@ -38,7 +36,7 @@ what only a cluster reaches, are in its README and
 | `SkiffJobWriter` | Implemented for dynamic rows | one single-table Skiff stream per descriptor; input-only system fields rejected; real `skiff_cat` worker e2e |
 | Shared worker/client format selection | Implemented | non-exhaustive `DataFormat` enum drives worker I/O, operation specs, and direct table I/O; YSON and Skiff remain explicit row representations |
 | Map / map-reduce / reduce / vanilla Skiff operation formats | Implemented | rendered spec tests for map, mapper, reducer and vanilla task; a format whose table-schema count cannot describe the operation's tables is refused before the spec is sent; binary YSON remains the default |
-| Skiff table client I/O | Implemented; the single-table map path is cluster-verified, at nine columns and 412 554 rows | mock-proxy request-shape/truncation tests; `skiff_launch` and `format_compare` on real clusters, described below. Both are one input table and one output descriptor; the multi-table shapes of required test 5 and the Go-against-the-cluster half are still required. |
+| Skiff table client I/O | Implemented; single-table map path cluster-verified, and run at nine columns and 412 554 rows on the local cluster | mock-proxy request-shape/truncation tests; `skiff_launch` on a managed multi-node cluster, `format_compare` on the local Docker cluster under arm64 emulation (below). Both are one input table and one output descriptor; required test 5's multi-table shapes and Go against the cluster are still required. |
 
 No typed row codec or inference API is claimed compatible until its gate is
 green; the dynamic APIs stay pre-release until the real-cluster and
@@ -48,20 +46,19 @@ bidirectional Go gates below are.
 
 `skiff_launch`, on a managed multi-node cluster on 2026-08-09: a Skiff stream
 written, mapped and read back, both rows compared element by element,
-including non-UTF-8 `string32`. This verifies the dynamic Skiff map path end
-to end, previously checked only against a mock proxy and a local worker. A
-one-table, one-output map emits no table, row or range indexes, key switches
-or extra descriptors, and the Go side ran only against checked-in vectors, so
-the claim is "the dynamic Skiff map path is cluster-verified", not "Skiff is
-cluster-verified".
+including non-UTF-8 `string32`. It verifies the dynamic Skiff map path end to
+end, previously checked only against a mock proxy and a local worker. A
+one-table, one-output map emits no indexes, key switches or extra descriptors,
+and Go ran only against checked-in vectors, so the claim is "the dynamic Skiff
+map path is cluster-verified", not "Skiff is cluster-verified".
 
-`format_compare`'s `project` task, on 2026-08-13/14: a Skiff map over
+`format_compare`'s `project` task, on 2026-08-13/14, on the single-node local
+Docker cluster running x86-64 images under arm64 emulation: a Skiff map over
 412 554 rows / 48 MiB in one job, nine mixed-type columns, a `Variant8`
 optional column, `string32` columns that are deliberately not UTF-8, and a
 hand-written positional schema. Its decoded output was diffed row for row
 against a typed-serde YSON leg, a `YsonValue` leg and a YQL query at the start
-of each of three nine-round runs, before any clock was read; all four agreed
-each time. That diff was exact and order-sensitive, and the matrix row rests
+of each of three nine-round runs, before any clock was read; all agreed. That diff was exact and order-sensitive, and the matrix row rests
 on it. The harness now compares sorted canonical binary-YSON encodings as a
 multiset, so a re-run confirms presence, absence and multiplicity, not order.
 
@@ -77,9 +74,8 @@ required test 5.
 
 1. C++ corpus. `cargo test -p ytsaurus-skiff --test cpp_interop` asserts this
    crate against the checked-in C++ bytes in both directions, in CI.
-   Regenerating them is manual, when the pin in `requirements.txt` moves, since
-   CI does not install the bindings; see
-   [its README](../tests/skiff-cpp-interop/README.md). This is the normative
+   Regenerating them is manual, when the `requirements.txt` pin moves
+   ([README](../tests/skiff-cpp-interop/README.md)). This is the normative
    gate as far as it reaches: where it and the Go corpus disagree, it is right.
 2. Go corpus. `(cd tests/skiff-go-interop && go test ./...)` compiles the
    pinned SDK and verifies its reference vectors: the small `Variant16` /
@@ -100,8 +96,7 @@ required test 5.
 5. Cluster fixtures. Capture raw Skiff streams from real jobs, covering table
    indexes, row/range indexes, key switches and multiple output descriptors.
    Open: `skiff_launch` (2 rows, 2 columns) and `format_compare` (412 554
-   rows, nine columns) are each one input table and one output descriptor, so
-   they cover none of the four. `format_compare` was scoped to one output so a
+   rows, nine columns) each have one input table and one output descriptor. `format_compare` was scoped to one output so a
    failure in this open ground could not be measured as slowness. Next is a
    two-input, two-output Skiff shape, as `cat --tables 2` is for YSON, which
    needs no Go on the cluster.
