@@ -22,7 +22,8 @@ First release. The version tracks the workspace. Published because
   describes: one column per field, in declaration order, the Rust type deciding
   the column type and `Option<T>` alone making a column optional. The types it
   targets (`TableSchema`, `Column`, `ColumnType`) live in
-  [`ytsaurus-client`](../ytsaurus-client/), which re-exports the derive.
+  [`ytsaurus-client`](../ytsaurus-client/), which re-exports the derive under
+  its `derive` feature.
 - Refused at compile time, instead of as error 314 from a create: key columns
   that are not a prefix, `unique_keys` with no key, duplicate column names,
   `Option<Option<T>>`, and a Rust type with no unambiguous column type.
