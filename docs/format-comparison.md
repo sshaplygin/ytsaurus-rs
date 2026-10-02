@@ -38,8 +38,8 @@ allocator. This comparison did not decide whether Skiff should be the default.
   cluster reports nothing under `user_job/cpu`. A production run is still owed
   (#70), and so is required test 5 (cluster fixtures) of
   [`skiff-compatibility.md`](skiff-compatibility.md).
-- The prediction recorded before the runs was refuted in three of its four
-  parts.
+- Of the four parts of the prediction recorded before the runs, two were
+  refuted, one was refuted in part and one held.
 
 ### The prediction and the outcome
 
@@ -501,7 +501,7 @@ computation attached.
 | --- | --- |
 | Scope | Rust-versus-YQL → four legs on one task, so the YQL numbers enter the Skiff decision |
 | Added | legs 2 and 3 and their worker modes; leg 2 added a larger confound than it removed |
-| Added | the pre-registered prediction, refuted in three of four parts |
+| Added | the pre-registered prediction ([outcome](#the-prediction-and-the-outcome)) |
 | Task | wordcount + full sessionize → *project-and-filter* (the pilot's map, one output) for the four-way comparison; the other two stay YSON-versus-YQL, inside phase 1 |
 | Constraint | one input, one output, no key switch: the only Skiff shape verified on a cluster |
 | Metric | job CPU → `time/exec` locally, `user_job/cpu/*` only where the cluster reports it |
