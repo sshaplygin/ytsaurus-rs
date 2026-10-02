@@ -42,7 +42,7 @@ launcher, plus example workers that build as fully static
 
 | Path | What it is |
 | --- | --- |
-| [crates/](crates/) | The nine crates above. [`ytsaurus-yson`](crates/ytsaurus-yson/) is a fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`; [`ytsaurus-job`'s examples](crates/ytsaurus-job/examples/) are the nine runnable worker binaries; `ytsaurus-rpc` is async on tokio, unlike the rest; `ytsaurus-proto` is generated from the `third_party/ytsaurus` submodule and committed. |
+| [crates/](crates/) | The nine crates above. [`ytsaurus-yson`](crates/ytsaurus-yson/) is a fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`; `ytsaurus-job` is a streaming row reader, control records and multi-table output, and [its examples](crates/ytsaurus-job/examples/) are the nine runnable worker binaries; `ytsaurus-rpc`, for dynamic tables under concurrency, is async on tokio, unlike the rest; `ytsaurus-proto` is generated from the `third_party/ytsaurus` submodule and committed. |
 | [xtask/](xtask/) | `cargo xtask generate-protos`, the one task that has to be Rust (`prost-build` is a Rust library). Never published. |
 | [scripts/](scripts/) | The rest of the automation, in Python: the CI checks below and the benchmark comparison posted on pull requests. |
 | [docs/](docs/) | Guides: writing a job, benchmarks, the protocol reference, and comparisons with the official C++ and Go clients. |
@@ -188,11 +188,10 @@ library crates; see the comment in [Cargo.toml](Cargo.toml).
 
 ## Status
 
-The codec, the job runtime, the client and the example workers are implemented
-and verified against a cluster. The ranked backlog is done, from job diagnostics
-to the full operation lifecycle, and each item has an example that checks
-itself on a cluster; [`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md)
-lists what has been run and what it reported.
+The ranked backlog is done, from job diagnostics to the full operation
+lifecycle, and each item has an example that checks itself on a cluster;
+[`tests/cluster-e2e/README.md`](tests/cluster-e2e/README.md) lists what has been
+run and what it reported.
 
 [`docs/sdk-comparison.md`](docs/sdk-comparison.md) compares this client with
 the official C++ and Go ones area by area; [`docs/go-parity.md`](docs/go-parity.md)
