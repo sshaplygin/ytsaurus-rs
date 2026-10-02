@@ -84,7 +84,7 @@ Skiff map succeeded: 2 rows
 That verifies the dynamic Skiff map path only: one table, one output
 descriptor, no table, range or row indexes, no key switch. Required test 4 of
 [`docs/skiff-compatibility.md`](../../docs/skiff-compatibility.md) needs all of
-those and is still open.
+those, and this run covers none.
 
 ### YQL, through the escape hatch
 
@@ -109,8 +109,8 @@ operations per query: 2 — see the paths above for where the ids appear
 ```
 
 A repeated query is served from cache and spawns no operations, so every timing
-needs `PRAGMA yt.QueryCacheMode = "disable"`. A YQL job here needs a little
-more than YQL's 545 MB default memory: 576M fails, 640M passes, hence
+needs `PRAGMA yt.QueryCacheMode = "disable"`. A YQL job here does not fit
+YQL's 545 MB default memory limit: 576M fails, 640M passes, hence
 `PRAGMA yt.DefaultMemoryLimit = "640M"` for a `map_reduce` stage. Both are in
 the example's `PRAGMAS`. It prints where each spawned operation's id appears
 in the `get_query` answer (`progress/yql_progress/<node>/remoteId`,
@@ -141,12 +141,12 @@ scripts/build-worker.sh wordcount
 cargo run --release -p ytsaurus-client --example format_compare
 ```
 
-`yt remove //tmp/ytsaurus_rs_compare --recursive` clears the tables it leaves. Every leg that
-produces rows is diffed against the first before any clock is read, so a run
-that reports timings is one whose legs agreed. Expect about a minute a round per
-leg on the local cluster at 48 MiB, and read the *paired by round* block, not
-the `vs first` columns. The `project` task needs a YQL agent, so run
-[the YQL check](#yql-through-the-escape-hatch) first on a fresh cluster.
+`yt remove //tmp/ytsaurus_rs_compare --recursive` clears its leftover tables.
+Every leg that produces rows is diffed against the first before any clock is
+read, so a run that reports timings is one whose legs agreed. Expect about a
+minute a round per leg on the local cluster at 48 MiB, and read the *paired by
+round* block, not the `vs first` columns. The `project` task needs a YQL agent,
+so run [the YQL check](#yql-through-the-escape-hatch) first on a fresh cluster.
 
 ### Without the `yt` CLI
 
@@ -205,9 +205,9 @@ exits non-zero if the operation succeeds.
 
 ## Last run
 
-All checks passed against `ghcr.io/ytsaurus/local:stable` on 2026-08-04 (Docker
-on macOS/arm64, x86_64 image under emulation) unless another date or cluster is
-given.
+On `ghcr.io/ytsaurus/local:stable` (Docker on macOS/arm64, x86_64 image under
+emulation) unless another cluster is given. `run_e2e.sh` and `diagnose` ran on
+2026-08-04; other dates are given where known.
 
 `run_e2e.sh`:
 
@@ -272,14 +272,14 @@ operation ID; a fresh mutation ID starts a second one.
 Re-sending a `mutation_id` without the `retry` flag is refused with
 `Duplicate request is not marked as "retry"`; `MutationId::as_retry()` sets it.
 
-`cached_upload`, with a 491 KiB worker: the first upload took 166 ms, the second
-was a cache hit in 32 ms finding the same file under
-`//tmp/yt_wrapper/file_storage/new_cache/`, and the identity map reproduced its
-input from the cached binary, which keeps its `executable` attribute and the name the command
-expects.
+`cached_upload`, with a 491 KiB worker (the gap grows with the binary): the
+first upload took 166 ms, the second was a cache hit in 32 ms finding the same
+file under `//tmp/yt_wrapper/file_storage/new_cache/`, and the identity map
+reproduced its input from the cached binary, keeping its `executable` attribute
+and expected name.
 
-`statistics`: seven rows in, three of them without a `key` column, which the
-job drops. The operation succeeds; only the statistic shows the dropped rows:
+`statistics`: seven rows in, three of them without a `key` column, which the job
+drops. The operation succeeds; only the statistic shows the dropped rows:
 `rows/read` 7, `rows/rejected` 3, `bytes/read` 147, each filed as
 `{"$"={completed={map={count=1;max=…;min=…;sum=…}}}}`.
 
@@ -322,8 +322,8 @@ its single row. A write naming a row range and a write whose path string spells
 one were both refused, leaving 5 rows. Why `key` and `key_bound` disagree on a
 prefix: [protocol reference](../../docs/protocol-reference.md#selecting-columns-and-rows-on-a-path).
 
-`table_usage` and `cluster_info` (the Go SDK's `table-usage` and
-`cypress-example`): 100 contacts written as Rust values; `row_count` 100, which
+`table_usage` and `cluster_info` (Go's `table-usage` and `cypress-example`):
+100 contacts written as Rust values; `row_count` 100, which
 the attribute map read into a one-field struct agrees with; all 100 read back
 equal, in order. A struct naming one column reads 100 names (the first
 `Some("Gopher 0")`) but cannot write: the row lacks three required columns,
@@ -333,7 +333,7 @@ value`. The cluster, created at 2026-08-04T16:42:47.385970Z and calling itself
 not fit is an error naming the path, not a panic:
 `get: … invalid type: string "2026-08-04T16:42:47.385970Z", expected u64`.
 
-`transaction` runs `launch`'s map so that nothing exists until commit. A table
+`transaction` runs `launch`'s map so nothing exists until commit. A table
 created in transaction `4-29da-10001-6f45` is seen inside it and not outside;
 aborting leaves nothing; a launcher that fails halfway loses its half-written
 table with no cleanup code, `?` dropping the handle. After the operation
@@ -356,10 +356,10 @@ hand, at 74.7 MiB. Streaming cost 1.0 MiB of peak RSS, reading it in 70.9 MiB.
 `ru_maxrss` is a high-water mark, so no spike hides in these figures.
 
 `cypress`: dated runs, a `latest` link, three transactions competing for one
-lock. `list` returned `["2026-08-02", "2026-08-03", "2026-08-01"]`; listing a
-table failed, `list: cluster error 103: "List" method is not supported`. A second
-copy was refused, `copy: cluster error 501: Node … already exists`;
-`copy_replacing` overwrote it; a move left nothing behind.
+lock. `list` returned `["2026-08-02", "2026-08-03", "2026-08-01"]`, unsorted;
+listing a table failed, `list: cluster error 103: "List" method is not
+supported`. A second copy was refused, `copy: cluster error 501: Node … already
+exists`; `copy_replacing` overwrote it; a move left nothing behind.
 `latest&/@target_path` was `…/runs/2026-08-01` while `latest/@type` was the
 target's `table`. A staging table moved over the live one in a transaction was
 invisible until the commit. The second exclusive lock was refused naming the
@@ -412,9 +412,9 @@ tests/cluster-e2e/capture_fixtures.sh
 
 Runs a map whose output format is text YSON while its input stays binary, so a
 shell one-liner can base64 the raw job stream into one row, then re-runs the
-offline test on the fresh bytes. `generate_fixtures.py` still builds the table payloads
-(`table_rows_*.bin`) from the specification, and a test checks they stay
-reproducible. Only the job-input framing is captured, because it is the
+offline test on the fresh bytes. `generate_fixtures.py` still builds the table
+payloads (`table_rows_*.bin`) from the specification, and a test checks they
+stay reproducible. Only the job-input framing is captured, because it is the
 cluster's to define.
 
 Capturing corrected two errors in the earlier hand-built fixture, both now
