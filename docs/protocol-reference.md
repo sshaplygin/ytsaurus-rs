@@ -38,7 +38,7 @@ Observed in a job: `YT_JOB_ID`, `YT_OPERATION_ID`, `YT_JOB_COOKIE`, `YT_JOB_INDE
   The name is one key, slash included; below it `$`, job state, job type, aggregate.
 - `Client::statistic_sum` totals the `completed` state across job types; an aborted job's work is redone by its replacement.
 - `JobStatistics` writes fd 5 only when `is_inside_job()`; in a launcher fd 5 may be a socket.
-- Built-in statistics are stored differently, hence `Client::job_statistic_sum`: the name nests by path component (`time` → `exec`) and the state separator is `$$`. A local cluster reports nothing under `user_job/cpu`; it reports `time/exec`.
+- Built-in statistics are stored differently, hence `Client::job_statistic_sum`: the name nests by path component (`time` → `exec`) and the state separator is `$$`. A local cluster reports nothing under `user_job/cpu`, so job-CPU comparisons cannot be run here; `time/exec` is what it does report.
 
 ## Table schemas
 

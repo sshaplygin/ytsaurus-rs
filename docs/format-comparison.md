@@ -295,7 +295,7 @@ none of it urgent.
 
 v1.0 collects "total job CPU time". This repository already knows better:
 
-> A local cluster reports **nothing under `user_job/cpu`**, so job-CPU
+> A local cluster reports nothing under `user_job/cpu`, so job-CPU
 > comparisons cannot be run here; `time/exec` is what it does report.
 > — [`docs/protocol-reference.md`](protocol-reference.md), *Custom job statistics*
 
