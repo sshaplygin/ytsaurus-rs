@@ -104,7 +104,7 @@ writes one table
 | Variable | What it does |
 | --- | --- |
 | `YT_PROXY` | The cluster address. A bare host name means `https://`. Required. |
-| `YT_TOKEN`, `YT_TOKEN_PATH` | The token, found as the `yt` CLI finds it: `YT_TOKEN`, then the file named by `YT_TOKEN_PATH`, then `~/.yt/token`. A token read from a file is trimmed, so a trailing newline does not fail authentication. |
+| `YT_TOKEN`, `YT_TOKEN_PATH` | The token, found as the `yt` CLI finds it: `YT_TOKEN`, then the file named by `YT_TOKEN_PATH`, then `~/.yt/token`. A token read from a file is trimmed. |
 | `YT_CA_BUNDLE` | A PEM file of roots to trust instead of the compiled-in Mozilla bundle. Read by the transport once per process, so `Client::new` uses it too. See [TLS](#tls). |
 | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Applied only to a name with no dot, no colon and no `localhost`, the Go SDK's gate. No suffix is compiled in. |
 | `YT_HEAVY_PROXY_DOMAINS` | `Client::with_heavy_proxies_under`, comma- or space-separated. |
@@ -114,6 +114,11 @@ writes one table
 The last four are inert when unset; a machine that sets none gets what
 `Client::new` gives. A variable set to an empty string is unset
 (`export YT_FILE_CACHE=` turns one off), `YT_PROXY` included.
+
+Responses, streamed reads included, are gzip-decompressed on arrival. Uploads
+are not compressed: that needs a compression dependency in a crate
+cross-compiled to musl
+([figures](../../docs/protocol-reference.md#authentication-and-compression)).
 
 ### TLS
 
@@ -140,9 +145,6 @@ Other TLS errors are retried: an expired certificate (a fleet mid-rotation may
 answer with a renewed one), and a platform verifier's `Other(…)`, which is how
 `rustls-platform-verifier` reports a failed revocation lookup or a briefly
 unavailable trust store. So is a reset connection.
-
-Responses are gzip-compressed; uploads are not, which would need a compression
-dependency in a crate cross-compiled to musl.
 
 ## Features
 
@@ -172,8 +174,6 @@ let root: ClusterInfo = client.get_as("//@")?;
 rows cost one buffer. `read_table_rows` returns the whole table as owned
 rows; a struct naming three of twenty columns is a projection. For larger tables
 see [`read_table_streaming`](#tables-bigger-than-memory).
-[`docs/go-parity.md`](../../docs/go-parity.md) compares the API with the Go
-SDK's examples.
 
 ## Typed tables
 
