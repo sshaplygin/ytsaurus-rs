@@ -43,6 +43,11 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 - **Breaking** `ClientError` is `#[non_exhaustive]`: a `match` over it needs a
   `_` arm. Naming, constructing and destructuring a variant are unaffected.
+- **Breaking** `Repeatable` gained a variant, `Heavy`, and
+  `#[non_exhaustive]`: an exhaustive `match` needs a `_` arm.
+- **Breaking** `Client::remove` sends the cluster's defaults (the node must
+  exist, a map node must be empty) instead of `recursive=%true; force=%true`.
+  To delete a subtree or tolerate absence, call `Client::remove_tree`.
 - **Breaking** `CachedFile` gained a `cached` field. Code that destructures
   every field needs `..`; matching by name or reading fields is unaffected.
 - **Breaking** a write to a path carrying a read selection is refused locally
@@ -322,604 +327,132 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   15 s; they are reported at once. Every other TLS failure, a reset or refused
   connection and a timeout are still retried.
 
-### Heavy commands go to a heavy proxy, without being asked to
-
-`Client::heavy_proxy` has always worked, and **nothing ever called it**. Every
-heavy command — `write_table`, `write_file`, `read_table`, `upload_worker`,
-`write_table_rows`, the streaming forms of each — went to whatever `YT_PROXY`
-held, which on an installation that separates proxy roles is a control proxy,
-and a control proxy refuses one. Run against a real multi-node cluster rather
-than a local Docker one, that failed **19 of the 21 shipped examples** at their
-first table write ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
-
-- **Added** automatic routing. The first heavy command asks `/hosts`, the
-  answer is kept for the client's lifetime and shared by every clone of it, and
-  a heavy command that fails for a reason another proxy might not have gives up
-  the host it used for the next name in that same answer. The failed command
-  itself is not re-sent: heavy commands are not retried, and by then a streamed
-  body is gone.
-
-- **A failure moves to the next proxy, not back to the configured address.**
-  The first cut of this feature had no ban list — Go's has one, and its absence
-  was disclosed in `docs/sdk-comparison.md` rather than reconsidered — so one
-  transient 503 from a draining data proxy, or one refused connection during a
-  restart, sent the next ten seconds of heavy commands to the address the
-  caller configured. On the deployment this whole feature was written for that
-  address is a balancer in front of the **control** proxies, which refuse every
-  heavy command with input data: the fallback reproduced [#30] on demand, once
-  per hiccup, and heavy commands are not retried, so every command in the
-  window failed. `/hosts` had already named the alternatives. Now the answer is
-  kept whole, best first, the failed host is dropped, and only an answer whose
-  every name has failed falls back to the configured address — for ten seconds,
-  and then the cluster is asked again.
-
-  A proxy that refuses heavy work **because of the role it has** is given up
-  the same way. `/hosts` lists whatever `default_role_filter` says, which is a
-  coordinator config parameter rather than a guarantee, so a control proxy can
-  appear in it; its refusal is a cluster error that no retry could ever fix and
-  that asking the coordinator again fixes immediately — which is exactly the
-  distinction `worth_asking_again` was split out for.
-
-- **Added** `Client::with_heavy_proxies_in`, a list of proxies written out by
-  hand. The domain rule below is a guard against a typo, not a boundary; and
-  `with_heavy_proxies_anywhere` was all-or-nothing, so the only cure for a rule
-  that missed by one label was to remove the rule. Names are compared without
-  case, and with a port only where both sides name one.
-
-- **Added** `Client::with_hosts_timeout` and `Client::with_hosts_retry_after`.
-  The lookup budget was `min(800 ms, the client's own timeout)`, so
-  `with_timeout` could only ever lower it and a cluster answering `/hosts` in
-  900 ms was unroutable by any configuration at all — while the first heavy
-  command, which is often a client's first request, pays DNS, TCP and a TLS
-  handshake out of the same 800 ms. The retry window is settable for a smaller
-  reason that turned out to matter: at a fixed ten seconds no test outlived one,
-  so `HeavyProxy::Configured` and `HeavyProxy::FellBack` were observationally
-  identical and either could be written where the other was with the whole suite
-  green. Both are now pinned by a test that sets the window to nothing.
-
-- **A `/hosts` answer this client declines in full is announced**, once, naming
-  what was refused and why — on stderr, or as a `WARN` event where the `tracing`
-  feature is on, and muted inside a job like every other thing this client says.
-  And when a heavy command is then refused at the configured address, the
-  cluster's `Control proxy may not serve heavy requests with input data` carries
-  the sentence the cluster cannot know: that this client asked, declined the
-  answer, and which builder call changes that. Silence there was the whole
-  failure mode — the operator gets back the error from #30 with nothing to
-  connect it to.
-
-  The refusal that prompted this is not hypothetical. `Client::new("hume")` — a
-  bare cluster name, which `Transport::new` supports on purpose and which is how
-  `YT_PROXY` is usually written — has no parent domain to take a leftmost label
-  off, so the rule degenerated to "the name itself" and refused
-  `["n0008-sas.hume.yt.example.net"]` in full, permanently and in silence. A
-  configured name with no dot is now matched as a **label** of the discovered
-  name, and not as its leftmost one: `hume` follows
-  `n0008-sas.hume.yt.example.net` and not `hume.evil.com`. The same break was
-  waiting in Kubernetes for anyone addressing the service by its short name.
-
-- **A bracketed name has to hold an IPv6 literal.** The rule was "an unbracketed
-  name with more than one colon is refused", which waved through anything that
-  started with `[`. Probed against `ureq` 3.3:
-  `https://[n0132.example.com]evil.attacker.com` parses with the host
-  `[n0132.example.com]` — the brackets are stripped only for a literal — so the
-  token went nowhere, and the cost was worse than a leak of nothing. The address
-  was remembered, every heavy command failed to resolve it, and (before the ban
-  list above) the failure repeated for as long as the client lived. A port is
-  now digits on either shape of name, too.
-
-[#30]: https://github.com/sshaplygin/ytsaurus-rs/issues/30
-
-- **The classification is the one the crate already had.** `Repeatable` encodes
-  the two bits the cluster's own command registry declares, `isVolatile` and
-  `isHeavy`, and `Repeatable::Never` was carrying both "heavy" and "mutating
-  where no mutation cache covers it". Those are now `Repeatable::Heavy` and
-  `Repeatable::Never`, so the heavy commands are the ones already marked heavy
-  rather than a second list beside the first, free to drift from it. The two
-  streaming seams — `Transport::open` and `Transport::upload` — are heavy by
-  construction, so a raw streaming command is routed too.
-
-  **Breaking** `Repeatable` gained a variant *and* `#[non_exhaustive]`. Code
-  that matches it exhaustively needs a `_` arm — and will not need another one
-  the next time the registry earns a name here.
-
-- **A discovered host is checked rather than pasted**: same domain as the
-  configured address (or the configured host itself), scheme and port from the
-  configured address, and no `://`, `/`, `@` or whitespace. Measured on the
-  first cut of this feature: `http://n0132` from an `https://` client stripped
-  TLS and put the token on the wire in cleartext, `real.example.net@evil.example.net`
-  connected to `evil.example.net`, and a configured `:8443` was dropped.
-  A refused name is passed over and the rest of the list tried; a `/hosts`
-  answer refused entirely leaves the upload going where it went before there
-  was a lookup.
-
-  **What the domain rule is worth** was overstated when it landed, and is worth
-  stating plainly instead. It is a guard against a typo in a configuration and
-  against an obviously foreign name — not what keeps the token where the caller
-  put it. Steering a heavy command with a `/hosts` body means controlling that
-  body: over `https://` that is owning the proxy, which has the token already,
-  and over `http://` it is being a man-in-the-middle, who reads the token out of
-  every light command without coming near this code. The threat it does cover is
-  a proxy registering itself in the coordinator under an unintended name, and
-  even there it is coarse, because a suffix rule with no public-suffix list
-  behind it — a dependency deliberately not taken — reads
-  `yt-1234.us-east-1.elb.amazonaws.com` as sharing a domain with every other
-  load balancer in the region. The scheme, the port and the `@`/`/`/`://`
-  refusals are the parts that hold up on their own.
-
-  **Added** `Client::with_heavy_proxies_anywhere`, the opt-in for an
-  installation whose `/hosts` genuinely names another domain. It relaxes the
-  domain rule and nothing else.
-
-- **The lookup has its own budget**: one attempt bounded by 800 ms, not the
-  client's five attempts of up to two minutes with fifteen seconds of backoff
-  between them — all of which used to run while holding the lock every other
-  heavy command wants. Measured: a `/hosts` answering 503 cost a heavy command
-  **15.03 s**, and one that accepted the question and never answered cost it
-  **615 s**. Both are now under a second (3 ms and 804 ms). A lookup that failed
-  for a reason that might pass leaves the configured address in use for ten
-  seconds and is then asked again, which is the same retry spread out where it
-  queues nobody: **eight threads against a hanging `/hosts` took 240 s and
-  performed 40 lookups, and now take 809 ms and perform one.** Eight threads
-  against a healthy one still ask exactly once, which they already did.
-
-- **A heavy proxy that cannot be reached is given up.** Before, the answer was
-  thrown away, the same question asked, the same dead host resolved, and every
-  upload for the rest of the client's life failed the same way — the shipped
-  test asserted exactly that. The measured trigger is ordinary: a single-node
-  container reached from the host is not on loopback (`172.17.0.2`), so
-  discovery runs and `/hosts` answers with a container-internal name. Now the
-  first upload fails, the next name in the answer takes over, and when there is
-  none the second upload succeeds against the configured address with the
-  cluster asked again ten seconds later.
-
-- **A cluster that names no heavy proxy keeps serving them itself.** That is
-  what leaves a single-node installation working exactly as it did, and an
-  absent `/hosts` (404) is remembered as such so it is not asked again before
-  every upload. So is a body that is not a list of host names, and so is an
-  answer whose every name was refused.
-
-- **A cluster on loopback is not asked at all**, which is the other half of
-  leaving local alone: `localhost` is this machine's own cluster or a tunnel to
-  one, and the address a proxy publishes for itself is not reachable from the
-  near end of either. Following it would break every upload that works today,
-  and the round trip could not have helped in the first place.
-  **Added** `Client::with_proxy_discovery` to override that in both directions
-  — on for a port-forward into a real installation, off to pin everything to
-  the address given. With it off, a heavy failure now takes no lock and reads
-  no state, rather than mutating an answer the client will never look at.
-
-- **A routed failure names the host it went to.** `write_table: transport
-  error: io: Connection refused` is a true report about an address that appears
-  nowhere in the caller's own code — the client chose it, out of a list the
-  cluster gave it, and then said nothing about the choice. It now reads
-  `write_table at n0132-sas.example.net:9013: …`.
-
-- **"Would waiting help?" and "would asking again help?" are two questions**,
-  and `retry::is_retriable` was being asked both. The second is now
-  `worth_asking_again`, used by the two places that decide whether to keep or
-  discard what `/hosts` said. They agree on every failure this release can
-  produce; the point of splitting them is the ones the next release can — a
-  refused redirect is worth asking again and a rejected certificate is not, and
-  neither answer is the retry policy's.
-
-- **Corrected** what this crate said about the refusal, twice over. The claim
-  that it is "not a 503, it is an HTTP 200" was never observed: `ClientError`
-  renders a cluster error without its status, so a 503 carrying an `X-YT-Error`
-  header looks exactly like a 200 carrying one. The cluster's own rule
-  (`TContext::TryRedirectHeavyRequests`) splits on whether the request carries
-  input data — a heavy **write** gets 503 with `Retry-After: 60` and the string
-  `Control proxy may not serve heavy requests with input data`, a heavy **read**
-  gets a **307** to a data proxy — and the documentation gives one half in its
-  `/hosts` section and the other in its return-code table. Only the error string
-  is first-hand here. "`/hosts` defaults to the `data` role" was asserted with
-  no citation and now has one: it is `default_role_filter`, a coordinator config
-  parameter whose compiled-in default is `data`, so an operator can change it.
-  And a deployment **behind a balancer is the case that breaks**, not the case
-  that works — the balancer fronts the control proxies. `heavy_proxy` remains,
-  no longer as the escape hatch that makes an upload work but as the way to see
-  the address or hand it to something that is not this client.
-
-- **Not done, and written down instead:** the documentation asks for `/hosts` to
-  be re-queried "every minute or every few queries", and both official clients
-  do. This one asks once per client and then walks the answer it was given,
-  asking again only when the answer runs out. That is a load-balancing
-  regression the cluster absorbs, not a correctness one, and it is now disclosed
-  in `docs/sdk-comparison.md` rather than left to be discovered.
-
-- **Tested offline**, because none of it can be verified here: two listeners in
-  `tests/request_shape.rs`, one answering `/hosts` with the other's address, and
-  assertions about which one each command reached. A cluster answers a heavy
-  command the same way whichever proxy was asked, so nothing about the answers
-  could have caught this. Every one of the three unpinned heavy call sites —
-  `write_file`, `write_skiff_table`, `read_skiff_table` — is now in that test's
-  exact request list; `write_file` is the one that mattered, because
-  `upload_worker`, `upload_current_exe` and `upload_worker_cached` all funnel
-  through it.
-
-### An operation is no longer a string and four commands
-
-- **Added** the rest of the operation lifecycle — `suspend_operation`,
-  `resume_operation`, `complete_operation`, `update_operation_parameters`,
-  `list_operations`, `list_operation_events`, `get_operation`,
-  `get_operation_by_alias`, `operation_suspended`, `operation_status`,
-  `get_job` and `get_job_input` — and `Operation`, a handle over a client and
-  an id, with the same commands on it.
-
-  **Both shapes, deliberately.** The flat `Client` methods are the primitives
-  and nothing was taken away from them; the handle exists because an operation
-  is a thing to pass around and, more to the point, a thing to *reattach* to.
-  `Client::attach_operation(id)` is that door — C++'s `AttachOperation`, Go's
-  `Track(id)` — and it is what a supervised pipeline needs after a restart: the
-  id is the durable name, so a process that did not start an operation can
-  still pause, reprice, wait for or finish it. `start_map` and its siblings
-  still return a `String`, so no existing call site changed.
-
-  Unlike `Transaction`, **dropping an `Operation` does nothing**. A transaction
-  is a scope and loses its work when the handle goes; an operation is meant to
-  outlive the process that started it, which is the whole point.
-
-  Four narrow readers — `operation_state`, `job_statistics`,
-  `operation_result_error` and the private `operation_error` — were each
-  building the same `get_operation` request. They are now one attribute of the
-  general one, and each one's *reading* is a function of the document that a
-  test runs against an answer a cluster actually sent.
-
-  `operation_status` reads the state and the suspension **together**, because
-  they are useless apart: suspension is not a state, so `state` says `running`
-  for a paused operation and only `suspended` says otherwise. It is what
-  `wait_for_operation` polls with, so a wait on a paused operation now reports
-  `running, suspended` instead of sitting silent until someone resumes it.
-
-- **Measured against a cluster**, because none of it is guessable from the
-  command reference:
-
-  - **suspension is not a state.** A suspended operation still reports
-    `running`; `operation_suspended` reads the attribute that actually says so.
-  - **suspend is idempotent and resume is not** — a second suspend is accepted,
-    a resume of something that is not suspended is refused with code 201. So
-    suspend is the one mutating scheduler command here that is retried, on its
-    own idempotency rather than under a mutation ID the master's cache would not
-    honour. An abort *causes* the scheduler to let go, so its retry always
-    fails; a repeated suspend just says the same thing twice.
-  - **complete is not idempotent**, exactly as abort is not.
-  - `update_operation_parameters` carries its parameters in the header, not a
-    body, whatever the command reference says — and answers with an empty body.
-    It assigns rather than increments, so it is repeated freely; an update that
-    would change nothing is refused here, because the cluster answers 200 and
-    does nothing.
-  - an alias needs `include_runtime=%true` or the cluster refuses to resolve it.
-    An alias could be **set** through `with_raw` before this and never found
-    again.
-  - `get_operation` with no attributes named asks for the whole document, which
-    was **119 KB** for a one-job vanilla operation. `attributes=[]` asks for
-    nothing at all.
-
-- **Added** the four operation types the enum could not name — `Merge`,
-  `Erase`, `RemoteCopy` and `JoinReduce` — with `MergeSpec`, `EraseSpec` and
-  `RemoteCopySpec` beside them, and `start_merge`, `start_erase` and
-  `start_remote_copy`.
-
-  **A sorted merge does not need `merge_by`**, which took a cluster to find
-  out: sent without one, it is accepted and the key comes from the sort columns
-  the inputs already carry, with the output arriving `sorted_by` those. An
-  earlier draft of this refused such a spec locally on the assumption that the
-  cluster would; it does not, and the check blocked an ordinary operation. The
-  `lifecycle` example runs the case, so the claim cannot drift back.
-
-  **`join_reduce` gets no spec builder**, and that is the answer rather than an
-  omission: the current documentation no longer lists it among
-  `start_operation`'s types and describes the same work as a reduce with
-  `join_by` and `enable_key_guarantee=%false`, which `ReduceSpec::with_raw`
-  builds today. The variant is there so the older type can still be named.
-
-- **Added** the `lifecycle` example, which runs all of the above against a
-  cluster and checks the answers: it starts a long vanilla operation under an
-  alias, attaches to it, finds it by that alias, pauses and resumes it, reprices
-  it, lists it back, reads one of its jobs by id, finishes it early, and then
-  merges two sorted tables and erases a row range from the result.
-
-### The client can be watched: a trace the cluster joins, and spans if you want them
-
-Two halves of one problem, kept apart because they cost different things. A
-launch that took four minutes, a command that was retried three times, a
-transaction that was never committed — none of it left anything behind to look
-at, and that is the first thing a production deployment needs.
-
-- **Added** `TraceContext` and `Client::with_trace_context`, which put every
-  request into a trace **without adding a dependency**. The cluster is already
-  instrumented: its proxy opens a span for each request it serves, and a
-  request carrying a `traceparent` has that span placed inside the caller's
-  trace instead of starting an orphan. So the whole of this half is a header,
-  and the operational value is most of the issue's.
-
-  The header is the [W3C one](https://www.w3.org/TR/trace-context/), which is
-  what all three official clients send — `FormatTraceParentHeader` in the C++
-  wrapper, `injectTracing` in the Go SDK, `generate_traceparent` in the Python
-  one — and what `TryParseTraceParent` reads on the proxy side. That parser is
-  slightly wider than the standard, and both of its spellings are accepted
-  here: the version may be missing entirely, which is the form the Go SDK
-  sends.
-
-  `TraceContext::parse` continues a trace that already exists, which is the
-  case that matters — a service passes on the context it was called in, and the
-  cluster's work turns up under the same trace as the request that caused it.
-  `TraceContext::new` starts one for a program nobody called. A malformed
-  header is **refused rather than sent**: the proxy drops one it cannot parse
-  without saying so, and the trace would then be quietly missing the half that
-  mattered. A header from a *later version* of the standard is not malformed,
-  though — the standard's versioning rule is to read the four fields version 00
-  defines and ignore whatever follows, which is the only thing that keeps this
-  parser working against a caller that has moved on, and the documented usage
-  `?`-propagates a refusal into a failed request.
-
-  The span id is carried through as it arrived, so the cluster's spans hang
-  under the span the *caller* named. A fully instrumented forwarder would
-  substitute its own; this crate emits no spans a collector would know about,
-  so an invented id would name a parent that does not exist. The work lands in
-  the right trace, one level up from where it would otherwise sit.
-
-- **Added** `TraceContext::with_tracestate`, which carries the `tracestate`
-  header the standard pairs with `traceparent`. A participant that forwards one
-  is required to forward the other unmodified: it is where a vendor keeps a
-  sampling decision or a correlation key, and dropping it on this hop costs the
-  caller's own backend — the proxy itself has no opinion about it. Not
-  rewritten on the way through, because rewriting the list means claiming a
-  vendor entry, and this client has none.
-
-  `TraceContext::yt_trace_id` spells the id the way the cluster does —
-  `8e9bcc43-5c2be9b4-56f18c4e-117ea314` rather than 32 undivided hex digits —
-  because that is the spelling in the proxy log, in the `X-YT-Trace-Id`
-  response header and in the UI. They are the same four 32-bit groups in the
-  same order; only the dashes and the leading zeros differ.
-
-  `/hosts` carries the header too. It is not a command and builds its own
-  request, which is exactly how it once came to carry neither the token nor the
-  timeout, and a heavy-proxy lookup slow enough to matter is one worth seeing.
-
-- **Added** a `tracing` feature, **off by default**, which is the half that
-  does cost a dependency. With it on, every attempt runs inside a span carrying
-  the command, the attempt number and how long it took, and the retry message
-  becomes a `WARN` event rather than a line on stderr — the same facts as
-  fields, going wherever the subscriber sends them.
-
-  Off by default for the reason `tls` is: this crate is linked into worker
-  binaries that cross-compile to musl with nothing but the Rust toolchain, and
-  a worker should carry only what it runs on. `examples/` already depends on
-  the client with `default-features = false`, so the worker build never sees
-  it. What it costs when it is on is three crates more to compile —
-  `tracing`, its `pin-project-lite`, and `tracing-core` — plus `once_cell`,
-  which a default build already has by way of `rustls` and a build without
-  TLS does not. The facade is taken without its `attributes` feature:
-  `#[instrument]` is a proc macro, and the one span here is opened by hand, at
-  the single seam every command already passes through.
-
-  Nothing is emitted without a subscriber, which is what makes it a facade — so
-  **the stderr line is printed after all when none is installed**. Cargo
-  unifies features across the whole graph, which means any crate anywhere in a
-  build can turn this on for everybody: a launcher that never asked for it
-  would otherwise find its only sign of a retry gone, a fifteen-second pause
-  looking like a hang, and nothing in its own manifest to explain the silence.
-  A feature should add a way of saying this, not take the old one away.
-
-  The event and the span agree on their counting. `attempt` is the try that
-  just failed and `of` is how many are allowed, in both — so `attempt == of`
-  means the last one, and an event never reads `4 of 4` beside a span that says
-  `attempt=5`.
-
-- **Kept**: the retry reporting still mutes itself inside a job. `RetryPolicy`
-  decides whether a retry is announced at all, and that decision now covers
-  both spellings of the announcement — a job's stderr is the cluster's bounded
-  diagnostic buffer, and a subscriber installed in a job is more often than not
-  writing to that same buffer. `RetryPolicy::loud` puts the messages back
-  either way.
-
-### The cluster end-to-end test no longer needs Python
-
-- **Added** the `e2e` example (now named `client_e2e`), which runs all three checks
-  `tests/cluster-e2e/run_e2e.sh` runs — `cat` as an identity map compared
-  byte-for-byte, two input and two output tables with table switching, and a
-  `wordcount` map-reduce against a hand-computed reference — through this
-  crate alone. The shell script needs the `yt` CLI, which needs a Python
-  installation, which is the one thing this stack exists to avoid.
-
-  Nothing had to be added to the client for it: every command the script sends
-  already had a method, including the two `--spec` fragments that carry the
-  meaning (`enable_input_table_index`, and `enable_key_switch` under
-  `reduce_job_io` rather than `job_io`). The one difference is that the example
-  **creates its destination tables** — `yt map --dst` makes them, and this
-  crate does not, because an operation that made its own outputs would turn a
-  mistyped destination into a stray table rather than an error.
-
-  The script stays. It reads the same tables with the official Python client,
-  so it checks the worker's output against an implementation we did not write;
-  the example proves the client can drive a cluster unaided.
-
-### A command this crate does not model can now be sent
-
-- **Added** `Client::raw_command`, and with it the answer to "can I do X
-  against my cluster?" stops being "fork the crate". `Transport::call` was
-  `pub(crate)`, so a command with no method on `Client` could not be sent at
-  all — the transport under it would have carried the request perfectly well,
-  and there was no way in. `Client::start_operation` taking a hand-built spec
-  already set the precedent; this generalises it to every command.
-
-  Four entry points, because a raw command has the same three shapes a
-  modelled one does:
-
-  - `raw_command(method, command, params, payload)` — buffered, the common
-    case;
-  - `raw_command_with(…, repeatable, mutation_id)` — the same, with the retry
-    classification the caller knows and the crate cannot;
-  - `raw_command_streaming(method, command, params)` — the response handed
-    back unread, for a command whose answer is the data (`read_file`,
-    `read_blob_table`);
-  - `raw_command_upload(method, command, params, body)` — the request body
-    read as it is sent, for a command with an input data stream.
-
-- **Added** `Method` and `Repeatable` to the public API, since a caller cannot
-  choose either for a command the crate has never heard of. `Method` carries
-  the proxy's own rule for picking a verb: *input data stream → PUT, mutating
-  → POST, otherwise GET*.
-
-- **Added** `ResponseReader`, the response-body reader `raw_command_streaming`
-  hands back. `TableReader` is now a name for it — the same type, unchanged
-  for every existing caller, because nothing about reading a body as it
-  arrives was ever specific to tables.
-
-- **Added** `yson_build::empty_map`, for a command that takes no parameters.
-  `map([])` cannot express it: the key type has nothing to be inferred from,
-  and `map` takes its entries as an `impl Trait` argument, so a turbofish is
-  not allowed either.
-
-  Three decisions made deliberately rather than by default:
-
-  - **A raw command is sent once.** A command the crate does not model cannot
-    be assumed idempotent, and a retry that applied an unknown mutation twice
-    is a worse failure than one lost to a flaky proxy — so `raw_command`
-    ignores the retry policy whatever it says. `raw_command_with` is where a
-    caller who knows the command says otherwise.
-  - **It is stamped with the client's transaction**, exactly as every modelled
-    command is, so a raw command sent through a `Transaction` is *in* it
-    rather than quietly beside it. The `NO_TRANSACTION` exceptions apply
-    unchanged.
-  - **The command name is checked before the URL is built.** It goes into
-    `/api/v4/{command}` as it is, so a name carrying `/`, `?`, `#` or
-    whitespace is refused: the failure it would otherwise produce is not an
-    error but a plausible answer from the wrong place. A payload passed with
-    `Method::Get` is refused for the same reason — a GET carries no body, so
-    it would be dropped in silence.
-
-### `remove` stopped being `rm -rf`
-
-- **Changed** `Client::remove`: it sent `recursive=%true; force=%true` on
-  every call, so `remove` of a map node deleted the entire subtree under it,
-  and a mistyped path "succeeded" by not existing. It now sends the
-  cluster's own defaults — the node must exist, a map node must be empty —
-  and the old behaviour has a deliberate spelling, `Client::remove_tree`.
-  **Breaking** for callers who relied on `remove` to clear subtrees or
-  tolerate absence: say `remove_tree`. The examples' cleanup already does.
-
-### The keep-alive pings can no longer lose the transaction they keep alive
-
-- **Fixed** transaction pings riding the full retry pipeline and the
-  two-minute request timeout: one hung proxy connection could stall the ping
-  thread for minutes — five attempts, two minutes each, backoff between —
-  while the 30-second transaction it was keeping alive quietly expired. A
-  ping now gets one attempt, bounded by half the ping interval; the next
-  ping is its retry.
-- **Fixed** the ping thread outliving its transaction: every error was
-  swallowed, so a cluster answering `No such transaction` was pinged again
-  every interval for as long as the handle lived. A definitive
-  "transaction is gone" answer now stops the thread; transient failures
-  keep it pinging.
-- **Fixed** `Drop` of an uncommitted `Transaction` sending its abort through
-  the full retry pipeline — a destructor, possibly during a panic unwind,
-  could block its thread for ten minutes against an unreachable cluster. The
-  abort from `Drop` is now one attempt with a five-second bound; a lost one
-  is cleaned up by expiry, exactly as if the process had crashed. The
-  explicit `abort()` keeps the full retries, since it has a caller to wait
-  for it.
-
-### A connection cut mid-body retries like one cut mid-request
-
-- **Fixed** a network failure while reading a response body being wrapped as
-  `Decode`, which the retry policy never repeats — so a `Repeatable::Freely`
-  read whose body was cut off failed permanently, while the identical reset
-  one packet earlier (before the headers) retried as `Transport`. Both are now
-  `Transport`.
-
-### Builder order stopped mattering in `MapReduceSpec`
-
-- **Fixed** `with_local_file`, `with_local_file_named` and `with_memory_limit`
-  reaching the mapper only when `with_mapper` had been called *first*. They
-  copied onto the phases as the calls arrived, so
-  `.with_local_file("//tmp/w").with_mapper("./w map")` produced a mapper with
-  no files and no memory limit — silently, since the reducer still had both.
-  Files and the limit now live on the spec and reach each phase when it is
-  rendered, so the same calls mean the same program in any order.
-
-### A table transfer is no longer on a two-minute clock
-
-- **Fixed** the 120-second request timeout applying end to end to streaming
-  transfers. It was installed as `ureq`'s global timeout, which by its own
-  definition runs "from DNS lookup to finishing reading the response body" —
-  so `read_table_streaming`, `write_table_rows` and `write_table_streaming`,
-  the APIs that exist for tables too big to buffer, were cut off mid-table
-  after two minutes. A streaming request now bounds each wait *around* the
-  data — resolve, connect, sending the request, the response headers — by the
-  same timeout, and leaves the data itself open-ended. Buffered commands keep
-  the end-to-end limit.
-- **Added** `Client::with_timeout`. The two-minute default was also the only
-  value: nothing let a caller on a slow link raise it, or a test against a
-  dead proxy lower it.
-
-### Stopping an operation, and adding to a table
-
-The two gaps [`docs/go-parity.md`](../../docs/go-parity.md) found by going
-through the Go SDK's examples, and the two it said were worth a decision.
-
-- **Added** `Client::abort_operation`. A launcher can now say never mind. Until
-  this, interrupting a wait left the operation running on the cluster, spending
-  quota on a result nobody would read.
-- **Added** `Client::operation_result_error`, promoted from a private helper:
-  the `reason` an abort carries is folded into the operation's error document
-  rather than kept beside it, so reading it back is what makes passing it worth
-  anything.
-- **Added** `TablePath`, and **changed** `write_table`, `write_table_rows` and
-  `write_table_streaming` to take `impl Into<TablePath>`. Existing call sites
-  pass `&str` and are unaffected; `TablePath::new(p).append()` adds rows instead
-  of replacing them.
-
-A YTsaurus path is a YSON value, not a string, and `<append=%true>` is an
-**attribute on the path**. That is why the type exists rather than an
-`append: bool` parameter: the attribute has to travel on the path itself, and a
-client that sent it beside the path would have the cluster replace the table and
-report success. A wire-level test pins the distinction.
-
-```rust
-client.write_table_rows(TablePath::new("//tmp/log").append(), entries)?;
-client.abort_operation(&id, Some("the input turned out to be yesterday's"))?;
-```
-
-Six cluster facts, each from probing before writing anything:
-
-- **Aborting is not idempotent, and never carries a mutation ID.** The scheduler
-  lets go of an operation as soon as the first abort lands and then answers `No
-  such operation`. That also rules out the usual retry protection: the master's
-  mutation cache does not cover a scheduler command, so a resend of the same ID
-  is refused rather than deduplicated, and a retry would report a successful
-  abort as a failed one. Sent once, `Repeatable::Never`.
-- **The operation is already aborted when the call returns**, ~350 ms later.
-  There is an `aborting` state; the request outlives it.
-- **Appends take a shared lock, replaces an exclusive one.** Four concurrent
-  appends to one table all land; four concurrent replaces leave one winner and
-  three `Cannot take "exclusive" lock` failures. Beyond the wire saving, this is
-  most of why append is worth having.
-- **Appending nothing is a no-op; *writing* nothing truncates the table.**
-- **Appending to a sorted table is checked.** The table stays sorted and a key
-  smaller than the last is refused with `Sort order violation: [0#9] > [0#1]`.
-  An append to a sorted table is a continuation of it, not an addition to it.
-- **Appending does not create the table.** A path that does not exist is refused
-  with `Error getting basic attributes of user objects`, which is the cluster
-  saying there was nothing to append to.
-
-Measured, in [`docs/benchmarking.md`](../../docs/benchmarking.md). Against the
-cluster, 60 000 rows in 12 pieces: appending takes 0.60 s and sends 60 000 rows;
-rewriting the table each time takes 1.03 s and sends 390 000 — 6.5× the data,
-because rewriting `k` pieces sends `(k+1)/2` times the rows. A new criterion
-benchmark, `cargo bench -p ytsaurus-client`, runs the write and read paths
-against a loopback socket and settles a claim the last release only asserted:
-the streaming row encoder is **about 20 % faster** than encoding into a `Vec`
-first, at 1 000, 10 000 and 100 000 rows alike. Bounded memory was the reason it
-was written that way; being quicker as well means it costs nothing.
-
-- **Fixed** a table write leaving its connection unusable. `ureq` returns a
-  connection to its pool only once the response body has been read, and the
-  upload path never read one, so **every** `write_table_rows` and
-  `write_table_streaming` opened a fresh connection — a few seconds of writing
-  left 11 623 sockets in `TIME_WAIT`. Reading and discarding the answer took
-  **23 %** off a thousand-row write. The benchmark found this; no test could
-  have, because every request still succeeded.
+### Heavy commands go to a heavy proxy (#30)
+
+- Added automatic routing. Heavy commands (`write_table`, `write_file`,
+  `read_table`, `upload_worker`, `write_table_rows` and the streaming forms)
+  went to `YT_PROXY`, which on a role-separated installation is a control proxy
+  that refuses them. The first heavy command now asks `/hosts`, and every clone
+  of the client shares the answer, refreshed as in the pool entry above. A
+  failed heavy command is not re-sent.
+- A failed heavy command drops the host it used, and the next name takes over.
+  So does a proxy that refuses heavy work for its role, or cannot be reached.
+  Only when every name has failed does the client fall back to the configured
+  address, for ten seconds, then ask again.
+- Added `Client::with_heavy_proxies_in`, an explicit list of proxies, compared
+  without case and with a port only where both sides name one.
+- Added `Client::with_hosts_timeout` (default 800 ms, one attempt, independent
+  of `with_timeout`) and `Client::with_hosts_retry_after` (default ten
+  seconds). The lookup no longer runs the client's retry policy while holding
+  the lock other heavy commands wait on.
+- A `/hosts` answer declined in full is announced once, on stderr or as a
+  `WARN` event under `tracing`, muted inside a job; a heavy command then refused
+  at the configured address carries a sentence saying so and naming the builder
+  call that changes it.
+- A discovered name is used only with the configured address's domain (or as
+  the configured host itself), its scheme and port, a numeric port, no `://`,
+  `/`, `@` or whitespace, and brackets only around an IPv6 literal. A
+  configured name with no dot matches as a non-leftmost label: `hume` follows
+  `n0008-sas.hume.yt.example.net`, not `hume.evil.com`. A refused name is
+  skipped. The domain rule is a typo guard, not a token boundary.
+- Added `Client::with_heavy_proxies_anywhere`, which relaxes only the domain
+  rule.
+- A cluster that names no heavy proxy, answers `/hosts` with 404 or with
+  something other than host names, or has every name refused, is served at the
+  configured address, and that answer is kept. A cluster on loopback is not
+  asked. Added `Client::with_proxy_discovery` to force discovery on or off.
+- A routed failure names its host: `write_table at n0132-sas.example.net:9013: …`.
+- Corrected the documented control-proxy refusal: a heavy write gets 503 with
+  `Retry-After: 60`, a heavy read a 307; it had said HTTP 200. `heavy_proxy`
+  remains for reading the chosen address.
+- Added `Repeatable::Heavy`, split from `Repeatable::Never`. `Transport::open`
+  and `Transport::upload` are heavy, so raw streaming commands are routed too.
+
+### The operation lifecycle
+
+- Added `suspend_operation`, `resume_operation`, `complete_operation`,
+  `update_operation_parameters`, `list_operations`, `list_operation_events`,
+  `get_operation`, `get_operation_by_alias`, `operation_suspended`,
+  `operation_status`, `get_job` and `get_job_input`, and `Operation`, a handle
+  over a client and an id with the same commands. `Client::attach_operation(id)`
+  makes one from an id. Dropping an `Operation` does nothing. `start_map` and
+  its siblings still return a `String`.
+- `operation_status` reads the state and the suspension together, and
+  `wait_for_operation` polls it, so a wait on a paused operation reports
+  `running, suspended`.
+- `suspend_operation` and `update_operation_parameters` are retried;
+  `resume_operation` and `complete_operation` are not. An update that would
+  change nothing is refused locally.
+- `operation_state`, `job_statistics` and `operation_result_error` now read
+  through `get_operation`.
+- Added `OperationType::Merge`, `Erase`, `RemoteCopy` and `JoinReduce`, with
+  `MergeSpec`, `EraseSpec`, `RemoteCopySpec`, `start_merge`, `start_erase` and
+  `start_remote_copy`. A sorted merge without `merge_by` is sent. `JoinReduce`
+  has no builder: use `ReduceSpec::with_raw` with `join_by` and
+  `enable_key_guarantee=%false`.
+- Added the `lifecycle` example.
+
+### Tracing
+
+- Added `TraceContext` and `Client::with_trace_context`: every request, `/hosts`
+  included, carries a W3C `traceparent`, with no new dependency.
+  `TraceContext::parse` continues a trace (the version field may be absent; a
+  later version's extra fields are ignored) and refuses a malformed header;
+  `TraceContext::new` starts one. The caller's span id is sent unchanged.
+- Added `TraceContext::with_tracestate`, forwarded unmodified, and
+  `TraceContext::yt_trace_id`, the cluster's spelling of the id
+  (`8e9bcc43-5c2be9b4-56f18c4e-117ea314`).
+- Added the `tracing` feature, off by default: a span per attempt (command,
+  attempt, duration), and retry messages as `WARN` events. It adds `tracing`,
+  `tracing-core`, `pin-project-lite`, and `once_cell` where TLS is off. **With
+  no subscriber installed, the stderr line is still printed.** `attempt` is the
+  try that failed and `of` the number allowed, in event and span alike.
+- Unchanged: retry reporting is muted inside a job, in both forms;
+  `RetryPolicy::loud` turns it on.
+
+### Raw commands and smaller changes
+
+- Added the `e2e` example (renamed `client_e2e` in 0.3.0): the three checks of
+  `tests/cluster-e2e/run_e2e.sh`, run through this crate with no Python. It
+  creates its destination tables, which operations here never do.
+- Added `Client::raw_command(method, command, params, payload)`,
+  `raw_command_with(…, repeatable, mutation_id)`,
+  `raw_command_streaming(method, command, params)`, which returns the response
+  unread, and `raw_command_upload(method, command, params, body)`, which streams
+  the body. `raw_command` is sent once whatever the retry policy, and is
+  stamped with the client's transaction (`NO_TRANSACTION` exceptions apply). A
+  command name containing `/`, `?`, `#` or whitespace is refused, as is a
+  payload with `Method::Get`.
+- Added `Method` and `Repeatable` to the public API, `ResponseReader` (which
+  `TableReader` now names), and `yson_build::empty_map`.
+- Fixed transaction pings: a ping is one attempt bounded by half the ping
+  interval instead of the full retry pipeline, and an answer that the
+  transaction is gone stops the ping thread; transient failures do not.
+- Fixed `Drop` of an uncommitted `Transaction` blocking for minutes: its abort
+  is one attempt bounded by five seconds. An explicit `abort()` keeps the full
+  retries.
+- Fixed a connection failing mid-body being reported as `Decode`, which is
+  never retried; it is `Transport`, so a `Repeatable::Freely` command retries it.
+- Fixed `MapReduceSpec::with_local_file`, `with_local_file_named` and
+  `with_memory_limit` reaching the mapper only when `with_mapper` came first.
+- Fixed the 120-second request timeout cutting off `read_table_streaming`,
+  `write_table_rows` and `write_table_streaming`: for streaming it bounds
+  resolve, connect, sending the request and the response headers, not the
+  data. Buffered commands keep it end to end. Added `Client::with_timeout`
+  (default two minutes).
+
+### Aborting an operation, appending to a table
+
+- Added `Client::abort_operation(id, reason)`, sent once
+  (`Repeatable::Never`), and `Client::operation_result_error`, which reads the
+  error document the reason is folded into.
+- Added `TablePath`; `write_table`, `write_table_rows` and
+  `write_table_streaming` take `impl Into<TablePath>`, so `&str` call sites are
+  unaffected. `TablePath::new(p).append()` appends instead of replacing.
+- Added the `cargo bench -p ytsaurus-client` benchmark
+  ([benchmarking](../../docs/benchmarking.md)).
+- Fixed every `write_table_rows` and `write_table_streaming` opening a new
+  connection: the response is now read, so the connection is pooled.
 
 ### Rows are Rust values
 
