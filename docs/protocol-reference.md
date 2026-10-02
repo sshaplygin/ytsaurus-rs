@@ -146,9 +146,9 @@ Observed:
   | Redirect | Result |
   | --- | --- |
   | same origin | followed, token included |
-  | other origin (scheme, host or port), with credentials | refused: `ClientError::Redirected`, naming the target |
-  | other origin, with data, token or not | refused: `RedirectRefusal::Payload` |
-  | other origin, `Content-Length: 0` | followed (a bodiless `POST` carries no data) |
+  | other origin (scheme, host or port), with a token | refused: `ClientError::Redirected`, naming the target |
+  | other origin, no token, with data | refused: `RedirectRefusal::Payload` |
+  | other origin, no token, no data (`Content-Length: 0` included) | followed (a bodiless `POST` carries no data) |
   | body not resendable (`Transport::upload`'s reader: `write_table_rows`, `raw_command_upload`) | refused anywhere; following would write no rows and return `Ok(())` |
   | longer than `MAX_REDIRECTS` | refused as a loop |
 
