@@ -105,14 +105,14 @@ writes one table
 | --- | --- |
 | `YT_PROXY` | The cluster address. A bare host name means `https://`. Required. |
 | `YT_TOKEN`, `YT_TOKEN_PATH` | The token, found as the `yt` CLI finds it: `YT_TOKEN`, then the file named by `YT_TOKEN_PATH`, then `~/.yt/token`. A token read from a file is trimmed, so a trailing newline does not fail authentication. |
-| `YT_CA_BUNDLE` | A PEM file of roots to trust instead of the compiled-in Mozilla bundle. See [TLS](#tls). |
+| `YT_CA_BUNDLE` | A PEM file of roots to trust instead of the compiled-in Mozilla bundle. Read by the transport once per process, so `Client::new` uses it too. See [TLS](#tls). |
 | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Applied only to a name with no dot, no colon and no `localhost`, the Go SDK's gate. No suffix is compiled in. |
 | `YT_HEAVY_PROXY_DOMAINS` | `Client::with_heavy_proxies_under`, comma- or space-separated. |
 | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes` for `Client::with_heavy_proxies_anywhere`. Applied after the domains, so the wider rule wins. |
 | `YT_FILE_CACHE` | `Client::with_file_cache`, for an installation whose shared worker cache is read-only to you. |
 
-The last four are inert when unset, so a machine that sets none gets exactly
-what `Client::new` gives. A variable set to an empty string is unset
+The last four are inert when unset; a machine that sets none gets what
+`Client::new` gives. A variable set to an empty string is unset
 (`export YT_FILE_CACHE=` turns one off), `YT_PROXY` included.
 
 ### TLS
@@ -196,9 +196,8 @@ Needs `features = ["derive"]` (the macro is from
 missing a required column: `Required column "size" cannot have "null" value`.
 `TableSchema::validate` catches locally what the cluster would answer with
 error 314: key columns that are not a prefix, duplicate names, a required
-`any`, `unique_keys` with no key. `create_table` fails if the path exists,
-because the cluster ignores a skipped create's attributes and would keep the old
-schema.
+`any`, `unique_keys` with no key. `create_table` fails on an existing path,
+since the cluster would ignore the new schema.
 
 On a table with rows, `alter_table` may add an optional column, relax a
 required one or drop `strict`; removing a column, adding a required one,
@@ -240,7 +239,7 @@ client.move_replacing(&staging, &format!("//tmp/runs/{today}"))?;
 client.link_replacing(&format!("//tmp/runs/{today}"), "//tmp/runs/latest")?;
 ```
 
-Readers of `latest` never see a half-written table. `list` is unsorted, and refuses a truncated
+Readers of `latest` never see a half-written table. `list` is unsorted and refuses a truncated
 (`<incomplete=%true>[…]`) listing. A link resolves to its target, attributes
 included: `latest/@type` is `table`, `latest&/@type` is `link`.
 
@@ -402,8 +401,8 @@ accept it and do nothing. A sorted merge takes its key from the inputs' sort
 columns without `merge_by`.
 
 `get_operation_by_alias("*nightly-load", &["state"])` finds an operation by a
-spec alias; `list_operations` takes an `OperationFilter`. See
-[`examples/lifecycle.rs`](examples/lifecycle.rs).
+spec alias; `list_operations` takes an `OperationFilter`
+([`examples/lifecycle.rs`](examples/lifecycle.rs)).
 
 ## Tables bigger than memory
 
