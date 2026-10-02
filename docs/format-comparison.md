@@ -1,7 +1,7 @@
 # Comparing formats on a cluster: YSON, Skiff and YQL
 
 *Planned on 13 August 2026 from the v1.0 YQL brief written the day before, at
-repository state `8861036` / 0.2.6, and run on 14 August 2026. Phase 0 is
+repository state `8861036` / 0.2.6, and run on 13–14 August 2026. Phase 0 is
 `yql_smoke`; phases 1 and 2 are `format_compare`. The cluster tables are in
 [benchmarking.md §5](benchmarking.md#5-the-same-map-in-three-formats-and-a-query),
 and the verdict on the Skiff default is
