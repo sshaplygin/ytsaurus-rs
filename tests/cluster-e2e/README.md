@@ -417,12 +417,7 @@ payloads (`table_rows_*.bin`) from the specification, and a test checks they
 stay reproducible. Only the job-input framing is captured, because it is the
 cluster's to define.
 
-Capturing corrected two errors in the earlier hand-built fixture, both now
-pinned by tests in `cat_e2e.rs`: YTsaurus writes `<table_index=0;>#` with a
-trailing `;` inside the attribute block, which the fixture omitted (the parser
-accepts both); and the fixture had a column value with attributes, which
-YTsaurus rejects at write time (`Table values cannot have top-level
-attributes`).
+Prefer a captured fixture over a hand-built one.
 
 ## Environment notes
 
