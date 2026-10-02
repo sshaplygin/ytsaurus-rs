@@ -8,6 +8,11 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
+      # No bench target reads these. A negative pattern has to follow the
+      # positive one it narrows.
+      - "!crates/**/*.md"
+      - "!crates/*/examples/**"
+      - "!crates/*/tests/**"
       - "rust-toolchain.toml"
       - "scripts/compare_criterion.py"
 
