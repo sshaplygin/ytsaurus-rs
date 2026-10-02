@@ -40,7 +40,7 @@ export YT_PROXY=http://localhost:8000
 cargo run -p ytsaurus-client --example launch
 ```
 
-Cluster behaviour, with evidence:
+Cluster behaviour it relies on:
 [protocol reference](../../docs/protocol-reference.md).
 
 ## What it covers
@@ -84,7 +84,7 @@ export YT_PROXY=http://localhost:8000
 cargo run -p ytsaurus-client --example skiff_launch
 ```
 
-Defaults that prevent mistakes the cluster does not report:
+Defaults against mistakes the cluster does not report:
 
 - Both formats are binary YSON, which `JobReader` and `JobWriter` expect.
 - `key_switch` is on for both grouping operations: in `reduce_job_io` for
@@ -93,8 +93,8 @@ Defaults that prevent mistakes the cluster does not report:
 - `upload_worker` sets the `executable` attribute, without which the cluster
   refuses to exec the binary with an error that does not mention it.
 
-`SortSpec` produces the sorted input reduce needs; its `output_table_path` is
-singular, since sort writes one table
+`SortSpec` sorts input for reduce; its `output_table_path` is singular, since
+sort writes one table
 ([`examples/sort_reduce.rs`](examples/sort_reduce.rs)).
 
 ## Configuration
@@ -112,8 +112,8 @@ singular, since sort writes one table
 | `YT_FILE_CACHE` | `Client::with_file_cache`, for an installation whose shared worker cache is read-only to you. |
 
 The last four are inert when unset, so a machine that sets none gets exactly
-what `Client::new` gives. A variable set to the empty string counts as
-unset (`export YT_FILE_CACHE=` turns one off), `YT_PROXY` included.
+what `Client::new` gives. A variable set to an empty string is unset
+(`export YT_FILE_CACHE=` turns one off), `YT_PROXY` included.
 
 ### TLS
 
@@ -128,7 +128,7 @@ export YT_PROXY=cluster.example.net
 export YT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ```
 
-Every certificate in the bundle is a root; other PEM sections are skipped. A
+Each certificate in the bundle is a root; other PEM sections are skipped. A
 bundle is refused, naming the file, if it yields no certificates, cannot be
 read, is not a regular file, or is larger than 16 MB. **One `BEGIN CERTIFICATE`
 block that is not X.509 refuses the whole file**: a PKCS#7 `.p7b` under that
@@ -141,16 +141,16 @@ answer with a renewed one), and a platform verifier's `Other(…)`, which is how
 `rustls-platform-verifier` reports a failed revocation lookup or a briefly
 unavailable trust store. So is a reset connection.
 
-Responses are gzip-compressed. Uploads are not: that needs a compression
+Responses are gzip-compressed; uploads are not, which would need a compression
 dependency in a crate cross-compiled to musl.
 
 ## Features
 
 | Feature | Default | |
 | --- | --- | --- |
-| `tls` | on | `rustls` and `https://` proxies. Without it the client needs no C toolchain, so a launcher-and-job binary cross-compiles to musl; an `https://` proxy then fails, naming the feature. |
+| `tls` | on | `rustls` and `https://` proxies. Without it the client speaks plain HTTP and needs no C toolchain, so a launcher-and-job binary cross-compiles to musl; an `https://` proxy then fails, naming the feature. |
 | `platform-verifier` | off | Trust the operating system's store instead of the Mozilla bundle. Off because it costs `rustls-platform-verifier`, and the compiled-in bundle is safer for a client running outside the network it talks to. |
-| `rpc` | off | The RPC proxy as a second transport: `create_rpc_client` beside `create_client`, both returning [`ytsaurus_api::TableClient`](https://docs.rs/ytsaurus-api). It is for latency and throughput under concurrency (one connection multiplexes many requests); HTTP v4 already reaches the dynamic-table commands. |
+| `rpc` | off | The RPC proxy as a second transport: `create_rpc_client` beside `create_client`, both returning [`ytsaurus_api::TableClient`](https://docs.rs/ytsaurus-api). It is for latency and throughput under concurrency (one connection multiplexes many requests); HTTP v4 reaches the dynamic-table commands too. |
 | `tracing` | off | A span per attempt; see [Seeing what it did](#seeing-what-it-did). Adds `tracing`, `pin-project-lite`, `tracing-core` and `once_cell` (already in a default build); no `#[instrument]`, so no `attributes`. |
 | `derive` | off | `#[derive(TableRow)]`, a table schema read off the row struct. |
 
@@ -168,8 +168,8 @@ let back: Vec<Contact> = client.read_table_rows("//tmp/contacts")?;
 let root: ClusterInfo = client.get_as("//@")?;
 ```
 
-`write_table_rows` encodes from an iterator inside the request body, so a
-million rows cost one buffer. `read_table_rows` returns the whole table as owned
+`write_table_rows` encodes an iterator inside the request body, so a million
+rows cost one buffer. `read_table_rows` returns the whole table as owned
 rows; a struct naming three of twenty columns is a projection. For larger tables
 see [`read_table_streaming`](#tables-bigger-than-memory).
 [`docs/go-parity.md`](../../docs/go-parity.md) compares the API with the Go
@@ -291,8 +291,8 @@ log, the `X-YT-Trace-Id` header and the UI spell it:
 which the proxy would drop silently. `with_tracestate()` forwards a
 `tracestate` for the caller's backend; the proxy ignores it.
 
-The `tracing` feature adds a span per attempt (command, attempt, elapsed time)
-and makes the retry message a `WARN` event. Retries are announced either
+The `tracing` feature adds a span per attempt (command, attempt, elapsed time),
+and the retry message becomes a `WARN` event. Retries are announced either
 way, except inside a job, where stderr is the cluster's bounded diagnostic
 buffer; `RetryPolicy::loud()` turns that back on. With no subscriber installed
 the stderr line is still printed, since another crate in the graph may have
