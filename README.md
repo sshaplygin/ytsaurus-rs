@@ -87,7 +87,9 @@ cargo run -p ytsaurus-client --example quickstart
 The dynamic read needs `YT_DYNAMIC_TABLE` to name a mounted table; mounting
 takes `Client::raw_command`, as in
 [both_transports.rs](crates/ytsaurus-client/examples/both_transports.rs).
-`create_client` sends no token; `create_client_with_token` does.
+`create_client` and `create_rpc_client` send no token, not even the one
+`from_env` found; `create_client_with_token` and `create_rpc_client_with_token`
+do.
 
 ## Layout
 

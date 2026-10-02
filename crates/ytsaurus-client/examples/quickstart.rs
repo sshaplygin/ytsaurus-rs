@@ -8,8 +8,13 @@
 //!
 //! This crate does not model creating or mounting a dynamic table, so the
 //! dynamic half reads one that already exists and is mounted, named by
-//! `YT_DYNAMIC_TABLE`, and is skipped when that is unset. `create_client`
-//! sends no token; a cluster that wants one needs `create_client_with_token`.
+//! `YT_DYNAMIC_TABLE`, and is skipped when that is unset.
+//!
+//! `create_client` and `create_rpc_client` send no token: the dynamic half
+//! does not share the token `Client::from_env` found for the static half. A
+//! cluster that wants one needs `create_client_with_token` or
+//! `create_rpc_client_with_token`.
+//!
 //! The dynamic half goes over HTTP only. The RPC constructor is a comment in
 //! it, because the README quotes this block and a `cfg(feature = "rpc")` there
 //! would name the reader's crate's feature, not this one's;
