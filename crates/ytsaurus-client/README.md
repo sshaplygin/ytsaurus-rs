@@ -240,7 +240,7 @@ client.move_replacing(&staging, &format!("//tmp/runs/{today}"))?;
 client.link_replacing(&format!("//tmp/runs/{today}"), "//tmp/runs/latest")?;
 ```
 
-Readers of `latest` never see a half-written table. `list` is not sorted, and refuses a truncated
+Readers of `latest` never see a half-written table. `list` is unsorted, and refuses a truncated
 (`<incomplete=%true>[…]`) listing. A link resolves to its target, attributes
 included: `latest/@type` is `table`, `latest&/@type` is `link`.
 
@@ -538,8 +538,8 @@ let body = client.raw_command(
 )?;
 ```
 
-`raw_command_streaming` and `raw_command_upload` stream the answer or the
-request (`read_blob_table`). The client still supplies the token, timeout,
+`raw_command_streaming` and `raw_command_upload` stream the answer
+(`read_blob_table`) or the request. The client still supplies the token, timeout,
 TLS, header encoding, `X-YT-Error` check and transaction. A raw command is sent
 once whatever the retry policy; `raw_command_with` takes a `Repeatable`. A
 command name with `/` or `?` is refused, since it goes into `/api/v4/{command}`.
