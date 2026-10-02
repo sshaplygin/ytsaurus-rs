@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A dynamic table.
     if let Ok(table) = std::env::var("YT_DYNAMIC_TABLE") {
-        let tables = ytsaurus_client::create_client(&std::env::var("YT_PROXY")?)?;
+        let tables = ytsaurus_client::create_client(std::env::var("YT_PROXY")?.trim())?;
         // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
         let found =
             tables.select_rows(&format!("* from [{table}] limit 10"), &Default::default())?;

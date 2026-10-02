@@ -15,6 +15,10 @@
 //! cluster that wants one needs `create_client_with_token` or
 //! `create_rpc_client_with_token`.
 //!
+//! The dynamic half also reads `YT_PROXY` itself, trimmed as `from_env` trims
+//! it, but without `YT_PROXY_SUFFIX`: `Client` has no accessor for the address
+//! `from_env` resolved. Spell the address out in full to use both halves.
+//!
 //! The dynamic half goes over HTTP only. The RPC constructor is a comment in
 //! it, because the README quotes this block and a `cfg(feature = "rpc")` there
 //! would name the reader's crate's feature, not this one's;
@@ -46,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A dynamic table.
     if let Ok(table) = std::env::var("YT_DYNAMIC_TABLE") {
-        let tables = ytsaurus_client::create_client(&std::env::var("YT_PROXY")?)?;
+        let tables = ytsaurus_client::create_client(std::env::var("YT_PROXY")?.trim())?;
         // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
         let found =
             tables.select_rows(&format!("* from [{table}] limit 10"), &Default::default())?;
