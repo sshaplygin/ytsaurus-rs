@@ -122,7 +122,8 @@ has to find record boundaries, and neither does user logic.
 For a job that does nothing but decode, field decoding is
 `51.96 − 17.43 = 34.5 ms`, 66 % of job CPU. That is the worst case for YSON: it
 assumes zero user logic. The pilot does something with its rows and spends
-10.6 % locally (§3) and 36.2 % on production (§4). For a given workload the
+10.6 % of its `time/exec` locally (§3) and 36.2 % on production (§4), shares of
+wall time rather than CPU. For a given workload the
 share sits between 10 % and 66 %, and the machine moves it as much as the job
 does.
 
