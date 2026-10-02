@@ -273,11 +273,11 @@ Three nine-round runs, every ratio paired within its round:
   which would make a blank a result, and the run output was not kept. The sign
   claims below apply to the whole-map rows, where the sign held in all nine
   rounds of all three runs.
-- Rounds of the first row fall between 1.68× and 2.18×. The decode bucket ranged
-  100 to 731 ms in the noisiest run, against a median of 308, and is an upper
-  estimate: the harness drops any round where a shallower stop measured slower
-  than a deeper one, which can only remove rounds where noise made the
-  difference small or negative.
+- Rounds of the first row fall between 1.68× and 2.18×. The decode row is a
+  mean over only the rounds that came out in order, whose decode bucket ranged
+  100 to 731 ms in the noisiest run. It is an upper estimate: the harness drops
+  any round where a shallower stop measured slower than a deeper one, which can
+  only remove rounds where noise made the difference small or negative.
 
 #### What the wire carries
 
