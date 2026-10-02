@@ -39,890 +39,289 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 ## 0.2.5 - 2026-08-10
 
-### A managed installation is configurable from the environment
+### Breaking changes
 
-Everything here comes from one run of the whole example suite against a managed
-multi-node installation rather than the local Docker cluster. Four of the
-differences stopped the suite outright, and none of them could be answered by
-configuration: every example builds its client with `Client::from_env`, so a
-policy settable only in Rust is a policy an example cannot be run under. The
-run needed a source patch, and that is the bug these entries fix.
+- **Breaking** `ClientError` is `#[non_exhaustive]`: a `match` over it needs a
+  `_` arm. Naming, constructing and destructuring a variant are unaffected.
+- **Breaking** `CachedFile` gained a `cached` field. Code that destructures
+  every field needs `..`; matching by name or reading fields is unaffected.
+- **Breaking** a write to a path carrying a read selection is refused locally
+  with `ClientError::Config`, before anything is sent; the cluster would
+  replace the whole table and answer 200. This covers `TablePath::columns` and
+  `TablePath::range` and selection syntax in the path string: a leading `<…>`
+  block, or an unescaped `[` or `{` (an escaped `\[` in a node name is still
+  writable). So `write_table("<append=%true>//tmp/t", rows)`, which appended,
+  now fails: use `TablePath::append()`, or `Client::raw_command` for any other
+  write attribute.
+- **Breaking** `TablePath` no longer derives `Eq`, since a key bound may hold a
+  double; `PartialEq` remains. Neither `TablePath` nor `RowRange` derives
+  `Default`. `read_skiff_table` refuses a path whose columns are selected twice,
+  by `TablePath::columns` or by `{…}` in the path string, because the Skiff
+  format adds a `columns` attribute itself; a row range, typed or in the
+  string, is allowed.
+- **Breaking** a row range that runs backwards (`rows(5..3)`, `keys(b..a)`) or
+  has a negative row index (`rows(-5..2)`) is refused rather than sent. The
+  cluster answers the first with no rows and clamps the second to 0. An empty
+  range (`rows(5..5)`, `keys(a..a)`) is still sent.
 
-- **Added** `Client::with_heavy_proxies_under(domains)`: the configured
-  address's own domain **plus** the ones named. The installation published all
-  79 of its heavy proxies in a zone of its own — a domain the configured address
-  does not share — so the default rule refused every one of them and no heavy
-  command could be sent at all, each upload dying at the control proxy with
-  `Control proxy may not serve heavy requests with input data`. The two settings
-  that existed were `with_heavy_proxies_in`, which meant writing 79 names down
-  and re-writing them whenever a proxy rotated, and `with_heavy_proxies_anywhere`,
-  which is the rule removed. A domain is what an installation actually has.
+### Configuration from the environment
 
-  It is still a suffix rule and still worth what one is worth — a guard against
-  a typo and an obviously foreign name, not a boundary that holds a credential;
-  `with_heavy_proxies_in` remains the boundary. Entries are normalised the way
-  people write them (space, a leading or trailing dot, a leading `*`, a scheme,
-  a port), and one left with **no dot in it** is dropped rather than honoured:
-  `net` would admit every `.net` host the cluster could name, which is
-  `with_heavy_proxies_anywhere` by accident. Worth recording beside this: the
-  **Go SDK filters `/hosts` not at all**, so `anywhere` is not a weakening
-  relative to the official client — it is the official client's behaviour.
-
-- **Added** four variables to `Client::from_env`. Each is inert when unset, and
-  all of them — `YT_PROXY` now included — are **trimmed**, with a variable set
-  to nothing read as unset. That last part changes `YT_PROXY` itself:
-  `YT_PROXY=" http://localhost:8000 "` used to reach `Client::new` verbatim and
-  fail as a malformed URL, and `YT_PROXY=` used to address `https://`.
+- Added `Client::with_heavy_proxies_under(domains)`: heavy proxies may be in the
+  configured address's domain or in any domain named, for an installation whose
+  heavy proxies sit in a zone of their own. Entries are normalised (whitespace,
+  a leading or trailing dot, a leading `*`, a scheme, a port), and one with no
+  dot is dropped, since it would admit a whole top-level domain. It is a typo
+  guard like the default; `with_heavy_proxies_in` is the boundary.
+- Added four variables to `Client::from_env`, each inert when unset:
 
   | Variable | Effect |
   | --- | --- |
-  | `YT_PROXY_SUFFIX` | Completes a bare cluster name — `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net` — behind the Go SDK's gate: no colon, no dot, no `localhost`. No suffix is compiled in, because this client is not one installation's. |
+  | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Only for a name with no colon, no dot and not `localhost`, as in the Go SDK. No suffix is compiled in. |
   | `YT_HEAVY_PROXY_DOMAINS` | Comma- or space-separated, into `with_heavy_proxies_under`. |
-  | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes`, into `with_heavy_proxies_anywhere`. Applied after the domains, so the wider of the two wins rather than whichever was exported last. |
+  | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes`, into `with_heavy_proxies_anywhere`. Applied after the domains, so the wider of the two wins. |
   | `YT_FILE_CACHE` | Into `with_file_cache`, for an installation whose shared cache is read-only. |
 
-  The environment can **widen** the heavy-proxy rule and cannot narrow it:
-  `with_heavy_proxies_in` is the mode that is a boundary, and a boundary a
-  variable could set is a boundary a variable could move.
+  The environment can widen the heavy-proxy rule and cannot narrow it:
+  `with_heavy_proxies_in` is settable only in Rust.
+- Changed `Client::from_env` to trim every variable it reads, `YT_PROXY`
+  included, and to treat a variable set to nothing as unset. Previously
+  `YT_PROXY=" http://localhost:8000 "` failed as a malformed URL and `YT_PROXY=`
+  addressed `https://`.
+- Changed the `UnknownIssuer` error: `ClientError::Transport` now names
+  `YT_CA_BUNDLE` and the `platform-verifier` feature when the root store
+  rejected the certificate. Not for `NotValidForName`, and not for a transient
+  platform-verifier failure such as `Other(OtherError("UnknownIssuer lookup
+  failed"))`, which is still retried.
+- Changed both messages about a declined `/hosts` answer (the one-time
+  announcement, and the sentence added to the cluster's refusal of each heavy
+  command) to offer `with_heavy_proxies_under`, `with_heavy_proxies_in` and
+  `with_heavy_proxies_anywhere` with their environment spellings, and to name a
+  domain dropped for having no dot.
+- Changed the `cached_upload` example to bring its own file cache, since a
+  managed shared cache refuses its clearing `remove` with code 901.
+  `YT_FILE_CACHE` points it at a shared one; it then stops with an explanation.
+- Changed the `profile` example to caption its result from the run
+  (`//sys/@cluster_name`, rounds, size), and raised the default
+  `YT_PROFILE_ROUNDS` from 3 to 5.
 
-  `YT_PROXY_SUFFIX` also makes the label rule reachable without a resolver
-  search list. That rule matches a dotless `YT_PROXY` as a label of the
-  discovered name, and until now a dotless `YT_PROXY` could only be connected to
-  if the machine's DNS configuration completed it.
+### Handing a transaction to another process (#13)
 
-- **Changed** the message a rejected root store produces. `invalid peer
-  certificate: UnknownIssuer` is the whole of what a cluster behind a private CA
-  says on its first request, before any YTsaurus logic runs, and it named
-  neither `YT_CA_BUNDLE` nor the `platform-verifier` feature — on a machine
-  where `curl` reaches the same cluster, nothing else about it suggests whose
-  roots were consulted. `ClientError::Transport` now carries both, for that
-  verdict only: `NotValidForName` is a certificate that does not cover the host
-  asked for, which no root store mends. Classified through `retry`'s existing
-  narrowing rather than by looking for the word, so
-  `Other(OtherError("UnknownIssuer lookup failed"))` — a transient
-  platform-verifier condition the client deliberately retries — does not collect
-  advice to enable the verifier it already has.
+- Added `Transaction::detach`, C++'s `ITransaction::Detach()`: stops the
+  keep-alive thread and returns the id, leaving the transaction running until
+  its timeout (30 s by default) after the last ping, unless the receiver keeps
+  it alive. It waits up to five seconds for the thread to stop; at most one ping
+  is left outstanding, and the thread exits after it. **Above a 30 s timeout a
+  stalled ping can outlast that wait, reach the master after `detach` returns
+  and restart the expiry clock.** At or below 30 s the wait always ends with the
+  thread's exit.
+- Added `Client::attach_transaction(id)`: a full `Transaction` (bound client,
+  ping thread, `commit`, `abort`, `ping`) for an id from elsewhere. It reads
+  `#<id>/@timeout` for the ping interval and pings once before returning, so a
+  transaction that is gone fails here, naming the id. **Dropping an attached
+  handle detaches rather than aborts.** It always pings; Go's
+  `AttachTx(id, {AutoPingable: false})` maps onto `with_transaction` and the
+  by-id commands. Two attaches to one id both ping, and the first to finish the
+  transaction decides it.
+- Added `Transaction::is_lost`: true once a ping was answered "no such
+  transaction" and the keep-alive stopped. Also false when the thread never
+  started or panicked. It takes `&self`; after `detach`, probe with
+  `Client::ping_transaction`.
+- Added `Client::ping_transaction`, `Client::commit_transaction` and
+  `Client::abort_transaction`, taking a bare id. Commit carries a mutation ID,
+  abort is retried freely, and a ping doubles as a liveness probe.
+- Unchanged: dropping a transaction this process started still aborts it.
+  Added the `detach` example. Documented that `mem::forget` on a `Transaction`
+  leaks its keep-alive thread, which holds the transaction and its locks open
+  for the life of the process; `detach` is the way to hand one on.
 
-- **Changed** both refusals an operator reads when `/hosts` is declined. They
-  offered `with_heavy_proxies_in` and `with_heavy_proxies_anywhere`: write out
-  79 names, or take the rule away. Both now offer all three, with the
-  environment spellings beside them — the announcement made once at the first
-  lookup, and the sentence appended to the cluster's own refusal on every heavy
-  command after it. A domain that could not be used — one with no dot in it,
-  which would admit a whole top-level domain — is named there too, rather than
-  dropped in silence and leaving the setting looking unread.
+### Reading a file
 
-- **Changed** `cached_upload` to bring its own file cache. It clears one entry
-  so the first upload is a real miss, and a shared managed cache refuses that —
-  `remove` is denied to an ordinary user, code 901 — which stopped the example
-  in setup on an installation where the client itself was fine. `YT_FILE_CACHE`
-  points it back at a shared one, and it now stops with an explanation instead
-  of timing two warm uploads against each other.
+- Added `Client::read_file` and `Client::read_file_streaming` (#10), buffered
+  and streaming like the table reads, and routed to a heavy proxy like them.
+- `read_file` checks the body against the node's `@uncompressed_data_size` with
+  one light `get` after the read, and fails, naming both numbers, on a mismatch
+  or a non-integer answer. The streaming read cannot check: compare
+  `FileReader::bytes_read` with the same attribute.
+- Added `FileReader`, the streaming read's type: `ResponseReader` under the
+  name the file path uses, as `TableReader` is for tables.
 
-- **Changed** `profile` to build its closing caption from the run — the cluster's
-  own `//sys/@cluster_name`, the rounds and the size — rather than printing a
-  hardcoded description of the laptop it was written on, and raised the default
-  `YT_PROFILE_ROUNDS` from 3 to 5: at 3 the example could not separate the phases
-  on a shared cluster and said so, which is the guard working and a poor default.
+### The 512 MiB cap on a buffered response
 
-### A transaction can outlive its handle
-
-- **Added** `Transaction::detach` (#13): stops the keep-alive thread and
-  leaves the transaction running, returning the id — what C++ spells
-  `ITransaction::Detach()`. Nothing is committed, aborted or otherwise
-  decided, so from there the transaction lives on the cluster's terms: it
-  expires its timeout after its last ping, 30 s by default, unless whoever
-  received the id keeps it alive. The keep-alive thread is asked to stop and
-  then waited for, **for up to five seconds** — a detach racing its own ping
-  neither panics nor, inside that bound, leaves a request behind to restart
-  the expiry clock after the caller has finished reasoning about it. The
-  keep-alive may still get one last ping away before it sees the stop, and
-  that ping is what the wait is for. The bound is deliberate, in place of the
-  ping's own request budget of `min(interval / 2, 120 s)` — two minutes for an
-  hour-long transaction against a proxy that has stopped answering — because
-  `detach` reads as instant at every call site.
-
-  **The bound is reachable, and then the promise stops.** Five seconds covers
-  a ping's whole budget while the transaction's timeout is under 30 s and
-  equals it at the 30 s default, so at or below the default the wait always
-  ends in the thread's exit. Above it — every long-running launcher
-  transaction — a ping stalled on a proxy that has stopped answering outlasts
-  the wait, is left in flight, and can reach the master *after* `detach`
-  returned, restarting the clock there: the transaction then lives a full
-  timeout from wherever that ping landed rather than from the detach. Nothing
-  leaks — the thread re-reads the stop flag as soon as its ping ends, so at
-  most one ping is outstanding and it exits inside that same budget — but a
-  caller above the default cannot treat `detach` as the transaction's last
-  ping. Both bounds are on `Transaction::detach`.
-
-- **Added** `Client::attach_transaction(id)`: the receiving half. Turns an id
-  into a real `Transaction` — bound client, ping thread, working
-  `commit`/`abort`/`ping` — where `with_transaction` only binds commands. The
-  ping interval is read from `#<id>/@timeout`, because the id alone does not
-  carry it; that round trip is also what makes attaching to a transaction that
-  is gone fail immediately, with the cluster's resolve error naming the id.
-  **Dropping an attached handle detaches rather than aborts**, following the
-  C++ destructor's line: an attacher's `?` must not destroy work the process
-  that started the transaction still holds a handle to. The handle always
-  pings — Go's `AttachTx(id, {AutoPingable: false})` maps onto
-  `with_transaction` plus the by-id commands below.
-
-  It also **pings once before returning**, a second round trip, because
-  `@timeout` is the *configured* lifetime and says nothing about how much of
-  it a handoff has already spent: an attach at t=21 s of a 30 s transaction
-  last pinged at t=0 would otherwise schedule its first ping for t=31 s, one
-  second after the cluster had expired it — and the reply, `No such
-  transaction`, would stop the keep-alive thread silently. Any handoff slower
-  than `timeout × 2/3` lost the transaction that way. The ping restarts the
-  clock at the attach and doubles as the probe, so a transaction that died in
-  the handoff is this call's error rather than a later command's.
-
-- **Added** `Transaction::is_lost`: whether the keep-alive has given up. It
-  stops on its own for exactly one reason — a ping answered "no such
-  transaction", which is final — and that exit used to be invisible, leaving a
-  handle that pings nothing looking exactly like a healthy one. Go reports the
-  same thing by pushing on `Tx.Finished()`; this is polled.
-
-  **False is not "something is pinging"**, and the doc now says which other
-  states read false: a thread that never started because the spawn failed, and
-  a thread that panicked (nothing on the ping path panics as it stands). A
-  ping does not expose either — it answers for the transaction, not for the
-  thread. `is_lost` is also `&self` where `detach` consumes the handle, so
-  after a detach the only probe left is `Client::ping_transaction` on the id.
-
-- **Added** `Client::ping_transaction`, `Client::commit_transaction` and
-  `Client::abort_transaction`, taking the bare id, so a process that holds
-  nothing else can finish someone else's transaction. Commit rides under a
-  mutation ID (it is not idempotent — the second commit is answered `No such
-  transaction`, which reads like the first one failed); abort is retried
-  freely on the cluster's own forgiveness (aborting a transaction that is
-  gone answers `{}`); a ping doubles as the liveness probe.
-
-- **Unchanged, and deliberately**: dropping a transaction this process
-  *started* still aborts it. That is what makes `?` safe inside a
-  transaction, and `examples/transaction.rs` still demonstrates exactly that;
-  `tests/transaction_lifecycle.rs` pins all four drop/detach shapes at the
-  wire level, stub-served in-process. The new `detach` example runs the
-  handoff against a cluster: start, detach, drop, attach from a second
-  client, hold past the transaction's own timeout, commit.
-
-- **Note for the paranoid**: `mem::forget` on a `Transaction` is not a way to
-  hand it on. It leaks the keep-alive thread, which goes on pinging for the
-  life of the process and holds the transaction and its locks open
-  indefinitely. `detach` is the sanctioned form, and it says so now. Nothing
-  stops two attaches to the same id either: each gets a handle and a thread of
-  its own, they ping the same transaction twice as often, and whichever
-  finishes it first decides it — deliberate, since a second process attaching
-  is the whole point, and documented on `attach_transaction`.
-### A file can be read back
-
-- **Added** `Client::read_file` and `Client::read_file_streaming` — the mirror
-  `write_file` shipped without, and the sharpest asymmetry in the crate until
-  now: a worker binary could be uploaded and never fetched back (#10). The
-  pair takes the shape of `read_table`'s: buffered for a result a launcher
-  inspects, streaming for a file that does not fit — which a file is exactly
-  the thing to be. `read_file` is a heavy command without input data, so both
-  go to the proxy the cluster names, as the table reads do, and an
-  installation whose control proxy answers heavy reads with a cross-host 307
-  is handled by the same routing rather than by following the redirect with
-  the token stripped. Verified against a local cluster: 4 MB of non-UTF-8
-  bytes round-trip byte-for-byte through both halves, and an empty file reads
-  back empty. The buffered half holds the whole file in memory, and the cap on
-  that is the bullet below.
-
-- **Added** the completeness check the buffered read needs where a table read
-  already had one. The proxy reports a mid-stream failure in a trailer `ureq`
-  cannot see, and a file's bytes carry no framing — where a truncated table
-  leaves a record that does not parse, a truncated file just ends, looking
-  exactly like a shorter file. So `read_file` compares the body against the
-  node's `@uncompressed_data_size`, one light `get` after the heavy read, and
-  a body of any other length is an error naming both numbers. The attribute is
-  the *logical* size — verified with `compression_codec=zlib_6`, 1 000 000
-  bytes reading back whole off 4 214 on disk — and there is no `@file_size`,
-  whatever the name suggests: asked, the cluster answers `Attribute
-  "file_size" is not found`. An answer that is not an integer fails the read
-  too, because a check that quietly stopped checking would be worse than none.
-  The streaming path cannot check — the point is not to have the whole thing —
-  and `FileReader` says what to compare instead: `bytes_read` against the same
-  attribute.
-
-- **Added** `FileReader`, the streaming read's return type — `ResponseReader`
-  under the name the file path uses, exactly as `TableReader` is for tables.
-
-### The 512 MiB cap on a buffered response, which was not one
-
-- **Fixed** the cap itself, which counted the wrong bytes and so bounded
-  nothing worth bounding. `ureq`'s `limit()` wraps the *raw* body source and
-  builds the gzip decoder on top of it, so the number it takes is a limit on
-  what arrives on the wire — and every request this crate sends carries
-  `Accept-Encoding: gzip`. Measured against a cluster: a 600 MiB file of zeros
-  read back through `read_file` crosses the wire in 611 522 bytes, and the code
-  as it stood — `.limit(536870912).read_to_vec()` — handed back all
-  629 145 600 without an error. At that ratio a 512 MiB wire cap admits
-  hundreds of gigabytes into memory. The cap now sits **above** the decoder and
-  counts the bytes that land in the `Vec`, so the promise the documentation
-  made is the one the code keeps: the same read is now refused, and
-  `read_file_streaming` still moves all 600 MiB of it. A body of *exactly* the
-  cap also passes now, where the old guard failed it — `ureq`'s reader errors
-  on the read that finds the end, so "larger than the limit" was a byte off,
-  and deflate expands what it cannot compress, so the wire backstop underneath
-  has to allow the largest permitted body room to arrive *bigger*: 4 096
-  incompressible bytes gzip to 4 119. The backstop is `deflateBound`'s worth of
-  slack, which still bounds the case it exists for — an endless stream of empty
-  deflate blocks, which decodes to nothing and so is invisible to a cap on
-  decoded bytes — at about 584 MiB of transfer.
-
-  **Observable:** a buffered response that decodes to more than 512 MiB used
-  to succeed, allocating however much it decoded to. It now fails.
+- Fixed the cap counting wire bytes instead of decoded ones. Responses are
+  gzip, so it bounded almost nothing. **A buffered response that decodes to more
+  than 512 MiB now fails**; a body of exactly 512 MiB now passes.
   `read_table_streaming`, `read_file_streaming` and `write_table` are
-  unaffected — none of them buffers.
-
-  **The cap is on what is held, not on what a process needs.** The bytes land
-  in a `Vec` that grows by doubling and copies as it grows, so peak residency
-  runs above the ceiling: measured, a 600 MiB read refused by the cap peaks at
-  611 385 344 bytes of resident set and one that holds 512 MiB peaks at
-  544 178 176, with about 1.5× the worst case the growth implies. And it is
-  the buffered commands and uploads that are capped, not the crate: two error
-  paths — the non-2xx branch of a streaming open, and the `/hosts` lookup —
-  still take `ureq`'s wire-only default.
-
-- **Changed** the error class for a buffered response over the cap, from
+  unaffected. The cap is on bytes held, not on peak memory (a growing `Vec`
+  peaks near 1.5×), and the non-2xx branch of a streaming open and the `/hosts`
+  lookup keep `ureq`'s wire-only default.
+- Changed the error for a buffered response over the cap from
   `ClientError::Transport` to a new `ClientError::ResponseTooLarge { command,
-  limit }`. It reaches `read_table`, `read_table_with_format`,
-  `read_skiff_table`, `read_table_rows`, a buffered `raw_command`, and any
-  light command with an answer that large. A caller matching
-  `ClientError::Transport { .. }` to back off and retry will stop matching —
-  which is the point. `Transport` means *the request never got its answer*, and
-  every predicate that narrows it by looking inside (`is_retriable`, and
-  through it `worth_asking_again` and `attributable_to_the_host`) answered
-  `true` here, because `BodyExceedsLimit` is not an `Io` error. So an over-cap
-  heavy read was retried, and it **dropped a healthy data proxy from the pool**
-  — enough of them empty it, and the fallback window then answers unrelated
-  writes with the control-proxy refusal #30 exists to prevent. The new variant
-  is retried by nothing and blamed on nobody, and its message names the cap and
-  the streaming half of the same command. `ClientError` is `#[non_exhaustive]`,
-  so a new variant cannot break an exhaustive match.
-### The read half of a rich path
+  limit }`, which is never retried and does not drop a heavy proxy from the
+  pool. It reaches `read_table`, `read_table_with_format`, `read_skiff_table`,
+  `read_table_rows`, a buffered `raw_command` and any light command answered
+  that large. A caller matching `Transport` to retry stops matching it. The
+  message names the cap and the streaming form of the command.
+
+### Selecting columns and rows on a read
+
+- Added `TablePath::columns(…)` and `TablePath::range(…)`, with `RowRange` and
+  `Key`, sent as the `columns` and `ranges` attributes on the path
+  ([rich YPath](https://ytsaurus.tech/docs/en/user-guide/storage/ypath)).
+- Row ranges are Rust ranges: `path.range(0..100)`, `range(100..)`,
+  `range(..)`. Key ranges are `RowRange::keys(Key::from("a")..Key::from("b"))`:
+  an included lower and excluded upper bound are sent as `key`, `..=` and
+  `Bound::Excluded` below as `key_bound`. `RowRange::exact_key` is the `exact`
+  selector. `keys(a..b)` and `keys(a..=b)` differ by every row whose key starts
+  with `b` ([protocol reference](../../docs/protocol-reference.md#selecting-columns-and-rows-on-a-path)).
+- Added `yson_build::uint`, for `uint64` keys above `i64::MAX`.
+- Changed `read_table`, `read_table_with_format`, `read_skiff_table`,
+  `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`.
+  `&str`, `String`, `&String`, `&&str` and `Cow<str>` compile unchanged; a call
+  relying on inference (`path.as_ref()`) may need `&str` spelled once.
+- A read still sends a path string verbatim, but refuses a typed selection
+  added to a string that already spells the same kind, where the cluster would
+  silently discard the string's half, or to a string opening with `<…>`. Rows
+  and columns from different sources compose and are sent.
+- `columns([])` is sent: it returns one empty map per row, counting a range's
+  rows with no column bytes on the wire.
+
+### Heavy proxies: a refreshed pool (#40)
+
+- Changed heavy-command routing to match the C++ and Go SDKs: the whole
+  `/hosts` answer is a pool, each heavy command picks a member at random, and
+  the first heavy command to find the answer older than the refresh interval
+  asks again. A failed refresh keeps the previous answer for another interval.
+  No background thread. A heavy command may now pay one `/hosts` round trip
+  mid-life (bounded by `with_hosts_timeout`, at most once per interval), and
+  "the cluster named no heavy proxy" expires after one interval instead of
+  lasting for the client's life. `with_proxy_discovery(false)`, `heavy_proxy()`
+  (the cluster's first pick) and `with_hosts_retry_after` are unchanged.
+- Fixed a failed heavy command dropping its host only on failures worth asking
+  `/hosts` again about. Any failure attributable to the host now drops it until
+  a refresh names it again: a refused connection, a 503, a wrong-role refusal
+  or a rejected certificate. An emptied pool falls back to the configured
+  address for `with_hosts_retry_after`, then asks afresh.
+- Added `Client::with_host_list_refresh_interval(Duration)`, default one minute.
+  `Duration::ZERO` asks before every heavy command; `Duration::MAX` never
+  refreshes, though a failed host is still dropped and an emptied pool still
+  falls back and asks again.
+
+### Batches (#11)
+
+- Added `BatchRequest` and `Client::execute_batch`, the cluster's
+  `execute_batch` (C++ `CreateBatchRequest`, Go `NewBatchRequest`). The answer
+  is a `Vec` of per-part results in part order: `Ok` holds the part's envelope
+  (`{node_id=…}` for a create, `{value=…}` for an exists), `Err` a
+  `ClientError::Cluster` named after the part's command.
+- `BatchRequest` builds parts with `create`, `create_table`, `exists`, `get`,
+  `list`, `remove`, `remove_tree` and `set_attribute`, which send what their
+  `Client` namesakes send, and `raw`. A `raw` part naming a command the cluster
+  will not batch (output type `tabular` or `binary`, or input `binary`; 21
+  names, `select_rows` and `lookup_rows` among them) is refused locally. That
+  list is one cluster's registry and may be incomplete.
+- Added `with_concurrency` (the server-side cap, cluster default 50) and
+  `with_max_part_size` (C++ `BatchPartMaxSize`). A larger batch is split into
+  consecutive requests, `concurrency × 5` parts each by default, with results in
+  part order. Nothing is rolled back across requests, and unlike the C++ client
+  a retriable part is not re-queued ([sdk-comparison](../../docs/sdk-comparison.md)).
+- Added `ClientError::BatchInterrupted { answered, parts, cause }`, for a split
+  batch that stops partway: `answered` holds the per-part results of every
+  request that completed. A one-request batch returns the underlying error as
+  before. `answered` is what came back, not what was applied: **a request that
+  failed while executing may have run all of its parts.**
+- Added `Client::execute_batch_with`, taking a caller's `MutationId`, so a
+  batch replayed after a crash under `id.as_retry()` is deduplicated part by
+  part. A batch that would be split is refused with `ClientError::Config` when
+  given an id.
+- Added `BatchRequest::raw_with`, taking a `Repeatable`, so a raw read does not
+  make the whole batch send-once. `Repeatable::Heavy` is refused.
+- A mutating batch is retried under one mutation id, which the cluster derives
+  per part. A batch of reads carries no id; a batch with a `raw` part is sent
+  once. A client bound to a transaction stamps each part, not the envelope,
+  whose `transaction_id` the cluster drops; a part naming its own transaction
+  keeps it, and a command with no transaction is left alone.
+- A batch sends its parameters in the POST body, not `X-YT-Parameters`; the
+  proxy merges the two (`TContext::CaptureParameters`; measured: `requests` in
+  the body and `mutation_id` in the header arrive as one set). A cross-origin
+  redirect on a batch is therefore refused with `RedirectRefusal::Payload` even
+  without a token, where the same commands sent singly would follow it.
+- Parts run in parallel, so a part and its consequence belong in two batches.
+  A part naming an unknown command fails the whole request with HTTP 400 after
+  the other parts have run.
+- The parser refuses a `results` count that does not match the parts, and an
+  item that is not `{output=…}`, `{error=…}` or, for `set`, `remove` or a `raw`
+  part, `{}`. A part's success must carry its key: `node_id` for `create`,
+  `value` for `exists`, `get` and `list`. A `create` answered `{}` used to pass
+  and panic the caller at `answer["node_id"]`.
+- Added the `batch` example. `tests/batch.rs` pins the single request and the
+  wire shape.
+
+### A file cache that refuses writes (#32)
+
+- Fixed `Client::upload_worker_cached` failing on an installation that manages
+  `//tmp/yt_wrapper/file_storage` itself. A code-901 refusal of the cache's own
+  writes (creating the cache directory, creating the staging node,
+  `put_file_to_cache`) now uploads the worker under `//tmp` and carries on. A
+  901 on the bytes themselves, or any other error, still fails. The code is
+  found anywhere in the error document. Not verified against a cluster that
+  denies access; `tests/file_cache.rs` scripts the refusals.
+- `CachedFile::cached` is true for a hit and an accepted upload, false only for
+  the fallback; branch on it, not on `uploaded`, which is true for both, or a
+  cleanup deletes the shared cache entry.
+- Added a warning when the fallback is taken, on stderr or as a `WARN` event
+  under the `tracing` feature: the refused path, the cluster's message, and
+  `Client::with_file_cache`.
+- Documented the fallback node: an ordinary `//tmp` node with `//tmp`'s ACL, no
+  expiry and a name that is unique but not unpredictable, so a co-tenant can
+  rewrite it before the job runs. Point `with_file_cache` at your own directory.
+
+### Redirects
+
+- Fixed a credential-carrying request following a redirect and arriving
+  without its token (`cluster error 111: Client is missing credentials`).
+  `ureq` follows no redirect now (`max_redirects(0)`); the client decides:
+  - same origin: followed, token included, `Location` resolved against the
+    request's address ([RFC 3986 §4.2](https://www.rfc-editor.org/rfc/rfc3986#section-4.2));
+  - another origin, with credentials: refused with `ClientError::Redirected`,
+    naming the status and target without vouching for the token, and pointing
+    to `Client::heavy_proxy` only for a command that could use one;
+  - another origin, with a non-empty body, token or not:
+    `RedirectRefusal::Payload`;
+  - a body that cannot be sent twice (`write_table_rows`,
+    `raw_command_upload`): refused anywhere, `RedirectRefusal::Body`. This
+    fixes `write_table` returning `Ok(())` with no rows written after a
+    redirect;
+  - more than ten hops: refused as a loop.
+- Changed a followed redirect to resend the same method and body, whatever the
+  status, so a bodiless `POST` follows a balancer's `301`.
+- Fixed the request timeout restarting on every hop; a redirect chain shares
+  one deadline per attempt (a retry still gets a fresh one), in
+  `Client::heavy_proxy` too.
+- Fixed `Location: ?path=//other` resolving against the request's directory
+  instead of its path
+  ([RFC 3986 §5.3](https://www.rfc-editor.org/rfc/rfc3986#section-5.3)); a bare
+  `#fragment` also keeps the query.
+- Added `RedirectRefusal` (`Credentials`, `Body`, `Payload`, `TooMany`;
+  non-exhaustive), a field of `ClientError::Redirected`.
+- Fixed `get_job_stderr` missing from the heavy-command list, so a redirected
+  stderr fetch got no advice. `read_file` and `read_blob_table` stay on it.
+
+### A cluster behind a private CA (#29)
+
+- Added `YT_CA_BUNDLE`, a PEM file of roots used instead of the compiled-in
+  Mozilla bundle, and the `platform-verifier` feature, which trusts the OS
+  store. Both off by default; the bundle wins where both are set. Both sit
+  behind `tls`: no new direct dependency, and the musl worker graph is
+  unchanged (CI also checks it for `rustls-platform-verifier`).
+- The bundle is read once per process and must be a regular file of at most
+  16 MB. One that cannot be read, holds no certificate, or holds a
+  `BEGIN CERTIFICATE` block that is not X.509 (a re-armoured PKCS#7 `.p7b`) is
+  refused at the first request that needs it, naming the file and the number of
+  bad blocks. A plain-HTTP cluster is unaffected.
+- Fixed `UnknownIssuer` and `NotValidForName` being retried five times, about
+  15 s; they are reported at once. Every other TLS failure, a reset or refused
+  connection and a timeout are still retried.
 
-- **Added** column and row selection to `TablePath`: `columns(…)` and
-  `range(…)`, with `RowRange` and `Key` behind the latter. Three columns of a
-  hundred rows now cost three columns of a hundred rows on the wire, not the
-  whole table. The selections travel as the `columns` and `ranges` attributes
-  *on the path* — the same mechanism as `<append=%true>`, and for the same
-  reason: a sibling parameter is silently dropped. Spellings are the
-  [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath),
-  and `ypath.Rich` in the Go SDK renders the identical shapes.
-
-- **Added** row ranges as plain Rust ranges — `path.range(0..100)`,
-  `range(100..)`, `range(..)` — because Rust's `..` and the cluster's
-  `row_index` limits mean the same thing: inclusive below, exclusive above.
-  Key ranges on sorted tables take the same shape,
-  `RowRange::keys(Key::from("a")..Key::from("b"))`, and the inclusivity
-  travels with the range: the two bounds the `key` selector says natively are
-  sent as `key`, the other two (`..=`, `Bound::Excluded` below) as the
-  cluster's `key_bound=[relation;prefix]` form, whose relation is the only one
-  the reference allows on that side. `RowRange::exact_key` is the `exact`
-  selector. A range never mixes `exact` with a limit because no constructor
-  can write that.
-
-  **The two selectors compare a short key by opposite rules, and the difference
-  is a group of rows.** Measured on a local cluster, table keyed
-  `(host, path)`, rows `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`: `keys(a..b)`
-  returned the two `a` rows, `keys(a..=b)` returned four — all of host `b` —
-  and `keys((Excluded(a), Unbounded))` returned three, having dropped every row
-  of host `a` rather than one row. `key` compares component-wise with the
-  shorter tuple smaller; `key_bound` truncates the row's key to the bound's
-  length first, so every row sharing the prefix compares equal to it. The same
-  run settled the other open question: a range entry carrying `key` on one side
-  and `key_bound` on the other — what `keys(a..=b)` sends — is accepted, though
-  the reference documents the two selectors only separately.
-  `examples/rich_path.rs` is that run, and it checks itself.
-
-- **Added** `yson_build::uint`, without which the top half of a `uint64` key
-  column had no spelling: the `From` shortcuts on `Key` give int64 for an
-  integer, so every key above `i64::MAX` was unnameable. Measured, the type
-  itself is not the obstacle — on a `uint64`-keyed table `{exact={key=[42]}}`
-  and `{exact={key=[42u]}}` both returned the row — but the row keyed
-  `18446744073709551615u` came back only for the uint spelling.
-
-- **Changed** `read_table`, `read_table_with_format`, `read_skiff_table`,
-  `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`,
-  as the write methods already did. Call sites that pass `&str`, `String`,
-  `&String`, `&&str` or `Cow<str>` compile unchanged; a call that leaned on
-  inference (`path.as_ref()`) may need to say `&str` once.
-
-- **Breaking** a *write* to a path carrying a read selection is refused
-  locally, as `ClientError::Config`, before anything is sent. The cluster
-  ignores a selection on a write and replaces the whole table with a 200 —
-  measured in both spellings: `write_table_rows("//tmp/t[#0:#2]", rows)`
-  replaced everything and reported success, and a `write_table` whose path
-  carried `ranges` as a typed *attribute* did exactly the same, 200 and three
-  rows replaced by one — so the only honest write is no write.
-  The same refusal covers selection syntax spelled into the path *string* on a
-  write: a leading `<…>` block, or an unescaped `[` / `{` (a literal bracket
-  in a node name is escaped, `\[`, and still writable). Reads keep taking
-  string-spelled paths verbatim, because the cluster honours them there and
-  always has — except where the typed API would spell **the same kind** of
-  selection a second time, or where the string opens with `<…>`. Measured in
-  the shape this client sends (attributes hung outside a YSON string node), a
-  doubled kind is not a draw: the **attribute wins and the caller's
-  string-spelled half is discarded**, at 200, with nothing said.
-  `<ranges=[…0:2]>"//tmp/t[#3:#5]"` returned rows 0–1, not 3–4, and
-  `<columns=[n]>"//tmp/t{k}"` returned column `n`, not `k`. Rows against
-  columns *compose* and are sent — `<columns=[n]>"//tmp/t[#3:#5]"` gave rows
-  3–4 carrying only `n`. A leading `<…>` is refused whatever it holds, not
-  because the cluster objects — it composes there too — but because this
-  client cannot parse the block to see which attribute it names, and if it
-  names the one being added the caller's is discarded in silence.
-
-  **In plain terms, one working spelling stops working:
-  `write_table("<append=%true>//tmp/t", rows)` used to append and now returns
-  `ClientError::Config`.** The cluster did parse and honour that string, so
-  nothing was being silently ignored there — but this client does not parse a
-  path string at all, and the one syntax covers both `<append=%true>`, which
-  the cluster honours on a write, and `<ranges=…>`, which it drops while
-  replacing the table. Telling them apart would mean parsing rich YPath;
-  refusing is the only answer that is right for both. `TablePath::append()` is
-  the replacement, and `Client::raw_command` takes any other write attribute.
-  Nothing in this repository used the string spelling, so the break is
-  external-only.
-
-- **Breaking** `TablePath` no longer derives `Eq` (a key bound may hold a
-  double, which has no `Eq`); `PartialEq` remains. Neither `TablePath` nor
-  `RowRange` derives `Default`: `TablePath::default()` is the empty path,
-  which names no table and no caller wanted. `read_skiff_table` refuses a path
-  whose **columns** are selected twice — `TablePath::columns`, and now also
-  `{…}` in the path *string*, since the Skiff format's fields become a
-  `columns` attribute whether the caller named one or not. Measured, the
-  synthesised attribute wins (`<columns=[n]>"//tmp/t{k}"` came back as column
-  `n`), so the Skiff tuple stays aligned with its schema and nothing decodes
-  wrong — what is lost is the caller's own `{…}`, discarded at 200 without a
-  word, and refusing is how they hear about it. **A row range joins a Skiff
-  read freely, typed or string-spelled** — `<columns=[n]>"//tmp/t[#3:#5]"`
-  answered 200 with rows 3–4 carrying only `n`, since ranges pick rows and the
-  schema picks columns.
-
-- **Breaking** a row range asking for rows no table has is refused rather than
-  sent, in both selectors: one that runs backwards (`rows(5..3)`,
-  `keys(b..a)`) and one with a negative row index (`rows(-5..2)`). Measured,
-  the two fail differently. A backwards range is answered 200 with no rows —
-  `{lower_limit={row_index=5};upper_limit={row_index=3}}` and
-  `{lower_limit={key=[3]};upper_limit={key=[1]}}` both came back empty. **A
-  negative row index is clamped to 0 and the read succeeds**:
-  `{lower_limit={row_index=-5}}` returned all five rows of a five-row table and
-  `-5..2` returned rows 0 and 1, so a negative lower limit reads exactly as `0`
-  would, and only a negative *upper* limit comes back empty. A bound that
-  arrives only from arithmetic that went wrong, and is then silently replaced
-  by one that reads from the start of the table, is worth an error. An *empty*
-  range is still fine: `rows(5..5)` is legal on a slice and honestly asks for
-  no rows, and `keys(a..a)` likewise.
-
-  **`columns([])` is not in that set and is sent.** Measured, `<columns=[]>`
-  answers 200 with one empty map per row and composes with a range, so it
-  counts the rows of a range — or probes whether a key range holds any — with
-  no column bytes on the wire, which `Client::row_count` cannot do, reading as
-  it does the whole-table `@row_count` attribute.
-
-### Heavy proxies: a pool, picked at random, refreshed — never one host for life
-
-- **Changed** how heavy commands choose their proxy, to parity with the C++
-  and Go SDKs (#40). The `/hosts` answer used to be resolved once and its
-  first name pinned for the client's whole life, stepping to the next name
-  only on a failure the *lookup's* predicate recognised. Both official
-  clients deliberately never commit to one host, and the divergence produced
-  two real failures: a certificate rejected `NotValidForName` — a per-host
-  condition; the fleet's other proxies were fine — pinned every upload to
-  the one bad proxy for as long as the client lived, and a fleet of pinned
-  clients never rebalanced, each keeping whichever host its one lookup
-  happened to name through every drain and load shift afterwards. Now the
-  whole answer is a pool, each heavy command picks a member at random (the
-  crate's existing id source is the entropy — *unique, not unpredictable* is
-  the right bar for load-spreading, so no new dependency), and the list is
-  refreshed lazily by the first heavy command that finds it older than the
-  refresh interval, per the documentation's own "re-query every minute". A
-  failed refresh keeps the previous answer in use and waits out another
-  interval before asking again. No background thread; a client that stops
-  uploading stops asking.
-
-  Two behaviour changes a caller can observe, neither breaking an API:
-  a heavy command may now pay one `/hosts` round trip mid-life — bounded by
-  `with_hosts_timeout`, at most once per interval — where it could only pay
-  one up front before; and "the cluster named no heavy proxy" now expires
-  with the same interval instead of settling for ever, so a first lookup
-  that landed during a rolling restart is no longer a verdict for the
-  client's whole life. `with_proxy_discovery(false)` still pins everything
-  to the configured address, `heavy_proxy()` still answers with the
-  cluster's first pick, and `with_hosts_retry_after` still means what it
-  meant — how long the fallback lasts.
-
-- **Fixed** the pinning half of that divergence on its own terms: a heavy
-  command's failure now drops the host it went to on any failure
-  *attributable to the host* — a refused connection, a 503, a wrong-role
-  refusal, and now a rejected certificate — rather than only on the failures
-  `worth_asking_again` recognises, which is the predicate for the `/hosts`
-  lookup and answers `false` for a certificate verdict. The dropped host
-  stays out until a refresh names it again — so a host that is *persistently*
-  bad costs one failed command per interval until an operator fixes it,
-  rather than every command until the client is restarted; a pool with
-  nobody left falls back to the configured address for
-  `with_hosts_retry_after` and the cluster is then asked afresh, exactly as
-  before.
-
-- **Added** `Client::with_host_list_refresh_interval(Duration)`, defaulting
-  to one minute. `Duration::ZERO` re-asks before every heavy command;
-  `Duration::MAX` disables the refresh — the first answer is kept as long as
-  it keeps working, though a failed host is still dropped and an emptied
-  pool still falls back and re-asks.
-
-### A dozen commands, one round trip, and the answers one by one
-
-- **Added** `BatchRequest` and `Client::execute_batch` — the cluster's
-  `execute_batch`, which both official clients have had all along
-  (C++ `CreateBatchRequest`, Go `NewBatchRequest`). A launcher that creates a
-  dozen tables no longer makes a dozen round trips (#11).
-
-  **The answer is a `Vec` of per-part `Result`s**, because that is what a
-  batch is: its parts fail individually, and collapsing them into one `Result`
-  would lose the only thing batching costs any clarity on. Each `Ok` carries
-  the part's own envelope, keyed by what that command returns — `{node_id=…}`
-  for a create, `{value=…}` for an exists — and each `Err` is an ordinary
-  `ClientError::Cluster` named after the part's command, flattened
-  outer-plus-innermost like every other. Verified on a local cluster with a
-  four-part batch answering `[error 501, ok, ok, error 500]`, in exactly the
-  order the parts went in.
-
-  **The building shape is a builder**, not a slice of prepared commands:
-  typed methods (`create`, `create_table`, `exists`, `get`, `list`, `remove`,
-  `remove_tree`, `set_attribute`) that send exactly what their `Client`
-  namesakes send, plus a `raw` escape hatch. A builder is what lets the retry
-  class be decided instead of guessed — see below — and what keeps a part
-  from being a shape the cluster refuses. **The cluster's rule is the
-  command's data types, not `isHeavy`**: a part is refused when its registered
-  output type is `tabular` or `binary`, or its input type is `binary`, and the
-  driver throws before any part runs, so one such name fails the *whole*
-  request. Measured against the registry the cluster serves at `GET /api/v4`
-  (190 commands) and confirmed name by name — 21 names, where the crate's
-  `HEAVY` list has 7, and the two differ in both directions: `get_job_spec` is
-  `is_heavy: true` and is **accepted** as a part, while `alter_query` and
-  `push_queue_producer` are `is_heavy: false` and are refused. `select_rows`
-  and `lookup_rows` are on it, and are what a caller would plausibly try. A
-  `raw` part naming one is refused where it is written rather than costing a
-  round trip and taking the other parts' answers with it. The list is a
-  snapshot of one cluster's registry, not a promise of completeness, and
-  `BatchRequest::raw_with` says so.
-
-- **Added** the two options both official clients expose:
-  `with_concurrency`, the command's own server-side cap (“to avoid exhausting
-  your request rate limit”, default 50 in the cluster's registration), and
-  `with_max_part_size`, the C++ client's `BatchPartMaxSize` — a bigger batch
-  is split into consecutive requests, `concurrency × 5` per request unless
-  told otherwise, results stitched back in part order. There is no rollback
-  across the requests, which is what the C++ client's `ExecuteBatch` does too;
-  the C++ client also re-queues a *retriable part* client-side, and this one
-  deliberately does not — per-part errors are handed back for the caller to
-  judge, and `docs/sdk-comparison.md` discloses the difference.
-
-- **Added** `ClientError::BatchInterrupted`, so a split batch that stops part
-  of the way through does not throw away the parts that already applied. The
-  loop used to return the failure and nothing else: five creates at two per
-  request, second request out of retries, and the caller got
-  `Http { status: 503 }` with no word of the two tables now on the cluster —
-  and no way to recover, because re-running the same `BatchRequest` mints
-  fresh mutation ids and applies the first two a second time. The error now
-  carries `answered` — one entry per part of every request that completed, in
-  part order, with the same per-part `Ok`/`Err` split the success path hands
-  back — beside `parts` and the `cause`. A batch that fits one request is
-  unchanged: there is no prefix, so the underlying error is returned as it
-  always was.
-
-  `answered` is what came **back**, which is deliberately not a claim about
-  what was *applied* — and the rendered one-liner says so too, because that is
-  the sentence a log line and an `unwrap()` panic show. A request refused
-  *while executing* runs **every one of its parts** and then throws the whole
-  result list away: the driver collects the sub-requests into callbacks, runs
-  them all through `CancelableRunWithBoundedConcurrency`, and discards
-  everything at `.ValueOrThrow()`. Dispatch is never aborted, so this is not a
-  race and no arrangement of the parts limits it — measured, a `create` beside
-  a part naming an unknown command landed with the bad part first *and* last,
-  two creates around one both landed, and at `concurrency=1` eight creates
-  before the bad part all landed. The bound that does hold is the other one: a
-  request refused while its *parameters are being read* runs nothing
-  (`Validation failed at /concurrency`, `Error loading parameter /requests`,
-  `Missing required parameter /requests` all left no node behind). So the parts
-  before `answered.len()` are settled, and the request that failed is unknown
-  territory — not because some of it might have run, but because all of it did
-  and none of it said what happened. That is what a transaction is for.
-
-- **Added** `Client::execute_batch_with`, taking a caller-supplied
-  `MutationId` — the same guarantee `Client::raw_command_with` offers and the
-  one a single process cannot give itself: persist the id, and a batch
-  replayed after a crash is deduplicated against the send that may already
-  have happened. It was the one thing the feature's own headline safety claim
-  rested on and the API could not express. **Reproduced through this method**
-  on a local cluster, with `create_table` parts and not `create` ones: sent
-  under an explicit id and again under `id.as_retry()` it answered the same two
-  node ids, where a fresh id got two `501 already exists`. The spelling
-  matters — `BatchRequest::create` sends `ignore_existing`, so a second send
-  answers with the *old* node's id whether or not a replay was recognised, and
-  a two-`create` batch under a **fresh** id was measured returning ids
-  identical to the first send's. That looks exactly like a deduplicated replay
-  and is not one; `create_table` omits `ignore_existing`, which is what makes
-  the identical ids mean something.
-
-  An id covers **one** request and a split batch with one is refused with
-  `ClientError::Config`: the cluster derives each part's id by incrementing
-  the batch's, so a second request under anything derived from the same id
-  would collide with the first request's parts and be answered with their
-  results.
-
-- **Added** `BatchRequest::raw_with`, taking the `Repeatable` its `Client`
-  namesake takes. `raw` hard-codes `Repeatable::Never`, and because a batch
-  retries as the most cautious of its parts, one raw **read** —
-  `check_permission`, `get_supported_features`, `parse_ypath` — demoted an
-  otherwise all-read batch to send-once. A caller who knows the command's
-  registry bits says so and keeps the retry. `Repeatable::Heavy` is refused:
-  it is not a class a part can have, since it asks for a heavy proxy and a
-  batch does not go to one.
-
-- **A mutating batch is retried under one mutation id, and that is safe
-  because the cluster spreads it over the parts.** The driver hands part *k*
-  the batch's id plus *k* (`GenerateNextBatchMutationId`) and stamps the
-  batch's `retry` flag into every volatile part, so a replayed batch replays
-  every part under its original id and the master's cache answers each with
-  its first response. Measured, not assumed, with `create_table` parts —
-  `create` sends `ignore_existing` and would have answered with the same ids
-  either way: replayed under its id with `retry=%true` the batch answered the
-  **same two node ids** both times, where the same batch under a fresh id got
-  two `501 already exists`.
-  A batch of nothing but reads mutates nothing and carries no id; a batch
-  holding a **`raw` part is sent once**, whatever the policy says, because a
-  command this crate cannot classify may mutate somewhere no mutation cache
-  covers — the scheduler commands are the measured example.
-
-- **A client bound to a transaction puts the parts in it, not the
-  envelope.** `execute_batch` has no transactional options, and a local
-  cluster proved what that means: an outer `transaction_id` was dropped in
-  silence and the part's create landed *outside* the transaction, surviving
-  its abort — the silent escape a transaction exists to prevent. Each part is
-  stamped instead, with the transport's own exceptions: a part that names its
-  own transaction keeps it, and a command with no transaction to be in is
-  left alone.
-
-- **The batch's parameters travel in the POST body**, where every other
-  command's ride in `X-YT-Parameters`: a batch's parameters *are* the batched
-  commands, and a header has a size nobody promises. The C++ client makes the
-  same choice for this same command, and the proxy merges body parameters
-  with the header's (`TContext::CaptureParameters`) — measured: `requests` in
-  the body and `mutation_id` in the header land as one parameter set.
-
-- **Parts run in parallel, and the documentation means it.** A batch that
-  created a node and asked `exists` about it in the same breath was answered
-  `%false` — both parts succeeded, and the read simply ran first. A part and
-  its consequence belong in two batches. Also measured: a part naming an
-  unknown command fails the **whole batch** (HTTP 400, `Unknown command
-  "frobnicate"`, no per-part results), because the driver resolves the command
-  before per-part error handling begins — and **every other part of that
-  request still ran**, at any position and at any concurrency, so the refusal
-  is not a rollback and not a race.
-
-- The parser refuses what it does not recognise — a `results` count that
-  does not match the parts, an item that is neither `{output=…}` nor
-  `{error=…}` nor a bare empty map — rather than reading it as somebody's
-  success, and it holds a part's success to **the key that command answers
-  under**: `node_id` for a `create`, `value` for an `exists`, `get` or `list`.
-  The key and not the wrapper, because a guard on the wrapper is dead on API
-  v4: measured one part apiece, `create` → `{output={node_id=…}}`, `set` →
-  `{output={}}`, `remove` → `{output={}}`, `exists` → `{output={value=%false}}`
-  — **no modelled command answers a bare `{}`**, and the registry the cluster
-  serves at `GET /api/v4` calls `remove` and `set` `structured` exactly as it
-  calls `create` (it is `/api/v3` that calls them `null`). So `{output={}}` is
-  a shape a v4 cluster really produces, it is a legitimate `set` success, and
-  only the key tells it from a `create` that would panic the caller at
-  `answer["node_id"]`. This crate's envelope rules were learned from `exists`
-  answering under `value`; the paranoia is paid for.
-
-  **And the empty map is only for the commands that can answer with one.**
-  `{}` means the driver wrote no `output` key, which it does only where the
-  command's registered output type is `Null` — `set` and `remove` here. It
-  used to be accepted for every command, so a cluster or proxy answering `{}`
-  to a `create` passed the parser as a success with nothing in it, and
-  `answer["node_id"]` — the access this crate teaches, in the rustdoc, in the
-  example and in the tests — then **panicked** in caller code one frame away.
-  A structured-output part is now held to an `output`, and only a `raw` part,
-  whose registry bits only its caller knows, is still taken as it comes.
-
-- **A batch is the crate's first light command with a body**, so a
-  cross-origin redirect on one is refused with `RedirectRefusal::Payload`
-  where the same creates sent individually are bodiless POSTs the rule
-  deliberately lets through. Narrow — a client with a token is refused a
-  cross-origin hop anyway — but a tokenless client behind a balancer that
-  canonicalises to another origin finds batching breaks what individual calls
-  did. Documented on `execute_batch`, where a caller meets it.
-
-  Verified end to end on a local cluster by
-  `cargo run -p ytsaurus-client --example batch`: twelve creates in one batch
-  and every node there afterwards, the one-fails-rest-succeed batch, a split
-  batch with a failure kept at its own index, a split batch stopped
-  mid-sequence reporting the two parts that had applied, one mutation id
-  replayed for the same two node ids, and a batch inside a transaction
-  invisible until the commit. The **round trip** itself is not something a
-  program on a cluster can see, so the example no longer claims it: it is
-  pinned by `tests/batch.rs` against an in-process socket that counts, and
-  measured once through a counting TCP relay at **1** request and 9.16 ms
-  against 140.77 ms for twelve individual calls. The wire shape — verb, body,
-  the mutation id repeated across a retry, absent from a read-only batch and
-  the caller's own when there is one — is pinned by the same file.
-
-### A cache that refuses you, and the upload that goes anyway
-
-- **Fixed** `Client::upload_worker_cached` dying at the first upload on an
-  installation that maintains `//tmp/yt_wrapper/file_storage` itself. The
-  `create` on the miss branch is answered `cluster error 901: Access denied for
-  user …: "write | modify_children" … is not allowed by any matching ACE`, and
-  four of the shipped examples never got past it — `vanilla`, `statistics`,
-  `cached_upload` and `profile` (#32). A 901 on the cache's **own** writes —
-  creating the cache directory, creating the staging node inside it, and the
-  handover to `put_file_to_cache` — now means "no cache for you": the worker
-  goes up under `//tmp` on a path of its own and the launch carries on.
-
-  Precisely those three. A 901 on the bytes themselves is about the node this
-  client has just created, not about the cache, and the same bytes sent
-  elsewhere would earn the same answer; a create that failed for a resolve
-  error or a lock held elsewhere is not a permission problem at all. Both are
-  returned as they always were, because a fallback that swallowed either would
-  upload twice and then report success.
-
-  The code is looked for anywhere in the error document rather than only at the
-  top, as the retry classifier and the transaction one already do: every
-  transcript seen so far is flat, and an outer code is routinely a category with
-  the reason nested under it.
-
-- **Breaking** `CachedFile` gained a `cached` field. Code that matches the
-  struct by name or reads its fields is unaffected; code that destructures every
-  field needs `..`.
-
-  It is there because `uploaded` was answering two questions with one bit. It is
-  true both for a file the cache accepted and for one that went to `//tmp`
-  because the cache would not, and `path` was the only difference — so a
-  launcher that cleans up after itself was deleting the installation's **shared
-  cache entry** on an ordinary cluster, evicting the binary for everyone else,
-  and one that does not clean up leaks a node per launch on the cluster where
-  the fallback fires, since nothing expires those. `cached` is the field to
-  branch on: true for a hit and for an accepted upload, false only for the
-  fallback.
-
-- **Added** a warning when that happens, on stderr and as a `WARN` event where
-  the `tracing` feature is on. The state is permanent until someone acts and
-  invisible otherwise — every launch re-sends the whole binary and leaves a node
-  behind. The message names the path that was refused, quotes the cluster so an
-  ACL failure is not mistaken for a flaky proxy, and names
-  `Client::with_file_cache`, which already existed and is the one line that puts
-  a cache back.
-
-- **Documented** what the fallback node is: an ordinary `//tmp` node with
-  whatever ACL `//tmp` carries, no expiry, and a name unguessable only as far
-  as a mutation ID is — the entropy behind one says of itself that its callers
-  need an id to be *unique, not unpredictable*, having been built to
-  deduplicate a retry rather than to withhold a name. On shared scratch space a
-  co-tenant can rewrite the worker's bytes between the upload and the job that
-  execs them. It is the ordinary exposure of anything left in `//tmp`, and it
-  is the reason to point `with_file_cache` at a directory of your own rather
-  than to accept the fallback as a settled state.
-
-**Not verified against a cluster.** A local cluster in Docker makes the caller
-`root` and can never answer `Access denied`, which is why this was found on a
-real multi-node installation and not before. `tests/file_cache.rs` scripts a
-cluster on a socket in-process and asserts the sequence of commands, which is
-what is actually under test: which call was refused, and what the client did
-next.
-
-### A token no longer follows a redirect to a host nobody chose
-
-- **Fixed** a credential-carrying request being redirected and arriving
-  unauthenticated. A control proxy does not refuse a heavy *read*: it answers
-  `307 Temporary Redirect` naming a data proxy on **another host** — the
-  [HTTP proxy reference][return-codes] gives that row as *"Redirecting heavy
-  queries from light to heavy proxies"* — and `ureq` drops the `Authorization`
-  header when it follows one; its default is `RedirectAuthHeaders::Never`. The
-  read then arrived without a token and the cluster answered `cluster error
-  111: Client is missing credentials`, which sent the user to check their
-  token, their token file and their permissions. None of them was at fault.
-
-  A request whose redirect **changes origin** — scheme, host or port — now
-  fails with **`ClientError::Redirected`** when it carries credentials, naming
-  the status and where it pointed. The alternative, re-attaching the
-  credentials and going, would follow an unsolicited instruction that arrived
-  mid-flight, on a request addressed somewhere else. Asking the cluster for a
-  data proxy is the deliberate route to the same place, `Client::heavy_proxy`,
-  and the error says so — but only to a command that could use one. A `create`
-  that met a balancer's `301` is not told to go and find a heavy proxy.
-
-  The error stops short of telling anyone their token is good: a gateway in
-  front of the cluster may answer an expired token with a redirect of its own,
-  so it reports only what this client is certain of — the credentials were not
-  sent to the host that answered.
-
-  A redirect that **stays on the same origin** is followed, token and all.
-  Nothing new learns the credential by it, and a balancer canonicalising its
-  own host would otherwise break every command against that installation. The
-  `Location` is resolved against the address the request went to
-  ([RFC 3986 §4.2][rfc3986]), so `Location: /api/v4/exists` is placed on the
-  host that sent it rather than reported as a path with no host in it.
-
-  `redirect_auth_headers(RedirectAuthHeaders::SameHost)` is **not** the fix and
-  the source says why where someone would reach for it: the redirect is
-  deliberately cross-host, which is exactly the case that setting does not
-  cover.
-
-- **Changed** a followed redirect now sends the **same request** again: same
-  method, same body. That is what `307` and `308` require by definition, and
-  what an API v4 command needs whatever the digit — a command's verb is fixed
-  by the command, so a `create` rewritten into a `GET` is not a `create`. A
-  bodiless `POST` therefore follows a balancer's canonical-host `301` like any
-  other command, and a same-origin `write_table` sends its rows on rather than
-  losing them.
-
-  Two things still do not travel, and the rule for both is the **origin**:
-
-  - **credentials** — unchanged, and described above;
-  - **data**, with or without a token
-    (`RedirectRefusal::Payload`, new). The same objection as the token, about
-    the other thing a caller picks a host for: a tokenless `write_table` does
-    not get to send a table's rows to whichever host a `Location` header
-    names. A body of length zero is not data — `Content-Length: 0` gives
-    nothing away — so most of API v4 is unaffected.
-
-  Separately, a body this client **cannot send a second time** is refused
-  wherever it points: `write_table_rows` and `raw_command_upload` read their
-  body as they send it, so by the time the `3xx` arrives some of it has gone
-  and a reader cannot be rewound. That closes a silent data loss that predates
-  all of this — a redirect that dropped the body left `write_table` returning
-  `Ok(())` having written no rows — and reports it as
-  `ClientError::Redirected { refusal: RedirectRefusal::Body, .. }`.
-
-- **Fixed** the request timeout being multiplied by the length of a redirect
-  chain. `Client::with_timeout` documents an end-to-end limit for a buffered
-  command, and taking the following away from `ureq` — whose `Timeout::Global`
-  had covered the whole chain — gave every hop a fresh copy of it instead. The
-  real limit became `(hops + 1) ×` the one asked for: a client with a 400 ms
-  timeout, meeting a proxy that redirects to itself with 300 ms of thought per
-  hop, returned from `exists` after **3.36 s and eleven requests**. At the
-  default two minutes that is twenty-two of them, on one `exists` — and the
-  same on `Client::heavy_proxy`, which follows its own redirects.
-
-  An attempt now takes its deadline once and gives each hop what is left of it,
-  so the chain spends one budget. A retry is a fresh attempt and still gets a
-  fresh budget, as it always did.
-
-- **Fixed** `Location: ?path=//other` resolving against the request's
-  *directory* rather than its path — `/api/v4/?path=//other` where
-  [RFC 3986 §5.3][rfc3986-5.3] asks for `/api/v4/exists?path=//other`. A
-  reference with no path of its own keeps the base's, and a bare `#fragment`
-  keeps the base's query as well. Costs a `404` rather than a credential, since
-  the origin is the same either way — but a `404` for a request the proxy meant
-  to have answered.
-
-- **Added** `RedirectRefusal`, the reason a redirect was refused:
-  `Credentials`, `Body`, `Payload` or `TooMany`. It is a field on
-  `ClientError::Redirected`, and it renders the clause the message carries.
-  Non-exhaustive, which is what let `Payload` join it.
-
-  `ureq` now follows **no** redirect for any transport (`max_redirects(0)`) and
-  this client follows them itself, because the answer turns on the credentials,
-  the origin and the body at once, and no combination of `max_redirects` and
-  `redirect_auth_headers` expresses that. A chain longer than ten hops is a
-  loop rather than a route, and is refused as one.
-
-- **Fixed** `get_job_stderr` missing from the list of heavy commands, so a
-  launcher whose stderr fetch met a redirect was refused with no advice
-  attached — at the moment it was already diagnosing a failure. The list is the
-  cluster's `isHeavy` bit rather than an inventory of what this crate models,
-  which is why `read_file` and `read_blob_table` stay on it: `raw_command`
-  sends those, and the documentation on `raw_command_streaming` reads a file.
-
-- **Breaking** `ClientError` is now `#[non_exhaustive]`. A `match` over it must
-  carry a `_` arm. The ways a cluster can refuse are the cluster's to add and
-  not this crate's to freeze — every release so far has added one — so the
-  attribute goes on while the release is source-breaking anyway rather than
-  after. Naming a variant, constructing one and destructuring one are
-  unaffected.
-
-[return-codes]: https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes
-[rfc3986]: https://www.rfc-editor.org/rfc/rfc3986#section-4.2
-[rfc3986-5.3]: https://www.rfc-editor.org/rfc/rfc3986#section-5.3
-
-### A cluster behind a private CA is reachable
-
-- **Added** `YT_CA_BUNDLE`, a PEM file of root certificates to verify the
-  cluster against instead of the Mozilla bundle `ureq` compiles in, and the
-  **`platform-verifier`** feature, which trusts whatever the operating system
-  trusts. Both are off by default and the default is unchanged: a client may be
-  running outside the network it is talking to, where the machine's own trust
-  store is the less trustworthy of the two.
-
-  Until now there was no way to name a CA at all, so an on-premises
-  installation whose chain ends at a corporate root was simply unreachable over
-  `https://` — which is the scheme a bare host name in `YT_PROXY` selects.
-  `curl` reaches the same URL, because it reads the OS trust store. There was no
-  workaround in this crate's public API. Both official clients and the `yt` CLI
-  let a deployment point at its own CA; this is that (#29).
-
-  **A bundle that yields no certificates is refused**, with an error naming the
-  file, rather than quietly becoming the Mozilla roots — a fallback would answer
-  a deliberate request with the very `UnknownIssuer` the variable exists to end,
-  and name neither the file nor the reason. So is one that cannot be read. The
-  refusal is discovered while the agent is being built, where there is nothing
-  to fail, so it waits for the first request that would have needed it. A
-  cluster reached over plain HTTP is not refused: there is no handshake for the
-  bundle to have configured.
-
-  **And so is a `BEGIN CERTIFICATE` block that is not an X.509 certificate.**
-  PEM is only an envelope: the reader splits the sections and base64-decodes
-  them, and `rustls` then discards a block it cannot parse *without telling
-  anyone*. So a PKCS#7 `.p7b` re-armoured under that label — how a Windows-born
-  bundle usually arrives — was accepted here, produced an empty root store, and
-  failed every request with exactly the `UnknownIssuer` that naming a CA is
-  supposed to prevent, mentioning neither the file nor the variable. Every block
-  is now checked to be a certificate, and one that is not refuses the whole
-  file, naming it and saying how many blocks were wrong: a root store silently
-  shorter than the one the caller wrote down is the same failure a step later.
-
-  The bundle wins where both are set. It is the more specific answer, and the
-  one the caller went out of their way to give.
-
-  The file is read **once per process** and capped at 16 MB, and it must be a
-  regular file. `Client::new` cannot fail and the client's global timeout covers
-  requests rather than files, so there was nothing above the read to bound it: a
-  variable naming a FIFO hung the constructor for ever, and one naming something
-  enormous was paid for in memory before anyone could be told. Once per process
-  because an agent is rebuilt more often than it looks — `Client::with_timeout`
-  makes a new one, and a transaction's start and drop each build a client.
-
-  **No new direct dependency, and the musl worker graph is unchanged.** `ureq`
-  3.3 already offers both routes; both sit behind the `tls` feature, which
-  `examples/` — what `build-worker.sh` cross-compiles — turns off. The CI guard
-  now searches for `rustls-platform-verifier` alongside `tracing`, `rustls` and
-  `ring`.
-
-- **Fixed** a certificate error being retried five times. An unknown issuer is
-  not a transient failure — the same roots reject the same certificate on the
-  fifth attempt — but it arrived as a transport error, and every transport error
-  was retriable, so a misconfigured CA took about fifteen seconds of doubling
-  backoff to report. It is reported at the first attempt now.
-
-  Deliberately narrow, and narrower than "the certificate was rejected". Only
-  `UnknownIssuer` and `NotValidForName` are settled, because both are decided by
-  *this client's* root store and *this client's* URL, neither of which the next
-  attempt changes. Every other TLS complaint is still retried: an expired or
-  revoked certificate is a property of the fleet member that answered, and a
-  round-robin set mid-rotation may answer with a renewed one; a revocation list
-  that could not be fetched is transient by definition; and
-  `rustls-platform-verifier` — which the new `platform-verifier` feature turns
-  on — reports a failed revocation lookup or a momentarily unreadable trust
-  store as `Other(…)` under the same prefix, so classifying that would have made
-  enabling the feature a way of turning a bad afternoon on this machine into a
-  permanent failure. A reset connection, a refused one and a timeout are all
-  still retried, as is every protocol-level disagreement mid-handshake.
 ### Heavy commands go to a heavy proxy, without being asked to
 
 `Client::heavy_proxy` has always worked, and **nothing ever called it**. Every
