@@ -66,7 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("wrote and read back {path}");
 
     // A dynamic table.
-    if let Ok(table) = std::env::var("YT_DYNAMIC_TABLE") {
+    let table = std::env::var("YT_DYNAMIC_TABLE").unwrap_or_default();
+    if !table.trim().is_empty() {
         let tables = ytsaurus_client::create_client(std::env::var("YT_PROXY")?.trim())?;
         // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
         let found =

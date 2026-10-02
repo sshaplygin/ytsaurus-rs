@@ -8,7 +8,8 @@
 //!
 //! This crate does not model creating or mounting a dynamic table, so the
 //! dynamic half reads one that already exists and is mounted, named by
-//! `YT_DYNAMIC_TABLE`, and is skipped when that is unset.
+//! `YT_DYNAMIC_TABLE`, and is skipped when that is unset or empty, as the
+//! client treats an empty variable.
 //!
 //! `create_client` and `create_rpc_client` send no token: the dynamic half
 //! does not share the token `Client::from_env` found for the static half. A
@@ -49,7 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("wrote and read back {path}");
 
     // A dynamic table.
-    if let Ok(table) = std::env::var("YT_DYNAMIC_TABLE") {
+    let table = std::env::var("YT_DYNAMIC_TABLE").unwrap_or_default();
+    if !table.trim().is_empty() {
         let tables = ytsaurus_client::create_client(std::env::var("YT_PROXY")?.trim())?;
         // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
         let found =
