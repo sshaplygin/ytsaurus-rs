@@ -369,8 +369,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   rule.
 - A cluster that names no heavy proxy, answers `/hosts` with 404 or with
   something other than host names, or has every name refused, is served at the
-  configured address, and that answer is kept. A cluster on loopback is not
-  asked. Added `Client::with_proxy_discovery` to force discovery on or off.
+  configured address, and that answer is kept until the next
+  `with_host_list_refresh_interval`. A cluster on loopback is not asked. Added
+  `Client::with_proxy_discovery` to force discovery on or off.
 - A routed failure names its host: `write_table at n0132-sas.example.net:9013: …`.
 - Corrected the documented control-proxy refusal: a heavy write gets 503 with
   `Retry-After: 60`, a heavy read a 307; it had said HTTP 200. `heavy_proxy`
