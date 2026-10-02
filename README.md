@@ -131,17 +131,17 @@ are trimmed; that one is a path and keeps its spelling.
 | `YT_PROXY` | none | The cluster address. A bare host means `https://`; a local cluster is `http://localhost:8000`. Required. |
 | `YT_TOKEN` | none | The token, looked for as the `yt` CLI does, stopping at the first source that has one. |
 | `YT_TOKEN_PATH` | `~/.yt/token` | A file holding the token, tried after `YT_TOKEN` and before the default path. Trimmed, so a trailing newline from `echo` does not fail authentication. |
-| `YT_CA_BUNDLE` | Mozilla roots | A PEM file of root certificates, for a cluster whose chain ends in a private CA. Without it such a cluster fails its first request with `invalid peer certificate: UnknownIssuer`. |
+| `YT_CA_BUNDLE` | Mozilla roots | A PEM file of root certificates, for a cluster whose chain ends in a private CA. Without it such a cluster fails its first request with `invalid peer certificate: UnknownIssuer`. Read by every client, `Client::new` included. |
 | `YT_PROXY_SUFFIX` | off | Completes a bare cluster name: `YT_PROXY=hume` plus `.yt.example.net` addresses `hume.yt.example.net`. Applied only to a name with no dot, no colon and no `localhost` in it. No suffix is compiled in. |
 | `YT_HEAVY_PROXY_DOMAINS` | none | More domains, comma- or space-separated, under which `/hosts` may name a heavy proxy. `Client::with_heavy_proxies_under`. |
-| `YT_HEAVY_PROXIES_ANYWHERE` | off | `1`, `true` or `yes` removes the domain rule, as the official Go SDK does with `/hosts`. Applied after the domains, so the wider of the two wins. |
+| `YT_HEAVY_PROXIES_ANYWHERE` | off | `1`, `true` or `yes` removes the domain rule, as the official Go SDK does with `/hosts`. Applied after the domains, so the wider wins. |
 | `YT_FILE_CACHE` | `//tmp/yt_wrapper/file_storage/new_cache` | Where `upload_worker_cached` keeps its files, for an installation whose shared cache is read-only to you. |
 
 The environment can widen the heavy-proxy rule but not narrow it; see [the client
 README](crates/ytsaurus-client/README.md#where-a-heavy-command-goes).
 
 Inside a job, YTsaurus sets variables that `ytsaurus-job` reads; `YT_JOB_ID` is
-what `is_inside_job` tests. The full list is in
+what `is_inside_job` tests; full list in
 [docs/writing-a-job.md](docs/writing-a-job.md#what-the-cluster-puts-in-a-jobs-environment).
 
 Examples and scripts that measure something take these:
