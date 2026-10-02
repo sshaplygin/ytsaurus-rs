@@ -20,7 +20,7 @@ cargo test -p ytsaurus-job --test cat_e2e
 
 Runs the real `cat` binary the way the cluster runs it (input on fd 0, output
 table 0 on fd 1, output table 1 on fd 4, wired by shell redirection) and
-compares its output with the captured golden bytes. Covers descriptor
+compares its output with the golden bytes. Covers descriptor
 numbering, control records, table routing, byte-exact pass-through of non-UTF-8
 data, empty input, and that a truncated stream fails the job.
 
@@ -55,9 +55,9 @@ Each command the script sends has a `Client` method (`remove --recursive
 --format '<format=binary>yson'` is `write_table`), and the spec builders model
 `enable_input_table_index` and `enable_key_switch` under `reduce_job_io`. The
 client, unlike `yt map --dst`, does not create destination tables, so a
-mistyped destination is an error; the example creates them. Both are kept:
-`client_e2e` runs where there is no Python, and `run_e2e.sh` checks the
-worker's output with a different implementation, the official Python client.
+mistyped destination is an error; the example creates them. Both stay:
+`client_e2e` needs no Python, and `run_e2e.sh` checks the worker's output with
+a different implementation, the official Python client.
 
 ### Dynamic Skiff map
 
@@ -73,7 +73,7 @@ YT_PROXY=http://localhost:8000 cargo run -p ytsaurus-client --example skiff_laun
 It writes a Skiff stream through `write_table_with_format`, runs a map whose
 mapper format is Skiff, reads the output through `read_table_with_format`,
 compares both rows element by element (including the non-UTF-8
-`[0, 0xff, b'x']`) and checks that no extra rows arrived. It is not in CI and
+`[0, 0xff, b'x']`) and checks no extra rows arrived. It is not in CI and
 has no captured fixture. Run on a managed multi-node installation on 2026-08-09:
 
 ```text
@@ -150,8 +150,8 @@ so run [the YQL check](#yql-through-the-escape-hatch) first on a fresh cluster.
 
 ### Without the `yt` CLI
 
-These examples drive a cluster through `ytsaurus-client` alone, with nothing
-Python on `PATH`:
+These examples drive a cluster through `ytsaurus-client` alone, with no Python
+on `PATH`:
 
 ```sh
 export YT_PROXY=http://localhost:8000
@@ -427,8 +427,10 @@ attributes`).
 ## Environment notes
 
 - The `yt` CLI's pitfalls (two Python packages for binary YSON, `--spec` in YSON,
-  `--map-local-file` / `--reduce-local-file`, `reduce_job_io`) are in the
-  [protocol reference](../../docs/protocol-reference.md#cluster-gotchas).
+  `--map-local-file` / `--reduce-local-file`) are in the
+  [protocol reference](../../docs/protocol-reference.md#cluster-gotchas); a
+  reducer's `reduce_job_io` is under
+  [control records](../../docs/protocol-reference.md#control-records).
 - YTsaurus publishes x86_64 images only. On Apple Silicon the cluster runs under
   emulation, which the YTsaurus docs say is not guaranteed to work. It worked
   here; a Linux x86_64 host is the reliable option.
