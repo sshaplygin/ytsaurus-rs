@@ -5,9 +5,8 @@
 
 Derive macros for [`ytsaurus-client`](../ytsaurus-client/).
 
-A job's rows are already described by a Rust struct. A table schema describes
-the same thing to the cluster, so writing it out again by hand is a chance to
-disagree with yourself:
+A job's rows are already described by a Rust struct; `#[derive(TableRow)]`
+derives the table schema from it instead of a second, hand-written copy:
 
 ```rust
 use ytsaurus_client::TableRow;
@@ -17,7 +16,7 @@ struct Visit<'a> {
     #[yt(key)]
     host: &'a str,               // utf8, required, sorted
     size: i64,                   // int64, required
-    referrer: Option<&'a str>,   // utf8, optional — the Rust type says so
+    referrer: Option<&'a str>,   // utf8, optional, as the Rust type says
 }
 
 client.create_table("//tmp/visits", &Visit::table_schema())?;
@@ -43,18 +42,15 @@ ytsaurus-client = { version = "0.3", features = ["derive"] }
 | `YsonValue` | `any` |
 | `Option<T>` | `T`, not required |
 
-Text and bytes do not collapse into one type: a Rust `String` is UTF-8 by
-construction and becomes `utf8`, while `Vec<u8>` becomes `string`, which is what
-YTsaurus calls a byte string. That distinction is the same one the codec is
-careful about, and it is the difference between a column that rejects a
-non-UTF-8 byte and one that stores it.
+A Rust `String` is UTF-8 by construction and becomes `utf8`; `Vec<u8>` becomes
+`string`, YTsaurus's byte string. One column rejects a non-UTF-8 byte, the
+other stores it.
 
-Anything else is a **compile error naming the field**. Guessing a column type
-from an unknown Rust type is how a schema comes to disagree with the data it
-describes, and the cluster enforces the schema on every write. Say what you mean
-with `#[yt(column_type = "…")]` — every type the cluster accepts is available by
-name, including `timestamp`, `date`, `interval`, `json` and `uuid`, which no
-Rust type maps to on its own.
+Any other type is a compile error naming the field, since the cluster enforces
+the schema on every write and a guessed column type would disagree with the
+data. Name the type with `#[yt(column_type = "…")]`: every type the cluster
+accepts is available, including `timestamp`, `date`, `interval`, `json` and
+`uuid`, which no Rust type maps to on its own.
 
 ## Attributes
 
@@ -77,21 +73,20 @@ On a field:
 
 ## What it refuses, and why
 
-Each of these is something a cluster answers with error 314 a round trip later.
-Catching them at compile time turns a nested error document into a message
-under the field:
+A cluster answers each of these with error 314 a round trip later; the derive
+refuses them at compile time with a message under the field:
 
-- **key columns that are not a prefix** — `Key columns must form a prefix of
-  schema`. The macro names the field to move rather than silently reordering
-  your struct;
-- **`unique_keys` with no key column** — the promise has nothing to be about;
-- **duplicate column names**, after renames;
-- **`Option<Option<T>>`** — a column is present or it is not; there is no second
-  layer for a schema to describe.
+- key columns that are not a prefix (`Key columns must form a prefix of
+  schema`); the macro names the field to move rather than reordering your
+  struct;
+- `unique_keys` with no key column;
+- duplicate column names, after renames;
+- `Option<Option<T>>`: a column is present or not, with no second layer for a
+  schema to describe.
 
-Three column types can never be required — `any`, `null` and `void` — because
-each already means "there may be nothing here". The derive never marks them so,
-whatever the Rust type says.
+`any`, `null` and `void` can never be required, since each already means
+"there may be nothing here". The derive never marks them required, whatever
+the Rust type says.
 
 ## Licence
 

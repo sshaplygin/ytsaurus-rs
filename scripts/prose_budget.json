@@ -1,23 +1,18 @@
 {
   "AGENTS.md": {},
   "README.md": {
-    "em_dash": 38,
-    "bold": 21
+    "bold": 4
   },
   "crates/ytsaurus-api/CHANGELOG.md": {
     "bold": 6
   },
-  "crates/ytsaurus-api/README.md": {
-    "em_dash": 11,
-    "bold": 6
-  },
+  "crates/ytsaurus-api/README.md": {},
   "crates/ytsaurus-client/CHANGELOG.md": {
     "em_dash": 289,
     "bold": 259
   },
   "crates/ytsaurus-client/README.md": {
-    "em_dash": 94,
-    "bold": 55
+    "bold": 15
   },
   "crates/ytsaurus-client/benches/rows.rs": {
     "history": 1
@@ -110,10 +105,7 @@
   "crates/ytsaurus-helpers/CHANGELOG.md": {
     "em_dash": 5
   },
-  "crates/ytsaurus-helpers/README.md": {
-    "em_dash": 7,
-    "bold": 5
-  },
+  "crates/ytsaurus-helpers/README.md": {},
   "crates/ytsaurus-helpers/src/lib.rs": {
     "longest_doc": 57
   },
@@ -121,10 +113,7 @@
     "em_dash": 24,
     "bold": 25
   },
-  "crates/ytsaurus-job/README.md": {
-    "em_dash": 6,
-    "bold": 12
-  },
+  "crates/ytsaurus-job/README.md": {},
   "crates/ytsaurus-job/src/lib.rs": {
     "longest_doc": 26
   },
@@ -145,18 +134,12 @@
   "crates/ytsaurus-proto/CHANGELOG.md": {
     "em_dash": 6
   },
-  "crates/ytsaurus-proto/README.md": {
-    "em_dash": 9,
-    "bold": 5
-  },
+  "crates/ytsaurus-proto/README.md": {},
   "crates/ytsaurus-rpc/CHANGELOG.md": {
     "em_dash": 14,
     "bold": 27
   },
-  "crates/ytsaurus-rpc/README.md": {
-    "em_dash": 11,
-    "bold": 10
-  },
+  "crates/ytsaurus-rpc/README.md": {},
   "crates/ytsaurus-rpc/src/connection.rs": {
     "history": 1
   },
@@ -167,18 +150,12 @@
   "crates/ytsaurus-skiff/src/schema.rs": {
     "history": 1
   },
-  "crates/ytsaurus-yson/BENCHMARKS.md": {
-    "em_dash": 5,
-    "bold": 8
-  },
+  "crates/ytsaurus-yson/BENCHMARKS.md": {},
   "crates/ytsaurus-yson/CHANGELOG.md": {
     "em_dash": 18,
     "bold": 13
   },
-  "crates/ytsaurus-yson/README.md": {
-    "em_dash": 7,
-    "bold": 10
-  },
+  "crates/ytsaurus-yson/README.md": {},
   "crates/ytsaurus-yson/src/de.rs": {
     "history": 1
   },
@@ -200,45 +177,16 @@
   "crates/ytsaurus-yson/tests/ytsaurus_protocol_tests.rs": {
     "history": 1
   },
-  "docs/benchmarking.md": {
-    "em_dash": 115,
-    "bold": 101
-  },
-  "docs/format-comparison.md": {
-    "em_dash": 137,
-    "bold": 168,
-    "banned": 2
-  },
-  "docs/go-parity.md": {
-    "em_dash": 36,
-    "bold": 24
-  },
-  "docs/rpc-compatibility.md": {
-    "em_dash": 39,
-    "bold": 27
-  },
-  "docs/sdk-comparison.md": {
-    "em_dash": 60,
-    "bold": 58
-  },
-  "docs/skiff-compatibility.md": {
-    "em_dash": 17,
-    "bold": 30
-  },
-  "docs/skiff-full-support-plan.md": {
-    "em_dash": 19,
-    "bold": 23
-  },
+  "docs/benchmarking.md": {},
+  "docs/format-comparison.md": {},
+  "docs/go-parity.md": {},
+  "docs/rpc-compatibility.md": {},
+  "docs/sdk-comparison.md": {},
+  "docs/skiff-compatibility.md": {},
+  "docs/skiff-full-support-plan.md": {},
   "docs/writing-a-job.md": {
-    "em_dash": 40,
-    "bold": 19
+    "bold": 4
   },
-  "tests/cluster-e2e/README.md": {
-    "em_dash": 150,
-    "bold": 38
-  },
-  "tests/skiff-cpp-interop/README.md": {
-    "em_dash": 7,
-    "bold": 6
-  }
+  "tests/cluster-e2e/README.md": {},
+  "tests/skiff-cpp-interop/README.md": {}
 }
