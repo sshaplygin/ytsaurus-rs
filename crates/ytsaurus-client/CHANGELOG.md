@@ -10,9 +10,9 @@ compile from their tarballs; this crate had no such file.
 
 - Added typed dynamic-table commands `lookup_rows_dynamic`,
   `select_rows_dynamic`, `insert_rows_dynamic` and `delete_rows_dynamic`,
-  previously reachable only through `Client::raw_command`. Insert and delete
-  send a tabular input stream, select returns one, lookup does both; all four
-  are heavy.
+  previously reachable only through `Client::raw_command`.
+- Insert and delete send a tabular input stream, select returns one, lookup
+  does both; all four are heavy.
 - Added `create_client` and `create_rpc_client`, which return the same
   `ytsaurus_api::TableClient`, so choosing a transport is one line.
 - Added the `rpc` feature, **off by default and required to stay off**: it pulls
@@ -27,10 +27,10 @@ compile from their tarballs; this crate had no such file.
   built `target/.../examples/e2e` and overwrote each other. The `ytsaurus-rpc`
   counterpart is `rpc_e2e`.
 - Added `error_summary(&YsonValue) -> Option<String>`, previously `pub(crate)`,
-  which `JobInfo::error` and the operation errors are built from: the outer
-  message and the innermost cause (`Failed to run query: Memory limit
-  exceeded`), without the attributes between. Use it on the error documents
-  `Client::raw_command` returns.
+  which `JobInfo::error` and the operation errors are built from. Use it on the
+  error documents `Client::raw_command` returns.
+- `error_summary` keeps the outer message and the innermost cause (`Failed to
+  run query: Memory limit exceeded`), without the attributes between.
 
 ## 0.2.6
 
@@ -59,19 +59,22 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - **Breaking** a write to a path carrying a read selection is refused locally
   with `ClientError::Config`, before anything is sent; the cluster would
   replace the whole table and answer 200. This covers `TablePath::columns` and
-  `TablePath::range` and selection syntax in the path string: a leading `<…>`
-  block, or an unescaped `[` or `{` (an escaped `\[` in a node name is still
-  writable). So `write_table("<append=%true>//tmp/t", rows)`, which appended,
-  now fails: use `TablePath::append()`, or `Client::raw_command` for any other
-  write attribute.
+  `TablePath::range`.
+- **Breaking** a write is also refused for selection syntax in the path string:
+  a leading `<…>` block, or an unescaped `[` or `{`. An escaped `\[` in a node
+  name is still writable.
+- **Breaking** `write_table("<append=%true>//tmp/t", rows)`, which appended,
+  now fails for that reason: use `TablePath::append()`, or
+  `Client::raw_command` for any other write attribute.
 - **Breaking** `TablePath` no longer derives `Eq`, since a key bound may hold a
   double; `PartialEq` remains. Neither `TablePath` nor `RowRange` derives
-  `Default`. `read_skiff_table` refuses a path whose columns are selected twice,
-  by `TablePath::columns` or by `{…}` in the path string, because the Skiff
-  format adds a `columns` attribute itself; a row range, typed or in the
+  `Default`.
+- **Breaking** `read_skiff_table` refuses a path whose columns are selected
+  twice, by `TablePath::columns` or by `{…}` in the path string, because the
+  Skiff format adds a `columns` attribute itself. A row range, typed or in the
   string, is allowed.
 - **Breaking** a row range that runs backwards (`rows(5..3)`, `keys(b..a)`) or
-  has a negative row index (`rows(-5..2)`) is refused rather than sent. The
+  has a negative row index (`rows(-5..2)`) is refused rather than sent; the
   cluster answers the first with no rows and clamps the second to 0. An empty
   range (`rows(5..5)`, `keys(a..a)`) is still sent.
 
@@ -79,35 +82,41 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 - Added `Client::with_heavy_proxies_under(domains)`: heavy proxies may be in the
   configured address's domain or in any domain named, for an installation whose
-  heavy proxies sit in a zone of their own. Entries are normalised (whitespace,
-  a leading or trailing dot, a leading `*`, a scheme, a port), and one with no
-  dot is dropped, since it would admit a whole top-level domain. It is a typo
-  guard like the default; `with_heavy_proxies_in` is the boundary.
-- Added four variables to `Client::from_env`, each inert when unset:
-
-  | Variable | Effect |
-  | --- | --- |
-  | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Only for a name with no colon, no dot and not `localhost`, as in the Go SDK. No suffix is compiled in. |
-  | `YT_HEAVY_PROXY_DOMAINS` | Comma- or space-separated, into `with_heavy_proxies_under`. |
-  | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes`, into `with_heavy_proxies_anywhere`. Applied after the domains, so the wider of the two wins. |
-  | `YT_FILE_CACHE` | Into `with_file_cache`, for an installation whose shared cache is read-only. |
-
-  The environment can widen the heavy-proxy rule and cannot narrow it:
-  `with_heavy_proxies_in` is settable only in Rust.
+  heavy proxies sit in a zone of their own. Like the default, it is a typo
+  guard; `with_heavy_proxies_in` is the boundary.
+- `with_heavy_proxies_under` normalises its entries (whitespace, a leading or
+  trailing dot, a leading `*`, a scheme, a port) and drops one with no dot,
+  since it would admit a whole top-level domain.
+- Added `YT_PROXY_SUFFIX` to `Client::from_env`: it completes a bare cluster
+  name, so `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses
+  `hume.yt.example.net`. Only for a name with no colon, no dot and not
+  `localhost`, as in the Go SDK. No suffix is compiled in.
+- Added `YT_HEAVY_PROXY_DOMAINS` to `Client::from_env`: comma- or
+  space-separated, into `with_heavy_proxies_under`.
+- Added `YT_HEAVY_PROXIES_ANYWHERE` to `Client::from_env`: `1`, `true` or `yes`,
+  into `with_heavy_proxies_anywhere`. Applied after the domains, so the wider
+  of the two wins.
+- Added `YT_FILE_CACHE` to `Client::from_env`: into `with_file_cache`, for an
+  installation whose shared cache is read-only.
+- The four new variables are inert when unset. The environment can widen the
+  heavy-proxy rule and cannot narrow it: `with_heavy_proxies_in` is settable
+  only in Rust.
 - Changed `Client::from_env` to trim every variable it reads, `YT_PROXY`
   included, and to treat a variable set to nothing as unset. Previously
   `YT_PROXY=" http://localhost:8000 "` failed as a malformed URL and `YT_PROXY=`
   addressed `https://`.
 - Changed the `UnknownIssuer` error: `ClientError::Transport` now names
   `YT_CA_BUNDLE` and the `platform-verifier` feature when the root store
-  rejected the certificate. Not for `NotValidForName`, and not for a transient
+  rejected the certificate.
+- That advice is not given for `NotValidForName`, nor for a transient
   platform-verifier failure such as `Other(OtherError("UnknownIssuer lookup
   failed"))`, which is still retried.
 - Changed both messages about a declined `/hosts` answer (the one-time
   announcement, and the sentence added to the cluster's refusal of each heavy
   command) to offer `with_heavy_proxies_under`, `with_heavy_proxies_in` and
-  `with_heavy_proxies_anywhere` with their environment spellings, and to name a
-  domain dropped for having no dot.
+  `with_heavy_proxies_anywhere`.
+- Both messages also give the environment spellings and name a domain dropped
+  for having no dot.
 - Changed the `cached_upload` example to bring its own file cache, since a
   managed shared cache refuses its clearing `remove` with code 901.
   `YT_FILE_CACHE` points it at a shared one; it then stops with an explanation.
@@ -120,30 +129,34 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Added `Transaction::detach`, C++'s `ITransaction::Detach()`: stops the
   keep-alive thread and returns the id, leaving the transaction running until
   its timeout (30 s by default) after the last ping, unless the receiver keeps
-  it alive. It waits up to five seconds for the thread to stop; at most one ping
-  is left outstanding, and the thread exits after it. **Above a 30 s timeout a
-  stalled ping can outlast that wait, reach the master after `detach` returns
-  and restart the expiry clock.** At or below 30 s the wait always ends with the
-  thread's exit.
+  it alive.
+- `detach` waits up to five seconds for the thread to stop. At most one ping is
+  left outstanding, and the thread exits after it; at or below a 30 s timeout
+  the wait always ends with the thread's exit.
+- **Above a 30 s timeout a stalled ping can outlast that wait**, reach the
+  master after `detach` returns and restart the expiry clock.
 - Added `Client::attach_transaction(id)`: a full `Transaction` (bound client,
-  ping thread, `commit`, `abort`, `ping`) for an id from elsewhere. It reads
-  `#<id>/@timeout` for the ping interval and pings once before returning, so a
-  transaction that is gone fails here, naming the id. **Dropping an attached
-  handle detaches rather than aborts.** It always pings; Go's
-  `AttachTx(id, {AutoPingable: false})` maps onto `with_transaction` and the
-  by-id commands. Two attaches to one id both ping, and the first to finish the
-  transaction decides it.
+  ping thread, `commit`, `abort`, `ping`) for an id from elsewhere. It always
+  pings; Go's `AttachTx(id, {AutoPingable: false})` maps onto
+  `with_transaction` and the by-id commands.
+- `attach_transaction` reads `#<id>/@timeout` for the ping interval and pings
+  once before returning, so a transaction that is gone fails here, naming the
+  id.
+- **Dropping an attached handle detaches rather than aborts.** Two attaches to
+  one id both ping, and the first to finish the transaction decides it.
 - Added `Transaction::is_lost`: true once a ping was answered "no such
-  transaction" and the keep-alive stopped. False does not prove pinging: it is
-  also false when the thread never started or has panicked. It takes `&self`;
-  after `detach`, probe with `Client::ping_transaction`.
+  transaction" and the keep-alive stopped. It is also false when the thread
+  never started or has panicked, so false does not prove pinging.
+- `is_lost` takes `&self`; after `detach`, probe with
+  `Client::ping_transaction`.
 - Added `Client::ping_transaction`, `Client::commit_transaction` and
   `Client::abort_transaction`, taking a bare id. Commit carries a mutation ID,
   abort is retried freely, and a ping doubles as a liveness probe.
 - Unchanged: dropping a transaction this process started still aborts it.
-  Added the `detach` example. Documented that `mem::forget` on a `Transaction`
-  leaks its keep-alive thread, which holds the transaction and its locks open
-  for the life of the process; `detach` is the way to hand one on.
+- Added the `detach` example.
+- Documented that `mem::forget` on a `Transaction` leaks its keep-alive thread,
+  which holds the transaction and its locks open for the life of the process;
+  `detach` is the way to hand one on.
 
 ### Reading a file
 
@@ -151,27 +164,30 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   and streaming like the table reads, and routed to a heavy proxy like them.
 - `read_file` checks the body against the node's `@uncompressed_data_size` with
   one light `get` after the read, and fails, naming both numbers, on a mismatch
-  or a non-integer answer. The streaming read cannot check: compare
-  `FileReader::bytes_read` with the same attribute.
+  or a non-integer answer.
+- The streaming read cannot check: compare `FileReader::bytes_read` with the
+  same attribute.
 - Added `FileReader`, the streaming read's type: `ResponseReader` under the
   name the file path uses, as `TableReader` is for tables.
 
 ### The 512 MiB cap on a buffered response
 
-- Fixed the cap counting wire bytes instead of decoded ones. Responses are
-  gzip, so it bounded almost nothing. **A buffered response that decodes to more
-  than 512 MiB now fails**; a body of exactly 512 MiB now passes.
-  `read_table_streaming`, `read_file_streaming` and `write_table` are
-  unaffected. The cap is on bytes held, not on peak memory (a growing `Vec`
-  peaks near 1.5×), and the non-2xx branch of a streaming open and the `/hosts`
-  lookup keep `ureq`'s wire-only default.
+- Fixed the cap counting wire bytes instead of decoded ones; responses are
+  gzip, so it bounded almost nothing. **A buffered response that decodes to
+  more than 512 MiB now fails**; a body of exactly 512 MiB now passes.
+- `read_table_streaming`, `read_file_streaming` and `write_table` are
+  unaffected by the cap. Nor are the non-2xx branch of a streaming open and the
+  `/hosts` lookup, which keep `ureq`'s wire-only default.
+- The cap is on bytes held, not on peak memory: a growing `Vec` peaks near
+  1.5×.
 - Changed the error for a buffered response over the cap from
   `ClientError::Transport` to a new `ClientError::ResponseTooLarge { command,
   limit }`, which is never retried and does not drop a heavy proxy from the
-  pool. It reaches `read_table`, `read_table_with_format`, `read_skiff_table`,
-  `read_table_rows`, a buffered `raw_command` and any light command answered
-  that large. A caller matching `Transport` to retry stops matching it. The
-  message names the cap and the streaming form of the command.
+  pool. A caller matching `Transport` to retry stops matching it.
+- `ResponseTooLarge` reaches `read_table`, `read_table_with_format`,
+  `read_skiff_table`, `read_table_rows`, a buffered `raw_command` and any light
+  command answered that large. Its message names the cap and the streaming
+  form of the command.
 
 ### Selecting columns and rows on a read
 
@@ -179,69 +195,77 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `Key`, sent as the `columns` and `ranges` attributes on the path
   ([rich YPath](https://ytsaurus.tech/docs/en/user-guide/storage/ypath)).
 - Row ranges are Rust ranges: `path.range(0..100)`, `range(100..)`,
-  `range(..)`. Key ranges are `RowRange::keys(Key::from("a")..Key::from("b"))`:
-  an included lower and excluded upper bound are sent as `key`, `..=` and
-  `Bound::Excluded` below as `key_bound`. `RowRange::exact_key` is the `exact`
-  selector. `keys(a..b)` and `keys(a..=b)` differ by every row whose key starts
-  with `b`, and `Excluded(a)` below skips every row starting with `a`
+  `range(..)`. `RowRange::exact_key` is the `exact` selector.
+- Key ranges are `RowRange::keys(Key::from("a")..Key::from("b"))`. An included
+  lower and an excluded upper bound are sent as `key`; `..=` and
+  `Bound::Excluded` below are sent as `key_bound`.
+- `keys(a..b)` and `keys(a..=b)` differ by every row whose key starts with
+  `b`, and `Excluded(a)` below skips every row starting with `a`
   ([protocol reference](../../docs/protocol-reference.md#selecting-columns-and-rows-on-a-path)).
 - Added `yson_build::uint`, for `uint64` keys above `i64::MAX`.
 - Changed `read_table`, `read_table_with_format`, `read_skiff_table`,
   `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`.
-  `&str`, `String`, `&String`, `&&str` and `Cow<str>` compile unchanged; a call
-  relying on inference (`path.as_ref()`) may need `&str` spelled once.
+- `&str`, `String`, `&String`, `&&str` and `Cow<str>` arguments compile
+  unchanged; a call relying on inference (`path.as_ref()`) may need `&str`
+  spelled once.
 - A read still sends a path string verbatim, but refuses a typed selection
   added to a string that already spells the same kind, where the cluster would
-  silently discard the string's half, or to a string opening with `<…>`. Rows
-  and columns from different sources compose and are sent.
+  silently discard the string's half, or to a string opening with `<…>`.
+- Rows and columns selected from different sources compose and are sent.
 - `columns([])` is sent: it returns one empty map per row, counting a range's
   rows with no column bytes on the wire.
 
 ### Heavy proxies: a refreshed pool (#40)
 
 - Changed heavy-command routing to match the C++ and Go SDKs: the whole
-  `/hosts` answer is a pool, each heavy command picks a member at random, and
-  the first heavy command to find the answer older than the refresh interval
-  asks again. A failed refresh keeps the previous answer for another interval.
-  No background thread and no new dependency. A heavy command may now pay one
-  `/hosts` round trip mid-life (bounded by `with_hosts_timeout`, at most once
-  per interval), and
-  "the cluster named no heavy proxy" expires after one interval instead of
-  lasting for the client's life. `with_proxy_discovery(false)`, `heavy_proxy()`
-  (the cluster's first pick) and `with_hosts_retry_after` are unchanged.
+  `/hosts` answer is a pool, and each heavy command picks a member at random.
+  No background thread and no new dependency.
+- The first heavy command to find the answer older than the refresh interval
+  asks again; a failed refresh keeps the previous answer for another interval.
+  So a heavy command may now pay one `/hosts` round trip mid-life, bounded by
+  `with_hosts_timeout`, at most once per interval.
+- "The cluster named no heavy proxy" now expires after one interval instead of
+  lasting for the client's life.
+- `with_proxy_discovery(false)`, `heavy_proxy()` (the cluster's first pick) and
+  `with_hosts_retry_after` are unchanged.
 - Fixed a failed heavy command dropping its host only on failures worth asking
   `/hosts` again about. Any failure attributable to the host now drops it until
   a refresh names it again: a refused connection, a 503, a wrong-role refusal
-  or a rejected certificate. An emptied pool falls back to the configured
-  address for `with_hosts_retry_after`, then asks afresh.
+  or a rejected certificate.
+- An emptied pool falls back to the configured address for
+  `with_hosts_retry_after`, then the cluster is asked afresh.
 - Added `Client::with_host_list_refresh_interval(Duration)`, default one minute.
-  `Duration::ZERO` asks before every heavy command; `Duration::MAX` never
-  refreshes, though a failed host is still dropped and an emptied pool still
-  falls back and asks again.
+  `Duration::ZERO` asks before every heavy command.
+- `Duration::MAX` never refreshes; a failed host is still dropped, and an
+  emptied pool still falls back and asks again.
 
 ### Batches (#11)
 
 - Added `BatchRequest` and `Client::execute_batch`, the cluster's
-  `execute_batch` (C++ `CreateBatchRequest`, Go `NewBatchRequest`). The answer
-  is a `Vec` of per-part results in part order: `Ok` holds the part's envelope
-  (`{node_id=…}` for a create, `{value=…}` for an exists), `Err` a
-  `ClientError::Cluster` named after the part's command.
+  `execute_batch` (C++ `CreateBatchRequest`, Go `NewBatchRequest`).
+- The answer is a `Vec` of per-part results in part order: `Ok` holds the
+  part's envelope (`{node_id=…}` for a create, `{value=…}` for an exists), `Err`
+  a `ClientError::Cluster` named after the part's command.
 - `BatchRequest` builds parts with `create`, `create_table`, `exists`, `get`,
   `list`, `remove`, `remove_tree` and `set_attribute`, which send what their
-  `Client` namesakes send, and `raw`. A `raw` part naming a command the cluster
-  will not batch (output type `tabular` or `binary`, or input `binary`; 21
-  names, `select_rows` and `lookup_rows` among them) is refused locally. That
-  list is one cluster's registry and may be incomplete.
-- Added `with_concurrency` (the server-side cap, cluster default 50) and
-  `with_max_part_size` (C++ `BatchPartMaxSize`). A larger batch is split into
+  `Client` namesakes send, and `raw`.
+- A `raw` part naming a command the cluster will not batch (output type
+  `tabular` or `binary`, or input `binary`; 21 names, `select_rows` and
+  `lookup_rows` among them) is refused locally. That list is one cluster's
+  registry and may be incomplete.
+- Added `with_concurrency`, the server-side cap (cluster default 50), and
+  `with_max_part_size`, C++'s `BatchPartMaxSize`. A larger batch is split into
   consecutive requests, `concurrency × 5` parts each by default, with results in
-  part order. Nothing is rolled back across requests, and unlike the C++ client
-  a retriable part is not re-queued ([sdk-comparison](../../docs/sdk-comparison.md)).
+  part order.
+- A split batch is not rolled back across requests, and unlike the C++ client
+  a retriable part is not re-queued
+  ([sdk-comparison](../../docs/sdk-comparison.md)).
 - Added `ClientError::BatchInterrupted { answered, parts, cause }`, for a split
   batch that stops partway: `answered` holds the per-part results of every
   request that completed. A one-request batch returns the underlying error as
-  before. `answered` is what came back, not what was applied: **a request that
-  failed while executing may have run all of its parts.**
+  before.
+- `answered` is what came back, not what was applied: **a request that failed
+  while executing may have run all of its parts.**
 - Added `Client::execute_batch_with`, taking a caller's `MutationId`, so a
   batch replayed after a crash under `id.as_retry()` is deduplicated part by
   part. A batch that would be split is refused with `ClientError::Config` when
@@ -250,9 +274,10 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   make the whole batch send-once. `Repeatable::Heavy` is refused.
 - A mutating batch is retried under one mutation id, which the cluster derives
   per part. A batch of reads carries no id; a batch with a `raw` part is sent
-  once. A client bound to a transaction stamps each part, not the envelope,
-  whose `transaction_id` the cluster drops; a part naming its own transaction
-  keeps it, and a command with no transaction is left alone.
+  once.
+- A client bound to a transaction stamps each part, not the envelope, whose
+  `transaction_id` the cluster drops. A part naming its own transaction keeps
+  it, and a command with no transaction is left alone.
 - A batch sends its parameters in the POST body (the proxy merges them with
   `X-YT-Parameters`, `TContext::CaptureParameters`). As a request with a body,
   a cross-origin redirect on it is refused with `RedirectRefusal::Payload` even
@@ -262,9 +287,10 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   the other parts have run.
 - The parser refuses a `results` count that does not match the parts, and an
   item that is not `{output=…}`, `{error=…}` or, for `set`, `remove` or a `raw`
-  part, `{}`. A part's success must carry its key: `node_id` for `create`,
-  `value` for `exists`, `get` and `list`. A `create` answered `{}` used to pass
-  and panic the caller at `answer["node_id"]`.
+  part, `{}`.
+- A part's success must carry its key: `node_id` for `create`, `value` for
+  `exists`, `get` and `list`. A `create` answered `{}` used to pass and panic
+  the caller at `answer["node_id"]`.
 - Added the `batch` example. `tests/batch.rs` pins the single request and the
   wire shape.
 
@@ -273,8 +299,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Fixed `Client::upload_worker_cached` failing on an installation that manages
   `//tmp/yt_wrapper/file_storage` itself. A code-901 refusal of the cache's own
   writes (creating the cache directory, creating the staging node,
-  `put_file_to_cache`) now uploads the worker under `//tmp` and carries on. A
-  901 on the bytes themselves, or any other error, still fails. The code is
+  `put_file_to_cache`) now uploads the worker under `//tmp` and carries on.
+- A 901 on the bytes themselves, or any other error, still fails. The code is
   found anywhere in the error document. Not verified against a cluster that
   denies access; `tests/file_cache.rs` scripts the refusals.
 - `CachedFile::cached` is true for a hit and an accepted upload, false only for
@@ -291,19 +317,21 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 - Fixed a credential-carrying request following a redirect and arriving
   without its token (`cluster error 111: Client is missing credentials`).
-  `ureq` follows no redirect now (`max_redirects(0)`); the client decides:
-  - same origin: followed, token included, `Location` resolved against the
-    request's address ([RFC 3986 §4.2](https://www.rfc-editor.org/rfc/rfc3986#section-4.2));
-  - another origin, with credentials: refused with `ClientError::Redirected`,
-    naming the status and target without vouching for the token, and pointing
-    to `Client::heavy_proxy` only for a command that could use one;
-  - another origin, with a non-empty body, token or not:
-    `RedirectRefusal::Payload`;
-  - a body that cannot be sent twice (`write_table_rows`,
-    `raw_command_upload`): refused anywhere, `RedirectRefusal::Body`. This
-    fixes `write_table` returning `Ok(())` with no rows written after a
-    redirect;
-  - more than ten hops: refused as a loop.
+  `ureq` follows no redirect now (`max_redirects(0)`); the client decides, as
+  the following entries say.
+- A same-origin redirect is followed, token included, with `Location` resolved
+  against the request's address
+  ([RFC 3986 §4.2](https://www.rfc-editor.org/rfc/rfc3986#section-4.2)).
+- A redirect to another origin with credentials is refused with
+  `ClientError::Redirected`, naming the status and target without vouching for
+  the token, and pointing to `Client::heavy_proxy` only for a command that
+  could use one.
+- A redirect to another origin with a non-empty body is refused, token or not:
+  `RedirectRefusal::Payload`.
+- A redirect on a body that cannot be sent twice (`write_table_rows`,
+  `raw_command_upload`) is refused anywhere: `RedirectRefusal::Body`. This
+  fixes `write_table` returning `Ok(())` with no rows written after a redirect.
+- A chain of more than ten hops is refused as a loop.
 - Changed a followed redirect to resend the same method and body, whatever the
   status, so a bodiless `POST` follows a balancer's `301`.
 - Fixed the request timeout restarting on every hop; a redirect chain shares
@@ -322,14 +350,15 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 - Added `YT_CA_BUNDLE`, a PEM file of roots used instead of the compiled-in
   Mozilla bundle, and the `platform-verifier` feature, which trusts the OS
-  store. Both off by default; the bundle wins where both are set. Both sit
-  behind `tls`: no new direct dependency, and the musl worker graph is
+  store. Both off by default; the bundle wins where both are set.
+- Both sit behind `tls`: no new direct dependency, and the musl worker graph is
   unchanged (CI also checks it for `rustls-platform-verifier`).
 - The bundle is read once per process and must be a regular file of at most
-  16 MB. One that cannot be read, holds no certificate, or holds a
+  16 MB. A plain-HTTP cluster is unaffected.
+- A bundle that cannot be read, holds no certificate, or holds a
   `BEGIN CERTIFICATE` block that is not X.509 (a re-armoured PKCS#7 `.p7b`) is
   refused at the first request that needs it, naming the file and the number of
-  bad blocks. A plain-HTTP cluster is unaffected.
+  bad blocks.
 - Fixed `UnknownIssuer` and `NotValidForName` being retried five times, about
   15 s; they are reported at once. Every other TLS failure, a reset or refused
   connection and a timeout are still retried.
@@ -339,13 +368,15 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Added automatic routing. Heavy commands (`write_table`, `write_file`,
   `read_table`, `upload_worker`, `write_table_rows` and the streaming forms)
   went to `YT_PROXY`, which on a role-separated installation is a control proxy
-  that refuses them. The first heavy command now asks `/hosts`, and every clone
-  of the client shares the answer, refreshed as in the pool entry above. A
-  failed heavy command is not re-sent.
+  that refuses them.
+- The first heavy command now asks `/hosts`, and every clone of the client
+  shares the answer, refreshed as in the pool entries above. A failed heavy
+  command is not re-sent.
 - A failed heavy command drops the host it used, and another host in the pool
   takes over; likewise for a proxy that refuses heavy work for its role or
-  cannot be reached. Only when every name has failed does the client fall back to the configured
-  address, for ten seconds, then ask again.
+  cannot be reached.
+- Only when every name has failed does the client fall back to the configured
+  address, for `with_hosts_retry_after`, then ask again.
 - A `/hosts` lookup that fails for a reason that might pass (a timeout, a 503)
   sends heavy commands to the configured address for `with_hosts_retry_after`,
   ten seconds by default, after which the cluster is asked again.
@@ -358,22 +389,23 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   commands use the configured address after a transient lookup failure or once
   every host in the answer has failed, before the cluster is asked again.
 - A `/hosts` answer declined in full is announced once, on stderr or as a
-  `WARN` event under `tracing`, muted inside a job; a heavy command then refused
+  `WARN` event under `tracing`, muted inside a job. A heavy command then refused
   at the configured address carries a sentence saying so and naming the builder
   call that changes it.
 - A discovered name is used only with the configured address's domain (or as
   the configured host itself), its scheme and port, a numeric port, no `://`,
-  `/`, `@` or whitespace, and brackets only around an IPv6 literal. A
-  configured name with no dot matches as a non-leftmost label: `hume` follows
-  `n0008-sas.hume.yt.example.net`, not `hume.evil.com`. A refused name is
-  skipped. The domain rule is a typo guard, not a token boundary.
+  `/`, `@` or whitespace, and brackets only around an IPv6 literal.
+- A configured name with no dot matches as a non-leftmost label: `hume`
+  follows `n0008-sas.hume.yt.example.net`, not `hume.evil.com`. A refused name
+  is skipped. The domain rule is a typo guard, not a token boundary.
 - Added `Client::with_heavy_proxies_anywhere`, which relaxes only the domain
   rule.
 - A cluster that names no heavy proxy, answers `/hosts` with 404 or with
   something other than host names, or has every name refused, is served at the
   configured address, and that answer is kept until the next
-  `with_host_list_refresh_interval`. A cluster on loopback is not asked. Added
-  `Client::with_proxy_discovery` to force discovery on or off.
+  `with_host_list_refresh_interval`.
+- A cluster on loopback is not asked. Added `Client::with_proxy_discovery` to
+  force discovery on or off.
 - A routed failure names its host: `write_table at n0132-sas.example.net:9013: …`.
 - Corrected the documented control-proxy refusal: a heavy write gets 503 with
   `Retry-After: 60`, a heavy read a 307; it had said HTTP 200. `heavy_proxy`
@@ -387,10 +419,10 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Added `suspend_operation`, `resume_operation`, `complete_operation`,
   `update_operation_parameters`, `list_operations`, `list_operation_events`,
   `get_operation`, `get_operation_by_alias`, `operation_suspended`,
-  `operation_status`, `get_job` and `get_job_input`, and `Operation`, a handle
-  over a client and an id with the same commands. `Client::attach_operation(id)`
-  makes one from an id. Dropping an `Operation` does nothing. `start_map` and
-  its siblings still return a `String`.
+  `operation_status`, `get_job` and `get_job_input`.
+- Added `Operation`, a handle over a client and an id with the same commands;
+  `Client::attach_operation(id)` makes one from an id. Dropping an `Operation`
+  does nothing. `start_map` and its siblings still return a `String`.
 - `operation_status` reads the state and the suspension together, and
   `wait_for_operation` polls it, so a wait on a paused operation reports
   `running, suspended`.
@@ -401,26 +433,27 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   through `get_operation`.
 - Added `OperationType::Merge`, `Erase`, `RemoteCopy` and `JoinReduce`, with
   `MergeSpec`, `EraseSpec`, `RemoteCopySpec`, `start_merge`, `start_erase` and
-  `start_remote_copy`. A sorted merge without `merge_by` is sent. `JoinReduce`
-  has no builder: use `ReduceSpec::with_raw` with `join_by` and
+  `start_remote_copy`. A sorted merge without `merge_by` is sent.
+- `JoinReduce` has no builder: use `ReduceSpec::with_raw` with `join_by` and
   `enable_key_guarantee=%false`.
 - Added the `lifecycle` example.
 
 ### Tracing
 
 - Added `TraceContext` and `Client::with_trace_context`: every request, `/hosts`
-  included, carries a W3C `traceparent`, with no new dependency.
-  `TraceContext::parse` continues a trace (the version field may be absent; a
+  included, carries a W3C `traceparent`, with no new dependency. The caller's
+  span id is sent unchanged.
+- `TraceContext::parse` continues a trace (the version field may be absent; a
   later version's extra fields are ignored) and refuses a malformed header;
-  `TraceContext::new` starts one. The caller's span id is sent unchanged.
+  `TraceContext::new` starts one.
 - Added `TraceContext::with_tracestate`, forwarded unmodified, and
   `TraceContext::yt_trace_id`, the cluster's spelling of the id
   (`8e9bcc43-5c2be9b4-56f18c4e-117ea314`).
 - Added the `tracing` feature, off by default: a span per attempt (command,
   attempt, duration), and retry messages as `WARN` events. It adds `tracing`,
-  `tracing-core`, `pin-project-lite`, and `once_cell` where TLS is off. **With
-  no subscriber installed, the stderr line is still printed.** `attempt` is the
-  try that failed and `of` the number allowed, in event and span alike.
+  `tracing-core`, `pin-project-lite`, and `once_cell` where TLS is off.
+- **With no subscriber installed, the stderr line is still printed.** `attempt`
+  is the try that failed and `of` the number allowed, in event and span alike.
 - Unchanged: retry reporting is muted inside a job, in both forms;
   `RetryPolicy::loud` turns it on.
 
@@ -429,14 +462,16 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Added the `e2e` example (renamed `client_e2e` in 0.3.0): the three checks of
   `tests/cluster-e2e/run_e2e.sh`, run through this crate with no Python. It
   creates its destination tables, which operations here never do.
-- Added `Client::raw_command(method, command, params, payload)`,
-  `raw_command_with(…, repeatable, mutation_id)`,
-  `raw_command_streaming(method, command, params)`, which returns the response
-  unread, and `raw_command_upload(method, command, params, body)`, which streams
-  the body. `raw_command` is sent once whatever the retry policy, and is
-  stamped with the client's transaction, except the scheduler and job commands
-  (`get_operation`, `list_jobs` and the like), which go without one. A
-  command name containing `/`, `?`, `#` or whitespace is refused, as is a
+- Added `Client::raw_command(method, command, params, payload)` and
+  `raw_command_with(…, repeatable, mutation_id)`. `raw_command` is sent once
+  whatever the retry policy.
+- Added `raw_command_streaming(method, command, params)`, which returns the
+  response unread, and `raw_command_upload(method, command, params, body)`,
+  which streams the body.
+- A raw command is stamped with the client's transaction, except the scheduler
+  and job commands (`get_operation`, `list_jobs` and the like), which go
+  without one.
+- A raw command name containing `/`, `?`, `#` or whitespace is refused, as is a
   payload with `Method::Get`.
 - Added `Method` and `Repeatable` to the public API, `ResponseReader` (which
   `TableReader` now names), and `yson_build::empty_map`.
@@ -452,8 +487,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `with_memory_limit` reaching the mapper only when `with_mapper` came first.
 - Fixed the 120-second request timeout cutting off `read_table_streaming`,
   `write_table_rows` and `write_table_streaming`: for streaming it bounds
-  resolve, connect, sending the request and the response headers, not the
-  data. Buffered commands keep it end to end. Added `Client::with_timeout`
+  resolve, connect, sending the request and the response headers, not the data.
+- Buffered commands keep the timeout end to end. Added `Client::with_timeout`
   (default two minutes).
 
 ### Aborting an operation, appending to a table
@@ -473,14 +508,16 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 - Added `Client::write_table_rows`, from any iterator of serialisable values,
   encoded a buffer at a time as the body is sent; a row that will not serialise
-  fails the write, naming the row. Added `Client::read_table_rows`, into any
-  deserialisable type; a struct naming some of the columns reads just those.
+  fails the write, naming the row.
+- Added `Client::read_table_rows`, into any deserialisable type; a struct
+  naming some of the columns reads just those.
 - Added `Client::get_as`, which reads a node or attribute into a Rust type.
 - Added `Client::read_table_streaming`, returning `TableReader`, and
   `Client::write_table_streaming`. They carry the same binary YSON list
   fragment as the buffered pair, so `ytsaurus_job::JobReader::binary` decodes
-  it. The streaming read has no completeness check (a truncated fragment fails
-  in the decoder) and a streaming write is never retried.
+  it.
+- The streaming read has no completeness check (a truncated fragment fails in
+  the decoder), and a streaming write is never retried.
 - Added `Client::job_statistics` and `Client::job_statistic_sum`, for the
   built-in statistics; both the `$` and `$$` separators are read.
 - Changed `Client::from_env` to look for a token as the `yt` CLI does:
@@ -492,27 +529,28 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Added the `schema` module (`TableSchema`, `Column`, `ColumnType`, `SortOrder`,
   the `TableRow` trait), `Client::create_table`, which sends the schema inside
   `attributes` and fails if the path exists, and `Client::table_schema`.
-  `TableSchema::validate` refuses non-prefix key columns, duplicate names, names
+- `TableSchema::validate` refuses non-prefix key columns, duplicate names, names
   starting with `@`, `unique_keys` without a key and a required `any`, naming
-  the column. `SortOrder::Descending` documents that a cluster is likely to
-  refuse it, gated by `//sys/@config/enable_descending_sort_order`.
+  the column.
+- `SortOrder::Descending` documents that a cluster is likely to refuse it,
+  gated by `//sys/@config/enable_descending_sort_order`.
 - Added the `derive` feature, off by default, re-exporting
   `#[derive(TableRow)]` from [`ytsaurus-helpers`](../ytsaurus-helpers/).
 - Added `Client::alter_table`, which sends `schema` as a top-level parameter
   and checks nothing locally; the cluster's error 316 names the column.
-- Added `Client::list`, which refuses a listing marked `<incomplete=%true>`;
-  `copy` / `copy_replacing`, `move_node` / `move_replacing` (`move` is a
-  keyword) and `link` / `link_replacing`, where the `_replacing` form
-  overwrites; and `lock` / `lock_waiting` with `LockMode` and `Lock`. `lock`
-  without a transaction is refused locally, and `lock_waiting` polls until
-  `acquired`, with a deadline.
+- Added `Client::list`, which refuses a listing marked `<incomplete=%true>`,
+  and `copy` / `copy_replacing`, `move_node` / `move_replacing` (`move` is a
+  keyword) and `link` / `link_replacing`; the `_replacing` form overwrites.
+- Added `lock` / `lock_waiting` with `LockMode` and `Lock`. `lock` without a
+  transaction is refused locally, and `lock_waiting` polls until `acquired`,
+  with a deadline.
 - Added `Transaction`, `Client::start_transaction`,
-  `Client::start_transaction_with` and `Client::with_transaction`. A
-  `Transaction` derefs to a `Client` bound to it (`tx.write_table(…)`,
+  `Client::start_transaction_with` and `Client::with_transaction`. Only
+  `commit` publishes, under a mutation ID; dropping an uncommitted handle
+  aborts. A thread pings three times per timeout.
+- A `Transaction` derefs to a `Client` bound to it (`tx.write_table(…)`,
   `tx.start_map(…)`), and every command it sends carries the id unless the
-  command names a transaction itself. A thread pings three times per timeout.
-  Only `commit` publishes, under a mutation ID; dropping an uncommitted handle
-  aborts.
+  command names a transaction itself.
 - Fixed `Client::exists`, which failed every call by reading the key `exists`
   instead of `value`.
 
@@ -525,30 +563,31 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   the `completed` jobs across job types.
 - Added `Client::upload_worker_cached`, `Client::file_from_cache`,
   `Client::put_file_to_cache` and `Client::with_file_cache`: an unchanged worker
-  is found in the cluster's MD5-keyed file cache instead of re-sent. The cache
-  defaults to `//tmp/yt_wrapper/file_storage/new_cache`, the Python wrapper's.
-  Added `with_local_file_named` to all three spec builders, since a cached file
-  is named by its hash; `file_paths` entries are YSON values. Added a
-  dependency on `md5` 0.8.
+  is found in the cluster's MD5-keyed file cache instead of re-sent.
+- The cache defaults to `//tmp/yt_wrapper/file_storage/new_cache`, the Python
+  wrapper's. Added a dependency on `md5` 0.8.
+- Added `with_local_file_named` to all three spec builders, since a cached file
+  is named by its hash; `file_paths` entries are YSON values.
 - Added `RetryPolicy` and `Client::with_retries`: light commands are retried,
   five attempts by default, the delay doubling from one second to ten;
-  `RetryPolicy::none()` turns it off. Retried: transport errors, HTTP
+  `RetryPolicy::none()` turns it off. Heavy commands are sent once.
+- Retried, as the Python client does: transport errors, HTTP
   429/500/502/503/504, and YTsaurus codes 3, 100, 105, 108, 904 and 2100
   anywhere in the error document (the outer error is often a
-  `Request retries failed` wrapper), as the Python client does; never 500
-  (resolve) or 501 (already exists). Heavy commands are sent once.
+  `Request retries failed` wrapper).
+- Never retried: codes 500 (resolve) and 501 (already exists).
 - Added `MutationId` and `Client::start_operation_with`; every mutating command
   carries a `mutation_id`, and `MutationId::as_retry()` marks a replay of a
   persisted one.
 - Added `ReduceSpec` / `Client::start_reduce` and `SortSpec` /
-  `Client::start_sort`. A reduce's `key_switch` goes under `job_io`. `sort_by`
-  is sent only when set; the cluster defaults it to `reduce_by`. `SortSpec`
-  sends a single `output_table_path`.
+  `Client::start_sort`. A reduce's `key_switch` goes under `job_io`.
+- `sort_by` is sent only when set; the cluster defaults it to `reduce_by`.
+  `SortSpec` sends a single `output_table_path`.
 - Added `Client::upload_current_exe`: with `ytsaurus_job::is_inside_job`, one
-  binary launches the operation and runs as its job. Added
-  `ClientError::NotAWorker`, which refuses an executable that is not a Linux
-  x86-64 ELF without an interpreter, saying what to build instead.
-  `upload_worker` still accepts anything, a shell script included.
+  binary launches the operation and runs as its job.
+- Added `ClientError::NotAWorker`: `upload_current_exe` refuses an executable
+  that is not a Linux x86-64 ELF without an interpreter, saying what to build
+  instead. `upload_worker` still accepts anything, a shell script included.
 - Added the `tls` feature, on by default. Without it an `https://` proxy fails
   with an error naming the feature, and a binary that is both launcher and job
   builds for musl with only the Rust toolchain.
@@ -559,7 +598,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   the error when an operation ends `failed` or `aborted`, best effort. Stderr is
   fetched whatever `stderr_size` says.
 - Added `Client::list_jobs`, `Client::get_job_stderr`, `JobInfo` and
-  `JobFailure`, and `Client::with_job_diagnostics` to turn the report off: the
+  `JobFailure`.
+- Added `Client::with_job_diagnostics` to turn the report off: the
   documentation asks that `list_jobs` be used only with an administrator's
   approval.
 - Changed the operation error to the flattened message (`Failed jobs limit
