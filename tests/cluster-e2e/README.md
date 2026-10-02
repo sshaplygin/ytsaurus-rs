@@ -82,7 +82,7 @@ Skiff map succeeded: 2 rows
 ```
 
 That verifies the dynamic Skiff map path only: one table, one output
-descriptor, no table, range or row indexes, no key switch. Required test 4 of
+descriptor, no table, range or row indexes, no key switch. Required test 5 (cluster fixtures) of
 [`docs/skiff-compatibility.md`](../../docs/skiff-compatibility.md) needs all of
 those, and this run covers none.
 
