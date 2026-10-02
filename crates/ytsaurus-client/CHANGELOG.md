@@ -344,12 +344,17 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   likewise a proxy that refuses heavy work for its role or cannot be reached.
   Only when every name has failed does the client fall back to the configured
   address, for ten seconds, then ask again.
+- A `/hosts` lookup that fails for a reason that might pass (a timeout, a 503)
+  sends heavy commands to the configured address for `with_hosts_retry_after`,
+  ten seconds by default, after which the cluster is asked again.
 - Added `Client::with_heavy_proxies_in`, an explicit list of proxies, compared
   without case and with a port only where both sides name one.
-- Added `Client::with_hosts_timeout` (default 800 ms, one attempt, independent
-  of `with_timeout`) and `Client::with_hosts_retry_after` (default ten
-  seconds). The lookup no longer runs the client's retry policy while holding
-  the lock other heavy commands wait on.
+- Added `Client::with_hosts_timeout`, the lookup's budget: one attempt, 800 ms
+  by default, independent of `with_timeout`. The lookup no longer runs the
+  client's retry policy while holding the lock other heavy commands wait on.
+- Added `Client::with_hosts_retry_after`, default ten seconds: how long heavy
+  commands use the configured address after a transient lookup failure or once
+  every host in the answer has failed, before the cluster is asked again.
 - A `/hosts` answer declined in full is announced once, on stderr or as a
   `WARN` event under `tracing`, muted inside a job; a heavy command then refused
   at the configured address carries a sentence saying so and naming the builder
