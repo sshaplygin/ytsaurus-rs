@@ -490,7 +490,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `attributes` and fails if the path exists, and `Client::table_schema`.
   `TableSchema::validate` refuses non-prefix key columns, duplicate names, names
   starting with `@`, `unique_keys` without a key and a required `any`, naming
-  the column. `SortOrder::Descending` documents that clusters refuse it.
+  the column. `SortOrder::Descending` documents that a cluster is likely to
+  refuse it, gated by `//sys/@config/enable_descending_sort_order`.
 - Added the `derive` feature, off by default, re-exporting
   `#[derive(TableRow)]` from [`ytsaurus-helpers`](../ytsaurus-helpers/).
 - Added `Client::alter_table`, which sends `schema` as a top-level parameter
