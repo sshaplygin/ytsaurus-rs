@@ -65,15 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(client.read_table_rows::<Contact>(path)?, rows);
     println!("wrote and read back {path}");
 
-    // A dynamic table, over HTTP or the RPC proxy.
+    // A dynamic table.
     if let Ok(table) = std::env::var("YT_DYNAMIC_TABLE") {
-        #[cfg(not(feature = "rpc"))]
         let tables = ytsaurus_client::create_client(&std::env::var("YT_PROXY")?)?;
-        #[cfg(feature = "rpc")]
-        let tables = ytsaurus_client::create_rpc_client(&std::env::var("YT_RPC_PROXY")?)?;
+        // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
         let found =
             tables.select_rows(&format!("* from [{table}] limit 10"), &Default::default())?;
-        println!("{} rows over {}", found.len(), tables.transport());
+        println!("{} rows", found.len());
     }
     Ok(())
 }

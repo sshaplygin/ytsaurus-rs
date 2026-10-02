@@ -10,8 +10,10 @@
 //! dynamic half reads one that already exists and is mounted, named by
 //! `YT_DYNAMIC_TABLE`, and is skipped when that is unset. `create_client`
 //! sends no token; a cluster that wants one needs `create_client_with_token`.
-//! Built with `--features rpc`, the same read goes to the RPC proxy named by
-//! `YT_RPC_PROXY` instead.
+//! The dynamic half goes over HTTP only. The RPC constructor is a comment in
+//! it, because the README quotes this block and a `cfg(feature = "rpc")` there
+//! would name the reader's crate's feature, not this one's;
+//! `both_transports.rs` runs the same calls over both.
 
 // README-START
 use serde::{Deserialize, Serialize};
@@ -37,15 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(client.read_table_rows::<Contact>(path)?, rows);
     println!("wrote and read back {path}");
 
-    // A dynamic table, over HTTP or the RPC proxy.
+    // A dynamic table.
     if let Ok(table) = std::env::var("YT_DYNAMIC_TABLE") {
-        #[cfg(not(feature = "rpc"))]
         let tables = ytsaurus_client::create_client(&std::env::var("YT_PROXY")?)?;
-        #[cfg(feature = "rpc")]
-        let tables = ytsaurus_client::create_rpc_client(&std::env::var("YT_RPC_PROXY")?)?;
+        // With the `rpc` feature: ytsaurus_client::create_rpc_client(&address)?
         let found =
             tables.select_rows(&format!("* from [{table}] limit 10"), &Default::default())?;
-        println!("{} rows over {}", found.len(), tables.transport());
+        println!("{} rows", found.len());
     }
     Ok(())
 }
