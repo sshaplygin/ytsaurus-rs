@@ -1,23 +1,12 @@
 # RPC proxy compatibility
 
-What `ytsaurus-rpc` implements, what it deliberately does not, and what has
-actually been run against a cluster. Same job as
-[skiff-compatibility.md](skiff-compatibility.md) and written for the same
-reason: a reverse-engineered binary protocol needs a contract naming every
-surface, its state and its ship gate, or "compatible" means whatever the reader
-hopes.
+Every surface of `ytsaurus-rpc`, its state, and its ship gate.
 
-**Status: published from 0.3.0, and pre-release.** Both `ytsaurus-proto` and
-`ytsaurus-rpc` are on crates.io, by the explicit human decision Hard rule 1
-asks for, and the gates below are **still not all green** — A is green for two
-of its four layers, and C, D and E are open. The publish changes nothing about
-that: the version is 0.x, the API may change in a patch release, and the scope
-stays deliberately narrow — transactions, `lookup_rows`, `select_rows` and
-`modify_rows`, not the other 150 request types. This is the same arrangement
-`ytsaurus-skiff` has had since 0.2.5, and for the same reason: `ytsaurus-client`
-gained `create_rpc_client`, which returns a `ytsaurus_api::TableClient` backed by
-this crate, and could not reach the registry while this one was `publish =
-false`.
+Status: pre-release. `ytsaurus-proto` and `ytsaurus-rpc` were published at
+0.3.0, by human decision (Hard rule 1), before these gates were green; the
+gates still apply to the claim of compatibility. The version is 0.x, the API
+may change in a patch release, and the scope is transactions, `lookup_rows`,
+`select_rows` and `modify_rows`, not the other 150 request types.
 
 ## What it is pinned to
 
@@ -27,18 +16,14 @@ false`.
 | Reference implementation for vectors | Go SDK `yt/go` v0.0.33 | `tests/rpc-go-interop/go.mod` |
 | Cluster verified against | `ghcr.io/ytsaurus/local:stable`, server `25.4.260522002` | [`rpc_e2e.rs`](../crates/ytsaurus-rpc/examples/rpc_e2e.rs) runs in the post-merge `Cluster E2E` workflow against the local cluster's RPC proxy |
 
-The protos are a **submodule, not a copy**. A submodule records an exact
-upstream commit, so the definitions are pinned the way protocol work needs
-while staying byte-identical to upstream's — there is no vendored copy that can
-silently drift, and nothing is fetched at build time. The pin moves only when a
-human moves it.
-
-`stable/25.4` rather than `main` because it is the branch the local cluster this
-was verified against actually runs.
+The protos are a submodule, not a copy: an exact upstream commit,
+byte-identical, with nothing fetched at build time.
+`stable/25.4` is the branch the local cluster this was verified against runs.
+The pin moves only when a human moves it.
 
 ## Layer by layer
 
-### Layer 1 — bus framing
+### Layer 1: bus framing
 
 | Surface | State | Verified by |
 | --- | --- | --- |
@@ -49,18 +34,16 @@ was verified against actually runs.
 | CRC-64 | Implemented | 12 canonical vectors + Go-produced bus-shaped vectors |
 | `NullChecksum` means "do not verify" | Implemented | `a_null_checksum_means_do_not_verify` |
 | Handshake | Implemented | Stub tests + live cluster |
-| Delivery-tracking acks | **Not implemented** — never requested, so never expected | — |
-| TLS / `SslAck` | **Not implemented**; a peer that requires encryption is refused, not downgraded | `a_peer_that_requires_encryption_is_refused_not_downgraded` |
-| Multiplexing bands | **Not implemented** — the default band is used | — |
+| Delivery-tracking acks | Not implemented; never requested, so never expected | |
+| TLS / `SslAck` | Not implemented; a peer that requires encryption is refused, not downgraded | `a_peer_that_requires_encryption_is_refused_not_downgraded` |
+| Multiplexing bands | Not implemented; the default band is used | |
 
-The CRC-64 is worth stating exactly, because reaching for an off-the-shelf one
-gives wrong answers: **polynomial `0xE543279765927881` in normal (MSB-first)
-form, zero initial value, no final xor, and the register byte-swapped on the way
-out.** It is not ECMA-182, not XZ, not ISO, not Jones. `crates/ytsaurus-rpc/src/crc64.rs`
-derives its table from that one constant and checks it against the Go SDK's
-table and vectors.
+The CRC-64 is polynomial `0xE543279765927881` in normal (MSB-first) form, zero
+initial value, no final xor, register byte-swapped on output: not ECMA-182,
+XZ, ISO or Jones. `crates/ytsaurus-rpc/src/crc64.rs` derives its table from
+that constant and checks it against the Go SDK's table and vectors.
 
-### Layer 2 — RPC envelope
+### Layer 2: RPC envelope
 
 | Surface | State | Verified by |
 | --- | --- | --- |
@@ -71,16 +54,15 @@ table and vectors.
 | Timeouts, in the header and locally | Implemented, and the two agree | Same test |
 | In-flight calls and cancellations | Bounded at 256 per connection; cancellation retains its slot until the writer handles it | Connection unit tests |
 | Token auth via `TCredentialsExt` (field 110) | Implemented | `the_token_is_appended_as_extension_field_110` |
-| Compression codecs | **Not implemented** — `ECodec::None` only, and the header says so | — |
-| Streaming payload / feedback messages | **Not implemented** | — |
-| Retries and `mutation_id` | Field is plumbed; **no retry policy** | — |
+| Compression codecs | Not implemented; `ECodec::None` only, and the header says so | |
+| Streaming payload / feedback messages | Not implemented | |
+| Retries and `mutation_id` | Field is plumbed; no retry policy | |
 
 `prost` does not generate proto2 extensions, so the credentials extension is
-appended by hand as field 110. That is wire-identical — an extension is an
-ordinary field with a reserved number — and a test decodes the bytes back to a
-`TCredentialsExt` to prove it.
+appended by hand as field 110, which is wire-identical; a test decodes it back
+to a `TCredentialsExt`.
 
-### Layer 3 — API surface and discovery
+### Layer 3: API surface and discovery
 
 | Surface | State |
 | --- | --- |
@@ -88,110 +70,87 @@ ordinary field with a reserved number — and a test decodes the bytes back to a
 | `StartTransaction` / `Ping` / `Commit` / `Abort` | Implemented |
 | `LookupRows`, `SelectRows`, `ModifyRows` | Implemented |
 | `DiscoverProxies` over RPC | Implemented |
-| HTTP `discover_proxies` bootstrap | **Not implemented** — see gate D |
-| Connection pool, per-proxy health, banning | **Not implemented** — one connection per client |
+| HTTP `discover_proxies` bootstrap | Not implemented; see gate D |
+| Connection pool, per-proxy health, banning | Not implemented; one connection per client |
 | Every other method of the 158 | Reachable via `Connection::invoke_raw`, not wrapped |
 
-### Layer 4 — row wire format
+### Layer 4: row wire format
 
 | Surface | State | Verified by |
 | --- | --- | --- |
 | Unversioned rowset encode and decode | Implemented | Go-produced golden vectors, both directions |
 | `Null`, `Int64`, `Uint64`, `Double`, `Boolean`, `String`, `Any` | Implemented | Golden vectors |
-| `Composite` | Implemented — **diverges from the Go SDK, see below** | Round-trip test + a Go test pinning the defect |
+| `Composite` | Implemented; diverges from the Go SDK, see below | Round-trip test + a Go test pinning the defect |
 | Null row vs empty row | Implemented, kept distinct | `the_null_row_survives_the_reference_bytes` |
 | 8-byte alignment and padding | Implemented | Every length 0..24 is walked |
 | Aggregate flag | Carried through | `the_aggregate_flag_survives` |
 | Aggregate rowset size | Refused above the 1 GiB RPC attachment limit before allocation | `a_rowset_larger_than_one_rpc_attachment_is_refused_before_allocation` |
-| Versioned rowsets | **Not implemented** — only on concrete need | — |
-| Row-stream block envelope | **Not implemented** — not used by these methods; see below | — |
+| Versioned rowsets | Not implemented; only on concrete need | |
+| Row-stream block envelope | Not implemented; not used by these methods, see below | |
 
 ## Deliberate divergences
 
-**Composite values.** The Go SDK's writer (`yt/go/wire/writer.go`, `writeValue`)
-handles `TypeBytes` and `TypeAny` but not `TypeComposite`, so a composite
-value's payload is never written — while its length word still claims the bytes
-are there and its own reader will read them back. The C++ treats `Composite` as
-string-like everywhere (`IsStringLikeType` covers `String`, `Any` and
-`Composite`), and this crate follows the C++. The defect is pinned by
-`TestCompositeWriterDropsItsPayload` in `tests/rpc-go-interop/`, so if the Go
-SDK is fixed, that test fails and this note gets revisited.
-
-**Checksum verification.** The Go SDK verifies every checksum unconditionally.
-The C++ skips verification when the stored value is `NullChecksum`
-(`packet.cpp` guards all three comparisons with `expectedChecksum != NullChecksum`),
-which is how a peer with checksums off — or one that checksums only its first
-few parts — interoperates. This crate follows the C++, which is strictly more
-permissive and cannot reject traffic the reference server considers valid.
-
-**Part size limit.** The C++ allows 1 GB per part; the Go SDK caps at 512 MB.
-This crate follows the C++ for what it will *accept*, and applies a much lower
-default ceiling on the whole packet so a corrupt length word cannot make it
-reserve unbounded memory.
-
-**No row-stream envelope.** `SerializeRowStreamBlockEnvelope` in the C++ wraps
-rowsets in a block envelope of part counts and lengths. That is the *streaming*
-path (table reader and writer). For request/response methods — the ones here —
-both reference clients put the descriptor in the protobuf message and the raw
-rowset bytes in the attachments, with no envelope: C++
-`DeserializeRowset(rsp->rowset_descriptor(), MergeRefsToRef(rsp->Attachments()))`
-and Go `decodeFromWire(rsp.Attachments)`. Implementing the envelope here would
-be wrong, not merely extra.
+- Composite values follow the C++, where `IsStringLikeType` covers `String`,
+  `Any` and `Composite`. The Go writer (`yt/go/wire/writer.go`, `writeValue`)
+  handles `TypeBytes` and `TypeAny` but not `TypeComposite`: it omits the
+  payload while the length word counts it, and its own reader reads it back.
+  `TestCompositeWriterDropsItsPayload` in `tests/rpc-go-interop/` pins the
+  defect and fails if the Go SDK is fixed.
+- Checksums follow the C++, which skips verification when the stored value is
+  `NullChecksum` (`packet.cpp` guards all three comparisons with
+  `expectedChecksum != NullChecksum`); Go verifies every one. That lets a peer
+  with checksums off, or on for its first few parts only, interoperate, and
+  rejects nothing the reference server accepts.
+- Part size: accepts what the C++ accepts (1 GB per part; Go caps at 512 MB),
+  with a much lower default ceiling on the whole packet so a corrupt length
+  word cannot reserve unbounded memory.
+- No row-stream envelope: the C++ `SerializeRowStreamBlockEnvelope` is for the
+  streaming table reader and writer. For request/response methods both
+  reference clients put the descriptor in the protobuf message and the raw
+  rowset in the attachments: C++
+  `DeserializeRowset(rsp->rowset_descriptor(), MergeRefsToRef(rsp->Attachments()))`,
+  Go `decodeFromWire(rsp.Attachments)`. An envelope here would be wrong.
 
 ## Ship gates
 
-Each must be green before this is described as anything but pre-release. They
-were written as gates on *publishing* as well, and publishing happened first, at
-0.3.0, by a human decision recorded above — so what they now gate is the claim,
-not the upload. Nothing below has been relaxed to match.
+All must be green before this is called anything but pre-release. None has
+been relaxed.
 
-- **A — the sans-io layers are checked against a reference, not against
-  themselves.** *Green for two of the four.* The row wire format has rowset
-  vectors produced by the pinned Go SDK and consumed in both directions, and
-  the CRC-64 matches all twelve canonical vectors plus bus-shaped ones.
-  **Bus framing and the RPC envelope have no reference-produced vectors**:
-  both are checked against this crate's own encoder, plus a live proxy that
-  accepts what they write and whose replies they read. The Go SDK's packet
-  encoder is unexported, so closing this properly means capturing bytes off a
-  real proxy and keeping them as fixtures.
-- **B — a live proxy accepts what this writes and this reads what it sends.**
-  *Green.* `cargo run -p ytsaurus-rpc --example rpc_e2e` writes, looks up, selects
-  and deletes on a real cluster. It runs in the post-merge `Cluster E2E`
-  workflow, which starts the local cluster with an RPC proxy.
-- **C — a differential test against the reference driver.** *Not started.* The
-  Go and C++ sources were read closely, but no test yet performs the same
-  operation through `ytsaurus-rpc-driver` and compares row for row. Until this
-  is green, "agrees with the reference implementation" is a claim about reading,
-  not about running.
-- **D — discovery bootstraps without being told a proxy.** *Not started.*
-  `DiscoverProxies` over RPC works, but it needs a proxy already. The HTTP
-  `discover_proxies` route both reference clients use is not implemented,
-  because it would add an HTTP stack to a crate that has none;
-  `ytsaurus-client` already speaks HTTP v4 and can answer it.
-- **E — the parsers are fuzzed.** *Not started.* Both the packet decoder and the
-  rowset decoder consume untrusted bytes off a socket. There are exhaustive
-  truncation tests, which is not the same thing.
-- **F2 — the connection's failure modes are covered.** *Green.*
-  `connection_failure_modes.rs` holds one test per defect that shipped: a
-  deadline that did not cover queuing the request, and a dead reader that left
-  later calls waiting for ever. Both were found by review rather than by use,
-  which is the argument for keeping the tests.
-- **F — a connection survives a proxy dying.** *Not started.* An in-flight call
-  fails cleanly when the connection drops, which is tested; reconnection and
-  per-proxy banning are not implemented.
-- **G — the numbers that justify the project.** *Not started.* The case for RPC
-  over HTTP is latency and throughput under concurrency, and it is unmeasured
-  here. Until it is, this crate is a protocol implementation, not a
-  recommendation.
-- **H — publishable.** *Not started.* `cargo package` does not include
-  submodules, so publishing `ytsaurus-proto` needs the generated bindings
-  committed, or the protos vendored at package time. Hard rule 1 governs the
-  release itself.
+- A, the sans-io layers are checked against a reference: green for two of
+  four. Rowset vectors come from the pinned Go SDK, consumed in both
+  directions; the CRC-64 matches twelve canonical vectors plus bus-shaped ones.
+  Bus framing and the RPC envelope are checked only against this crate's own
+  encoder and a live proxy. The Go packet encoder is unexported, so closing
+  this means capturing bytes off a real proxy as fixtures.
+- B, a live proxy and this crate understand each other: green.
+  `cargo run -p ytsaurus-rpc --example rpc_e2e` writes, looks up, selects and
+  deletes in the post-merge `Cluster E2E` workflow.
+- C, a differential test against the reference driver: not started. No test
+  runs the same operation through `ytsaurus-rpc-driver` and compares row for
+  row; agreement with the reference is from reading the Go and C++ sources.
+- D, discovery without a known proxy: not started. `DiscoverProxies` over RPC
+  needs a proxy already. The HTTP `discover_proxies` route both reference
+  clients use would add an HTTP stack to this crate; `ytsaurus-client` can
+  answer it.
+- E, the parsers are fuzzed: not started. The packet and rowset decoders read
+  untrusted bytes; they have exhaustive truncation tests only.
+- F2, the connection's failure modes are covered: green.
+  `connection_failure_modes.rs` tests the two defects that shipped: a deadline
+  not covering queuing, and a dead reader leaving later calls waiting for ever.
+- F, a connection survives a proxy dying: not started. An in-flight call fails
+  cleanly on a dropped connection (tested); there is no reconnection or
+  per-proxy banning.
+- G, the numbers that justify the project: not started. Latency and
+  throughput under concurrency, the case for RPC over HTTP, are unmeasured
+  (#67); until then this is a protocol implementation, not a recommendation.
+- H, publishable: green. `cargo package` omits submodules, so
+  `ytsaurus-proto` commits its generated bindings, with no build script; CI
+  regenerates them and fails on a diff.
 
 ## Running the checks
 
 ```sh
-./scripts/init-protos.sh                       # once, after cloning
+./scripts/init-protos.sh                       # only to regenerate ytsaurus-proto
 cargo test -p ytsaurus-rpc                     # unit tests + golden vectors
 cd tests/rpc-go-interop && go test ./...       # regenerate the vectors
 cargo run -p ytsaurus-rpc --example rpc_e2e    # against a live RPC proxy
