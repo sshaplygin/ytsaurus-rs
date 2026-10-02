@@ -25,11 +25,10 @@ covered, what is deliberately not, and what the comparison added.
 
 Six are covered. Each of the other six is a decision, recorded below.
 
-Two examples here go further than their Go counterparts: `schema.rs` creates
-all 26 column types the crate can name and checks that the cluster refuses
-what it should, where the Go example is twenty lines with every error
-discarded; `cypress.rs` is a tour of `list`/`copy`/`move`/`link`/`lock` with no
-Go counterpart.
+`schema.rs` goes further than its Go counterpart: it creates all 26 column
+types the crate can name and checks that the cluster refuses what it should,
+where the Go example is twenty lines with every error discarded. `cypress.rs`,
+a tour of `list`/`copy`/`move`/`link`/`lock`, has no Go counterpart.
 
 ## What the Go examples asked for
 
