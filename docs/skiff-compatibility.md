@@ -58,7 +58,7 @@ Docker cluster running x86-64 images under arm64 emulation: a Skiff map over
 optional column, `string32` columns that are deliberately not UTF-8, and a
 hand-written positional schema. Its decoded output was diffed row for row
 against a typed-serde YSON leg, a `YsonValue` leg and a YQL query at the start
-of each of three nine-round runs, before any clock was read; all agreed. That diff was exact and order-sensitive, and the matrix row rests
+of each of three nine-round runs, before any clock was read; all four agreed each time. That diff was exact and order-sensitive, and the matrix row rests
 on it. The harness now compares sorted canonical binary-YSON encodings as a
 multiset, so a re-run confirms presence, absence and multiplicity, not order.
 
