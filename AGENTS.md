@@ -79,10 +79,11 @@ MapReduce workers in Rust, is secondary to the clients.
 5. No scope creep. Non-Linux targets are out of scope until a human decides
    otherwise. A human added custom job statistics (`JobStatistics`). A human
    also brought the RPC proxy, the protobuf row format and dynamic tables into
-   scope. `ytsaurus-rpc` implements transactions, `lookup_rows`, `select_rows`
-   and `modify_rows` only, not the other 150 request types; see
-   [docs/rpc-compatibility.md](docs/rpc-compatibility.md). Dynamic tables are
-   also served over HTTP. The protobuf row format is not implemented.
+   scope, for transactions, `lookup_rows`, `select_rows` and `modify_rows`
+   only, not the other 150 request types; see
+   [docs/rpc-compatibility.md](docs/rpc-compatibility.md). `ytsaurus-rpc`
+   implements those; dynamic tables are also served over HTTP; the protobuf
+   row format is not implemented.
 
 ## Writing
 
