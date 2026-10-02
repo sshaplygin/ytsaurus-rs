@@ -23,11 +23,10 @@ all green, and the API may change in a patch release.
 
 No change to the bytes this crate encodes or decodes, and no public API change.
 
-- Added a byte-level comparison against the C++ `library/cpp/skiff`, in
+- Added a byte-level comparison against the C++ `library/cpp/skiff`:
   [`tests/cpp_interop.rs`](tests/cpp_interop.rs) and
-  [`tests/skiff-cpp-interop/`](../../tests/skiff-cpp-interop/). What it covers
-  and the gaps it found are in
-  [docs/skiff-full-support-plan.md](../../docs/skiff-full-support-plan.md).
+  [`tests/skiff-cpp-interop/`](../../tests/skiff-cpp-interop/). Its coverage and
+  findings: [docs/skiff-full-support-plan.md](../../docs/skiff-full-support-plan.md).
 - Added `benches/codec_throughput.rs`, a Criterion benchmark of encode and
   decode.
 

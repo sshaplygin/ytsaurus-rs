@@ -18,10 +18,10 @@ crates.io in 0.3.0. This crate had none of its own.
 First release. The version tracks the workspace. Published because
 `ytsaurus-client`'s optional `derive` feature depends on it.
 
-- Added `#[derive(TableRow)]`, which produces the table schema a struct
-  describes: one column per field, in declaration order, the Rust type deciding
-  the column type and `Option<T>` alone making a column optional. The types it
-  targets (`TableSchema`, `Column`, `ColumnType`) live in
+- Added `#[derive(TableRow)]`: the table schema a struct describes, one column
+  per field in declaration order, the Rust type deciding the column type and
+  `Option<T>` alone making a column optional.
+- The types it targets (`TableSchema`, `Column`, `ColumnType`) live in
   [`ytsaurus-client`](../ytsaurus-client/), which re-exports the derive under
   its `derive` feature.
 - Refused at compile time, instead of as error 314 from a create: key columns

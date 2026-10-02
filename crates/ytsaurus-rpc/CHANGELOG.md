@@ -101,11 +101,10 @@ Recorded in [docs/rpc-compatibility.md](../../docs/rpc-compatibility.md).
 
 ### Added later in the same cycle
 
-- `ytsaurus_rpc::blocking`, a blocking facade in the shape of
-  `reqwest::blocking`: a private current-thread runtime, one call at a time. It
-  implements `ytsaurus_api::TableClient`, so `ytsaurus_client::create_rpc_client`
-  returns the same interface as `create_client`. The async `Client`, which
-  multiplexes, is unchanged.
+- `ytsaurus_rpc::blocking`, a facade in the shape of `reqwest::blocking`: a
+  private current-thread runtime, one call at a time, implementing
+  `ytsaurus_api::TableClient`, the interface `create_rpc_client` and
+  `create_client` both return. The multiplexing async `Client` is unchanged.
 - `lookup_rows_with_columns` and the transaction's `select_rows_with_columns`,
   which also return the reply's column names.
 

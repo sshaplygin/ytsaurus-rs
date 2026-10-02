@@ -23,11 +23,10 @@ workers.
 
 The tag was never cut; nothing in this section reached crates.io until 0.3.0.
 
-- Added eight example workers, previously a separate package in the repository
-  and now published here: `cat`, `wordcount`, `hello`, `sessionize`, `boom`,
-  `counted`, `shards` and `skiff_cat` (`cargo run -p ytsaurus-job --example
-  wordcount`). A ninth, `selfrun`, needs `ytsaurus-client` and is excluded from
-  the package.
+- Added eight example workers, published with this crate (before, a separate
+  package in the repository): `cat`, `wordcount`, `hello`, `sessionize`,
+  `boom`, `counted`, `shards` and `skiff_cat`. A ninth, `selfrun`, needs
+  `ytsaurus-client` and is excluded from the package.
 - Added the `example-tls` feature: TLS for the `selfrun` example and nothing
   else, off by default. It is repository-only; on crates.io it reads
   `example-tls = []` and does nothing.
@@ -73,11 +72,10 @@ launcher against the API. Each closes the numbered issue.
 
 ### Added
 
-- `JobReader::groups_by`, `Group::key` and `GroupKey` ([#2]): a reducer gets
-  its reduce key, read from the group's first row since YTsaurus does not
-  transmit it. `GroupKey` accessors are byte-first (`bytes`, `str`, `i64`,
-  `get`); a missing key column is absent, not an error. `groups()` is unchanged
-  and leaves `Group::key` empty.
+- `JobReader::groups_by`, `Group::key` and `GroupKey` ([#2]): the reduce key,
+  read from the group's first row (YTsaurus does not transmit it). Accessors
+  are byte-first (`bytes`, `str`, `i64`, `get`); a missing key column is absent,
+  not an error. `groups()` is unchanged and leaves `Group::key` empty.
 - `JobError::kind` and `JobError::is_row_local` ([#1]): a stable,
   allocation-free identifier (`invalid_yson`, `truncated_record`, …), and
   whether to quarantine the row or stop.
