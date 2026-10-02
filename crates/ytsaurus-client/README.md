@@ -135,10 +135,10 @@ export YT_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 
 Each certificate in the bundle is a root; other PEM sections are skipped. A
 bundle is refused, naming the file, if it yields no certificates, cannot be
-read, is not a regular file, or is larger than 16 MB. **One `BEGIN CERTIFICATE`
-block that is not X.509 refuses the whole file**, naming it and counting the bad
-blocks: a PKCS#7 `.p7b` under that label is the usual case, and
-`openssl pkcs7 -print_certs` converts it.
+read, is not a regular file, or is larger than 16 MB.
+**One `BEGIN CERTIFICATE` block that is not X.509 refuses the whole file**,
+naming it and counting the bad blocks: a PKCS#7 `.p7b` under that label is the
+usual case, and `openssl pkcs7 -print_certs` converts it.
 
 An unknown issuer or a certificate that does not cover the requested host is
 reported at once and not retried, since neither changes between attempts.
@@ -203,8 +203,9 @@ since the cluster would ignore the new schema.
 On a table with rows, `alter_table` may add an optional column, relax a
 required one or drop `strict`; removing a column, adding a required one,
 changing a type or sorting the table is refused, naming the column
-([full list](../../docs/protocol-reference.md#changing-a-schema)). **An empty
-table accepts every change**, so a migration rehearsed on one proves nothing.
+([full list](../../docs/protocol-reference.md#changing-a-schema)).
+**An empty table accepts every change**, so a migration rehearsed on one proves
+nothing.
 **A non-strict schema can never gain a named column**, so relaxing `strict`
 cannot be undone.
 
@@ -327,8 +328,8 @@ client.write_table_rows(TablePath::new("//tmp/log").append(), entries)?;
 Without it every write replaces the table. The table must exist, and a sorted
 one stays sorted: a key smaller than the last is refused with
 `Sort order violation: [0#9] > [0#1]`. Appends take a shared lock, so
-concurrent ones all land. **Appending nothing is a no-op; writing nothing
-truncates.** Rewriting a table in twelve pieces sends 6.5× the rows;
+concurrent ones all land.
+**Appending nothing is a no-op; writing nothing truncates.** Rewriting a table in twelve pieces sends 6.5× the rows;
 [`examples/append.rs`](examples/append.rs) measures it.
 
 ## Reading part of a table
