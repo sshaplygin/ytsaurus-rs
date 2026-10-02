@@ -8,6 +8,14 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
+      # No bench target compiles these. Cargo still needs every declared
+      # [[example]] file to exist to load the workspace; ci.yml fails when one
+      # is missing. A negative pattern has to follow the positive one it
+      # narrows.
+      - "!crates/**/*.md"
+      - "!crates/*/examples/**"
+      - "!crates/*/tests/**"
+      - ".cargo/config.toml"
       - "rust-toolchain.toml"
       - "scripts/compare_criterion.py"
 
