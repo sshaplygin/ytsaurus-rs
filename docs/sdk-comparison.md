@@ -66,14 +66,17 @@ unpredictable*), so with no new dependency. The observations and reasons behind 
 [protocol-reference.md](protocol-reference.md#where-a-heavy-command-goes).
 One line per difference, with the setting that changes it:
 
-- Refresh is lazy, as in C++, on the heavy command that finds the answer older
-  than one minute; no background thread, unlike Go; a failed refresh keeps the
-  previous answer: `Client::with_host_list_refresh_interval`.
-- A host whose failure is attributable to it, a rejected certificate included,
-  is dropped until a refresh names it again, shorter than Go's five-minute ban:
-  a draining host is back within a minute by default, and a persistently bad
-  one costs a failed command per interval:
+- Refresh is lazy, as in C++, with no background thread, unlike Go: it runs on
+  the first heavy command that finds the list at least one refresh interval (a
+  minute by default) past its last fetch. A failed, empty or fully refused
+  refresh keeps the pool in hand and waits another interval:
   `Client::with_host_list_refresh_interval`.
+- A host whose failure is attributable to it, a rejected certificate included,
+  is dropped from the pool and returns at the first successful refresh that
+  lists it. While the cluster keeps listing it and refreshes succeed, it is
+  out for at most one interval plus the wait for the next heavy command,
+  where Go bans for five minutes; a persistently bad host costs one failed
+  command per interval: `Client::with_host_list_refresh_interval`.
 - An empty pool falls back to the configured address for ten seconds before
   `/hosts` is asked again: `Client::with_hosts_retry_after`.
 - A discovered name is used only within the configured address's domain, with
