@@ -129,7 +129,7 @@ Observed:
 - `ureq`'s `limit()` bounds transferred bytes, not memory: `BodyWithConfig::do_build` puts the gzip decoder on top of a `LimitReader`. Measured: a `read_file` of 600 MiB of zeros arrived in 611 522 wire bytes, and `.limit(536870912)` returned all 629 145 600. The memory cap, `http::CapReader`, sits above the decoder.
 - A wire limit is still needed underneath: a chunked stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing, and `flate2` loops inside one `read`.
 - The wire limit cannot be the memory cap: 4 096 incompressible bytes gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip wrapper.
-- The memory cap is not a process budget: `read_to_end` doubles a `Vec` and copies, so both buffers are resident during a copy (about 1.5×). Measured (release build, local listener): a read of 536 870 911 bytes peaked at 544 178 176 bytes resident, a 600 MiB read refused by the 512 MiB cap at 611 385 344.
+- The memory cap is not a process budget: `read_to_end` doubles a `Vec` and copies, so both buffers are resident during a copy (about 1.5× where the allocator cannot extend in place). Measured (release build, local listener): a read of 536 870 911 bytes peaked at 544 178 176 bytes resident, a 600 MiB read refused by the 512 MiB cap at 611 385 344. Quote the cap as what is held, never as what to size a container for.
 
 ## Authentication and compression
 
