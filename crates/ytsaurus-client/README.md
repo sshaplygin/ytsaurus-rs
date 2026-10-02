@@ -84,17 +84,17 @@ export YT_PROXY=http://localhost:8000
 cargo run -p ytsaurus-client --example skiff_launch
 ```
 
-Defaults against mistakes the cluster does not report:
+Defaults against mistakes the cluster reports badly or never:
 
 - Both formats are binary YSON, which `JobReader` and `JobWriter` expect.
 - `key_switch` is on for both grouping operations: in `reduce_job_io` for
   map-reduce (a section per job type) and `job_io` for reduce. The wrong section
-  is accepted and ignored, and the reducer sees every key as one group.
+  is accepted and ignored, and the reducer sees all keys as one group.
 - `upload_worker` sets the `executable` attribute, without which the cluster
   refuses to exec the binary with an error that does not mention it.
 
-`SortSpec` sorts input for reduce; its `output_table_path` is singular, since
-sort writes one table
+`SortSpec` sorts input for reduce; its `output_table_path` is singular: sort
+writes one table
 ([`examples/sort_reduce.rs`](examples/sort_reduce.rs)).
 
 ## Configuration
