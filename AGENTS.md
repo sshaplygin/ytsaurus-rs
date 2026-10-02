@@ -68,16 +68,17 @@ operations.
    refresh) is checked against the official clients' source before it is
    designed here: C++ (`yt/cpp/mapreduce`), Go (`yt/go`), and the Python
    wrapper where it is the reference (the retry list). Where they disagree, say
-   which was followed and why; a deviation from both is recorded in
-   [docs/sdk-comparison.md](docs/sdk-comparison.md). Read
+   which was followed and why; a deviation from both is a deliberate decision
+   recorded in [docs/sdk-comparison.md](docs/sdk-comparison.md). Read
    [docs/go-parity.md](docs/go-parity.md) before adding client API.
 4. Every change ends with green CI: `cargo fmt --check`, `cargo clippy
    --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
 5. No scope creep. Non-Linux targets are out of scope until a human decides
-   otherwise. Scope a human has added: custom job statistics (`JobStatistics`)
-   and the RPC proxy (`ytsaurus-rpc`: transactions, `lookup_rows`,
-   `select_rows`, `modify_rows`; see
-   [docs/rpc-compatibility.md](docs/rpc-compatibility.md)).
+   otherwise. A human added custom job statistics (`JobStatistics`). A human
+   also added the RPC proxy, the protobuf row format and dynamic tables, in
+   `ytsaurus-rpc`, for transactions, `lookup_rows`, `select_rows` and
+   `modify_rows` only, not the other 150 request types; see
+   [docs/rpc-compatibility.md](docs/rpc-compatibility.md).
 
 ## Writing
 
