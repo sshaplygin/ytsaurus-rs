@@ -340,9 +340,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   that refuses them. The first heavy command now asks `/hosts`, and every clone
   of the client shares the answer, refreshed as in the pool entry above. A
   failed heavy command is not re-sent.
-- A failed heavy command drops the host it used, and the next name takes over;
-  likewise a proxy that refuses heavy work for its role or cannot be reached.
-  Only when every name has failed does the client fall back to the configured
+- A failed heavy command drops the host it used, and another host in the pool
+  takes over; likewise for a proxy that refuses heavy work for its role or
+  cannot be reached. Only when every name has failed does the client fall back to the configured
   address, for ten seconds, then ask again.
 - A `/hosts` lookup that fails for a reason that might pass (a timeout, a 503)
   sends heavy commands to the configured address for `with_hosts_retry_after`,
