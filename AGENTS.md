@@ -129,6 +129,8 @@ python3 scripts/check_package_includes.py   # no published file may include_str!
                                             # data from outside its own crate
 python3 scripts/check_prose.py              # the Writing rules' countable part;
                                             # --tighten after a cleanup
+python3 scripts/check_readme_example.py     # README.md's quick start matches
+                                            # crates/ytsaurus-client/examples/quickstart.rs
 
 cargo test --workspace            # 941 tests: 863 unit and integration, 78 doc
 cargo clippy --workspace --all-targets -- -D warnings

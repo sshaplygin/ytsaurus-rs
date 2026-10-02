@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The 13 `.py` files here are this repository's automation, not a package,
+      # The `.py` files here are this repository's automation, not a package,
       # so there is nothing to install — `uvx` fetches the tools and runs them.
       # Configuration for both lives in the repository's pyproject.toml.
       - uses: astral-sh/setup-uv@v5
@@ -36,6 +36,12 @@ jobs:
         run: |
           python3 scripts/check_prose.py --self-test
           python3 scripts/check_prose.py
+
+      # README.md's quick start is a copy of a compiled example; this keeps it one.
+      - name: README quick start
+        run: |
+          python3 scripts/check_readme_example.py --self-test
+          python3 scripts/check_readme_example.py
 
   go-skiff-reference:
     name: pinned Go Skiff reference
