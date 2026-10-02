@@ -418,7 +418,7 @@ client.write_table_streaming("//tmp/big", File::open("rows.yson")?)?;
 The stream is what a job reads on fd 0, so one decoder serves both. On a local
 cluster, [`examples/streaming.rs`](examples/streaming.rs) streamed a
 67.7 MiB table for 1.0 MiB of peak RSS, against 70.9 MiB to read it into memory
-([output](../../tests/cluster-e2e/README.md)). A stream has no completeness
+([results](../../tests/cluster-e2e/README.md)). A stream has no completeness
 check (the decoder fails on a record cut short instead), and a streaming write
 is never retried, because a consumed reader cannot be resent.
 
