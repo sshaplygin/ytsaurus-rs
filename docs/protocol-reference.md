@@ -81,12 +81,12 @@ All observed:
 
 ## Transactions
 
-Commands: `start_transaction`, `commit_transaction`, `abort_transaction`, `ping_transaction` (`start_tx` is not registered). `start_transaction` answers `{transaction_id="3-5bc70-10001-387a"}`; the other three take `transaction_id` and answer `{}` or a commit timestamp. Other commands join through a `transaction_id` parameter, stamped in `Transport::in_transaction`.
+Commands: `start_transaction`, `commit_transaction`, `abort_transaction`, `ping_transaction` (`start_tx` and friends are not registered). `start_transaction` answers `{transaction_id="3-5bc70-10001-387a"}`; the other three take `transaction_id` and answer `{}` or a commit timestamp. Other commands join through a `transaction_id` parameter, stamped in `Transport::in_transaction`.
 
 Observed:
 
 - A transaction expires 30 000 ms after its last ping (default `@timeout`; `Transaction` reads it to pick its ping interval). A 2 s timeout left for 4 s: `Transaction … has expired or was aborted`.
-- A commit is not idempotent: a second one fails with `No such transaction`. Commits carry a mutation ID.
+- A commit is not idempotent: a second one fails with `No such transaction`, which reads as if the first had failed. Commits carry a mutation ID for that reason.
 - An abort of a committed or nonexistent transaction answers `{}`, so aborting from `Drop` is safe.
 - `get_operation`, `list_jobs`, `get_job_stderr` and the file-cache commands accept `transaction_id` and ignore it. The client omits it for the scheduler and job commands listed in `NO_TRANSACTION` (`http.rs`; no `TTransactionalOptions`), in case a version refuses unknown parameters: `Transaction` derefs to `Client`, so `wait_for_operation` runs inside one. `start_operation` is not listed, since an operation inside a transaction keeps its output invisible until commit. A command naming a transaction itself keeps its own.
 - `start_transaction` under a transaction makes a nested one.
@@ -121,7 +121,7 @@ Observed:
 ### Reading and writing files
 
 - `read_file` streams and `write_file` takes a chunked body: a 4 MB round trip through `Client::raw_command_streaming` and `raw_command_upload` held the file in neither direction.
-- The buffered `read_file` compares the body with `@uncompressed_data_size`: a truncated body looks like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot read. On `compression_codec=zlib_6` nodes of 1 000 000 bytes, `@compressed_data_size` was 4 214 for cycling `i % 256` bytes, 999 for zeros and 1 000 324 for `os.urandom`. `@file_size` does not exist (`Attribute "file_size" is not found`).
+- The buffered `read_file` compares the body with `@uncompressed_data_size`: a truncated body looks like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot read. On `compression_codec=zlib_6` nodes of 1 000 000 bytes, `@compressed_data_size` was 4 214 for cycling `i % 256` bytes, 999 for zeros and 1 000 324 for `os.urandom`; the read passes against all three. `@file_size` does not exist (`Attribute "file_size" is not found`).
 - A rich path does nothing to a file read. On a 1000-byte file, `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads all 1000 bytes; `//tmp/f[#0:#10]` also returns 1000, then fails the size check because `//tmp/f[#0:#10]/@uncompressed_data_size` does not parse (`Error reading parameter /path: Unexpected token "/" of type "slash"`). Files are sliced by the `offset` and `length` parameters; selection is #12.
 
 ### Response size limits
@@ -411,7 +411,7 @@ Enabled in the operation spec:
 - Two operations writing one output table serialise on an exclusive lock, and the loser fails to prepare. Give concurrent operations separate outputs.
 - A column value cannot carry attributes: `Table values cannot have top-level attributes`.
 - The cluster re-encodes rows on ingest: 309 676 bytes uploaded came back as 309 688. Compare read-back against read-back.
-- `stderr_size` from `list_jobs` is a hint: several hundred bytes of stderr reported as `1`.
+- `stderr_size` from `list_jobs` is a hint: several hundred bytes of stderr reported as `1`. Never use it to decide whether there is stderr to fetch.
 - A Rust panic reaches the cluster as `Process terminated by signal 6` (`panic = "abort"`); the message is in the job's stderr, which `wait_for_operation` fetches.
 - A job error's outer message is a category (`User job failed`); the cause is at the bottom of `inner_errors`. Both `ClientError` paths flatten outer plus innermost.
 - A v4 answer is keyed by what it returns; for `exists` the key is `value`, not `exists` (the wrong key failed every call for two releases). Every command whose result is read needs a call site.
