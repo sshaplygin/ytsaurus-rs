@@ -62,9 +62,10 @@ Both official clients pick a heavy proxy at random per command (`THostManager`
 with `RandomNumber`, Go's `ProxySet.PickRandom`); C++ refreshes `/hosts`
 lazily, Go in the background with a five-minute ban on a failing proxy. This
 client also picks at random, from the crate's id source (*unique, not
-unpredictable*), so with no new dependency. The observations and reasons behind each line below are in
-[protocol-reference.md](protocol-reference.md#where-a-heavy-command-goes).
-One line per difference, with the setting that changes it:
+unpredictable*), so with no new dependency. One line per difference, with the
+setting that changes it; the observations and reasons behind these heavy-proxy
+lines are in
+[protocol-reference.md](protocol-reference.md#where-a-heavy-command-goes):
 
 - Refresh is lazy, as in C++, with no background thread, unlike Go: it runs on
   the first heavy command that finds the list at least one refresh interval (a
@@ -84,9 +85,13 @@ One line per difference, with the setting that changes it:
   `Client::with_heavy_proxies_anywhere(true)` (no filter),
   `Client::with_heavy_proxies_under([…])` (add domains),
   `Client::with_heavy_proxies_in([…])` (only the names listed).
-- Requests from inside a job are allowed, where Go refuses them unless
-  `AllowRequestsFromJob` is set: no setting.
-- Retry logging mutes itself inside a job (`YT_JOB_ID`): no setting.
+
+Inside a job:
+
+- Requests are allowed. Go refuses them unless `AllowRequestsFromJob` is set,
+  to keep a hundred thousand jobs from reaching the master at once; the
+  one-binary launcher-and-worker pattern needs them: no setting.
+- Retry logging mutes itself (`YT_JOB_ID`): no setting.
 
 Logging is thinner: a span per attempt and an event per retry, where the
 official clients log request bodies, proxy choices and connection lifecycles.
