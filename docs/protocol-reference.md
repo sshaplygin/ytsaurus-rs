@@ -367,7 +367,7 @@ Observed:
   | `requests` missing | `Missing required parameter /requests` |
 
 - Parts run in parallel: `create` and `exists` on one node got `%false`. Put a dependent part in a second batch.
-- A replay under one mutation id is deduplicated per part. Part *k* gets the batch's id plus *k* (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`) and the batch's `retry` flag. Measured with `BatchRequest::create_table` (no `ignore_existing`):
+- A replay under one mutation id is deduplicated per part. Part *k* gets the batch's id plus *k* (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`), and every volatile part gets the batch's `retry` flag. Measured with `BatchRequest::create_table` (no `ignore_existing`):
 
   ```text
   first  (id)          : ["2-2e82-10191-d4fdeff4", "2-2e83-10191-b0f0b0cd"]
