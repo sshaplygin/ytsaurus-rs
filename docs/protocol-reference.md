@@ -360,11 +360,11 @@ Observed:
   `Client::execute_batch` reports the prefix it was answered for; `ClientError::BatchInterrupted` does not call it "applied".
 - A batch refused while parsing parameters runs nothing; one that reaches execution runs everything. The message tells which:
 
-  | Probe (each with a `create`; nothing applied) | Message |
-  | --- | --- |
-  | `concurrency=0` | `Validation failed at /concurrency` |
-  | part missing `command`; part `parameters` not a dict; `requests` not a list | `Error loading parameter /requests` |
-  | `requests` missing | `Missing required parameter /requests` |
+  | Probe (a `create` in each request that has parts) | Message | Applied |
+  | --- | --- | --- |
+  | `concurrency=0` | `Validation failed at /concurrency` | nothing |
+  | part missing `command`; part `parameters` not a dict; `requests` not a list | `Error loading parameter /requests` | nothing |
+  | `requests` missing | `Missing required parameter /requests` | n/a |
 
 - Parts run in parallel: `create` and `exists` on one node got `%false`. Put a dependent part in a second batch.
 - A replay under one mutation id is deduplicated per part. Part *k* gets the batch's id plus *k* (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`), and every volatile part gets the batch's `retry` flag. Measured with `BatchRequest::create_table` (no `ignore_existing`):
