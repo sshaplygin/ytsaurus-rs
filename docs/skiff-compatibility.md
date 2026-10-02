@@ -13,11 +13,12 @@ Moving it means changing this document, the Go vectors and the bidirectional
 test results together, never just because a newer module exists.
 
 Go is the executable reference; C++ is the normative one. A cluster links
-`library/cpp/skiff` and its job proxy writes with it; Go implements a subset: no `int128`/`int256` codec, no `$sparse_columns`, no
-`$other_columns`. A green Go gate is necessary, not sufficient, and where the
-two disagree C++ decides. [`tests/skiff-cpp-interop/`](../tests/skiff-cpp-interop/)
-compares against C++ through a wheel; its limits are in its README and
-[the full-support plan](./skiff-full-support-plan.md).
+`library/cpp/skiff` and its job proxy writes with it; Go implements a subset: no
+`int128`/`int256` codec, no `$sparse_columns`, no `$other_columns`. A green Go
+gate is necessary, not sufficient, and where the two disagree C++ decides.
+[`tests/skiff-cpp-interop/`](../tests/skiff-cpp-interop/) compares against C++
+through a wheel; its limits are in its README and [the full-support
+plan](./skiff-full-support-plan.md).
 
 ## Compatibility matrix
 
@@ -54,13 +55,14 @@ map path is cluster-verified", not "Skiff is cluster-verified".
 
 `format_compare`'s `project` task, on 2026-08-13/14, on the single-node local
 Docker cluster running x86-64 images under arm64 emulation: a Skiff map over
-412 554 rows / 48 MiB in one job, nine mixed-type columns, a `Variant8`
-optional column, `string32` columns that are deliberately not UTF-8, and a
-hand-written positional schema. Its decoded output was diffed row for row
-against a typed-serde YSON leg, a `YsonValue` leg and a YQL query at the start
-of each of three nine-round runs, before any clock was read; all four agreed each time. That diff was exact and order-sensitive, and the matrix row rests
-on it. The harness now compares sorted canonical binary-YSON encodings as a
-multiset, so a re-run confirms presence, absence and multiplicity, not order.
+412 554 rows / 48 MiB in one job, nine mixed-type columns, a `Variant8` optional
+column, `string32` columns that are deliberately not UTF-8, and a hand-written
+positional schema. Its decoded output was diffed row for row against a
+typed-serde YSON leg, a `YsonValue` leg and a YQL query at the start of each of
+three nine-round runs, before any clock was read; all four agreed each time.
+That diff was exact and order-sensitive, and the matrix row rests on it. The
+harness now compares sorted canonical binary-YSON encodings as a multiset, so a
+re-run confirms presence, absence and multiplicity, not order.
 
 It also showed that YQL's own job I/O is Skiff (read from the operation
 spec), with a schema that differs from the hand-written one only in carrying
@@ -96,11 +98,11 @@ required test 5.
    decoded values otherwise.
 5. Cluster fixtures. Capture raw Skiff streams from real jobs, covering table
    indexes, row/range indexes, key switches and multiple output descriptors.
-   Open: `skiff_launch` (2 rows, 2 columns) and `format_compare` (412 554
-   rows, nine columns) each have one input table and one output descriptor. `format_compare` was scoped to one output so a
-   failure in this open ground could not be measured as slowness. Next is a
-   two-input, two-output Skiff shape, as `cat --tables 2` is for YSON, which
-   needs no Go on the cluster.
+   Open: `skiff_launch` (2 rows, 2 columns) and `format_compare` (412 554 rows,
+   nine columns) each have one input table and one output descriptor.
+   `format_compare` was scoped to one output so a failure in this open ground
+   could not be measured as slowness. Next is a two-input, two-output Skiff
+   shape, as `cat --tables 2` is for YSON, which needs no Go on the cluster.
 6. Regression. Binary-YSON unit, offline e2e and cluster e2e tests stay
    green; Skiff must not alter their byte-exact behavior.
 
