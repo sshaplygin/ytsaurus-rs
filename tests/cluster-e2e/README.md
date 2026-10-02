@@ -439,7 +439,7 @@ all 24 examples passed with the environment below. The names are placeholders.
 ```sh
 export YT_PROXY=cluster.example.net
 
-# 1. A private CA. Without this the first request fails with
+# 1. A private CA. Without this every request, from the very first, fails with
 #    `invalid peer certificate: UnknownIssuer` (compiled-in Mozilla roots, not
 #    the machine's store). The `yt` CLI reads the same variable; the Go SDK
 #    takes the system store.
