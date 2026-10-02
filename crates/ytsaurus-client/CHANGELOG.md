@@ -131,9 +131,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   by-id commands. Two attaches to one id both ping, and the first to finish the
   transaction decides it.
 - Added `Transaction::is_lost`: true once a ping was answered "no such
-  transaction" and the keep-alive stopped. Also false when the thread never
-  started or panicked. It takes `&self`; after `detach`, probe with
-  `Client::ping_transaction`.
+  transaction" and the keep-alive stopped. False does not prove pinging: it is
+  also false when the thread never started or has panicked. It takes `&self`;
+  after `detach`, probe with `Client::ping_transaction`.
 - Added `Client::ping_transaction`, `Client::commit_transaction` and
   `Client::abort_transaction`, taking a bare id. Commit carries a mutation ID,
   abort is retried freely, and a ping doubles as a liveness probe.
@@ -180,7 +180,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   an included lower and excluded upper bound are sent as `key`, `..=` and
   `Bound::Excluded` below as `key_bound`. `RowRange::exact_key` is the `exact`
   selector. `keys(a..b)` and `keys(a..=b)` differ by every row whose key starts
-  with `b` ([protocol reference](../../docs/protocol-reference.md#selecting-columns-and-rows-on-a-path)).
+  with `b`, and `Excluded(a)` below skips every row starting with `a`
+  ([protocol reference](../../docs/protocol-reference.md#selecting-columns-and-rows-on-a-path)).
 - Added `yson_build::uint`, for `uint64` keys above `i64::MAX`.
 - Changed `read_table`, `read_table_with_format`, `read_skiff_table`,
   `read_table_rows` and `read_table_streaming` to take `impl Into<TablePath>`.
@@ -199,8 +200,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `/hosts` answer is a pool, each heavy command picks a member at random, and
   the first heavy command to find the answer older than the refresh interval
   asks again. A failed refresh keeps the previous answer for another interval.
-  No background thread. A heavy command may now pay one `/hosts` round trip
-  mid-life (bounded by `with_hosts_timeout`, at most once per interval), and
+  No background thread and no new dependency. A heavy command may now pay one
+  `/hosts` round trip mid-life (bounded by `with_hosts_timeout`, at most once
+  per interval), and
   "the cluster named no heavy proxy" expires after one interval instead of
   lasting for the client's life. `with_proxy_discovery(false)`, `heavy_proxy()`
   (the cluster's first pick) and `with_hosts_retry_after` are unchanged.
@@ -306,8 +308,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   one deadline per attempt (a retry still gets a fresh one), in
   `Client::heavy_proxy` too.
 - Fixed `Location: ?path=//other` resolving against the request's directory
-  instead of its path
-  ([RFC 3986 §5.3](https://www.rfc-editor.org/rfc/rfc3986#section-5.3)); a bare
+  (`/api/v4/?path=//other`) instead of its path (`/api/v4/exists?path=//other`,
+  [RFC 3986 §5.3](https://www.rfc-editor.org/rfc/rfc3986#section-5.3)); a bare
   `#fragment` also keeps the query.
 - Added `RedirectRefusal` (`Credentials`, `Body`, `Payload`, `TooMany`;
   non-exhaustive), a field of `ClientError::Redirected`.
@@ -338,8 +340,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   that refuses them. The first heavy command now asks `/hosts`, and every clone
   of the client shares the answer, refreshed as in the pool entry above. A
   failed heavy command is not re-sent.
-- A failed heavy command drops the host it used, and the next name takes over.
-  So does a proxy that refuses heavy work for its role, or cannot be reached.
+- A failed heavy command drops the host it used, and the next name takes over;
+  likewise a proxy that refuses heavy work for its role or cannot be reached.
   Only when every name has failed does the client fall back to the configured
   address, for ten seconds, then ask again.
 - Added `Client::with_heavy_proxies_in`, an explicit list of proxies, compared
@@ -488,16 +490,18 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Added `Client::alter_table`, which sends `schema` as a top-level parameter
   and checks nothing locally; the cluster's error 316 names the column.
 - Added `Client::list`, which refuses a listing marked `<incomplete=%true>`;
-  `copy` / `copy_replacing`, `move_node` / `move_replacing`, `link` /
-  `link_replacing`, where the `_replacing` form overwrites; and `lock` /
-  `lock_waiting` with `LockMode` and `Lock`. `lock` without a transaction is
-  refused locally, and `lock_waiting` polls until `acquired`, with a deadline.
+  `copy` / `copy_replacing`, `move_node` / `move_replacing` (`move` is a
+  keyword) and `link` / `link_replacing`, where the `_replacing` form
+  overwrites; and `lock` / `lock_waiting` with `LockMode` and `Lock`. `lock`
+  without a transaction is refused locally, and `lock_waiting` polls until
+  `acquired`, with a deadline.
 - Added `Transaction`, `Client::start_transaction`,
   `Client::start_transaction_with` and `Client::with_transaction`. A
-  `Transaction` derefs to a `Client` bound to it, and every command it sends
-  carries the id unless the command names a transaction itself. A thread pings
-  three times per timeout. Only `commit` publishes, under a mutation ID;
-  dropping an uncommitted handle aborts.
+  `Transaction` derefs to a `Client` bound to it (`tx.write_table(…)`,
+  `tx.start_map(…)`), and every command it sends carries the id unless the
+  command names a transaction itself. A thread pings three times per timeout.
+  Only `commit` publishes, under a mutation ID; dropping an uncommitted handle
+  aborts.
 - Fixed `Client::exists`, which failed every call by reading the key `exists`
   instead of `value`.
 
@@ -505,7 +509,7 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 
 - Added `VanillaSpec`, `VanillaTask` and `Client::start_vanilla`.
   `output_table_paths` is always sent, even empty; anything else, such as
-  `gang_options`, goes through `with_raw`.
+  `gang_options` or `stderr_table_path`, goes through `with_raw`.
 - Added `Client::custom_statistics` and `Client::statistic_sum`, which totals
   the `completed` jobs across job types.
 - Added `Client::upload_worker_cached`, `Client::file_from_cache`,
@@ -519,7 +523,7 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   five attempts by default, the delay doubling from one second to ten;
   `RetryPolicy::none()` turns it off. Retried: transport errors, HTTP
   429/500/502/503/504, and YTsaurus codes 3, 100, 105, 108, 904 and 2100
-  anywhere in the error document; never 500 (resolve) or 501 (already exists).
+  anywhere in the error document, as the Python client does; never 500 (resolve) or 501 (already exists).
   Heavy commands are sent once.
 - Added `MutationId` and `Client::start_operation_with`; every mutating command
   carries a `mutation_id`, and `MutationId::as_retry()` marks a replay of a
@@ -528,9 +532,10 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `Client::start_sort`. A reduce's `key_switch` goes under `job_io`. `sort_by`
   is sent only when set; the cluster defaults it to `reduce_by`. `SortSpec`
   sends a single `output_table_path`.
-- Added `Client::upload_current_exe` and `ClientError::NotAWorker`, which
-  refuses an executable that is not a Linux x86-64 ELF without an interpreter,
-  saying what to build instead.
+- Added `Client::upload_current_exe`: with `ytsaurus_job::is_inside_job`, one
+  binary launches the operation and runs as its job. Added
+  `ClientError::NotAWorker`, which refuses an executable that is not a Linux
+  x86-64 ELF without an interpreter, saying what to build instead.
   `upload_worker` still accepts anything, a shell script included.
 - Added the `tls` feature, on by default. Without it an `https://` proxy fails
   with an error naming the feature, and a binary that is both launcher and job
