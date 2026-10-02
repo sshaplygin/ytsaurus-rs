@@ -45,6 +45,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `_` arm. Naming, constructing and destructuring a variant are unaffected.
 - **Breaking** `Repeatable` gained a variant, `Heavy`, and
   `#[non_exhaustive]`: an exhaustive `match` needs a `_` arm.
+- **Breaking** `OperationType` gained `Merge`, `Erase`, `RemoteCopy` and
+  `JoinReduce`, and is not `#[non_exhaustive]`: an exhaustive `match` needs
+  arms for them or a `_` arm.
 - **Breaking** `Client::remove` sends the cluster's defaults (the node must
   exist, a map node must be empty) instead of `recursive=%true; force=%true`.
   To delete a subtree or tolerate absence, call `Client::remove_tree`.
