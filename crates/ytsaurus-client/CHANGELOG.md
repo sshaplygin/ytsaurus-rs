@@ -378,8 +378,9 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
 - Corrected the documented control-proxy refusal: a heavy write gets 503 with
   `Retry-After: 60`, a heavy read a 307; it had said HTTP 200. `heavy_proxy`
   remains for reading the chosen address.
-- Added `Repeatable::Heavy`, split from `Repeatable::Never`. `Transport::open`
-  and `Transport::upload` are heavy, so raw streaming commands are routed too.
+- Added `Repeatable::Heavy`, split from `Repeatable::Never`: sent once and
+  routed to a heavy proxy. `raw_command_streaming` and `raw_command_upload`
+  are always heavy, whatever the caller passes, so they are routed too.
 
 ### The operation lifecycle
 
@@ -433,7 +434,8 @@ cut; these changes reached crates.io in 0.3.0. This crate had none of its own.
   `raw_command_streaming(method, command, params)`, which returns the response
   unread, and `raw_command_upload(method, command, params, body)`, which streams
   the body. `raw_command` is sent once whatever the retry policy, and is
-  stamped with the client's transaction (`NO_TRANSACTION` exceptions apply). A
+  stamped with the client's transaction, except the scheduler and job commands
+  (`get_operation`, `list_jobs` and the like), which go without one. A
   command name containing `/`, `?`, `#` or whitespace is refused, as is a
   payload with `Method::Get`.
 - Added `Method` and `Repeatable` to the public API, `ResponseReader` (which
