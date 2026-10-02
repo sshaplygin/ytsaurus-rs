@@ -35,8 +35,8 @@ allocator. This comparison did not decide whether Skiff should be the default.
   cannot be run: Skiff has no typed rows
   ([§ Skiff in a job](#skiff-in-a-job-today)).
 - The decode share in the threshold's unit, job CPU, is not measured: the local
-  cluster reports nothing under `user_job/cpu`. A production run is still owed
-  (#70), and so is required test 5 (cluster fixtures) of
+  cluster reports nothing under `user_job/cpu`. Repeated production runs are
+  still owed (#70), and so is required test 5 (cluster fixtures) of
   [`skiff-compatibility.md`](skiff-compatibility.md).
 - Of the four parts of the prediction recorded before the runs, two were
   refuted, one was refuted in part and one held.
@@ -336,10 +336,10 @@ through `INSERT INTO`; reading them through Query Tracker would measure the
 display path and cap at its result-row limit. `abort_query` is there so that a
 harness killed mid-run does not leave a query running on the cluster.
 
-Query Tracker keeps its state in dynamic tables, a recorded non-goal; these
-ordinary HTTP commands do not touch that path. Whether it becomes client API is
-not this plan's decision: [`docs/sdk-comparison.md`](sdk-comparison.md) records
-it as undecided, not excluded. For scale: `read_file` was 1824 lines across 15
+Query Tracker is a non-goal of this client (AGENTS.md); the harness reaches it
+through `raw_command`, as
+[`docs/sdk-comparison.md`](sdk-comparison.md#query-tracker-through-raw_command)
+shows. For scale: `read_file` was 1824 lines across 15
 files (#47), transaction detach 1864 (#45), batch requests 3371 (#44). A minimal
 query surface (`start_query`, `get_query`, `wait_for_query`, `abort_query`, a
 `QueryState` enum, a parsed `QueryInfo`) would be roughly 1.5–2 k lines with

@@ -175,8 +175,8 @@ YT_WORKER_BINARY=target/x86_64-unknown-linux-musl/release-worker/selfrun \
     cargo run -p ytsaurus-job --example selfrun
 ```
 
-[`tests/cluster-e2e/README.md`](../tests/cluster-e2e/README.md) holds the output
-of each, from the runs that were made.
+[`tests/cluster-e2e/README.md`](../tests/cluster-e2e/README.md) holds the
+results of each run that was made.
 
 ## Interop below the examples
 

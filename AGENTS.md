@@ -286,15 +286,10 @@ and their APIs may change in a patch release. Release history is in each
 crate's CHANGELOG; measurements are in [docs/benchmarking.md](docs/benchmarking.md)
 and [`crates/ytsaurus-yson/BENCHMARKS.md`](crates/ytsaurus-yson/BENCHMARKS.md).
 
-Whether Skiff becomes the default job format is undecided. For the pilot job,
-decoding is ~10 % of job CPU on the local Docker cluster and 36 % on a
-production one (`cargo run -p ytsaurus-client --example profile`), against a
-30 % threshold, and both readings scatter 2× across rounds. Do not quote the
-10 % alone. [docs/format-comparison.md](docs/format-comparison.md) did not
-decide it: typed YSON against typed Skiff cannot be measured while Skiff has no
-typed rows. A spread from repeated production runs is still needed (#70); the
-harness is in-tree and the access exists, so the run only has to be done. A
-local Docker cluster is enough for everything else.
+Whether Skiff becomes the default job format is undecided; the readings, the
+threshold and what is still owed (#70) are in
+[docs/benchmarking.md](docs/benchmarking.md#the-verdict). A local Docker cluster
+is enough for everything else.
 
 Open work is tracked in issues:
 

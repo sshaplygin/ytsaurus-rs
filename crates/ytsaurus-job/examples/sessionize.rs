@@ -205,7 +205,7 @@ fn map_parse() -> Result<(), JobError> {
 ///
 /// One output rather than two for the same reason as the reduce is absent: a
 /// second output descriptor is outside the single shape Skiff is
-/// cluster-verified in (`docs/skiff-compatibility.md`, required test 4), and
+/// cluster-verified in (`docs/skiff-compatibility.md`, required test 5, cluster fixtures), and
 /// the Skiff leg has to run the same job as this one or the legs are not
 /// comparable. Bad rows are counted and dropped instead of quarantined — the
 /// count goes to stderr, which the operation shows.
