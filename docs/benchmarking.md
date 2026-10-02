@@ -18,7 +18,7 @@ spread from repeated production runs is still needed (#70). Do not quote the
 
 The format comparison (§5) did not decide it. The comparison that would, typed
 YSON against typed Skiff, cannot be run while Skiff has no typed rows.
-[`skiff-compatibility.md`](skiff-compatibility.md)'s required test 4 is still
+[`skiff-compatibility.md`](skiff-compatibility.md)'s required test 5 (cluster fixtures) is still
 open; see [Decision criteria](#decision-criteria).
 
 ## Pull-request comparison
@@ -369,7 +369,7 @@ columns.
 
 The Skiff leg exercised nine columns, mixed types and an optional variant, more
 shape than `skiff_launch` covered on 2026-08-09, but one input table, one
-output table and no key switch. Required test 4 of
+output table and no key switch. Required test 5 (cluster fixtures) of
 [`skiff-compatibility.md`](skiff-compatibility.md) stays open.
 
 ## What has *not* been measured

@@ -36,7 +36,7 @@ allocator. This comparison did not decide whether Skiff should be the default.
   ([§ Skiff in a job](#skiff-in-a-job-today)).
 - The decode share in the threshold's unit, job CPU, is not measured: the local
   cluster reports nothing under `user_job/cpu`. A production run is still owed
-  (#70), and so is required test 4 of
+  (#70), and so is required test 5 (cluster fixtures) of
   [`skiff-compatibility.md`](skiff-compatibility.md).
 - The prediction recorded before the runs was refuted in three of its four
   parts.
@@ -158,13 +158,13 @@ From [`docs/skiff-compatibility.md`](skiff-compatibility.md), the contract:
 | typed rows, schema inference, typed `Scan`/`Write` | planned, so leg 3 is positional `Value::Tuple` with a hand-written schema, and there is no "Skiff typed" leg |
 | indexes and key switch, decoding | implemented offline |
 | on a real cluster | one input table, one output descriptor, a map: what `skiff_launch` settled on 2026-08-09 |
-| table indexes, row/range indexes, key switches, multiple output descriptors on a cluster | open, as required test 4 |
+| table indexes, row/range indexes, key switches, multiple output descriptors on a cluster | open, as required test 5 (cluster fixtures) |
 
 So the task is one input table, one output table, no key switch: a Skiff leg
-outside that shape would run inside required test 4's open ground, where a
-failure cannot be told from a slow result. Extending the single-table task to
-two inputs and two outputs is the cheapest way to close test 4; it is not part
-of this plan.
+outside that shape would run inside that open ground, where a failure cannot be
+told from a slow result. Extending the single-table task to two inputs and two
+outputs is the cheapest way to close required test 5 (cluster fixtures); it is
+not part of this plan.
 
 ### The task: the pilot's map, one output
 
@@ -464,7 +464,7 @@ spread it reports.
 - The Skiff entry under *Status* in [`AGENTS.md`](../AGENTS.md#status), which
   says a spread from repeated production runs is still needed (#70). This plan
   owes that spread too and adds no third single number.
-- [`skiff-compatibility.md`](skiff-compatibility.md) required test 4: one input,
+- [`skiff-compatibility.md`](skiff-compatibility.md) required test 5 (cluster fixtures): one input,
   one output, no key switch, so the gate stays open.
 
 Any YQL advantage has to be decomposed into projection, runtime and stage
