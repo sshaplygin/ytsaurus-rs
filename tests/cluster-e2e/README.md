@@ -112,8 +112,9 @@ A repeated query is served from cache and spawns no operations, so every timing
 needs `PRAGMA yt.QueryCacheMode = "disable"`. A YQL job here needs a little
 more than YQL's 545 MB default memory: 576M fails, 640M passes, hence
 `PRAGMA yt.DefaultMemoryLimit = "640M"` for a `map_reduce` stage. Both are in
-the example's `PRAGMAS`. It prints where each spawned operation's id appears in the `get_query` answer
-(`progress/yql_progress/<node>/remoteId`, `…/yql_statistics/…/_id`) and reads
+the example's `PRAGMAS`. It prints where each spawned operation's id appears
+in the `get_query` answer (`progress/yql_progress/<node>/remoteId`,
+`…/yql_statistics/…/_id`) and reads
 the operations back through `Client::list_operations` with
 `OperationFilter::with_substring(query_id)`, which the cluster matches against
 the title YQL gives each operation.

@@ -72,8 +72,9 @@ describes the same work as a reduce with `join_by` and
 `DataFormat` (binary or text YSON, or validated dynamic Skiff) is taken by
 `MapSpec::with_formats`, the map-reduce equivalents, and the `_with_format`
 table methods. Skiff table I/O derives the column projection from the format,
-as the Go SDK does; the `*_skiff_*` methods are wrappers. Skiff has no typed rows or schema inference
-yet ([compatibility contract](../../docs/skiff-compatibility.md)).
+as the Go SDK does; the `*_skiff_*` methods are wrappers. Skiff has no typed
+rows or schema inference yet
+([compatibility contract](../../docs/skiff-compatibility.md)).
 [`skiff_launch.rs`](examples/skiff_launch.rs) runs a Skiff map over non-UTF-8
 `string32` data with the `skiff_cat` worker:
 
