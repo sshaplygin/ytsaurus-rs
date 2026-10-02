@@ -56,51 +56,37 @@ Go's `ytjaeger` and `ytotel` adapters read it from an ambient
 `context.Context`; Rust has none, so it is passed to the client, and an
 OpenTelemetry application formats its current span into a `traceparent`.
 
-### Heavy proxies
+### Heavy proxies and in-job use
 
-Both official clients pick a host at random per command (`THostManager` with
-`RandomNumber`, Go's `ProxySet.PickRandom`) and never commit to one. C++
-refreshes `/hosts` lazily on access; Go refreshes in the background and bans a
-failing proxy for five minutes. This client:
+Both official clients pick a heavy proxy at random per command (`THostManager`
+with `RandomNumber`, Go's `ProxySet.PickRandom`); C++ refreshes `/hosts`
+lazily, Go in the background with a five-minute ban on a failing proxy. This
+client also picks at random, from the crate's id source (*unique, not
+unpredictable*), so with no new dependency. The observations and reasons behind each line below are in
+[protocol-reference.md](protocol-reference.md#where-a-heavy-command-goes).
+One line per difference, with the setting that changes it:
 
-- picks at random using the crate's id source (*unique, not unpredictable*),
-  so no new dependency;
-- refreshes the C++ way: the heavy command that finds the answer older than
-  `Client::with_host_list_refresh_interval` (one minute by default, the
-  [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)'s
-  "re-query every minute") asks `/hosts` first. No background thread; a failed
-  refresh keeps the previous answer;
-- drops a host whose failure is attributable to it, a rejected certificate
-  included, until a refresh names it again: a persistently bad host costs one
-  failed command per interval. A pool with nobody left falls back to the
-  configured address for ten seconds before `/hosts` is asked again. With separate roles that address is a
-  control proxy, which answers uploads with `Control proxy may not serve heavy
-  requests with input data`.
-
-Deviation from both: a discovered name is used only if it shares the
-configured address's domain, with the scheme and port of the configured
-address. It guards against typos and foreign names; it is not a token
-boundary, because steering the `/hosts` body takes the proxy or the wire, and
-either already has the token. Go filters nothing (`listHeavyProxies` returns
-the list verbatim; `proxy_set.go` adds every entry). A managed installation
-answered `/hosts` with 79 heavy proxies under a domain the configured address
-does not share; the default rule refused all of them and no heavy command
-could be sent. Settings:
-
-- `Client::with_heavy_proxies_anywhere(true)`: no filter, as the official
-  clients;
-- `Client::with_heavy_proxies_under([…])`: the configured domain plus those
-  named; survives a proxy rotation;
-- `Client::with_heavy_proxies_in([…])`: only the names listed; of the four
-  settings, the only boundary.
+- Refresh is lazy, as in C++, on the heavy command that finds the answer older
+  than one minute; no background thread, unlike Go; a failed refresh keeps the
+  previous answer: `Client::with_host_list_refresh_interval`.
+- A host whose failure is attributable to it, a rejected certificate included,
+  is dropped until a refresh names it again, shorter than Go's five-minute ban:
+  a draining host is back within a minute by default, and a persistently bad
+  one costs a failed command per interval:
+  `Client::with_host_list_refresh_interval`.
+- An empty pool falls back to the configured address for ten seconds before
+  `/hosts` is asked again: `Client::with_hosts_retry_after`.
+- A discovered name is used only within the configured address's domain, with
+  its scheme and port; neither official client filters:
+  `Client::with_heavy_proxies_anywhere(true)` (no filter),
+  `Client::with_heavy_proxies_under([…])` (add domains),
+  `Client::with_heavy_proxies_in([…])` (only the names listed).
+- Requests from inside a job are allowed, where Go refuses them unless
+  `AllowRequestsFromJob` is set: no setting.
+- Retry logging mutes itself inside a job (`YT_JOB_ID`): no setting.
 
 Logging is thinner: a span per attempt and an event per retry, where the
 official clients log request bodies, proxy choices and connection lifecycles.
-
-Only this client mutes retry logging inside a job (`YT_JOB_ID`) and works from
-inside a job at all; Go refuses unless `AllowRequestsFromJob` is set, guarding
-against a hundred thousand jobs finding the master at once. The one-binary
-launcher-and-worker pattern depends on it.
 
 ## Cypress and paths
 
@@ -181,12 +167,14 @@ once.
 interval from `#<id>/@timeout`; `ping_transaction`, `commit_transaction` and
 `abort_transaction` work from the id alone. `Drop` follows the C++ destructor:
 a handle this process *started* aborts, which makes `?` safe inside a
-transaction; an *attached* one detaches. Go's `AttachTx(id, {AutoPingable:
-false})` maps onto `with_transaction` plus the by-id commands, so
-`attach_transaction` always pings, and pings before returning, which neither
-official client does: `@timeout` is the configured lifetime, not what a
-handoff has left. Go's `Tx.Finished()` is pushed; `Transaction::is_lost` must
-be polled.
+transaction; an *attached* one detaches. Go's
+`AttachTx(id, {AutoPingable: false})` maps onto `with_transaction` plus the
+by-id commands.
+
+- `attach_transaction` always pings, and pings once before returning, which
+  neither official client does: no setting
+  ([why](protocol-reference.md#handing-a-transaction-to-another-process)).
+- Go's `Tx.Finished()` is pushed; `Transaction::is_lost` is polled: no setting.
 
 ## Dynamic tables, administration, the rest
 
