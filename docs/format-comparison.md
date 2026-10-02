@@ -23,8 +23,8 @@ allocator. This comparison did not decide whether Skiff should be the default.
 - Skiff against dynamic YSON (`YsonValue`), whole map: 1.85×, 1.88×, 1.93×.
   79–88 % of that gap on the cluster (88 %, 82 %, 79 % by run) and 98 % of it
   off the cluster lies between the two YSON legs, which share format, bytes,
-  reader and serializer. It is a representation difference, keyed map against
-  positional tuple, and must not be quoted as a format ratio.
+  reader and serializer. It is mostly a representation difference, keyed map
+  against positional tuple, and must not be quoted as a format ratio.
 - Wire volume is the solid result: Skiff moves 54.6 MiB in and 47.2 out, binary
   YSON 91.1 and 85.7, identical in all three runs. Off the cluster: 54.6/47.2
   and 90.7/85.7, the 0.4 MiB on the YSON input being control records rather
