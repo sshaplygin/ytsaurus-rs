@@ -4,242 +4,100 @@
 
 ### Fixed
 
-- **`tests/skiff_reader_tests.rs` is no longer published.** It `include_str!`s a
-  control-row vector from `tests/skiff-go-interop/`, which is outside this
-  crate, and `include_str!` resolves at compile time — so the file compiled in
-  the repository and could not compile from the 0.3.0 tarball. `cargo test`
-  inside an unpacked `ytsaurus-job` 0.3.0 fails for this reason; anyone merely
-  *depending* on the crate was unaffected, since cargo does not build a
-  dependency's tests.
-
-  `tests/cat_e2e.rs` was excluded in 0.3.0 for exactly this reason and this one
-  was missed: the search was a line-based grep, and here the macro has a
-  newline in it. `scripts/check_package_includes.py` now parses instead of
-  matching, and runs in CI.
+- `tests/skiff_reader_tests.rs` is no longer published. It `include_str!`s a
+  control-row vector from `tests/skiff-go-interop/`, outside this crate, so
+  `cargo test` inside an unpacked 0.3.0 failed; depending on the crate was
+  unaffected. `scripts/check_package_includes.py` now checks this in CI.
 
 ## 0.3.0 - 2026-08-16
 
-No change to this crate's library — the runtime, the reader and the writers are
-what they were in 0.2.5. What reaches crates.io here is the example move below,
-which was prepared as 0.2.6 and never released, together with a rewritten
-throughput benchmark and the end-to-end tests that drive the example workers.
+No library change since 0.2.5. This release ships the 0.2.6 changes below, a
+rewritten throughput benchmark, and end-to-end tests that drive the example
+workers.
 
-- **Excluded** `tests/cat_e2e.rs` from the package. It `include_bytes!`s golden
-  fixtures that live outside this crate, and `include_bytes!` resolves at
-  compile time — so shipping it handed anyone who unpacked the crate a build
-  error with no way to fix it. It runs in the repository, where the fixtures
-  are. The other end-to-end tests build the published example workers and are
-  unaffected.
+- Excluded `tests/cat_e2e.rs` from the package: it `include_bytes!`s golden
+  fixtures from outside this crate and could not build from the tarball. It
+  still runs in the repository.
 
 ## 0.2.6 — never released
 
-The version was bumped in the workspace and the tag was never cut, so nothing in
-this section reached crates.io until 0.3.0.
+The tag was never cut; nothing in this section reached crates.io until 0.3.0.
 
-### The worker examples live here now
-
-- **Added** eight runnable workers under `examples/` — `cat`, `wordcount`,
-  `hello`, `sessionize`, `boom`, `counted`, `shards` and `skiff_cat` — which
-  were a separate package in the repository before and are now published with
-  this crate. `cargo run -p ytsaurus-job --example wordcount`, and on docs.rs
-  they sit beside the API they demonstrate.
-
-  A ninth, `selfrun`, stays in the repository and is **excluded from the
-  package**. It is launcher and job in one binary, so it needs
-  `ytsaurus-client` — which dev-depends on this crate in turn, so the
-  dependency here carries a path and no version to keep two published crates
-  from becoming cyclic. Cargo drops a version-less dev-dependency on publish,
-  and an example importing a crate the manifest no longer names is an example
-  nobody could build.
-
-- **Added** the `example-tls` feature, which gives that same `selfrun` example
-  TLS for a cluster reached over https. It affects nothing else: this crate's
-  library has no HTTP in it. Off by default, because the workers cross-compile
-  to musl and `rustls` reaches `ring`, which wants a C cross-compiler.
-
-  It is a **repository-only** feature. It enables a feature of a version-less
-  dev-dependency, which publishing drops, and the example it serves is excluded
-  from the package — so on crates.io it reads `example-tls = []` and does
-  nothing.
-
-- **Changed** the criterion dev-dependency to `0.7`. Cargo compiles a package's
-  dev-dependencies whenever it builds that package's examples, and criterion
-  0.8 reaches `alloca`, whose build script wants the same cross-compiler.
-  Nothing in the bench used a 0.8 feature.
+- Added eight example workers, previously a separate package in the repository
+  and now published here: `cat`, `wordcount`, `hello`, `sessionize`, `boom`,
+  `counted`, `shards` and `skiff_cat` (`cargo run -p ytsaurus-job --example
+  wordcount`). A ninth, `selfrun`, needs `ytsaurus-client` and is excluded from
+  the package.
+- Added the `example-tls` feature: TLS for the `selfrun` example and nothing
+  else, off by default. It is repository-only; on crates.io it reads
+  `example-tls = []` and does nothing.
+- Changed the criterion dev-dependency to `0.7`: 0.8 reaches `alloca`, whose
+  build script needs a C cross-compiler that the musl worker build lacks.
 
 ## 0.2.5 - 2026-08-10
 
-### An empty reduce group stays empty
-
-- **Fixed** back-to-back key switches producing a "empty" group that was
-  actually live: it handed out the *next* group's rows under the empty
-  group's (absent) key, and that group was never seen at all. An empty group
-  now comes out with no rows, and the group after it keeps its rows and its
-  key. YTsaurus does not emit consecutive switches today, which is why this
-  had not bitten; the iterator no longer depends on that staying true.
-
-### A late row is refused, not lost
-
-- **Fixed** `JobWriter` accepting rows after `finish()`. Such a row went into
-  the buffer, `Drop` saw a finished writer and flushed nothing, and the job
-  exited zero with a short table — the exact outcome `finish` exists to rule
-  out. Writing after `finish` now fails with the new
+- Fixed back-to-back key switches: an empty reduce group now has no rows, and
+  the group after it keeps its rows and its key. Before, the empty group handed
+  out the next group's rows. YTsaurus does not emit consecutive switches today.
+- Fixed `JobWriter` accepting rows after `finish()`, which were then lost while
+  the job exited zero. Writing after `finish` now fails with
   `JobError::WriteAfterFinish`. **Breaking** for anyone matching `JobError`
   exhaustively; add `..` or a `_` arm.
-
-### Row numbering matches the cluster's
-
-- **Fixed** `Row::row_index` standing still between control records. YTsaurus
-  emits `<row_index=N>#` only at discontinuities — the start of a range or a
-  chunk — and every row after it implicitly advances the index; the reader now
-  counts rows the way the Go, C++ and Python SDKs do, instead of stamping every
-  row of a run with the same `N`. Rows skipped by `Groups` draining a group
-  advance the index too, since they are still rows of the table.
-- **Fixed** a table switch leaving `range_index` stale: `<table_index=…>#`
-  now drops the previous table's range index along with its row index, so a row
-  of the new table never reports a range it was not read from.
-
-### A job can report its own numbers
-
-- **Added** `JobStatistics`. The cluster measures a job from the outside — CPU,
-  memory, rows in and out — but nothing tells you how many rows a job *rejected*
-  unless the job says so. Statistics go to the descriptor YTsaurus reserves for
-  them (fd 5) as a YSON list fragment, matching the Python wrapper's
-  `write_statistics`, and the operation aggregates them across jobs.
-
-  ```rust
-  let mut stats = JobStatistics::new();
-  stats.add("rows/rejected", 1)?;
-  stats.finish()?;
-  ```
-
-  Values accumulate and are sent once, by `finish` — the cluster has no defined
-  behaviour for one name arriving twice. `Drop` makes a last-ditch attempt and
-  complains on stderr, as with `JobWriter`.
-
-- **Added** `JobError::TooManyStatistics` and `JobError::Statistics`. A job may
-  report at most 128 distinct names, so the 129th is refused locally rather than
-  by the cluster rejecting the lot. The second is separate from `JobError::Write`
-  because fd 5 is not an output table, and reporting it as "output table 5"
-  would send the reader looking for a table that does not exist. **Breaking**
-  for anyone matching `JobError` exhaustively; add `..` or a `_` arm.
-
-**Nothing is written unless `is_inside_job()`.** Outside a job, fd 5 is not the
-cluster's — and with one binary serving as both launcher and job, it is as
-likely to be an open socket to the cluster as to be nothing at all. Writing YSON
-into that would be worse than losing a statistic.
-
-### Knowing which job of the task this is
-
-- **Added** `job_cookie`, the job's index within its task (`YT_JOB_COOKIE`),
-  counting from zero and stable across a restart. A map job rarely needs it —
-  its share of the work arrives on fd 0 — but a **vanilla** job has no input at
-  all, so this is how it takes its own share, and how a retried job redoes that
-  share rather than someone else's.
-
-The entry point for a job with no input is the same `run`: a `JobReader` was
-never mandatory. See `ytsaurus-client`'s `VanillaSpec` for the other side.
-
-### One binary can be both the launcher and the job
-
-- **Added** `is_inside_job`, `run_if_inside_job` and `job_id`. The cluster
-  starts a job with `YT_JOB_ID` in its environment, so a program can tell which
-  role it is playing:
-
-  ```rust
-  fn main() {
-      ytsaurus_job::run_if_inside_job(mapper);   // never returns inside a job
-      launch();                                  // only your machine gets here
-  }
-  ```
-
-  With `Client::upload_current_exe` on the other side, the binary uploads
-  itself, and "the cluster is running last week's worker" stops being possible.
-  This is the shape of Go's `mapreduce.InsideJob` / `JobMain`.
-
-  Verified on a cluster rather than assumed: a job printed its environment, and
-  `YT_JOB_ID` was in it, alongside `YT_OPERATION_ID`, `YT_JOB_COOKIE`,
-  `YT_JOB_INDEX`, `YT_START_ROW_INDEX` and `YT_FIRST_OUTPUT_TABLE_FD=1` — the
-  `3k + 1` descriptor rule from the cluster's own mouth. The full list is in
-  [`docs/writing-a-job.md`](../../docs/writing-a-job.md) §3.
-
-  An empty `YT_JOB_ID` does not count as a job. `YT_JOB_ID=` in a shell would
-  otherwise run the job body on a developer's machine, reading their terminal as
-  an input stream.
+- Fixed `Row::row_index` standing still between control records: after each
+  `<row_index=N>#` it now advances by one per row, as the Go, C++ and Python
+  SDKs count, including rows skipped by `Groups` draining a group.
+- Fixed a table switch leaving `range_index` stale: `<table_index=…>#` now drops
+  the previous table's range index along with its row index.
+- Added `JobStatistics`: custom statistics written to fd 5 as a YSON list
+  fragment, as the Python wrapper's `write_statistics` does. Values accumulate
+  and are sent once, by `finish`; `Drop` makes a last-ditch attempt and
+  complains on stderr. Nothing is written unless `is_inside_job()`.
+- Added `JobError::TooManyStatistics`, for a 129th distinct name (the limit is
+  128 per job), and `JobError::Statistics`, for a failed write to fd 5, apart
+  from `JobError::Write`. **Breaking** for anyone matching `JobError`
+  exhaustively; add `..` or a `_` arm.
+- Added `job_cookie`, the job's index within its task (`YT_JOB_COOKIE`),
+  counting from zero and stable across a restart: how a vanilla job, which has
+  no input, takes its share. Such a job uses the same `run`; see
+  `ytsaurus-client`'s `VanillaSpec`.
+- Added `is_inside_job`, `run_if_inside_job` and `job_id`, so one binary can be
+  both launcher and job (with `Client::upload_current_exe`), in the shape of
+  Go's `mapreduce.InsideJob` / `JobMain`. A job is detected by a non-empty
+  `YT_JOB_ID`; an empty one does not count.
 
 ## 0.2.0
 
-Everything here came from writing a production-shaped pilot
-([`sessionize`](../../crates/ytsaurus-job/examples/sessionize.rs)) and a launcher
-([`ytsaurus-client`](../ytsaurus-client/)) against the API, then filing what got
-in the way. Each change closes a numbered issue.
+Changes from writing the
+[`sessionize`](../../crates/ytsaurus-job/examples/sessionize.rs) pilot and a
+launcher against the API. Each closes the numbered issue.
 
 ### Added
 
-- **`JobReader::groups_by`, `Group::key` and `GroupKey`** ([#2]). A reducer no
-  longer has to re-derive the reduce key by parsing its first row, copy it out,
-  and write a dead branch for the "no rows yet" case that cannot happen:
-
-  ```rust
-  let mut groups = reader.groups_by(["user_id"]);
-  while let Some(mut group) = groups.next_group()? {
-      let user = group.key().bytes("user_id").unwrap_or_default();
-      // ...
-  }
-  ```
-
-  YTsaurus does not transmit the key — `key_switch` carries no payload — so this
-  reads it from the group's first row. Same work, done once instead of in every
-  reducer. `groups()` is unchanged and leaves `Group::key` empty.
-
-  `GroupKey` accessors are byte-first (`bytes`, `str`, `i64`, `get`) because
-  reduce keys are routinely not UTF-8. A key column missing from a row is absent
-  rather than fatal.
-
-- **`JobError::kind` and `JobError::is_row_local`** ([#1]). A validating mapper
-  has to fold two error types — the runtime's `JobError` and its own validation
-  reason — into one path. Previously that meant `to_string()`, which allocates
-  per bad row and produces a message that can change between versions, which is
-  awkward for a column you intend to group by.
-
-  `kind()` returns a stable, allocation-free identifier (`invalid_yson`,
-  `truncated_record`, …). `is_row_local()` says whether to quarantine the row or
-  stop: a truncated stream or a failed write means every later row is suspect.
-
-- **`JobWriter::named` and `TableId`** ([#4]). Output tables can be declared by
-  name and addressed by handle:
-
-  ```rust
-  let (mut writer, [events, rejects]) = JobWriter::named(["events", "rejects"])?;
-  writer.write(rejects, &row)?;
-  ```
-
-  A bare `usize` still converts, so 0.1 code keeps compiling. The point is the
-  call site: a job with two output tables of different meaning is where
-  transposing `0` and `1` yields something that runs happily and fills each table
-  with the other's rows.
-
-  `JobWriter::table_name` and `named_writers` (for tests) come with it.
+- `JobReader::groups_by`, `Group::key` and `GroupKey` ([#2]): a reducer gets
+  its reduce key, read from the group's first row since YTsaurus does not
+  transmit it. `GroupKey` accessors are byte-first (`bytes`, `str`, `i64`,
+  `get`); a missing key column is absent, not an error. `groups()` is unchanged
+  and leaves `Group::key` empty.
+- `JobError::kind` and `JobError::is_row_local` ([#1]): a stable,
+  allocation-free identifier (`invalid_yson`, `truncated_record`, …), and
+  whether to quarantine the row or stop.
+- `JobWriter::named` and `TableId` ([#4]): output tables declared by name and
+  addressed by handle. `JobWriter::table_name` and `named_writers` (for tests)
+  come with it.
 
 ### Changed
 
-- **`JobWriter::write` and `write_raw` take `impl Into<TableId>`** instead of
+- `JobWriter::write` and `write_raw` take `impl Into<TableId>` instead of
   `usize`. Source-compatible: `write(0, &row)` still resolves.
-
-- **`JobError::UnknownTable` gained a `names` field**, so an out-of-range write
-  reports `output table 9 does not exist; this job has 2 output table(s): events,
-  rejects` rather than a bare index. **Breaking** for anyone matching the variant
+- `JobError::UnknownTable` gained a `names` field, so an out-of-range write
+  names the job's output tables. **Breaking** for anyone matching the variant
   exhaustively; add `..` to the pattern.
 
 ### Documentation
 
-- The guide now covers the **output** side ([#3]). An output row may borrow from
-  the input row — the value is serialized before the borrow ends — so a rejects
-  table does not need `row.raw().to_vec()`. The copying version compiles and is
-  correct, which is exactly why nothing pushed you off it; the cost only shows up
-  on a large run. This was filed as an API gap and turned out to be a
-  documentation gap, verified by compiling the borrowing form against 0.1.0.
-- Added a section on reporting why a row was rejected, using the new `kind()` and
+- The guide covers the output side ([#3]): an output row may borrow from the
+  input row, so a rejects table does not need `row.raw().to_vec()`.
+- The guide covers reporting why a row was rejected, with `kind()` and
   `is_row_local()`.
 
 [#1]: https://github.com/sshaplygin/ytsaurus-rs/issues/1
@@ -251,5 +109,3 @@ in the way. Each change closes a numbered issue.
 
 First release. Streaming reader with control records and reduce grouping,
 multi-table output over descriptors or table switches, panic-to-stderr wrapper.
-Verified against a real cluster; 2 GB of input streams without growing the
-process.
