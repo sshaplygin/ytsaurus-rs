@@ -110,6 +110,13 @@ to a `TCredentialsExt`.
   rowset in the attachments: C++
   `DeserializeRowset(rsp->rowset_descriptor(), MergeRefsToRef(rsp->Attachments()))`,
   Go `decodeFromWire(rsp.Attachments)`. An envelope here would be wrong.
+- The major protocol version is per service, as in the C++, which takes it from
+  the service descriptor (`client.cpp`,
+  `serviceDescriptor.ProtocolVersion.Major`): `ApiService` announces 1 (the
+  `ProtocolVersionMajor` of `yt/go/yt/internal/rpcclient/rpc_proxy.go`),
+  `DiscoveryService` announces 0. A real proxy refuses a `DiscoveryService`
+  call announcing 1 with "Server major protocol version differs from client
+  major protocol version" (`crates/ytsaurus-rpc/src/rpc.rs`).
 
 ## Ship gates
 
@@ -134,8 +141,9 @@ been relaxed.
 - E, the parsers are fuzzed: not started. The packet and rowset decoders read
   untrusted bytes; they have exhaustive truncation tests only.
 - F2, the connection's failure modes are covered: green.
-  `connection_failure_modes.rs` tests the two defects that shipped: a deadline
-  not covering queuing, and a dead reader leaving later calls waiting for ever.
+  `connection_failure_modes.rs` tests the two defects fixed before release: a
+  deadline not covering queuing, and a dead reader leaving later calls waiting
+  for ever.
 - F, a connection survives a proxy dying: not started. An in-flight call fails
   cleanly on a dropped connection (tested); there is no reconnection or
   per-proxy banning.
