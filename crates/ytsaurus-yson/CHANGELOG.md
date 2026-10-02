@@ -28,7 +28,7 @@ No changes to this crate beyond the version, which tracks the workspace.
 
 ## 0.1.0 — the fork
 
-Everything below shipped in the crate's first release and still applies.
+Everything below shipped in 0.1.0 and still applies.
 
 ### Forked
 
@@ -38,8 +38,8 @@ Everything below shipped in the crate's first release and still applies.
 - Renamed the package `yson-rs` to `ytsaurus-yson`; the module layout is
   unchanged, so `yson_rs::x` becomes `ytsaurus_yson::x`.
 - Licence: Apache-2.0. Upstream offers yson-rs under MIT or Apache-2.0 at the
-  recipient's option; this project takes it under Apache-2.0, the licence of
-  the whole repository. Both upstream licence texts (`LICENSE-APACHE`,
+  recipient's option; this project takes it under Apache-2.0, the repository's
+  licence. Both upstream licence texts (`LICENSE-APACHE`,
   `LICENSE-MIT`) are kept verbatim as notices received with the code, and
   [`NOTICE`](NOTICE) states the attribution and the derivation.
 - Moved shared dependency versions to the workspace, and removed the crate-local
@@ -66,10 +66,10 @@ Everything below shipped in the crate's first release and still applies.
   offset of the first trailing byte. `StreamDeserializer` reads a sequence of
   values.
 
-- A varint longer than `u64` decoded to a wrong number instead of an error: a
-  tenth byte carrying more than the top bit was shifted out silently. Ten-byte
-  varints that fit, such as `u64::MAX`, still decode. Regression test:
-  `a_ten_byte_varint_that_overflows_is_an_error`.
+- A varint longer than `u64` decoded to a wrong number instead of an error. The
+  tenth byte of a `u64` varint holds one payload bit (bit 63); payload beyond it
+  was shifted out silently. Ten-byte varints that fit, such as `u64::MAX`, still
+  decode. Regression test: `a_ten_byte_varint_that_overflows_is_an_error`.
 
 - A fixed-length visitor (a tuple, a tuple struct, an array) left its closing
   `]` unread: it stops after its length, where a `Vec`'s extra `None` consumes
