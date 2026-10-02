@@ -5,26 +5,27 @@ anything.
 
 ## What this is
 
-A Rust stack for writing [YTsaurus](https://ytsaurus.tech) MapReduce workers in
-Rust instead of C++. A YTsaurus job is an arbitrary executable: it reads input
-rows from fd 0 and writes output tables to fds 1, 4, 7…; the default wire format
-is binary YSON. There is no official Rust SDK. This repository provides a YSON
-and Skiff codec, a job runtime, and HTTP and RPC clients for launching
-operations.
+Rust clients for [YTsaurus](https://ytsaurus.tech), which has no official Rust
+SDK. The main product is working with tables from Rust: `ytsaurus-client` over
+the HTTP API and `ytsaurus-rpc` over the RPC proxy, behind the one interface in
+`ytsaurus-api`. The HTTP client also covers Cypress, transactions, files and
+operations. The YSON and Skiff codecs are the HTTP client's wire formats; the
+RPC client speaks protobuf. `ytsaurus-job`, a runtime for writing MapReduce
+workers in Rust, is secondary to the clients.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
+| `crates/ytsaurus-client/` | HTTP API v4 client: static tables, dynamic tables through `ytsaurus-api`'s `TableClient`, Cypress, transactions, files, batched commands, and operations (upload a worker, start it, wait, report why it failed). |
+| `crates/ytsaurus-api/` | Transport-independent client interface: `TableClient` and the row model both transports speak. Mirrors `yt/yt/client/api` in the C++; lets `create_client` (HTTP) and `create_rpc_client` (RPC) return the same thing. Published from 0.3.0, pre-release: the interface has not settled and is the most expensive thing here to change later. |
+| `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope, the dynamic-table row wire format. Async on tokio, unlike the other crates. Published from 0.3.0, pre-release; gates in [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
+| `crates/ytsaurus-proto/` | Protobuf bindings for the RPC proxy, generated from the upstream `.proto` files in the `third_party/ytsaurus` submodule. The generated Rust is committed and there is no build script, because `cargo package` does not walk into a submodule. Regenerate with `cargo xtask generate-protos`; CI fails on a diff. Published from 0.3.0. |
+| `crates/ytsaurus-helpers/` | Proc-macro crate: `#[derive(TableRow)]` infers a table schema from a struct. |
 | `crates/ytsaurus-yson/` | YSON codec (text + binary). Fork of [ss123she/yson-rs](https://github.com/ss123she/yson-rs) @ `ba2044c`. |
-| `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. Reads and writes YSON or Skiff. |
 | `crates/ytsaurus-skiff/` | Skiff schema, format and bounded streaming codec. Pre-release, published from 0.2.5 because `ytsaurus-job` and `ytsaurus-client` depend on it. The ship gates in [docs/skiff-compatibility.md](docs/skiff-compatibility.md) are not all green; the API may change in a patch release. |
 | `crates/ytsaurus-format/` | `DataFormat`: the one format selection shared by launcher and worker. Pre-release, published from 0.2.5 with `ytsaurus-skiff`. |
-| `crates/ytsaurus-client/` | HTTP API v4 launcher: upload a worker, start an operation, wait for it, report why it failed. No Python needed. |
-| `crates/ytsaurus-helpers/` | Proc-macro crate: `#[derive(TableRow)]` infers a table schema from a struct. |
-| `crates/ytsaurus-api/` | Transport-independent client interface: `TableClient` and the row model both transports speak. Mirrors `yt/yt/client/api` in the C++; lets `create_client` (HTTP) and `create_rpc_client` (RPC) return the same thing. Published from 0.3.0, pre-release: the interface has not settled and is the most expensive thing here to change later. |
-| `crates/ytsaurus-proto/` | Protobuf bindings for the RPC proxy, generated from the upstream `.proto` files in the `third_party/ytsaurus` submodule. The generated Rust is committed and there is no build script, because `cargo package` does not walk into a submodule. Regenerate with `cargo xtask generate-protos`; CI fails on a diff. Published from 0.3.0. |
-| `crates/ytsaurus-rpc/` | RPC proxy client: bus framing, the RPC envelope, the dynamic-table row wire format. Async on tokio, unlike the other crates. Published from 0.3.0, pre-release; gates in [docs/rpc-compatibility.md](docs/rpc-compatibility.md). |
+| `crates/ytsaurus-job/` | Job runtime: streaming reader, control records, multi-table output. Reads and writes YSON or Skiff. |
 | `docs/` | [protocol-reference.md](docs/protocol-reference.md) (protocol and cluster behaviour), [writing-a-job.md](docs/writing-a-job.md) (user guide), [benchmarking.md](docs/benchmarking.md) (measurements and the Skiff decision), [skiff-compatibility.md](docs/skiff-compatibility.md) (Go SDK compatibility and every gap), [go-parity.md](docs/go-parity.md) (every Go SDK example mapped onto this repo), [sdk-comparison.md](docs/sdk-comparison.md) (the C++ and Go clients beside this one), [rpc-compatibility.md](docs/rpc-compatibility.md) (what the RPC client implements and its divergences), [format-comparison.md](docs/format-comparison.md) (YSON, Skiff and YQL on one task: plan, three nine-round cluster runs, a refuted pre-registered prediction, an adversarial review). |
 | `tests/cluster-e2e/` | Cluster scripts and captured golden fixtures. |
 | `tests/rpc-go-interop/` | Version-pinned Go program that produces byte vectors for the RPC row wire format and CRC-64, consumed by the Rust tests. Same shape as `tests/skiff-go-interop/`. |
@@ -90,9 +91,11 @@ the countable part in CI; the rest is on review.
    [docs/protocol-reference.md](docs/protocol-reference.md). Measurements and
    method: `docs/benchmarking.md` and `docs/format-comparison.md`. What changed
    for a caller: the crate's CHANGELOG. An item's contract: its rustdoc.
-   History: git. Anywhere else, link to the home instead of restating it.
+   History: git. Open work: the issue tracker; this file names no issue
+   numbers, because they go stale. Anywhere else, link to the home instead of
+   restating it.
 2. State results as they are. A null or negative result is written as one:
-   "X did not decide Y; Z is still needed (#70)." Do not present it as a
+   "X did not decide Y; Z is still needed." Do not present it as a
    finding, a success, or a question that is still "not lost".
 3. A reversal is one line: what was believed, what is true, the evidence. No
    defence of the earlier position.
@@ -243,8 +246,8 @@ not text:
 Also added: `Serialize` for `YsonValue`/`YsonNode`, `Copy` on `YsonFormat`,
 `Serializer::with_buffer`/`into_output`, and the `scan` module.
 
-The fork and the three defects are filed upstream as
-[ss123she/yson-rs#1](https://github.com/ss123she/yson-rs/issues/1). Known
+The fork and the three defects are reported upstream to
+[ss123she/yson-rs](https://github.com/ss123she/yson-rs). Known
 limitations are in [`crates/ytsaurus-yson/README.md`](crates/ytsaurus-yson/README.md);
 the two that matter most: maps round-trip as values not bytes, and decoding
 into `String` fails on non-UTF-8 columns (use `serde_bytes`).
@@ -277,9 +280,8 @@ synthetic fixture was wrong in two ways that only the cluster showed.
 
 ## Status
 
-Release 0.3.1, tagged `v0.3.1` on
-[GitHub](https://github.com/sshaplygin/ytsaurus-rs). All nine crates are on
-crates.io at 0.3.1 and share the workspace version. Four are pre-release:
+All nine crates are on crates.io and share the workspace version; the current
+one is on the badges in [README.md](README.md). Four are pre-release:
 `ytsaurus-skiff` and `ytsaurus-format` (published since 0.2.5), `ytsaurus-api`
 and `ytsaurus-rpc` (since 0.3.0). Their compatibility gates are not all green
 and their APIs may change in a patch release. Release history is in each
@@ -287,22 +289,15 @@ crate's CHANGELOG; measurements are in [docs/benchmarking.md](docs/benchmarking.
 and [`crates/ytsaurus-yson/BENCHMARKS.md`](crates/ytsaurus-yson/BENCHMARKS.md).
 
 Whether Skiff becomes the default job format is undecided; the readings, the
-threshold and what is still owed (#70) are in
+threshold and what is still owed are in
 [docs/benchmarking.md](docs/benchmarking.md#the-verdict). A local Docker cluster
 is enough for everything else.
 
-Open work is tracked in issues:
-
-| Issue | |
-| --- | --- |
-| [#63](https://github.com/sshaplygin/ytsaurus-rs/issues/63) | the post-0.3 backlog |
-| [#66](https://github.com/sshaplygin/ytsaurus-rs/issues/66) | RPC production plumbing: discovery bootstrap, connection pool, TLS |
-| [#67](https://github.com/sshaplygin/ytsaurus-rs/issues/67) | the RPC-vs-HTTP benchmark |
-| [#69](https://github.com/sshaplygin/ytsaurus-rs/issues/69) | Skiff to full support |
-| [#70](https://github.com/sshaplygin/ytsaurus-rs/issues/70) | the production-cluster Skiff run |
-| [#71](https://github.com/sshaplygin/ytsaurus-rs/issues/71) | needs a human: a public write-up of 0.3 |
-| [#72](https://github.com/sshaplygin/ytsaurus-rs/issues/72) | needs a human: upstreaming to [ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk); the maintainers' stance in ytsaurus#6 is "PRs welcome". **Do not start without a go-ahead.** |
-| [#73](https://github.com/sshaplygin/ytsaurus-rs/issues/73) | needs a human: convergence with the yson-rs author (co-ownership, publishing, the patches) |
+Open work is in the [issue tracker](https://github.com/sshaplygin/ytsaurus-rs/issues).
+Three things need a human decision; do not start them without one: upstreaming
+to [ytsaurus-rust-sdk](https://github.com/ytsaurus/ytsaurus-rust-sdk), whose
+maintainers have said PRs are welcome; convergence with the yson-rs author
+(co-ownership, publishing, the patches); and a public write-up of 0.3.
 
 ## Non-goals
 

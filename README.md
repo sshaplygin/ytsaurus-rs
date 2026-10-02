@@ -6,8 +6,8 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](rust-toolchain.toml)
 
-All nine crates are on crates.io at 0.3.1, released together under the
-workspace version. Four of them, `ytsaurus-skiff`, `ytsaurus-format`,
+All nine crates are on crates.io, released together under the workspace
+version shown on the badges. Four of them, `ytsaurus-skiff`, `ytsaurus-format`,
 `ytsaurus-api` and `ytsaurus-rpc`, are pre-release: the version is 0.x, their
 compatibility gates are not all green, and their APIs may change in a patch
 release.
