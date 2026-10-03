@@ -20,8 +20,9 @@ pub type TableReader = ResponseReader;
 /// A file's bytes as they are read, from
 /// [`Client::read_file_streaming`](crate::Client::read_file_streaming).
 ///
-/// A file has no framing, so a body ended early by a mid-stream failure looks
-/// complete. Compare [`bytes_read`] with the expected size, as the buffered
+/// A proxy reports a mid-stream failure in a trailer, which `ureq` does not
+/// expose, and a file has no framing, so a body ended early looks complete.
+/// Compare [`bytes_read`] with the expected size, as the buffered
 /// [`Client::read_file`](crate::Client::read_file) does with the node's
 /// `@uncompressed_data_size`.
 ///
@@ -31,8 +32,9 @@ pub type FileReader = ResponseReader;
 /// A response body as it is read: [`TableReader`], [`FileReader`], and what
 /// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming)
 /// returns for a command whose answer is data, such as `read_blob_table`.
-/// Uncapped, unlike the buffered path. A body cut short ends early and says
-/// nothing, so its consumer has to notice.
+/// Uncapped, unlike the buffered path. A proxy reports a mid-stream failure in
+/// a trailer, which `ureq` does not expose, so a body cut short ends early and
+/// says nothing; its consumer has to notice.
 pub struct ResponseReader {
     inner: ureq::BodyReader<'static>,
     read: u64,
