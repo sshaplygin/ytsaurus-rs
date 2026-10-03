@@ -3725,17 +3725,10 @@ mod tests {
     /// operation that was completed early.
     const GET_OPERATION: &str = include_str!("../tests/fixtures/get_operation.yson");
 
-    /// The narrow readers are each one attribute of `get_operation`, and each
-    /// assumes where that attribute sits. A response shape is a guess until
-    /// something runs against a real answer, so this calls the readers
-    /// themselves — the ones `operation_state`, `operation_suspended`,
-    /// `operation_status` and `operation_result_error` are — on a document a
-    /// cluster sent. Re-implementing the field access here instead would pass
-    /// just as happily after a reader started looking somewhere else.
-    ///
-    /// Three of the four attributes: the capture does not include `progress`,
-    /// so `job_statistics` is pinned separately below against a shape that is
-    /// stated to be a guess rather than pretending otherwise.
+    /// The readers behind `operation_state`, `operation_suspended`,
+    /// `operation_status` and `operation_result_error`, run on a document a
+    /// cluster sent. The capture has no `progress`, so `job_statistics` is
+    /// tested separately below.
     #[test]
     fn the_narrow_readers_agree_with_a_document_a_cluster_sent() {
         let document = from_slice(GET_OPERATION.as_bytes(), YsonFormat::Text).expect("valid YSON");
@@ -3749,9 +3742,8 @@ mod tests {
             "suspension is read from its own attribute, not from the state"
         );
 
-        // The case `operation_result_error` exists to get right: an operation
-        // that succeeded still has an error document, code 0 with an empty
-        // message. Reporting that as `Some("")` would fire on every success.
+        // A succeeded operation still has an error document, code 0 with an
+        // empty message, which must not read as `Some("")`.
         assert_eq!(
             operation::result_error_of(&document),
             None,
@@ -3759,10 +3751,8 @@ mod tests {
         );
     }
 
-    /// The deepest of the four guesses — `progress` → `job_statistics` — and
-    /// the one the captured document cannot pin, because it was fetched
-    /// without `progress`. Written out here so the assumption is at least
-    /// visible and breaks a test when the reader stops matching it.
+    /// `progress` → `job_statistics`, which the captured document lacks: an
+    /// assumed shape, written out so a change to the reader breaks a test.
     #[test]
     fn job_statistics_are_read_from_under_progress() {
         let document = from_slice(
@@ -3777,8 +3767,7 @@ mod tests {
             "the subtree, not the progress node that holds it: {statistics:?}"
         );
 
-        // And the empty answer, which is what an operation that has not run a
-        // job yet gives — distinct from a failure to find the attribute.
+        // An operation that has not run a job yet: empty, not missing.
         let empty = from_slice(br#"{"progress"={}}"#, YsonFormat::Text).expect("valid YSON");
         assert!(matches!(
             operation::statistics_of(&empty).node,
@@ -3786,10 +3775,7 @@ mod tests {
         ));
     }
 
-    /// The client inserts a transaction id, a mutation id and a retry flag
-    /// into the parameters it is handed, and inserting into anything that is
-    /// not a dict panics. A caller's mistake must be an error rather than the
-    /// end of their process.
+    /// Inserting the client's own parameters into a non-dict would panic.
     #[test]
     fn raw_parameters_that_are_not_a_dict_are_refused() {
         let client = Client::new("http://localhost:8000").with_retries(RetryPolicy::none());
@@ -3803,9 +3789,7 @@ mod tests {
         assert!(refuse_non_dict_parameters("c", &yson_build::empty_map()).is_ok());
     }
 
-    /// An id that came out of a file the way the documentation shows keeps its
-    /// newline, and the cluster answers a whitespace-carrying id with an error
-    /// that never mentions whitespace.
+    /// An id read from a file written by `echo` keeps its newline.
     #[test]
     fn an_attached_id_is_trimmed() {
         let client = Client::new("http://localhost:8000");
@@ -3816,11 +3800,8 @@ mod tests {
 
     #[test]
     fn a_get_answer_decodes_straight_into_the_type_asked_for() {
-        // What `get_as` does with the response body, without a cluster to ask.
-        // The point of the envelope struct: one pass over the document, and
-        // attributes the type does not mention are skipped rather than
-        // collected — which is what makes `//@`, with dozens of them, worth
-        // asking about at all.
+        // What `get_as` does with the response body: attributes the type does
+        // not name are skipped.
         #[derive(serde::Deserialize)]
         struct Node {
             account: String,
@@ -3892,26 +3873,14 @@ mod tests {
 
     #[test]
     fn a_skiff_path_refuses_a_column_selection_spelled_into_its_string() {
-        // The branch's own invariant — one spelling of a selection per path —
-        // has a hole here that it has nowhere else: this function
-        // *synthesises* a `columns` attribute out of the format's fields, so
-        // there is a second column selection whether the caller typed one or
-        // not, and the typed check above cannot see a string-spelled first
-        // one. Measured, the synthesised attribute wins —
-        // `<columns=[n]>"//tmp/t{k}"` answered with column `n` — so the tuple
-        // stays aligned with the schema and no value is decoded wrong. What
-        // is lost is the caller's own `{found}`, silently discarded at 200,
-        // which is the trap: the filter they wrote simply never happened.
+        // The synthesised `columns` would silently override `{found}`.
         let refused = skiff_table_path(&TablePath::from("//tmp/table{found}"), &skiff_format());
         assert!(
             matches!(&refused, Err(ClientError::Config(reason)) if reason.contains("already selects columns")),
             "a string column selection was not refused: {refused:?}"
         );
-        // A leading attribute block is refused one step removed: the cluster
-        // takes it happily (`<ranges=[…0:2]>"<columns=[n]>//tmp/t"` composed
-        // at 200), but this client cannot read the block to know whether it
-        // names `columns` too, and if it does the synthesised one wins in
-        // silence.
+        // A leading attribute block cannot be read here to see whether it
+        // names `columns`.
         for path in [
             "<columns=[found]>//tmp/table",
             "<primary_medium=default>//tmp/table",
@@ -3923,17 +3892,14 @@ mod tests {
             );
         }
 
-        // A *row* range is not a column selection. Measured on the cluster,
-        // `<columns=[n]>//tmp/t[#0:#2]` answers 200 with rows 0-1 carrying
-        // only `n` — the two attributes answer different questions — so the
-        // string spelling of a range goes through, as it does for read_table.
+        // A row range composes with the columns, spelled in the string or
+        // typed.
         let ranged = skiff_table_path(&TablePath::from("//tmp/table[#0:#2]"), &skiff_format())
             .expect("a string row range is not a column selection");
         assert_eq!(
             ytsaurus_yson::to_string(&ranged, YsonFormat::Text).unwrap(),
             r#"<columns=[found;rcl]>"//tmp/table[#0:#2]""#
         );
-        // And so is a typed one, which renders its own `ranges` alongside.
         assert!(
             skiff_table_path(&TablePath::from("//tmp/table").range(0..2), &skiff_format()).is_ok()
         );
@@ -4072,8 +4038,7 @@ mod tests {
 
         let headers = String::from_utf8_lossy(&request);
         assert!(headers.contains("x-yt-parameters: {}"), "{headers}");
-        // Handed back as it arrived. A raw command has no idea what the answer
-        // means, and decoding it would be this crate guessing.
+        // Handed back as it arrived, undecoded.
         assert_eq!(body, br#"{"value"={};}"#);
     }
 
@@ -4098,9 +4063,7 @@ mod tests {
             "{headers}"
         );
         assert!(request.ends_with(b"payload"), "{headers}");
-        // The whole point of routing this through `Transport` rather than
-        // handing out a bare `ureq` agent: a raw command inside a transaction
-        // is *in* it, not quietly beside it.
+        // A raw command inside a transaction is in it.
         assert!(
             headers.contains(r#"transaction_id="3-5d231-10001-db88""#),
             "{headers}"
@@ -4109,10 +4072,8 @@ mod tests {
 
     #[test]
     fn a_raw_command_is_sent_once_unless_the_caller_says_otherwise() {
-        // A command this crate does not model cannot be assumed idempotent, so
-        // the default ignores the retry policy. Proved by serving one request
-        // from a listener that would accept a second: a retried request would
-        // hang here rather than fail.
+        // Sent once whatever the retry policy: the listener serves one request,
+        // so a retry would hang here.
         let (proxy, request) = one_request_proxy(Vec::new());
         let client = Client::new(&proxy).with_retries(RetryPolicy::none());
         client
@@ -4123,11 +4084,7 @@ mod tests {
 
     #[test]
     fn a_mutation_id_is_sent_even_when_the_command_is_not_retried() {
-        // The two answer different questions: `Repeatable` decides whether
-        // *this* call may go twice, a mutation ID whether a *later* call from a
-        // restarted process is recognised as the same mutation. A command too
-        // dangerous to retry in-process can still be worth making replayable
-        // across one, so the ID must not be dropped along with the retries.
+        // A caller's mutation ID is sent even under `Repeatable::Never`.
         let id = MutationId::new().as_retry();
         let (proxy, request) = one_request_proxy(Vec::new());
         Client::new(&proxy)
@@ -4150,8 +4107,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&request)
         );
-        // And it admits to being a replay, which is what the cluster refuses a
-        // duplicate for not doing.
+        // The cluster refuses a duplicate not marked as a retry.
         assert_eq!(
             parameter(&sent, "retry").map(|v| &v.node),
             Some(&YsonNode::Boolean(true)),
@@ -4162,16 +4118,8 @@ mod tests {
 
     /// The `X-YT-Parameters` document of a captured request, decoded.
     ///
-    /// Reading the value rather than its spelling, because the spelling of a
-    /// *generated* value is not stable. The text YSON writer leaves a string
-    /// unquoted when it looks like an identifier — first byte a letter or `_`,
-    /// the rest alphanumeric or `_-.`, see `ser::is_safe_unquoted` — and a
-    /// mutation ID is a hex GUID printed with no leading zeros. So
-    /// `ebd6e011-…` goes on the wire bare and `3f2a1b-…` goes on it quoted,
-    /// decided by the first hex digit: **measured at 39.8 % unquoted over
-    /// 100 000 IDs**, which is what an assertion on either spelling would have
-    /// cost in flakes. Both spell the same string and the cluster takes both —
-    /// the `idempotent` example deduplicated a replay whose ID went unquoted.
+    /// Compares values, not spellings: text YSON quotes a generated mutation
+    /// ID or not depending on its first hex digit (`ser::is_safe_unquoted`).
     fn sent_parameters(request: &[u8]) -> YsonValue {
         let head = String::from_utf8_lossy(request);
         let line = head
@@ -4193,8 +4141,7 @@ mod tests {
 
     /// One entry of a decoded parameter document.
     ///
-    /// `YsonValue` indexes with a panicking `Index`, and a panic here would
-    /// throw away the request the assertion wants to print.
+    /// Not `Index`, which panics before the assertion can print the request.
     fn parameter<'a>(params: &'a YsonValue, key: &str) -> Option<&'a YsonValue> {
         match &params.node {
             YsonNode::Map(m) => m.get(key.as_bytes()),
@@ -4204,9 +4151,7 @@ mod tests {
 
     #[test]
     fn a_command_name_that_would_change_the_url_is_refused() {
-        // The name goes into `/api/v4/{command}` as it is. A caller that got
-        // one from configuration must not be able to address `//sys` or append
-        // a query string, because the answer would still look like an answer.
+        // The name goes into `/api/v4/{command}` as it is.
         let client = Client::new("http://localhost:8000");
         for bad in [
             "",
@@ -4230,9 +4175,7 @@ mod tests {
 
     #[test]
     fn a_payload_on_a_get_is_refused_rather_than_dropped() {
-        // `dispatch` sends a GET through ureq's bodiless builder, so the bytes
-        // would go nowhere and the request would succeed. Silent is the one
-        // thing it must not be.
+        // A GET would drop the body and succeed.
         let error = Client::new("http://localhost:8000")
             .raw_command(
                 Method::Get,
@@ -4250,17 +4193,9 @@ mod tests {
 
     #[test]
     fn read_file_refuses_a_body_it_will_not_hold() {
-        // `http`'s own tests drive `Transport::send` at a small cap; this is
-        // the method a caller actually calls, all the way through — parameters,
-        // heavy routing, `retry::run`, `after_heavy`, and the size check that
-        // would otherwise have swallowed the verdict.
-        //
-        // The cap the transport was built with is what decides it, which is
-        // exactly what a hardcoded `RESPONSE_LIMIT` at the read would not be:
-        // 40 000 bytes of zeros are half a gigabyte short of the real ceiling,
-        // so a `send` that ignored the field would sail past this and fail
-        // later, on the size `get` this listener never answers — a different
-        // error, from a request that should never have been sent.
+        // Through the public method, at the cap the transport was built with
+        // rather than the 512 MiB default: a read that ignored it would fail
+        // later, on the size `get` this listener never answers.
         let (proxy, served) = one_gzip_request_proxy(vec![0_u8; 40_000]);
         let mut client = Client::new(&proxy);
         client.transport.set_response_limit(4_096);
@@ -4292,9 +4227,7 @@ mod tests {
 
     /// `one_request_proxy`, with the body gzipped and announced as such.
     ///
-    /// The wire and the `Vec` are only different quantities when something
-    /// compresses them, and the cap's whole claim is about which of the two it
-    /// counts. Every request this client sends asks for gzip already.
+    /// Shows that the cap counts decoded bytes, not wire bytes.
     fn one_gzip_request_proxy(payload: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&payload).unwrap();
@@ -4384,9 +4317,7 @@ mod tests {
 
     #[test]
     fn a_token_file_written_with_echo_still_works() {
-        // `echo token > ~/.yt/token` is how these files get written, and the
-        // newline it leaves would fail authentication with an error that never
-        // mentions a newline.
+        // `echo token > ~/.yt/token` leaves a newline.
         let path = std::env::temp_dir().join(format!(
             "ytsaurus-rs-token-{}-{:?}",
             std::process::id(),
@@ -4415,9 +4346,7 @@ mod tests {
 
     #[test]
     fn a_truncated_listing_is_an_error_rather_than_a_short_list() {
-        // What `max_size` produces, and what a node with too many children
-        // produces on its own. The marker is an attribute on the list, so a
-        // caller who does not look gets a listing quietly missing entries.
+        // What `max_size`, or a node with too many children, produces.
         let value =
             from_slice(br#"<"incomplete"=%true;>["t1";]"#, YsonFormat::Text).expect("valid YSON");
 
@@ -4437,9 +4366,7 @@ mod tests {
             .expect("the answer is an envelope around `value`");
         assert!(matches!(value.node, YsonNode::Boolean(false)));
 
-        // The command's own name is not a key in its answer. Looking for it
-        // there failed every call to `exists` with a decode error, for as long
-        // as nothing in the crate called `exists`.
+        // The key is `value`, not the command's own name.
         assert!(client.value_field(EXISTS_RESPONSE, "exists").is_err());
     }
 
@@ -4459,8 +4386,7 @@ mod tests {
     fn a_statistic_totals_over_completed_jobs() {
         let all = statistics();
 
-        // The name keeps its slash: the cluster stores it as one key rather
-        // than nesting it, which a path-walking lookup would miss entirely.
+        // The name keeps its slash as one key; a path walk would miss it.
         assert_eq!(
             jobs::field(&all, "rows/rejected").and_then(completed_total),
             Some(3)
@@ -4509,10 +4435,8 @@ mod tests {
         assert!(err.to_string().contains("YT_PROXY"));
     }
 
-    /// `Client::from_env` against a fixed environment, with nothing global
-    /// touched. A plain lookup and nothing more: trimming and empty-is-unset
-    /// belong to `from_lookup`, and a helper that repeated them here would be
-    /// the thing the tests below were pinning.
+    /// `Client::from_env` against a fixed environment. A plain lookup:
+    /// trimming and empty-is-unset belong to `from_lookup`.
     fn from_environment(vars: &[(&str, &str)]) -> Result<Client> {
         Client::from_lookup(|name| {
             vars.iter()
@@ -4523,9 +4447,7 @@ mod tests {
 
     #[test]
     fn each_variable_reaches_the_setting_it_names() {
-        // The mapping itself, which review is the only other thing that checks:
-        // swap two of these names and every other test in the crate still
-        // passes.
+        // The variable-to-setter mapping, which nothing else checks.
         let client = from_environment(&[
             ("YT_PROXY", "hume"),
             ("YT_PROXY_SUFFIX", ".yt.example.net"),
@@ -4539,10 +4461,8 @@ mod tests {
             "https://hume.yt.example.net"
         );
         assert_eq!(client.file_cache, "//tmp/mine/cache");
-        // The whole rendering, not a substring of it: `Only([…])` holds the
-        // same two names as `Under { … }`, so wiring the variable to
-        // `with_heavy_proxies_in` would pass a `contains` check — which is
-        // exactly the swap this test is here to catch. Brittle on purpose.
+        // The whole rendering: `Only([…])` holds the same names as
+        // `Under { … }`, so a `contains` check would miss that swap.
         assert_eq!(
             client.transport.heavy_hosts_debug(),
             r#"Under { domains: ["proxy-zone.net", "other-zone.net"], ignored: [] }"#
@@ -4551,9 +4471,7 @@ mod tests {
 
     #[test]
     fn a_machine_that_sets_nothing_gets_the_defaults() {
-        // The invariant the whole feature rests on: four new variables, and a
-        // client built where none of them is set is the client this crate
-        // shipped before they existed.
+        // With none of the variables set, the client is `Client::new`'s.
         let bare = from_environment(&[("YT_PROXY", "http://localhost:8000")])
             .expect("YT_PROXY is set")
             .transport;
@@ -4571,9 +4489,7 @@ mod tests {
 
     #[test]
     fn the_wider_heavy_proxy_setting_wins_however_it_was_exported() {
-        // Both set is a machine where somebody tried the domain and then gave
-        // up on the rule. Reading them in export order would make that machine
-        // behave differently depending on which line of the profile came last.
+        // With both set, the wider wins, whatever the export order.
         let hosts = from_environment(&[
             ("YT_PROXY", "https://cluster.example.net"),
             ("YT_HEAVY_PROXY_DOMAINS", "proxy-zone.net"),
@@ -4585,8 +4501,7 @@ mod tests {
 
         assert!(hosts.contains("Anywhere"), "{hosts}");
 
-        // And anything that is not one of the three spellings of yes leaves the
-        // rule where the domains put it.
+        // Anything but a yes leaves the rule where the domains put it.
         let hosts = from_environment(&[
             ("YT_PROXY", "https://cluster.example.net"),
             ("YT_HEAVY_PROXY_DOMAINS", "proxy-zone.net"),
@@ -4604,10 +4519,8 @@ mod tests {
 
     #[test]
     fn a_variable_set_to_nothing_is_a_variable_that_is_not_set() {
-        // `export YT_FILE_CACHE=` in a profile is how a knob gets turned back
-        // off, and taking it literally would point the cache at `""`. The rule
-        // lives in `from_lookup` rather than in the lookup, so this exercises
-        // the same code `from_env` runs.
+        // `export YT_FILE_CACHE=` turns the knob off rather than pointing the
+        // cache at `""`.
         let client = from_environment(&[
             ("YT_PROXY", "  https://cluster.example.net  "),
             ("YT_FILE_CACHE", "   "),
@@ -4627,11 +4540,7 @@ mod tests {
 
     #[test]
     fn a_proxy_set_to_nothing_is_a_proxy_that_is_not_set() {
-        // `export YT_PROXY=` is how a profile turns one off, and the message
-        // that says what to export is the right answer to it. Taken literally
-        // — and with a suffix set — it would instead address
-        // `https://.yt.example.net`, which looks like a name and resolves
-        // nowhere.
+        // An empty `YT_PROXY` is unset, not `https://.yt.example.net`.
         let err = from_environment(&[("YT_PROXY", "   "), ("YT_PROXY_SUFFIX", ".yt.example.net")])
             .expect_err("an empty proxy is not a proxy");
 
@@ -4640,16 +4549,13 @@ mod tests {
 
     #[test]
     fn a_bare_cluster_name_is_completed_only_when_a_suffix_says_so() {
-        // The ordinary spelling wherever an installation's clusters share one
-        // domain, and the one this client turned into `https://hume`.
+        // A bare cluster name.
         assert_eq!(
             expanded_proxy("hume", Some(".yt.example.net")),
             "hume.yt.example.net"
         );
-        // Written without the leading dot by whoever thinks of it as a domain,
-        // and with a trailing one by whoever thinks of it as an FQDN. A
-        // trailing dot left on connects and then fails every domain
-        // comparison, which is worse than not connecting.
+        // With or without a leading dot; a trailing one would fail every
+        // domain comparison.
         for suffix in ["yt.example.net", "yt.example.net.", " .yt.example.net "] {
             assert_eq!(
                 expanded_proxy("hume", Some(suffix.trim())),
@@ -4657,16 +4563,13 @@ mod tests {
                 "{suffix:?}"
             );
         }
-        // No suffix, no expansion: the suffix is not compiled in, because this
-        // client is not one installation's.
+        // No suffix is compiled in.
         assert_eq!(expanded_proxy("hume", None), "hume");
     }
 
     #[test]
     fn a_name_that_needs_no_completing_is_left_alone() {
-        // Go's gate, kept: a colon is a scheme or a port, a dot is a name that
-        // already means something, and `localhost` is this machine whatever
-        // else is set.
+        // Go's gate: no colon, no dot, no `localhost`.
         for proxy in [
             "http://localhost:8000",
             "localhost",
@@ -4674,9 +4577,7 @@ mod tests {
             "cluster.example.net",
             "10.0.0.7",
             "hume:80",
-            // The surprising half of Go's gate, spelled out because it is
-            // `contains` and not equality: a cluster whose own name carries
-            // `localhost` is never completed.
+            // `contains`, not equality, as in Go.
             "mylocalhostcluster",
         ] {
             assert_eq!(expanded_proxy(proxy, Some(".yt.example.net")), proxy);
@@ -4703,9 +4604,7 @@ mod tests {
         for value in ["1", "true", "TRUE", "yes", " Yes "] {
             assert!(truthy(value), "{value}");
         }
-        // A knob that is already off has nothing to gain from guessing, and
-        // reading `0` as a yes is the way a variable meant to disable something
-        // enables it.
+        // Only `1`, `true` and `yes` are yes.
         for value in ["0", "false", "no", "on", "enabled", ""] {
             assert!(!truthy(value), "{value}");
         }
