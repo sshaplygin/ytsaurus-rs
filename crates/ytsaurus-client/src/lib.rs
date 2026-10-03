@@ -308,8 +308,7 @@ impl Client {
     /// `~/.yt/token`. A token read from a file is trimmed, so a trailing
     /// newline does not fail authentication; an unreadable file means no token.
     ///
-    /// The other variables are inert when unset, so with none set this behaves
-    /// as [`Client::new`]:
+    /// The other variables are inert when unset, as in [`Client::new`]:
     ///
     /// | Variable | Effect |
     /// | --- | --- |
@@ -326,8 +325,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if `YT_PROXY` is not set, or set to
-    /// nothing.
+    /// Returns [`ClientError::Config`] if `YT_PROXY` is unset or empty.
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(environment_value)
     }
@@ -422,33 +420,29 @@ impl Client {
     /// [`Client::read_table`], [`Client::write_file`], [`Client::read_file`],
     /// [`Client::upload_worker`] and their streaming forms. A control proxy
     /// refuses them, so by default the first one asks `/hosts`, keeps the
-    /// answer as a pool and sends each heavy command to a member picked at
-    /// random. Light commands stay on the configured address.
+    /// answer as a pool and sends each heavy command to a random member; light
+    /// commands stay on the configured address.
     ///
-    /// - The pool is refreshed lazily once older than
-    ///   [`Client::with_host_list_refresh_interval`].
-    /// - A host that fails a command for a reason of its own is dropped from
-    ///   the pool. Only an empty pool falls back to the configured address,
-    ///   until [`Client::with_hosts_retry_after`] has passed.
-    /// - A cluster that names no heavy proxy, or whose address is on loopback,
-    ///   uses the configured address for everything.
-    /// - A discovered name must share the configured address's domain, and
-    ///   takes its scheme and port from it; see
-    ///   [`Client::with_heavy_proxies_anywhere`].
+    /// - The pool is refreshed lazily ([`Client::with_host_list_refresh_interval`]).
+    /// - A host that fails a command for a reason of its own is dropped. Only
+    ///   an empty pool falls back to the configured address, until
+    ///   [`Client::with_hosts_retry_after`] has passed.
+    /// - A cluster naming no heavy proxy, or on loopback, uses the configured
+    ///   address for everything.
+    /// - A discovered name must share the configured domain, and takes its
+    ///   scheme and port from it ([`Client::with_heavy_proxies_anywhere`]).
     ///
-    /// `true` asks even on loopback, as through a port-forward into a real
-    /// installation; `false` pins every command to the configured address, as
-    /// behind a balancer that routes by role. Neither disturbs what a client
-    /// this was cloned from has resolved. [`Client::heavy_proxy`] shows the
-    /// result. Details: [Where a heavy command goes](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#where-a-heavy-command-goes).
+    /// `true` asks even on loopback (a port-forward into a real installation);
+    /// `false` pins every command to the configured address (a balancer that
+    /// routes by role). Neither disturbs what a client this was cloned from
+    /// has resolved. [`Client::heavy_proxy`] shows the result; [details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#where-a-heavy-command-goes).
     #[must_use]
     pub fn with_proxy_discovery(mut self, enabled: bool) -> Self {
         self.transport.set_proxy_discovery(enabled);
         self
     }
 
-    /// Lets `/hosts` name a heavy proxy outside the configured address's own
-    /// domain.
+    /// Lets `/hosts` name a heavy proxy outside the configured domain.
     ///
     /// Off by default: a discovered name is used only if it is the configured
     /// host or under its parent domain, so `https://cluster.example.net`
@@ -456,29 +450,23 @@ impl Client {
     /// A dotless configured name is matched as a non-leftmost label: `hume`
     /// follows `n0008-sas.hume.yt.example.net`. Refused names are passed over;
     /// if a whole `/hosts` answer is refused, heavy commands go to the
-    /// configured address and the client says so once.
+    /// configured address and the client says so once. The symptom is
+    /// `Control proxy may not serve heavy requests with input data` while
+    /// [`Client::heavy_proxy`] shows a declined address.
     ///
-    /// The domain rule guards against a typo and an obviously foreign name; it
-    /// is not a boundary for the token. [`Client::with_heavy_proxies_in`] is.
-    /// With the rule off, the scheme and port still come from the configured
-    /// address, and a name carrying `://`, `/`, `@` or whitespace is still
-    /// refused.
-    ///
-    /// The symptom of needing a wider rule is `Control proxy may not serve
-    /// heavy requests with input data` while [`Client::heavy_proxy`] shows an
-    /// address the client declined. [`Client::with_heavy_proxies_under`] names
-    /// one more domain instead of removing the rule.
+    /// The domain rule guards against a typo and an obviously foreign name,
+    /// not the token; [`Client::with_heavy_proxies_in`] is a boundary, and
+    /// [`Client::with_heavy_proxies_under`] widens the rule by one domain. With
+    /// the rule off, the scheme and port still come from the configured
+    /// address, and a name carrying `://`, `/`, `@` or whitespace is refused.
     ///
     /// ```
-    /// use ytsaurus_client::Client;
-    ///
-    /// let client = Client::new("https://cluster.example.net")
+    /// let client = ytsaurus_client::Client::new("https://cluster.example.net")
     ///     .with_heavy_proxies_anywhere(true);
     /// ```
     ///
-    /// The last of this, `with_heavy_proxies_under` and `with_heavy_proxies_in`
-    /// to be called decides. None disturbs what a client this was cloned from
-    /// has resolved.
+    /// The last of these three setters to be called decides. None disturbs
+    /// what a client this was cloned from has resolved.
     #[must_use]
     pub fn with_heavy_proxies_anywhere(mut self, enabled: bool) -> Self {
         self.transport.set_heavy_proxies_anywhere(enabled);
@@ -525,9 +513,7 @@ impl Client {
     /// when a proxy rotates.
     ///
     /// ```
-    /// use ytsaurus_client::Client;
-    ///
-    /// let client = Client::new("https://cluster.example.net")
+    /// let client = ytsaurus_client::Client::new("https://cluster.example.net")
     ///     .with_heavy_proxies_under(["proxy-zone.net"]);
     /// ```
     ///
@@ -537,12 +523,11 @@ impl Client {
     /// admit a whole top-level domain.
     ///
     /// The configured address's own domain still applies, so an empty list is
-    /// the default. A second call replaces the first.
-    /// `with_heavy_proxies_anywhere(false)` after this restores the default
-    /// rule and discards these domains. This is still a suffix rule, not a
-    /// boundary; see [`Client::with_heavy_proxies_in`]. The last of the three
-    /// setters to be called decides, and none disturbs what a client this was
-    /// cloned from has resolved.
+    /// the default. A second call replaces the first;
+    /// `with_heavy_proxies_anywhere(false)` after this discards these domains.
+    /// Still a suffix rule, not a boundary ([`Client::with_heavy_proxies_in`]).
+    /// The last of the three setters to be called decides, and none disturbs
+    /// what a client this was cloned from has resolved.
     #[must_use]
     pub fn with_heavy_proxies_under<I, S>(mut self, domains: I) -> Self
     where
@@ -695,17 +680,13 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
     /// # let client = Client::from_env()?;
     /// # let rows: Vec<u8> = Vec::new();
     /// let tx = client.start_transaction()?;
-    ///
     /// tx.create("table", "//tmp/out")?;   // no one else can see it yet
     /// tx.write_table("//tmp/out", &rows)?;
-    ///
     /// tx.commit()?;                       // and now everyone can
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// The transaction expires 30 seconds after its last ping, the cluster's
@@ -734,39 +715,28 @@ impl Client {
 
     /// Attaches to a transaction something else started, and keeps it alive.
     ///
-    /// The receiving half of [`Transaction::detach`]: turns an id from another
-    /// process into a [`Transaction`] that pings, commits and aborts. Unlike a
-    /// handle this process started:
-    ///
-    /// - **dropping it detaches rather than aborts**, as in the C++ client; an
-    ///   explicit [`Transaction::abort`] still aborts;
-    /// - the ping interval comes from the cluster: this reads `#<id>/@timeout`,
-    ///   then pings once before returning, since the timeout says nothing
-    ///   about how much of it is left.
-    ///
-    /// Both round trips use this client's retry policy. Two attaches to one id
-    /// are two independent handles; whichever commits or aborts first decides,
-    /// and the other then fails with `No such transaction`. For no ping
-    /// thread, use [`Client::with_transaction`] and the bare-id commands.
+    /// The receiving half of [`Transaction::detach`]. Unlike a handle this
+    /// process started, **dropping it detaches rather than aborts**, as in the
+    /// C++ client; [`Transaction::abort`] still aborts. The ping interval comes
+    /// from `#<id>/@timeout`, and this pings once before returning, since the
+    /// timeout says nothing about how much of it is left. Both round trips use
+    /// this client's retry policy. Two attaches to one id are independent
+    /// handles; whichever commits or aborts first decides. For no ping thread,
+    /// use [`Client::with_transaction`] and the bare-id commands.
     ///
     /// ```no_run
-    /// # use ytsaurus_client::Client;
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
-    /// # let client = Client::from_env()?;
-    /// # let id_from_elsewhere = String::new();
-    /// let tx = client.attach_transaction(&id_from_elsewhere)?;
-    ///
-    /// tx.create("table", "//tmp/out")?;   // inside the shared transaction
-    /// tx.commit()?;                       // and now published, by this process
-    /// # Ok(())
-    /// # }
+    /// # let (client, id) = (ytsaurus_client::Client::from_env()?, String::new());
+    /// let tx = client.attach_transaction(&id)?;
+    /// tx.create("table", "//tmp/out")?; // inside the shared transaction
+    /// tx.commit()?;                     // and now published, by this process
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the transaction does not exist, has expired,
     /// or its timeout cannot be read. The error names the id, which the
-    /// cluster's answer may not ([transaction errors](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#handing-a-transaction-to-another-process)).
+    /// cluster's answer may not ([details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#handing-a-transaction-to-another-process)).
     pub fn attach_transaction(&self, id: &str) -> Result<Transaction> {
         Transaction::attach(self, id.to_owned())
     }
@@ -937,16 +907,12 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
     /// # let client = Client::from_env()?;
-    /// let wider = TableSchema::new([
-    ///     Column::new("host", ColumnType::Utf8).required().key(),
-    ///     Column::new("size", ColumnType::Int64).required(),
-    ///     Column::new("referrer", ColumnType::Utf8), // new, and optional
-    /// ]);
-    /// client.alter_table("//tmp/visits", &wider)?;
-    /// # Ok(())
-    /// # }
+    /// # let host = Column::new("host", ColumnType::Utf8).required().key();
+    /// # let size = Column::new("size", ColumnType::Int64).required();
+    /// let referrer = Column::new("referrer", ColumnType::Utf8); // new, and optional
+    /// client.alter_table("//tmp/visits", &TableSchema::new([host, size, referrer]))?;
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// **A table with rows accepts only changes that ask less of them**: adding
@@ -1288,9 +1254,8 @@ impl Client {
 
     // ------------------------------------------------------------- batches
 
-    /// Executes every part of a [`BatchRequest`] in one round trip, answering
-    /// with a `Result` per part in part order: an `Ok` is the part's answer as
-    /// its command alone gives it, an `Err` a [`ClientError::Cluster`].
+    /// Executes a [`BatchRequest`] in one round trip, with a `Result` per part
+    /// in part order: `Ok` as the command alone answers, else [`ClientError::Cluster`].
     ///
     /// ```no_run
     /// # let client = ytsaurus_client::Client::new("localhost:8000");
@@ -1302,11 +1267,11 @@ impl Client {
     /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
-    /// Parts run in parallel. A mutating batch is retried under a mutation id,
+    /// Parts run in parallel. A mutating batch is retried under a mutation id
     /// unless a [`BatchRequest::raw`] part makes it send-once; a bound
     /// transaction is stamped on each part. Parts past
     /// [`BatchRequest::with_max_part_size`] go as further requests, with no
-    /// rollback. [Details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands).
+    /// rollback ([details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands)).
     ///
     /// # Errors
     ///
@@ -1327,10 +1292,7 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::{BatchRequest, Client, MutationId};
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
-    /// # let client = Client::from_env()?;
-    /// # let mut batch = BatchRequest::new();
-    /// # batch.create("table", "//tmp/pipeline/clicks");
+    /// # let (client, batch) = (Client::from_env()?, BatchRequest::new());
     /// let id = MutationId::new();
     /// // …persist `id.as_str()` here, before sending…
     /// let made = match client.execute_batch_with(&batch, Some(&id)) {
@@ -1338,9 +1300,7 @@ impl Client {
     ///     // After a crash: the cluster answers with what the first send did.
     ///     Err(_) => client.execute_batch_with(&batch, Some(&id.as_retry()))?,
     /// };
-    /// # let _ = made;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// # Errors
@@ -1475,33 +1435,28 @@ impl Client {
     /// Uploads a worker, or finds it already on the cluster.
     ///
     /// Keyed by the file's MD5 in the file cache ([`Client::with_file_cache`]),
-    /// so an unchanged binary is uploaded once. The cached node is named after
-    /// the hash, so pass [`CachedFile::name`] to
-    /// [`MapSpec::with_local_file_named`]:
+    /// so an unchanged binary is uploaded once. The node is named after the
+    /// hash: pass [`CachedFile::name`] to [`MapSpec::with_local_file_named`].
     ///
     /// ```no_run
-    /// # use ytsaurus_client::{Client, MapSpec};
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
-    /// # let client = Client::from_env()?;
+    /// # use ytsaurus_client::MapSpec; let client = ytsaurus_client::Client::from_env()?;
     /// let worker = client.upload_worker_cached("target/.../my_job")?;
     /// let spec = MapSpec::new("./my_job", ["//tmp/in"], ["//tmp/out"])
     ///     .with_local_file_named(&worker.path, &worker.name);
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// If the cluster answers `Access denied` to creating the cache directory,
     /// creating the staging node in it, or `put_file_to_cache`, the worker goes
     /// up under `//tmp` instead, with a warning on stderr (a `WARN` event with
-    /// the `tracing` feature) naming [`Client::with_file_cache`]. Every such
+    /// the `tracing` feature) naming [`Client::with_file_cache`]; every such
     /// launch re-sends the binary and leaves a node no expiry collects.
-    /// [`CachedFile::cached`] says which happened; read it before removing
-    /// [`CachedFile::path`].
+    /// Read [`CachedFile::cached`] before removing [`CachedFile::path`].
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the file cannot be read or the upload fails,
-    /// including an `Access denied` on anything but the three cache writes.
+    /// including on `Access denied` to anything but those three cache writes.
     pub fn upload_worker_cached(&self, local: impl AsRef<std::path::Path>) -> Result<CachedFile> {
         let local = local.as_ref();
         let bytes = std::fs::read(local).map_err(|source| ClientError::Io {
@@ -2076,34 +2031,25 @@ impl Client {
         Ok(body)
     }
 
-    /// Writes rows to a table from anything that yields them.
-    ///
-    /// [`Client::write_table`] with Rust values for rows:
+    /// Writes rows to a table from anything that yields them:
+    /// [`Client::write_table`] with Rust values for rows.
     ///
     /// ```no_run
-    /// # use ytsaurus_client::Client;
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
-    /// # let client = Client::from_env()?;
+    /// # let client = ytsaurus_client::Client::from_env()?;
     /// #[derive(serde::Serialize)]
-    /// struct Contact<'a> {
-    ///     name: &'a str,
-    ///     email: &'a str,
-    ///     age: i64,
-    /// }
+    /// struct Contact<'a> { name: &'a str, email: &'a str, age: i64 }
     ///
     /// client.write_table_rows("//tmp/contacts", (0..100).map(|n| Contact {
     ///     name: "Gordon Freeman",
     ///     email: "gordon@black-mesa.example",
     ///     age: 27 + n,
     /// }))?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// Rows are serialised a bufferful at a time as the connection takes them,
-    /// so memory stays at one buffer however many rows there are. Replaces the
-    /// table's contents, and refuses a path carrying a read selection, as
-    /// [`Client::write_table`] does.
+    /// so memory stays at one buffer. Replaces the table's contents, and
+    /// refuses a path carrying a read selection, as `write_table` does.
     ///
     /// # Errors
     ///
@@ -2144,7 +2090,6 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, TablePath};
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
     /// # let client = Client::from_env()?;
     /// #[derive(serde::Deserialize)]
     /// struct Contact { name: String, age: i64 }
@@ -2156,8 +2101,7 @@ impl Client {
     /// // select two columns of the first hundred rows on the cluster instead.
     /// let path = TablePath::new("//tmp/contacts").columns(["name", "age"]).range(0..100);
     /// let some: Vec<Contact> = client.read_table_rows(path)?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// # Errors
@@ -2179,7 +2123,6 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
     /// # let client = Client::from_env()?;
     /// #[derive(serde::Deserialize)]
     /// struct Cluster {
@@ -2191,8 +2134,7 @@ impl Client {
     ///
     /// let root: Cluster = client.get_as("//@")?;
     /// println!("the cluster was created at {}", root.creation_time);
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// # Errors
@@ -2226,23 +2168,18 @@ impl Client {
     /// Reads a table as a stream, without holding it.
     ///
     /// The binary YSON list fragment [`Client::read_table`] returns, as it
-    /// arrives. It is what a job reads on fd 0, so the same decoder handles
-    /// both:
+    /// arrives: what a job reads on fd 0, so the same decoder handles both.
     ///
     /// ```no_run
-    /// # use ytsaurus_client::Client;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let client = Client::from_env()?;
+    /// # let client = ytsaurus_client::Client::from_env()?;
     /// let mut reader = ytsaurus_job::JobReader::binary(client.read_table_streaming("//tmp/big")?);
-    ///
     /// let mut rows = 0_u64;
     /// while let Some(event) = reader.next_event()? {
     ///     if matches!(event, ytsaurus_job::Event::Row(_)) {
     ///         rows += 1;
     ///     }
     /// }
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// A fragment cut short leaves a record that does not parse, so the
@@ -2581,15 +2518,13 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, OperationParameters};
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
     /// # let client = Client::from_env()?;
     /// # let id = String::new();
     /// client.update_operation_parameters(
     ///     &id,
     ///     &OperationParameters::new().with_pool("interactive").with_weight(2.0),
     /// )?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
     /// Retried, since it assigns rather than increments. If the operation ends
@@ -3187,40 +3122,23 @@ impl Client {
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Method, yson_build};
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = Client::from_env()?;
-    ///
-    /// // Not modelled here; takes no parameters.
-    /// let body = client.raw_command(
-    ///     Method::Get,
-    ///     "get_supported_features",
-    ///     &yson_build::empty_map(),
-    ///     None,
-    /// )?;
-    ///
+    /// # let client = Client::from_env()?;
+    /// let params = yson_build::empty_map(); // not modelled; takes no parameters
+    /// let body = client.raw_command(Method::Get, "get_supported_features", &params, None)?;
     /// println!("{}", String::from_utf8_lossy(&body));
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
-    /// The token, timeout, TLS, header encoding and `X-YT-Error` check
-    /// ([`ClientError::Cluster`]) apply as for any command, and so does the
-    /// client's transaction, except for scheduler commands and a command that
-    /// names its own. [`Method`] gives the rule for picking the verb.
-    ///
-    /// **Sent once, to the configured address** ([`Repeatable::Never`]),
-    /// whatever the retry policy: the command may mutate. A heavy command sent
-    /// this way reaches a control proxy where proxy roles are separate; say
-    /// [`Repeatable::Heavy`] through [`Client::raw_command_with`].
-    /// [`Client::raw_command_streaming`] and [`Client::raw_command_upload`] are
-    /// heavy already.
+    /// The token, timeout, TLS, the `X-YT-Error` check and the client's
+    /// transaction apply (scheduler commands and one naming its own
+    /// transaction are not stamped). [`Method`] gives the rule for the verb.
+    /// **Sent once, to the configured address** ([`Repeatable::Never`]); for a
+    /// heavy command, pass [`Repeatable::Heavy`] to [`Client::raw_command_with`].
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if `command` is not a bare command name,
-    /// if `params` is not a YSON dict, or if a body is passed with
-    /// [`Method::Get`], which would drop it. Otherwise [`ClientError`] as any
-    /// command fails.
+    /// [`ClientError::Config`] if `command` is not a bare name, `params` is not
+    /// a dict, or a body is passed with [`Method::Get`]; else as any command.
     pub fn raw_command(
         &self,
         method: Method,
@@ -3271,24 +3189,16 @@ impl Client {
     }
 
     /// Sends a command this crate does not model and hands back its response
-    /// **unread**.
-    ///
-    /// For a command whose answer is the data, such as `read_blob_table`.
+    /// **unread**, for a command whose answer is the data.
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Method, yson_build};
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let client = Client::from_env()?;
-    /// // `Client::read_file_streaming` is this call; any command goes the same way.
-    /// let mut file = client.raw_command_streaming(
-    ///     Method::Get,
-    ///     "read_file",
-    ///     &yson_build::map([("path", yson_build::string("//tmp/worker"))]),
-    /// )?;
-    ///
+    /// // What `Client::read_file_streaming` sends; any command goes the same way.
+    /// let params = yson_build::map([("path", yson_build::string("//tmp/worker"))]);
+    /// let mut file = client.raw_command_streaming(Method::Get, "read_file", &params)?;
     /// std::io::copy(&mut file, &mut std::fs::File::create("worker")?)?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// Treated as [`Repeatable::Heavy`]: sent once, to a heavy proxy, with no
@@ -3385,12 +3295,9 @@ impl Client {
     }
 }
 
-/// A `create` inside the cache that was refused, or a `create` that failed.
-///
-/// Only ever called with the failure of one of the two creates
-/// [`Client::upload_into_cache`] makes, both of which write into the cache
-/// directory — which is what makes "denied" mean "no cache here" rather than
-/// "denied something".
+/// A refused `create` in the cache directory as [`Cached::Refused`]; any other
+/// failure as an error. Called only for the two creates in
+/// [`Client::upload_into_cache`].
 fn refused_or_reported(error: ClientError) -> Result<Cached> {
     if denied(&error, "create") {
         return Ok(Cached::Refused(error));
@@ -3400,21 +3307,10 @@ fn refused_or_reported(error: ClientError) -> Result<Cached> {
 
 /// Whether `error` is the cluster refusing `command` on ACL grounds.
 ///
-/// Both halves matter, and dropping either is how this would come to swallow
-/// something it should report. The code alone catches every `Access denied` a
-/// launch can earn, including ones no fallback addresses; the command alone
-/// catches a create that failed because the path is a table, or because
-/// somebody else holds a lock — failures a second attempt elsewhere would not
-/// fix and a caller needs to hear about.
-///
-/// The code is looked for **anywhere in the document**, as
-/// [`retry::is_retriable`] and `transaction_is_gone` look for theirs: an outer
-/// code is often a category — `Error resolving path`, `Request retries failed`
-/// — with the reason nested under it. Every transcript of this failure seen so
-/// far is flat, so the walk changes nothing that has been observed; it is here
-/// because the flat reading is the one that silently stops working the day a
-/// proxy wraps the answer, and a fallback that stopped firing would show up as
-/// a launch that used to work.
+/// Both the command and the code must match: the code alone would catch
+/// denials no fallback addresses, the command alone failures of other kinds.
+/// The code is looked for anywhere in the error document, as
+/// [`retry::is_retriable`] does, since an outer code is often a category.
 fn denied(error: &ClientError, command: &str) -> bool {
     matches!(
         error,
@@ -3430,16 +3326,9 @@ fn denied(error: &ClientError, command: &str) -> bool {
 
 /// Refuses a command name that would address something other than a command.
 ///
-/// A name goes straight into `/api/v4/{command}`, and every modelled command
-/// puts a literal there. The raw door takes one from a caller, so a name
-/// carrying `/`, `?`, `#` or whitespace could reach a different path, append a
-/// query string, or truncate the URL — none of which the caller would see,
-/// because what came back would still be a plausible answer from *something*.
-///
-/// Command names in the driver's registry are lowercase words joined by
-/// underscores, so this accepts a superset of them and nothing that changes the
-/// shape of the URL. A name this refuses that a future cluster accepts is a
-/// one-line change here; the reverse is a bug nobody can see.
+/// The name goes into `/api/v4/{command}`, so `/`, `?`, `#` or whitespace
+/// would change the URL. Accepts ASCII letters, digits and underscores, a
+/// superset of the registry's names.
 fn check_command_name(command: &str) -> Result<()> {
     if command.is_empty() {
         return Err(ClientError::Config(
@@ -3463,13 +3352,9 @@ fn check_command_name(command: &str) -> Result<()> {
 
 /// Refuses parameters that are not a dict.
 ///
-/// `X-YT-Parameters` is a dict on every command, including the ones that take
-/// none — [`yson_build::empty_map`] is the spelling for those. The client also
-/// *adds* to what it is given: a transaction id, a mutation id and its retry
-/// flag are all inserted into the caller's parameters on the way out, and
-/// inserting into a value that is not a dict panics. A caller who passes a list
-/// or a string here has made a mistake the cluster would report in its own
-/// words at best, and which would otherwise abort their process.
+/// `X-YT-Parameters` is always a dict ([`yson_build::empty_map`] for none),
+/// and the client inserts a transaction id and a mutation id into it, which
+/// would panic on anything else.
 fn refuse_non_dict_parameters(command: &str, params: &YsonValue) -> Result<()> {
     if !matches!(params.node, YsonNode::Map(_)) {
         return Err(ClientError::Config(format!(
@@ -3483,11 +3368,8 @@ fn refuse_non_dict_parameters(command: &str, params: &YsonValue) -> Result<()> {
 
 /// Refuses a request body on a verb that does not carry one.
 ///
-/// `Transport::dispatch` sends a GET through `ureq`'s bodiless builder, which
-/// is right — every GET command has an empty input stream by definition. A
-/// caller who passes a payload anyway has picked the wrong verb, and the body
-/// would otherwise be dropped without a word. See [`Method`] for the rule that
-/// decides which verb a command wants.
+/// `Transport::dispatch` sends a GET without a body, so a payload would be
+/// dropped silently. See [`Method`].
 fn refuse_body_on_get(method: Method, command: &str, has_body: bool) -> Result<()> {
     if has_body && matches!(method, Method::Get) {
         return Err(ClientError::Config(format!(
@@ -3500,42 +3382,18 @@ fn refuse_body_on_get(method: Method, command: &str, has_body: bool) -> Result<(
 
 /// One variable, as the process has it.
 ///
-/// The whole of what [`Client::from_env`] adds to [`Client::from_lookup`], and
-/// deliberately nothing else: trimming and the empty-is-unset rule live in
-/// `from_lookup`, on the path every caller and every test takes.
+/// Trimming and the empty-is-unset rule are in [`Client::from_lookup`].
 fn environment_value(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
 /// A bare cluster name completed by the suffix this machine was given.
 ///
-/// A bare cluster name — `hume` — is the ordinary spelling at an installation
-/// whose clusters all sit under one domain, and it is the one thing this client
-/// could not take: `Transport::new` puts `https://` in front of whatever it is
-/// handed, and `https://hume` resolves nowhere unless a resolver search list
-/// happens to complete it. The Go SDK completes it in `yt/go/config.go` — no
-/// colon, no dot, not `localhost`, then a suffix — and the same gate is used
-/// here.
-///
-/// **The suffix is not compiled in.** Go's is, because that SDK ships with one
-/// installation in mind; this client does not, so the suffix comes from
-/// `YT_PROXY_SUFFIX` and there is no expansion at all without it. Leading and
-/// trailing dots come off: `.yt.example.net`, `yt.example.net` and
-/// `yt.example.net.` are all how a person writes one, and a trailing dot left
-/// on would make a name that connects and then fails every domain comparison
-/// in [`crate::Client::with_heavy_proxies_under`]'s neighbourhood.
-///
-/// The gate is what keeps it from touching anything else. A colon means a scheme
-/// or a port — `http://localhost:8000` has both — a dot means a name that
-/// already resolves or is meant to, and anything *carrying* `localhost` is this
-/// machine whatever else is set. That last test is `contains`, exactly as Go
-/// writes it, so a cluster genuinely named `mylocalhostcluster` is left alone;
-/// spelling it out is the price of matching the gate this was ported from.
-///
-/// This also makes the label rule in `http::same_domain` reachable **without a
-/// resolver search list**: the rule matches a dotless `YT_PROXY` as a label of
-/// the discovered name, and until now the only way to have a dotless `YT_PROXY`
-/// that connected at all was for the machine's DNS configuration to complete it.
+/// `hume` plus `.yt.example.net` is `hume.yt.example.net`. The gate is the Go
+/// SDK's (`yt/go/config.go`): a name with no colon, no dot and not containing
+/// `localhost`, so `mylocalhostcluster` is left alone. Unlike Go, no suffix is
+/// compiled in. Leading and trailing dots come off the suffix; a trailing one
+/// would fail the heavy-proxy domain comparison.
 fn expanded_proxy(proxy: &str, suffix: Option<&str>) -> String {
     let proxy = proxy.trim();
     let Some(suffix) = suffix else {
@@ -3550,10 +3408,7 @@ fn expanded_proxy(proxy: &str, suffix: Option<&str>) -> String {
 
 /// The domains out of `YT_HEAVY_PROXY_DOMAINS`.
 ///
-/// Comma **or** whitespace: a list in a shell profile is written one way by
-/// whoever thinks of it as a list and the other by whoever thinks of it as
-/// arguments, and neither is worth an error message. Empty entries fall out
-/// here, and [`Client::with_heavy_proxies_under`] drops anything left over.
+/// Separated by commas or whitespace; empty entries are dropped.
 fn split_domains(value: &str) -> Vec<String> {
     value
         .split([',', ' ', '\t', '\n'])
@@ -3565,11 +3420,7 @@ fn split_domains(value: &str) -> Vec<String> {
 
 /// Whether a variable spells yes.
 ///
-/// The three spellings a shell profile uses, without case. Anything else is
-/// **not** a yes, including `0` and `false` — a flag this client cannot read is
-/// a flag it has not been given, and guessing at `on`, `y` or `enabled` would
-/// mean guessing at what `off`, `n` and `disabled` should do to a knob that is
-/// already off.
+/// `1`, `true` or `yes`, without case. Anything else is not.
 fn truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -3579,9 +3430,8 @@ fn truthy(value: &str) -> bool {
 
 /// Finds a token the way the `yt` CLI finds one.
 ///
-/// `YT_TOKEN`, then `YT_TOKEN_PATH`, then `~/.yt/token` — first one that has
-/// something in it wins. Nothing here fails: a cluster that wants no token is
-/// ordinary, and so is a home directory with no `.yt` in it.
+/// `YT_TOKEN`, then `YT_TOKEN_PATH`, then `~/.yt/token`; the first non-empty
+/// one wins. Nothing here fails.
 fn token_from_environment() -> Option<String> {
     if let Some(token) = std::env::var("YT_TOKEN").ok().and_then(clean_token) {
         return Some(token);
@@ -3606,9 +3456,7 @@ fn read_token_file(path: &std::path::Path) -> Option<String> {
 
 /// A token with the whitespace taken off, or nothing if that leaves nothing.
 ///
-/// The trailing newline is the point: `echo token > ~/.yt/token` writes one,
-/// and a header carrying it fails authentication with an error that never
-/// mentions the newline.
+/// `echo token > ~/.yt/token` leaves a newline that fails authentication.
 fn clean_token(raw: String) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -3616,8 +3464,7 @@ fn clean_token(raw: String) -> Option<String> {
 
 /// Decodes a binary YSON list fragment into typed rows.
 ///
-/// Shared by [`Client::read_table_rows`] and the tests that check what the row
-/// encoder produced, so the two halves of the round trip are the same code.
+/// Shared by [`Client::read_table_rows`] and the row-encoder tests.
 fn decode_rows<T: serde::de::DeserializeOwned>(bytes: &[u8], path: &str) -> Result<Vec<T>> {
     let mut rows = Vec::new();
     let mut stream = ytsaurus_yson::StreamDeserializer::<T>::new(bytes, true);
@@ -3638,9 +3485,8 @@ fn decode_rows<T: serde::de::DeserializeOwned>(bytes: &[u8], path: &str) -> Resu
 
 /// Reads the child names out of a `list` answer.
 ///
-/// A truncated answer is an error rather than a short list. The cluster says so
-/// with `<incomplete=%true>` — an *attribute* on the list, not an error — and a
-/// caller who does not look gets a listing that is quietly missing entries.
+/// A truncated answer, marked by an `<incomplete=%true>` attribute, is an
+/// error rather than a short list.
 fn child_names(value: &YsonValue, path: &str) -> Result<Vec<String>> {
     if matches!(
         value.attr("incomplete").map(|v| &v.node),
@@ -3676,20 +3522,16 @@ fn child_names(value: &YsonValue, path: &str) -> Result<Vec<String>> {
 
 /// Totals one custom statistic over the jobs that completed.
 ///
-/// The cluster files a statistic as `$` → job state → job type → the
-/// aggregate, so the number a user means by "how many rows did we reject" is
-/// the `sum` of the `completed` jobs, added across job types. Captured from a
-/// local cluster:
+/// A statistic is filed as `$` → job state → job type → aggregate; this adds
+/// the `sum` of `completed` across job types:
 ///
 /// ```text
 /// {"rows/rejected"={"$"={completed={map={count=1;max=3;min=3;sum=3}}}}}
 /// ```
 ///
-/// A flatter shape is accepted too, so a cluster that reports a bare aggregate
-/// still yields a number rather than nothing.
+/// A bare aggregate is accepted too.
 fn completed_total(statistic: &YsonValue) -> Option<i64> {
-    // `$` under a custom statistic, `$$` under a built-in one. The cluster
-    // spells the same idea two ways depending on which tree you are in.
+    // `$` under a custom statistic, `$$` under a built-in one.
     let by_state = jobs::field(statistic, "$").or_else(|| jobs::field(statistic, "$$"));
     let Some(by_state) = by_state else {
         return jobs::field(statistic, "sum").and_then(YsonValue::as_i64);
@@ -3711,8 +3553,7 @@ fn completed_total(statistic: &YsonValue) -> Option<i64> {
 
 /// Verifies that `data` is a whole binary YSON list fragment.
 ///
-/// Walks record boundaries without decoding, so the cost is a scan rather than
-/// a parse of the whole table.
+/// Walks record boundaries without decoding.
 #[cfg(test)]
 fn check_complete_fragment(data: &[u8]) -> std::result::Result<(), String> {
     check_complete_yson_fragment(data, YsonFormat::Binary)
@@ -3759,22 +3600,8 @@ fn unsupported_data_format() -> ClientError {
     )
 }
 
-/// Builds the rich table path a direct Skiff table read/write requires.
-///
-/// The Go SDK derives this `columns` projection from the single table schema;
-/// without it the positional tuple has no explicit column selection. Job I/O
-/// differs: its format may have several schemas and uses the Variant16 table
-/// prefix, so it is deliberately configured through operation specs instead.
-///
-/// The path's own attributes are kept: a Skiff write to an appending
-/// [`TablePath`] has to append, exactly as the YSON one does.
-/// Refuses a spec whose Skiff format does not describe the tables it will meet.
-///
-/// Refused here rather than sent, for the reason the duplicate-task check
-/// above is: the cluster's answer to this is a rejected operation at best, and
-/// at worst a job that reads a table its format does not describe and fails
-/// part-way through, having already written output that now has to be cleaned
-/// up.
+/// Refuses a spec whose Skiff format does not describe the tables it will
+/// meet, which would otherwise fail part-way through, after writing output.
 fn refuse_skiff_table_mismatch(mismatch: Option<String>) -> Result<()> {
     match mismatch {
         Some(reason) => Err(ClientError::Config(reason)),
@@ -3785,14 +3612,9 @@ fn refuse_skiff_table_mismatch(mismatch: Option<String>) -> Result<()> {
 /// Refuses a write whose path carries a read selection, before it is sent.
 ///
 /// The cluster ignores `columns` and `ranges` on a write and replaces the
-/// whole table with a 200 — measured on a local cluster, where
-/// `write_table_rows("//tmp/t[#0:#2]", rows)` replaced everything and
-/// reported success. Refusing locally is the only version of this that the
-/// caller ever hears about; the [rich YPath
-/// reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath) agrees
-/// on the scope, listing both attributes as recognized by the *read*
-/// commands. The rule and the string-syntax half of it live on
-/// [`TablePath`].
+/// whole table with a 200; the [rich YPath
+/// reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath) lists
+/// both for read commands only. The rule lives on [`TablePath`].
 fn refuse_selection_on_write(path: &TablePath) -> Result<()> {
     match path.write_refusal() {
         Some(reason) => Err(ClientError::Config(reason)),
@@ -3800,12 +3622,10 @@ fn refuse_selection_on_write(path: &TablePath) -> Result<()> {
     }
 }
 
-/// Refuses a read that spells the *same kind* of selection twice — once in
-/// the path string, once through the typed API. Measured, the typed attribute
-/// wins and the caller's string half is discarded at 200, so the filter they
-/// wrote into the path simply never happens and nothing says so. Rows against
-/// columns compose and are sent; a string opening with `<…>` is refused
-/// because this client cannot parse the block to see which attribute it names.
+/// Refuses a read that spells the same kind of selection both in the path
+/// string and through the typed API, where the cluster would silently discard
+/// the string's. Rows and columns compose; a string opening with `<…>` is
+/// refused because this client cannot parse the block.
 fn refuse_mixed_selection_on_read(path: &TablePath) -> Result<()> {
     match path.read_refusal() {
         Some(reason) => Err(ClientError::Config(reason)),
@@ -3813,6 +3633,10 @@ fn refuse_mixed_selection_on_read(path: &TablePath) -> Result<()> {
     }
 }
 
+/// The rich table path for direct Skiff table I/O: the single table schema's
+/// fields as `columns`, as the Go SDK derives them, beside the path's own
+/// attributes (append, ranges). Job I/O, with several schemas and a Variant16
+/// table prefix, is configured through operation specs instead.
 fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue> {
     if path.selected_columns().is_some() {
         return Err(ClientError::Config(format!(
@@ -3822,18 +3646,8 @@ fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue>
             path.as_str()
         )));
     }
-    // The same rule for the *string* spelling, which the typed check above
-    // cannot see: this function synthesises a `columns` attribute out of the
-    // format's fields whether the caller asked for one or not, so `//tmp/t{a}`
-    // is a doubled column selection even though nothing typed was set.
-    // Measured, the synthesised attribute wins — `<columns=[n]>"//tmp/t{k}"`
-    // came back as column `n` — so the Skiff tuple stays aligned with its
-    // schema and nothing is decoded wrong; what is lost is the caller's own
-    // `{a}`, discarded at 200 with no mention. Only the *column* half is a
-    // conflict: a string-spelled row range answers a different question and
-    // composes, as `<columns=[n]>"//tmp/t[#0:#2]"` confirmed by returning rows
-    // 0-1 carrying only `n`. A leading `<…>` is refused too, for the reason
-    // `selection_conflict` documents — the block cannot be read from here.
+    // The same rule for the string spelling: `//tmp/t{a}` would be silently
+    // overridden by the synthesised `columns`. A string row range composes.
     if let Some(reason) = path.selection_conflict(
         true,
         false,
@@ -3869,10 +3683,7 @@ fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue>
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // The path renders its own attributes — append, and any row ranges —
-    // and the format's field list joins them as `columns`. Ranges are rows,
-    // columns are the tuple shape; they answer different questions and
-    // combine freely.
+    // The path's own attributes, plus the format's fields as `columns`.
     let mut value = path.to_yson();
     value
         .attributes
@@ -3883,12 +3694,8 @@ fn skiff_table_path(path: &TablePath, format: &SkiffFormat) -> Result<YsonValue>
 
 /// Checks that a returned or submitted Skiff stream is a whole number of rows.
 ///
-/// Walks the rows without building them: `skip_row` applies the same framing,
-/// schema and limit checks the decoder does — including the per-blob bound —
-/// and allocates nothing. Decoding instead would build a `Value` tree for
-/// every row of the caller's whole table only to drop it, which on the write
-/// path is a second copy of the table in memory before the request is even
-/// made. The YSON counterpart walks record boundaries the same way.
+/// `skip_row` applies the decoder's framing, schema and limit checks without
+/// building or allocating rows.
 fn check_complete_skiff_stream(
     data: &[u8],
     format: &SkiffFormat,
