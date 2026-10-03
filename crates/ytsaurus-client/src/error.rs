@@ -180,8 +180,9 @@ pub enum ClientError {
         reason: String,
     },
 
-    /// Refused by this client before anything was sent: the environment did
-    /// not describe a cluster, or a call or its arguments failed a local check.
+    /// Refused by this client: the environment did not describe a cluster, a
+    /// call or its arguments failed a local check before the request was sent,
+    /// or [`Client::lock_waiting`](crate::Client::lock_waiting) ran out of time.
     #[error("{0}")]
     Config(String),
 }
