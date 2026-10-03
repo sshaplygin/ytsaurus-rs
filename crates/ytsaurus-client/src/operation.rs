@@ -1,6 +1,5 @@
 //! [`Operation`], a client and an id with the [`Client`] lifecycle commands on
-//! it, and the filters and parameters those commands take. Reattaching to an
-//! operation started by another process:
+//! it, and the filters and parameters they take. Reattaching from elsewhere:
 //!
 //! ```no_run
 //! # use ytsaurus_client::{Client, VanillaSpec, VanillaTask};
@@ -27,10 +26,9 @@ use crate::jobs::{JobInfo, field, text};
 use crate::stream::ResponseReader;
 use crate::{Client, yson_build};
 
-/// An operation and the client that can ask about it, from
-/// [`Client::attach_operation`]. Each method is the [`Client`] method of the
-/// same name with the id filled in. Dropping it does nothing: an operation is
-/// meant to outlive the process that started it.
+/// An operation and its client, from [`Client::attach_operation`]. Each method
+/// is the [`Client`] method of the same name with the id filled in; dropping it
+/// does nothing, since an operation may outlive the process that started it.
 #[derive(Debug, Clone)]
 pub struct Operation {
     client: Client,
@@ -123,7 +121,8 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, or code 201 if it was not suspended.
+    /// Returns [`ClientError::Cluster`] with code 201 (`Operation is in "running"
+    /// state`) if it was not suspended, or [`ClientError`] if the request fails.
     pub fn resume(&self) -> Result<()> {
         self.client.resume_operation(&self.id)
     }
@@ -132,7 +131,8 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails; a second complete gets `No such operation`.
+    /// Returns [`ClientError::Cluster`] (`No such operation`) on a second
+    /// complete, or [`ClientError`] if the request fails.
     pub fn complete(&self) -> Result<()> {
         self.client.complete_operation(&self.id)
     }
