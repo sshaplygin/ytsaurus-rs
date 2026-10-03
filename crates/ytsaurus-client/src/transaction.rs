@@ -413,8 +413,8 @@ pub(crate) fn abort_by_id(client: &Client, id: &str) -> Result<()> {
 }
 
 /// How often to ping: a third of the timeout, so one lost ping is not a lost
-/// transaction, and at least once a second. Below a 3 s timeout the pings fall
-/// behind, which suits a transaction that is meant to expire.
+/// transaction, and never more often than once a second. Below a 3 s timeout
+/// the pings fall behind, which suits a transaction that is meant to expire.
 fn ping_interval(timeout: Duration) -> Duration {
     (timeout / 3).max(Duration::from_secs(1))
 }
