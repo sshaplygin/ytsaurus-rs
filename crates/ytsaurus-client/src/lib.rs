@@ -1419,9 +1419,8 @@ impl Client {
 
     /// Uploads a local file to Cypress, marking it executable.
     ///
-    /// This is what makes a worker runnable on a node: without the `executable`
-    /// attribute YTsaurus copies the binary but refuses to exec it, and the job
-    /// fails with a permission error that does not mention the attribute.
+    /// Without the `executable` attribute a node refuses to exec the binary,
+    /// with a permission error that does not mention the attribute.
     ///
     /// # Errors
     ///
@@ -1438,20 +1437,13 @@ impl Client {
 
     /// Uploads the **running executable** to Cypress, marked executable.
     ///
-    /// This is the one-binary pattern: the same program launches the operation
-    /// and runs as its job, telling the two apart with
-    /// [`ytsaurus_job::is_inside_job`]. The binary on the cluster is then by
-    /// construction the one you just built — the whole "I uploaded a stale
-    /// worker" class of bug disappears.
+    /// For one program that both launches the operation and runs as its job,
+    /// telling the two apart with [`ytsaurus_job::is_inside_job`].
     ///
-    /// The running executable has to be something a node can exec, so its ELF
-    /// header is checked before the upload: Linux, x86-64, statically linked.
-    /// Launching from macOS, or from a Linux host where the launcher is
-    /// dynamically linked, it is not — this returns
-    /// [`ClientError::NotAWorker`] naming the reason, instead of uploading a
-    /// binary that fails on the node minutes later. Build the worker with
-    /// `scripts/build-worker.sh` and upload it with [`Client::upload_worker`]
-    /// in that case.
+    /// The ELF header is checked first: the executable must be Linux, x86-64
+    /// and statically linked. Otherwise (on macOS, or a dynamically linked
+    /// launcher) build the worker with `scripts/build-worker.sh` and use
+    /// [`Client::upload_worker`].
     ///
     /// [`ytsaurus_job::is_inside_job`]: https://docs.rs/ytsaurus-job/latest/ytsaurus_job/fn.is_inside_job.html
     ///
@@ -1482,12 +1474,9 @@ impl Client {
 
     /// Uploads a worker, or finds it already on the cluster.
     ///
-    /// Keyed by the file's MD5, so an unchanged binary is uploaded once and
-    /// every later launch reuses it. That is the difference between a dev loop
-    /// that re-sends tens of megabytes on every run and one that does not.
-    ///
-    /// The cached node is named after the hash, so the returned
-    /// [`CachedFile::name`] is the name to give it in the sandbox — see
+    /// Keyed by the file's MD5 in the file cache ([`Client::with_file_cache`]),
+    /// so an unchanged binary is uploaded once. The cached node is named after
+    /// the hash, so pass [`CachedFile::name`] to
     /// [`MapSpec::with_local_file_named`]:
     ///
     /// ```no_run
@@ -1501,39 +1490,18 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// The cache is shared: [`Client::with_file_cache`] defaults to the path
-    /// the Python wrapper uses, so an installation that already expires old
-    /// entries there expires these too.
-    ///
-    /// # A cache you may not write to
-    ///
-    /// On an installation where that shared path is maintained by its
-    /// operators, an ordinary user may read it and nothing more — and the
-    /// cluster answers a write with `Access denied`. That is a **degraded
-    /// cache, not a failed upload**: the worker goes up outside the cache
-    /// instead, to a path of its own under `//tmp`, and the launch proceeds.
-    ///
-    /// It is warned about rather than passed over, on stderr — as a `WARN`
-    /// event where the `tracing` feature is on — because the state is
-    /// permanent until someone acts on it and invisible otherwise: every launch
-    /// re-sends the whole binary, and every launch leaves a node behind that no
-    /// cache expiry will collect. The warning names
-    /// [`Client::with_file_cache`], which is the one line that puts a cache
-    /// back.
-    ///
-    /// Only the cluster's refusal of *the cache* is treated this way — creating
-    /// the cache directory, creating the staging node inside it, and the
-    /// handover to `put_file_to_cache`. Any other failure, including an
-    /// `Access denied` on anything else, is returned.
-    ///
-    /// [`CachedFile::cached`] is which of the two happened, and it is the field
-    /// to read before doing anything to [`CachedFile::path`]: on the fallback
-    /// path that node is this launch's own and nobody else's, while on the
-    /// ordinary path it is the installation's shared cache entry.
+    /// If the cluster answers `Access denied` to creating the cache directory,
+    /// creating the staging node in it, or `put_file_to_cache`, the worker goes
+    /// up under `//tmp` instead, with a warning on stderr (a `WARN` event with
+    /// the `tracing` feature) naming [`Client::with_file_cache`]. Every such
+    /// launch re-sends the binary and leaves a node no expiry collects.
+    /// [`CachedFile::cached`] says which happened; read it before removing
+    /// [`CachedFile::path`].
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the file cannot be read or the upload fails.
+    /// Returns [`ClientError`] if the file cannot be read or the upload fails,
+    /// including an `Access denied` on anything but the three cache writes.
     pub fn upload_worker_cached(&self, local: impl AsRef<std::path::Path>) -> Result<CachedFile> {
         let local = local.as_ref();
         let bytes = std::fs::read(local).map_err(|source| ClientError::Io {
@@ -1558,9 +1526,8 @@ impl Client {
 
         let (path, cached) = match self.upload_into_cache(&bytes, &digest)? {
             Cached::At(path) => {
-                // Set on the cached path too: whether the attribute survives
-                // the move decides whether the job can exec at all, and it is
-                // cheap to be sure.
+                // Set on the cached path too, in case the attribute did not
+                // survive the handover.
                 self.set_attribute(&path, "executable", yson_build::boolean(true))?;
                 (path, true)
             }
@@ -1580,38 +1547,20 @@ impl Client {
 
     /// Everything in [`Client::upload_worker_cached`] that touches the cache.
     ///
-    /// Three of the calls here can be refused by an installation that keeps the
-    /// cache to itself, and all three mean the same thing — this caller has no
-    /// cache at this path — so all three come back as [`Cached::Refused`] for
-    /// the caller to fall back on: creating the cache directory, creating the
-    /// staging node **inside** it, and the handover, `put_file_to_cache`. The
-    /// two creates ask for the same permission on the same directory, so which
-    /// of them a given cluster refuses first is its own business.
-    ///
-    /// Nothing else is caught, deliberately. Between those calls the client is
-    /// writing to a node it has just created: a refusal there is about that
-    /// node rather than about the cache, and the same bytes sent to another
-    /// path would earn the same answer, so falling back would upload twice and
-    /// still fail. And a create refused for some *other* reason — a path that
-    /// resolves to something else, a lock held elsewhere — is not a permission
-    /// problem at all. Both are returned as they always were.
+    /// An `Access denied` on creating the cache directory, creating the staging
+    /// node inside it, or `put_file_to_cache` comes back as [`Cached::Refused`].
+    /// Nothing else is caught: a refusal while writing the node just created is
+    /// about that node, and another path would earn the same answer.
     fn upload_into_cache(&self, bytes: &[u8], digest: &str) -> Result<Cached> {
-        // Created here rather than in the lookup: a cache the installation
-        // maintains is one a user may only be able to read, and a lookup that
-        // mutated it would fail on exactly the clusters where the cache is
-        // worth the most. Being refused *here* costs a slower upload, which is
-        // what makes that trade worth making.
+        // Created here rather than in the lookup, so a lookup works against a
+        // cache the caller may only read.
         if let Err(denial) = self.create("map_node", &self.file_cache) {
             return refused_or_reported(denial);
         }
 
-        // Staged inside the cache node, so a cluster that expires the cache
-        // expires an interrupted upload with it.
-        //
-        // The name carries a nonce as well as the hash. Keyed by the hash alone
-        // it names the same node for every process uploading the same binary,
-        // and two CI jobs launching together would write to one node and then
-        // remove it from under each other.
+        // Staged inside the cache node, so cache expiry also collects an
+        // interrupted upload. The nonce keeps two processes uploading the same
+        // binary from sharing, and removing, one staging node.
         let staging = format!("{}/staged_{digest}_{}", self.file_cache, MutationId::new());
         if let Err(denial) = self.create("file", &staging) {
             return refused_or_reported(denial);
@@ -1622,28 +1571,20 @@ impl Client {
             .and_then(|()| self.set_attribute(&staging, "executable", yson_build::boolean(true)))
             .and_then(|()| self.put_file_to_cache(&staging, digest));
 
-        // Removed whichever way that went. On success the cache may have kept
-        // the node itself rather than a copy, so this is `force`-removing
-        // something that may already be gone, which `remove_tree` tolerates.
-        // On failure it is what stops a rejected upload from leaving tens of
-        // megabytes behind for good: cache expiry walks the entries the cache
-        // itself created, not the staging nodes beside them.
+        // Removed either way. On success the cache may have taken the node
+        // itself, and `remove_tree` tolerates its absence; on failure, cache
+        // expiry would not collect it.
         let removed = self.remove_tree(&staging);
 
         match cached {
             Ok(path) => {
-                // The upload's own failure is the one worth reporting; a
-                // cleanup that also failed only matters when there was nothing
-                // else wrong.
+                // A failed cleanup is reported only when nothing else failed.
                 removed?;
                 Ok(Cached::At(path))
             }
-            // Refused at the handover, with the bytes already on the cluster —
-            // they are about to be sent again, which is the price of a launch
-            // that runs at all. A removal that failed too is dropped here
-            // rather than reported: a cache that refuses the handover may well
-            // refuse the cleanup, and failing the launch over a staging node is
-            // exactly what this is not doing.
+            // Refused at the handover: the bytes are sent again outside the
+            // cache. A failed removal is ignored, since a cache that refuses
+            // the handover may refuse the cleanup too.
             Err(denial) if denied(&denial, "put_file_to_cache") => Ok(Cached::Refused(denial)),
             Err(failed) => Err(failed),
         }
@@ -1652,31 +1593,10 @@ impl Client {
     /// Uploads the worker outside the cache, for a cluster whose cache this
     /// caller may not write to.
     ///
-    /// A path of its own every time, nonce and all, for the reason the staging
-    /// node has one: a name derived from the hash alone is the same node for
-    /// every process uploading the same binary, and two launchers starting
-    /// together would take an exclusive lock on it in turn. The cost is a node
-    /// per launch that no cache expiry will collect, which is the second reason
-    /// the warning names [`Client::with_file_cache`].
-    ///
-    /// # What this node is not
-    ///
-    /// It is an ordinary `//tmp` node: it inherits whatever ACL `//tmp` carries
-    /// on the installation, it is given no expiry, and its name is unguessable
-    /// only as far as [`MutationId`] is — and the entropy it draws on says of
-    /// itself that its callers need an id to be *unique, not unpredictable*,
-    /// because what it was built for is deduplicating a retry rather than
-    /// withholding a name. On a cluster where
-    /// `//tmp` is shared scratch space, a co-tenant who can list it can also
-    /// **rewrite the worker's bytes between this upload and the job that execs
-    /// them**.
-    ///
-    /// That is the ordinary exposure of anything left in `//tmp`, and it is the
-    /// same exposure the shared file cache has — but the cache is at least a
-    /// path an installation curates, and this is the path taken *because* the
-    /// curated one was refused. A caller who cannot accept it should point
-    /// [`Client::with_file_cache`] at a directory of its own, which removes
-    /// both this node and the refusal that produced it.
+    /// A new path per launch (the nonce keeps concurrent launchers of one
+    /// binary off one node), never expired. It is an ordinary `//tmp` node with
+    /// `//tmp`'s ACL and a name that is unique, not unpredictable: a co-tenant
+    /// who can list `//tmp` can rewrite the worker before it runs.
     fn upload_uncached(&self, digest: &str, bytes: &[u8]) -> Result<String> {
         let remote = format!(
             "{UNCACHED_UPLOAD_DIR}/ytsaurus_rs_worker_{digest}_{}",
@@ -1688,13 +1608,9 @@ impl Client {
 
     /// Looks up a file in the cluster's file cache by its MD5.
     ///
-    /// `None` means nothing is cached under that hash — including when the
-    /// cache directory does not exist yet, which is what
-    /// [`Client::upload_worker_cached`] creates on its way past, on a cluster
-    /// that lets it.
-    ///
-    /// A lookup and nothing more: it sends no mutation, so it works against a
-    /// cache the caller may only read.
+    /// `None` means nothing is cached under that hash, including when the cache
+    /// directory does not exist. Sends no mutation, so it works against a cache
+    /// the caller may only read.
     ///
     /// # Errors
     ///
@@ -1704,11 +1620,7 @@ impl Client {
             ("md5", yson_build::string(md5)),
             ("cache_path", yson_build::string(&self.file_cache)),
         ]);
-        // A `cache_path` that does not exist needs no special case: the cluster
-        // answers 200 with the same empty string it uses for any other miss,
-        // rather than the resolve error a missing path usually earns. Checked
-        // against a local cluster with no `//tmp/yt_wrapper` at all, which is
-        // the state a first upload starts from.
+        // A missing `cache_path` is answered as a miss, not a resolve error.
         let body = self.transport.call(
             Method::Get,
             "get_file_from_cache",
@@ -1752,10 +1664,8 @@ impl Client {
 
     /// Reads the path out of a file-cache response.
     ///
-    /// These two commands answer with a **bare string**, not the `{path=…}`
-    /// envelope the rest of API v4 uses, and a cache miss is an *empty* string
-    /// rather than an error or an entity. Both shapes are accepted so that a
-    /// cluster that grows an envelope later does not break this.
+    /// These commands answer with a bare string, and a miss with an empty one;
+    /// a `{path=…}` envelope is accepted too.
     fn cached_path(&self, body: &[u8], command: &str) -> Result<Option<String>> {
         let value = self.strip_envelope(body, command)?;
         let value = match &value.node {
@@ -1813,108 +1723,30 @@ impl Client {
         Ok(())
     }
 
-    /// Reads a whole Cypress file into memory.
+    /// Reads a whole Cypress file into memory. [`Client::read_file_streaming`]
+    /// moves the same bytes without holding them.
     ///
-    /// The mirror of [`Client::write_file`], and the buffered half of the
-    /// pair: for a worker binary fetched back, a config a launcher inspects —
-    /// results, not bulk data. For a file that does not fit,
-    /// [`Client::read_file_streaming`] moves the same bytes without holding
-    /// them.
+    /// **At most 512 MiB is held**, counted in decoded bytes; a larger file is
+    /// refused, not truncated. The process may briefly hold about 1.5× that
+    /// while the buffer grows ([limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits)).
     ///
-    /// **The whole file is held in memory, and there is a ceiling: 512 MiB.**
-    /// That is the transport's cap on any buffered response, counted in the
-    /// bytes that land in the `Vec` — and a file past it is refused rather
-    /// than truncated, with a [`ClientError::ResponseTooLarge`] that names the
-    /// number and names the streaming half. A file of exactly the ceiling is
-    /// not past it. A worker binary is comfortably under; a dataset someone
-    /// stored as a file may not be, and that is exactly the case the pair
-    /// comes in two halves for.
+    /// `path` is a plain node path such as `//tmp/worker`. Limits on a rich
+    /// path are ignored and the whole file is read; a `[#0:#10]` range reads
+    /// the whole file and then fails the size check.
     ///
-    /// **512 MiB held is not 512 MiB of process.** The buffer grows by
-    /// doubling and copies as it grows, so both halves are resident for the
-    /// length of a copy — up to about 1.5× the cap where the allocator cannot
-    /// extend in place. Measured in a release build: a read that hands back
-    /// 536 870 911 bytes peaks at 544 178 176 of resident set, and a 600 MiB
-    /// read refused by the cap peaks at 611 385 344. Size for that, not for
-    /// the ceiling.
-    ///
-    /// The cap counts *decoded* bytes because the compressed ones are not the
-    /// same quantity and are not close to it: this client asks for gzip, and
-    /// measured against a cluster, a 600 MiB file of zeros crosses the wire in
-    /// 611 522 bytes. A cap on what arrives would have let all 600 MiB into
-    /// memory — which is what it did until this was fixed.
-    ///
-    /// `path` is a **plain node path** — `//tmp/worker`. Not a rich one, and
-    /// the reason is worth spelling out, because a rich path here does not
-    /// fail so much as quietly do nothing. Measured on a cluster, on a file of
-    /// 1000 bytes:
-    ///
-    /// - `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads back
-    ///   **all 1000 bytes** and passes the size check. A file is sliced by the
-    ///   command's own `offset` and `length` parameters, not by limits on the
-    ///   path, so limits written there are accepted and ignored — and the
-    ///   caller who thought they had asked for ten bytes is told nothing.
-    ///   `<append=%false>//tmp/f` is the same story with a harmless attribute.
-    /// - `//tmp/f[#0:#10]` also reads back all 1000 bytes, and then fails: the
-    ///   size check builds `{path}/@uncompressed_data_size` out of this string
-    ///   textually, and `//tmp/f[#0:#10]/@uncompressed_data_size` is not a path
-    ///   the cluster will parse — `Error reading parameter /path: Unexpected
-    ///   token "/" of type "slash"`. A whole file downloaded and then refused
-    ///   over a range that was never going to be honoured.
-    ///
-    /// So: a plain path. Selection on reads is [#12], and belongs in
-    /// parameters this method would have to grow, not smuggled in through
-    /// this argument.
-    ///
-    /// The body's length is checked against the size Cypress records for the
-    /// node. That is not pedantry — the proxy reports a mid-stream failure in
-    /// a trailer this client cannot see (see [`TableReader`] for the trailer
-    /// gap), and a file's bytes carry no framing of their own: where a
-    /// truncated table leaves a record that does not parse, a truncated file
-    /// just ends, looking exactly like a shorter file. So after the read, one
-    /// light `get` fetches the node's `@uncompressed_data_size` — the byte
-    /// count of the content, whatever compression the node's own codec applies
-    /// beneath it — and a body of any other length is an error rather than a
-    /// file.
-    ///
-    /// The two requests are not atomic, and the race runs both ways. A writer
-    /// replacing the file between them can fail the check for a body that was
-    /// complete when it was sent — the ordinary hazard of reading what someone
-    /// else is rewriting, surfaced as an error rather than as a mix of the two
-    /// versions. The converse is rarer and quieter: a body genuinely cut short
-    /// at N bytes, racing a replacement whose own
-    /// `@uncompressed_data_size` is exactly N, passes the check, and a
-    /// truncated read of the old version is returned as a whole file. That one
-    /// cannot be closed from here — the only in-band verdict on a cut stream
-    /// is the proxy's trailer, which `ureq` 3.3 does not read, so there is no
-    /// header to prefer over the second request. A reader who needs a file
-    /// pinned while others replace it takes a [`LockMode::Snapshot`] lock in a
-    /// transaction, which is exactly what that mode is for, and closes both
-    /// directions at once.
-    ///
-    /// Verified against a local cluster: a 4 MB [`Client::write_file`] of
-    /// non-UTF-8 bytes comes back byte-for-byte through both halves of the
-    /// pair, an empty file reads back empty, and a node carrying
-    /// `compression_codec=zlib_6` — 1 000 000 logical bytes, 4 214 on disk —
-    /// reads back its logical bytes with the check passing, which is the case
-    /// that would break if the attribute were the on-disk size. And a 600 MiB
-    /// file of zeros — 611 522 bytes on the wire — is refused rather than held,
-    /// while `read_file_streaming` moves all 629 145 600 of it.
+    /// After the read, the body's length is checked against the node's
+    /// `@uncompressed_data_size`, since a truncated file looks like a shorter
+    /// one. The two requests are not atomic: a concurrent rewrite can fail the
+    /// check, or rarely let a truncated body pass. Read under a
+    /// [`LockMode::Snapshot`] lock in a transaction to pin the file.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, if the response is larger
-    /// than the 512 MiB this holds in memory — a
-    /// [`ClientError::ResponseTooLarge`], which is never retried and never
-    /// blamed on the proxy that served it — if the node's size cannot be
-    /// read — the check refuses loudly rather than quietly not happening — or
-    /// if the body's length is not the size the cluster records. A missing
-    /// path fails the read itself, before the size is ever asked for: code 1,
-    /// `Error getting basic attributes of user objects`, with the resolve
-    /// error nested inside — a category outside and the reason within, as a
-    /// missing table is reported too.
-    ///
-    /// [#12]: https://github.com/sshaplygin/ytsaurus-rs/issues/12
+    /// Returns [`ClientError`] if the request fails, including a missing path
+    /// (`Error getting basic attributes of user objects`);
+    /// [`ClientError::ResponseTooLarge`], never retried, past 512 MiB; and
+    /// [`ClientError::Decode`] if the node's size cannot be read or differs
+    /// from the body's length.
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let params = yson_build::map([("path", yson_build::string(path))]);
         let body = self.transport.call(
@@ -1925,9 +1757,7 @@ impl Client {
             Repeatable::Heavy,
         )?;
 
-        // After the body rather than before: a size read first would age
-        // across the whole transfer, and the point of comparing is to compare
-        // against what the file was when the proxy finished sending it.
+        // After the body, so the size is the file's when the transfer ended.
         let recorded = self.file_size(path)?;
         if recorded != body.len() as i64 {
             return Err(ClientError::Decode {
@@ -1944,25 +1774,12 @@ impl Client {
         Ok(body)
     }
 
-    /// The byte count Cypress records for a file's content.
-    ///
-    /// `@uncompressed_data_size`, which is the content's logical length — a
-    /// `compression_codec` on the node changes what the chunks weigh
-    /// (`@compressed_data_size`), not what `read_file` returns. Both watched
-    /// on a local cluster; there is no `@file_size`, whatever the name
-    /// suggests — asked for one, the cluster answers `Attribute "file_size"
-    /// is not found`. An answer that is not an integer is refused rather than
-    /// skipped: a completeness check that quietly stopped checking would be
-    /// worse than none, because [`Client::read_file`] promises it.
-    ///
-    /// Both ways of failing are reported as `read_file`, and the `get`'s own
-    /// error is quoted inside rather than handed back as itself. The `get` is
-    /// an implementation detail of the read, and it fails *after* the file's
-    /// bytes have already arrived — so a bare `get: transport error …` names
-    /// a command the caller never sent, and the obvious remedy for it, sending
-    /// it again, is not what their retry will do: it will download the whole
-    /// file a second time. The message says which command failed and which
-    /// part of it did.
+    /// The byte count Cypress records for a file's content:
+    /// `@uncompressed_data_size`, the logical length whatever the node's
+    /// `compression_codec`. A non-integer answer is refused, so the check in
+    /// [`Client::read_file`] cannot silently stop checking. Failures are
+    /// reported as `read_file`, saying the bytes arrived but the size could
+    /// not be read: the caller never sent a `get`.
     fn file_size(&self, path: &str) -> Result<i64> {
         let size = self
             .get(&format!("{path}/@uncompressed_data_size"))
@@ -1985,10 +1802,7 @@ impl Client {
 
     /// Reads a file as a stream, without holding it.
     ///
-    /// The same bytes [`Client::read_file`] returns, arriving as they come off
-    /// the connection — and a file is exactly the thing that might not fit in
-    /// memory, which is why [`Client::write_file`]'s mirror comes in two
-    /// halves. What comes out is a plain `Read`:
+    /// The bytes [`Client::read_file`] returns, as a plain `Read`:
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2000,13 +1814,10 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// [`Client::read_file`] checks the body against the size the cluster
-    /// records; this cannot, because the point is not to have the whole thing
-    /// — and unlike a table, whose truncation leaves a record that does not
-    /// parse, a file cut short by a mid-stream failure simply ends. A caller
-    /// who needs certainty compares the reader's
-    /// [`bytes_read`](ResponseReader::bytes_read) against the node's
-    /// `@uncompressed_data_size` — see [`FileReader`] for why that gap exists.
+    /// Unlike [`Client::read_file`], this does not check the length, and a
+    /// file cut short mid-stream simply ends. To be sure, compare
+    /// [`bytes_read`](ResponseReader::bytes_read) with the node's
+    /// `@uncompressed_data_size`; see [`FileReader`].
     ///
     /// # Errors
     ///
@@ -2049,13 +1860,10 @@ impl Client {
     /// `rows` must be a binary YSON list fragment — exactly what a
     /// `ytsaurus-job` worker writes.
     ///
-    /// A path carrying a read selection — [`TablePath::columns`],
-    /// [`TablePath::range`], or rich YPath syntax spelled into the path
-    /// string — is **refused locally**, before anything is sent. The cluster
-    /// ignores those on a write and replaces the whole table with a 200
-    /// (measured: `write_table_rows("//tmp/t[#0:#2]", rows)` replaced
-    /// everything and reported success), and this refusal is what keeps that
-    /// silent loss unwritable. See [`TablePath`].
+    /// A path carrying a read selection ([`TablePath::columns`],
+    /// [`TablePath::range`], or rich YPath syntax in the string) is **refused
+    /// locally**: the cluster would ignore it and replace the whole table. See
+    /// [`TablePath`].
     ///
     /// # Errors
     ///
@@ -2133,10 +1941,8 @@ impl Client {
         format: &SkiffFormat,
     ) -> Result<()> {
         refuse_selection_on_write(path)?;
-        // The path first: it is what rejects a format that is not single-table
-        // direct I/O. Checking the stream first would answer a multi-table
-        // format with a decode error about a tag mismatch, which describes a
-        // consequence rather than the mistake.
+        // The path first, so a multi-table format is refused as such rather
+        // than as a tag mismatch in the stream.
         let path_value = skiff_table_path(path, format)?;
         check_complete_skiff_stream(rows, format).map_err(|reason| ClientError::Decode {
             command: "write_table".to_owned(),
@@ -2156,13 +1962,8 @@ impl Client {
 
     /// Reads a whole table as a binary YSON list fragment.
     ///
-    /// Reads it into memory: this is for results a launcher inspects, not for
-    /// bulk export.
-    ///
-    /// The path can select which part of the table to read —
-    /// [`TablePath::columns`] and [`TablePath::range`] travel as attributes on
-    /// it, so three columns of a hundred rows cost three columns of a hundred
-    /// rows, not the whole table:
+    /// Reads it into memory; [`Client::read_table_streaming`] does not.
+    /// [`TablePath::columns`] and [`TablePath::range`] select on the cluster:
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, TablePath};
@@ -2173,11 +1974,8 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// The result is checked to be a complete list fragment. That is not
-    /// pedantry — the proxy reports a mid-stream failure in a trailer this
-    /// client cannot see (see the `http` module), so a truncated body is the
-    /// symptom that *is* detectable, and returning it as success would hand the
-    /// caller a silently short table.
+    /// The result is checked to be a complete list fragment, since the proxy
+    /// reports a mid-stream failure in a trailer this client cannot read.
     ///
     /// # Errors
     ///
@@ -2233,29 +2031,14 @@ impl Client {
 
     /// Reads one table as a complete Skiff stream.
     ///
-    /// `format` must have exactly one table schema. Its named fields select
-    /// the table columns and determine the bytes returned — which is why a
-    /// path that *also* names columns is refused. That covers both spellings,
-    /// [`TablePath::columns`] and `{…}` in the path *string*, because the
-    /// format's fields become a `columns` attribute here whether the caller
-    /// named one or not.
+    /// `format` must have exactly one table schema, whose named fields become
+    /// the path's `columns`. A path that also selects columns, by
+    /// [`TablePath::columns`] or `{…}` in its string, is refused: the cluster
+    /// would silently discard the caller's selection. So is a path string
+    /// opening with `<…>`, which this client cannot parse. Row ranges combine
+    /// with the schema's columns and are accepted.
     ///
-    /// **What that costs is a silently ignored filter, not a corrupt decode.**
-    /// Measured, the synthesised attribute wins: `<columns=[n]>"//tmp/t{k}"`
-    /// answered with column `n`. A Skiff read therefore still receives exactly
-    /// the columns its format names, and the tuple stays aligned — but the
-    /// `{…}` the caller wrote is discarded without a word, at 200. Refusing is
-    /// how they get to hear about it. A path string opening with `<…>` is
-    /// refused one step removed: this client cannot parse the block to see
-    /// whether it names `columns` as well.
-    ///
-    /// **Row selections are not column selections and are not refused.** A
-    /// [`TablePath::range`] combines, and so does a range spelled into the
-    /// string — measured, `<columns=[n]>"//tmp/t[#0:#2]"` answered 200 with
-    /// rows 0-1 carrying only `n`. Ranges pick rows, the schema picks columns.
-    ///
-    /// The response is decoded to its end before being returned so a truncated
-    /// Skiff stream is never reported as a successful table read.
+    /// The response is decoded to its end, so a truncated stream is an error.
     ///
     /// # Errors
     ///
@@ -2295,8 +2078,7 @@ impl Client {
 
     /// Writes rows to a table from anything that yields them.
     ///
-    /// The rows are Rust values; the encoding is this crate's problem, which is
-    /// the difference between this and [`Client::write_table`]:
+    /// [`Client::write_table`] with Rust values for rows:
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2318,22 +2100,16 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// It takes an iterator rather than a slice because the encoder sits
-    /// *inside* the request body: rows are serialised a bufferful at a time as
-    /// the connection asks for bytes, so a million rows cost one buffer rather
-    /// than a million rows' worth of memory, and the caller never has to
-    /// materialise them either.
-    ///
-    /// Replaces the table's contents, as [`Client::write_table`] does — and
-    /// refuses a path carrying a read selection before anything is sent, for
-    /// the reason given there.
+    /// Rows are serialised a bufferful at a time as the connection takes them,
+    /// so memory stays at one buffer however many rows there are. Replaces the
+    /// table's contents, and refuses a path carrying a read selection, as
+    /// [`Client::write_table`] does.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if the path carries a read selection,
-    /// [`ClientError::Decode`] naming the row if one cannot be serialised —
-    /// the write fails rather than sending the rows before it — or
-    /// [`ClientError`] if the request fails.
+    /// [`ClientError::Decode`] naming the row if one cannot be serialised (the
+    /// write then fails as a whole), or [`ClientError`] if the request fails.
     pub fn write_table_rows<T, I>(&self, path: impl Into<TablePath>, rows: I) -> Result<()>
     where
         T: serde::Serialize,
@@ -2351,8 +2127,8 @@ impl Client {
             .transport
             .upload(Method::Put, "write_table", &params, &mut stream);
 
-        // Checked first: a body that failed to encode fails the request too,
-        // and the transport's account of that is "the body ended early".
+        // Checked first: the transport reports an encoding failure only as a
+        // body that ended early.
         if let Some(reason) = stream.failed {
             return Err(ClientError::Decode {
                 command: "write_table".to_owned(),
@@ -2362,46 +2138,24 @@ impl Client {
         sent.map(|_| ())
     }
 
-    /// Reads a whole table as typed rows.
-    ///
-    /// ```no_run
-    /// # use ytsaurus_client::Client;
-    /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
-    /// # let client = Client::from_env()?;
-    /// #[derive(serde::Deserialize)]
-    /// struct Contact {
-    ///     name: String,
-    ///     age: i64,
-    /// }
-    ///
-    /// for contact in client.read_table_rows::<Contact>("//tmp/contacts")? {
-    ///     println!("{} is {}", contact.name, contact.age);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// Rows are **owned**, and the whole table is read before any of it is
-    /// returned — this is [`Client::read_table`] with the decoding done, and it
-    /// inherits the same purpose: results a launcher inspects. For a table that
-    /// does not fit, or for rows borrowed from the buffer they arrived in,
-    /// [`Client::read_table_streaming`] feeds `ytsaurus_job::JobReader`.
-    ///
-    /// Columns the type does not mention are ignored, so a struct naming two
-    /// columns of a twenty-column table is a projection rather than an error —
-    /// but the *whole* row still crosses the wire and is decoded before the
-    /// projection happens. [`TablePath::columns`] moves the projection to the
-    /// cluster, and [`TablePath::range`] does the same for rows:
+    /// Reads a whole table as typed rows: [`Client::read_table`] with the
+    /// decoding done. Rows are owned and the whole table is read first;
+    /// [`Client::read_table_streaming`] streams instead.
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, TablePath};
     /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
     /// # let client = Client::from_env()?;
-    /// # #[derive(serde::Deserialize)]
-    /// # struct Contact { name: String, age: i64 }
-    /// let some: Vec<Contact> = client.read_table_rows(
-    ///     TablePath::new("//tmp/contacts").columns(["name", "age"]).range(0..100),
-    /// )?;
+    /// #[derive(serde::Deserialize)]
+    /// struct Contact { name: String, age: i64 }
+    ///
+    /// for contact in client.read_table_rows::<Contact>("//tmp/contacts")? {
+    ///     println!("{} is {}", contact.name, contact.age);
+    /// }
+    /// // Columns `T` does not name are ignored, after crossing the wire; these
+    /// // select two columns of the first hundred rows on the cluster instead.
+    /// let path = TablePath::new("//tmp/contacts").columns(["name", "age"]).range(0..100);
+    /// let some: Vec<Contact> = client.read_table_rows(path)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -2420,8 +2174,8 @@ impl Client {
 
     /// Reads a node, or an attribute, into a Rust type.
     ///
-    /// [`Client::get`] hands back a [`YsonValue`] to walk; this hands back the
-    /// shape you were going to walk it into:
+    /// [`Client::get`] returns a [`YsonValue`]; this deserialises into `T`.
+    /// Attributes `T` does not name are ignored:
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2441,9 +2195,6 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// Attributes the type does not mention are ignored, which is what makes
-    /// `//@` — a node with dozens of them — worth asking about at all.
-    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails or the answer does not fit
@@ -2458,11 +2209,8 @@ impl Client {
             Repeatable::Freely,
         )?;
 
-        // Decoded straight out of the response, envelope and all. Going through
-        // `get` would build a whole `YsonValue` tree, encode it back to bytes
-        // and decode those into `T` — three passes over the document and two
-        // copies of it in memory, where one pass does the same job. Invisible
-        // for `//@`; not for a large attribute or a subtree.
+        // Decoded straight from the response in one pass, rather than through
+        // `get`'s `YsonValue` tree.
         let envelope: Envelope<T> =
             from_slice(&body, YsonFormat::Text).map_err(|e| ClientError::Decode {
                 command: "get".to_owned(),
@@ -2477,11 +2225,8 @@ impl Client {
 
     /// Reads a table as a stream, without holding it.
     ///
-    /// The same bytes [`Client::read_table`] returns — a binary YSON list
-    /// fragment — arriving as they come off the connection, so the table's size
-    /// stops being the program's memory ceiling.
-    ///
-    /// What comes out is what a job reads on fd 0, so the same decoder handles
+    /// The binary YSON list fragment [`Client::read_table`] returns, as it
+    /// arrives. It is what a job reads on fd 0, so the same decoder handles
     /// both:
     ///
     /// ```no_run
@@ -2500,16 +2245,9 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// [`Client::read_table`] checks that what came back is a complete
-    /// fragment; this cannot, because it never has the whole thing. A fragment
-    /// cut short instead leaves a record that does not parse, and the decoder
-    /// fails on it — see [`TableReader`] for why that is the same protection
-    /// rather than none.
-    ///
-    /// The path can carry a read selection — [`TablePath::columns`] and
-    /// [`TablePath::range`] — which is worth the most here of anywhere: a
-    /// streaming read exists because the table is too big to hold, and a
-    /// selection is how most of it never arrives at all.
+    /// A fragment cut short leaves a record that does not parse, so the
+    /// decoder fails on it; see [`TableReader`]. The path can carry
+    /// [`TablePath::columns`] and [`TablePath::range`].
     ///
     /// # Errors
     ///
@@ -2528,10 +2266,7 @@ impl Client {
 
     /// Writes a table from a stream, without holding it.
     ///
-    /// `rows` is read to its end and sent as it is read, so the rows can come
-    /// from a file, a pipe, or something that generates them — anything that is
-    /// a `Read`. The bytes are a binary YSON list fragment, exactly as
-    /// [`Client::write_table`] expects them.
+    /// `rows` is any `Read` of a binary YSON list fragment, sent as it is read.
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2543,10 +2278,8 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// This is one attempt and can never be more: a reader that has been
-    /// consumed cannot be sent again. That agrees with the retry rules — heavy
-    /// commands are not repeated — and a transaction is what makes such a write
-    /// safe to fail.
+    /// One attempt, since a consumed reader cannot be sent again; a
+    /// transaction makes such a write safe to fail.
     ///
     /// # Errors
     ///
@@ -2616,18 +2349,15 @@ impl Client {
 
     /// Starts a vanilla operation, returning its ID.
     ///
-    /// Jobs with no input tables: a distributed process, a side-car
-    /// computation, anything that is not a transformation of a table.
+    /// Jobs with no input tables.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if two tasks share a name, and
     /// [`ClientError`] if the request fails.
     pub fn start_vanilla(&self, spec: &VanillaSpec) -> Result<String> {
-        // Refused here rather than sent: the spec keys tasks by name, so the
-        // cluster would take two tasks called the same thing as one, run half
-        // the jobs, and complete. A silent half-run is worse than a rejected
-        // launch.
+        // The spec keys tasks by name, so the cluster would silently run only
+        // one of two tasks sharing a name.
         if let Some(name) = spec.duplicate_task() {
             return Err(ClientError::Config(format!(
                 "two vanilla tasks are both called {name:?}; a spec keys its tasks \
@@ -2642,12 +2372,9 @@ impl Client {
 
     /// Starts a merge operation, returning its ID.
     ///
-    /// A [`MergeMode::Sorted`] merge does **not** need
-    /// [`MergeSpec::with_merge_by`]: measured against a cluster, one sent
-    /// without it is accepted and the key is taken from the sort columns the
-    /// inputs already carry, with the output coming back sorted by them.
-    /// Naming the columns is how to merge by fewer of them than the inputs are
-    /// sorted by, or to state the assumption where a reader can see it.
+    /// A [`MergeMode::Sorted`] merge without [`MergeSpec::with_merge_by`] takes
+    /// its key from the inputs' sort columns, and the output is sorted by them.
+    /// Name the columns to merge by fewer of them.
     ///
     /// # Errors
     ///
@@ -2689,14 +2416,9 @@ impl Client {
 
     /// Starts an operation under a mutation ID you control.
     ///
-    /// `start_operation` already tags its own retries with a fresh
-    /// [`MutationId`], so a retried start never leaves two operations running.
-    /// This is for the guarantee a single process cannot give itself: persist
-    /// the ID, and after a crash the same call returns the operation that was
-    /// already started instead of starting a second one.
-    ///
-    /// The cluster remembers a mutation ID for five to ten minutes, so this is
-    /// a guard against a crash-and-restart, not a permanent key.
+    /// `start_operation` already retries under its own [`MutationId`]. Persist
+    /// this one, and after a crash the same call returns the operation already
+    /// started. The cluster remembers a mutation ID for five to ten minutes.
     ///
     /// # Errors
     ///
@@ -2741,34 +2463,16 @@ impl Client {
 
     /// Stops an operation that is still running.
     ///
-    /// The counterpart to starting one, and the reason it is worth having: a
-    /// launcher that gives up — an interrupted `wait_for_operation`, a failed
-    /// step further down the script — otherwise leaves the operation running on
-    /// the cluster, spending quota on a result nobody will read.
+    /// `reason` goes into the operation's error document, under the cluster's
+    /// `Operation aborted by user request`. When this returns, the operation is
+    /// already `aborted`.
     ///
-    /// `reason` is put in the operation's error document, under the cluster's
-    /// own `Operation aborted by user request`, so whoever finds the aborted
-    /// operation later is told who stopped it and why. Pass `None` to say
-    /// nothing.
-    ///
-    /// By the time this returns the operation is already `aborted`: the call
-    /// takes a few hundred milliseconds, and the state has changed within it.
-    /// The `aborting` state exists but no caller of this can observe it.
-    ///
-    /// **This is not idempotent, unlike [`Transaction::abort`].** Once the
-    /// scheduler has let go of an operation it answers `No such operation`, and
-    /// it lets go as soon as the first abort is accepted — so a second abort is
-    /// an error rather than a shrug, even for an operation that was still
-    /// running a moment ago. An operation that finished *by itself* can still
-    /// be aborted for the short while the scheduler keeps it, so this is not a
-    /// reliable way to ask whether one has finished either.
-    ///
-    /// **Sent once, and never retried**, which is the other side of the same
-    /// coin. `abort_operation` is a scheduler command and the master's mutation
-    /// cache does not cover it: a retry after a lost answer would be told `No
-    /// such operation` and would report a successful abort as a failed one.
-    /// A transport error here means the request may or may not have arrived,
-    /// and the honest thing is to say so rather than to guess.
+    /// **Not idempotent, unlike [`Transaction::abort`]**: the scheduler lets go
+    /// of the operation once the first abort is accepted, and answers a second
+    /// with `No such operation`. An operation that finished by itself can
+    /// still be aborted for a short while. **Sent once, never retried**: the
+    /// master's mutation cache does not cover scheduler commands, so a
+    /// transport error means the abort may or may not have arrived.
     ///
     /// # Errors
     ///
@@ -2785,12 +2489,8 @@ impl Client {
             "abort_operation",
             &params,
             Payload::None,
-            // Not `WithMutationId`, though this is a mutating command: that
-            // deduplication lives in the master and this request goes to the
-            // scheduler. Verified — a second send of the same mutation ID,
-            // flagged as a retry, is answered `No such operation` rather than
-            // with the first response. A retry would turn an abort that worked
-            // into an error the caller believes.
+            // Not `WithMutationId`: a replayed id goes to the scheduler, not
+            // the master's cache, and is answered `No such operation`.
             Repeatable::Never,
         )?;
         Ok(())
@@ -2798,21 +2498,14 @@ impl Client {
 
     /// Pauses a running operation.
     ///
-    /// Its jobs stop being scheduled; what is already running keeps running
-    /// unless `abort_running_jobs` says otherwise, in which case the work those
-    /// jobs had done is lost and will be done again after
+    /// No new jobs are scheduled. Running jobs continue unless
+    /// `abort_running_jobs`, in which case their work is redone after
     /// [`Client::resume_operation`].
     ///
-    /// **Suspension is not a state.** A suspended operation still answers
-    /// `running` to [`Client::operation_state`] — the cluster reports it in a
-    /// separate `suspended` attribute, which is what
-    /// [`Client::operation_suspended`] reads. Verified on a local cluster, and
-    /// it is the sort of thing a poll loop gets wrong forever.
-    ///
-    /// **Unlike its counterpart, this one is idempotent**: suspending a
-    /// suspended operation answers `{}`, so it is retried like a read. That
-    /// holds only while the scheduler still has the operation — once it has let
-    /// go, this answers `No such operation` like every other command here.
+    /// **Suspension is not a state**: [`Client::operation_state`] still says
+    /// `running`; [`Client::operation_suspended`] reads the separate
+    /// attribute. Idempotent while the scheduler has the operation, so it is
+    /// retried.
     ///
     /// # Errors
     ///
@@ -2831,11 +2524,7 @@ impl Client {
             "suspend_operation",
             &params,
             Payload::None,
-            // Mutating, and repeated anyway: a second suspend of a suspended
-            // operation is accepted, so a retry after a lost answer says the
-            // same thing twice rather than turning a success into an error.
-            // That is exactly what `abort_operation` cannot do — an abort makes
-            // the scheduler let go, so its retry is guaranteed to fail.
+            // Mutating, but a second suspend is accepted, so a retry is safe.
             Repeatable::Freely,
         )?;
         Ok(())
