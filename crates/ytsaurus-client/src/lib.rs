@@ -1,7 +1,7 @@
 //! A [YTsaurus](https://ytsaurus.tech) client over HTTP API v4: static tables,
 //! Cypress, transactions, files, batched commands and operations, with no
 //! Python installation needed. Dynamic tables are reached through
-//! [`create_client`] (or [`create_rpc_client`] for the RPC proxy), which both
+//! [`create_client`] (or `create_rpc_client` for the RPC proxy), which both
 //! return the transport-independent [`ytsaurus_api::TableClient`].
 //!
 //! # Example
@@ -49,7 +49,7 @@
 //! | `tls` | on | `rustls`, and so `https://` proxies. Off where a worker binary is cross-compiled to musl. |
 //! | `platform-verifier` | off | Trust the operating system's certificate store instead of the Mozilla bundle. |
 //! | `derive` | off | `#[derive(TableRow)]`: a table schema read off the row struct. |
-//! | `rpc` | off | [`create_rpc_client`], the RPC proxy as a second transport. Pulls in tokio and prost. |
+//! | `rpc` | off | `create_rpc_client`, the RPC proxy as a second transport. Pulls in tokio and prost. |
 //! | `tracing` | off | A span per attempt, and retry messages as `WARN` events. |
 //!
 //! `rpc` and `tracing` must stay off in worker builds: a worker should carry
@@ -77,7 +77,7 @@ mod dynamic;
 // ---------------------------------------------------------------------------
 
 /// Connects over HTTP API v4, returning the same interface as
-/// [`create_rpc_client`]. The counterpart of `CreateClient` in the C++ client.
+/// `create_rpc_client`. The counterpart of `CreateClient` in the C++ client.
 ///
 /// ```no_run
 /// # fn main() -> Result<(), ytsaurus_api::Error> {
@@ -315,7 +315,7 @@ impl Client {
     /// | Variable | Effect |
     /// | --- | --- |
     /// | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Off unless set, and applied only to a name with no dot, no colon and no `localhost` in it — the gate the Go SDK uses. There is no builder for this one: in Rust, spell the address out. |
-    /// | `YT_CA_BUNDLE` | A PEM file of roots, for a cluster behind a private CA, which otherwise fails with `invalid peer certificate: UnknownIssuer`. Every block must be an X.509 certificate, or the whole file is refused. Read by the transport, so by [`Client::new`] too. |
+    /// | `YT_CA_BUNDLE` | A PEM file of roots, for a cluster behind a private CA, which otherwise fails with `invalid peer certificate: UnknownIssuer`. Every block must be an X.509 certificate, or the whole file is refused. Read by the transport, so by [`Client::new`] too, and only in a build with the `tls` feature. |
     /// | `YT_HEAVY_PROXY_DOMAINS` | One more domain — or several, comma- or space-separated — that `/hosts` may name a heavy proxy under. [`Client::with_heavy_proxies_under`]. |
     /// | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes` removes the domain rule outright. [`Client::with_heavy_proxies_anywhere`]. |
     /// | `YT_FILE_CACHE` | Where [`Client::upload_worker_cached`] keeps its files, for an installation whose shared cache is read-only. [`Client::with_file_cache`]. |
@@ -1256,31 +1256,30 @@ impl Client {
 
     // ------------------------------------------------------------- batches
 
-    /// Executes a [`BatchRequest`] in one round trip, with a `Result` per part
-    /// in part order: `Ok` as the command alone answers, else [`ClientError::Cluster`].
+    /// Executes a [`BatchRequest`] in one round trip: a `Result` per part, in part order, each
+    /// `Err` a [`ClientError::Cluster`].
     ///
     /// ```no_run
     /// # let client = ytsaurus_client::Client::new("localhost:8000");
     /// let mut batch = ytsaurus_client::BatchRequest::new();
     /// batch.create("map_node", "//tmp/pipeline").exists("//tmp/elsewhere");
-    /// for part in client.execute_batch(&batch)? {
-    ///     println!("{part:?}"); // Ok({node_id=…}), Ok({value=…}) or Err(…)
-    /// }
+    /// let parts = client.execute_batch(&batch)?; // [Ok({node_id=…}), Ok({value=…})]
     /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
-    /// Parts run in parallel. Read-only batches retry freely, mutating ones under
-    /// a mutation id, ones with a [`BatchRequest::raw`] part never; a bound
-    /// transaction is stamped on each part. Parts past [`BatchRequest::with_max_part_size`]
-    /// go as further requests, with no rollback ([details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands)).
+    /// Parts run in parallel. Read-only batches retry freely, mutating ones under a mutation
+    /// id, ones with a [`BatchRequest::raw`] part never; a bound transaction is stamped on
+    /// each part. Parts past [`BatchRequest::with_max_part_size`] go as further requests.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Config`] for an empty batch; [`ClientError::BatchInterrupted`]
-    /// when a split batch stops after earlier requests ran, with their answers
-    /// (sending it again reapplies them); [`ClientError::Decode`] for a
-    /// malformed answer; [`ClientError::Redirected`] on a cross-origin redirect;
-    /// otherwise as any command. Per-part failures are the `Err` items.
+    /// [`ClientError::Config`] for an empty batch; [`ClientError::BatchInterrupted`] when a
+    /// split batch stops after earlier requests ran, with their answers (no rollback; sending
+    /// it again reapplies them); [`ClientError::Decode`] for a malformed answer;
+    /// [`ClientError::Redirected`] on a cross-origin redirect; otherwise as any command. A
+    /// request refused while executing (a part naming an unknown command, or with tabular
+    /// output) returns no results but has run every part; one refused while its parameters
+    /// are parsed has run none ([details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands)).
     pub fn execute_batch(&self, batch: &BatchRequest) -> Result<Vec<Result<YsonValue>>> {
         self.execute_batch_with(batch, None)
     }
