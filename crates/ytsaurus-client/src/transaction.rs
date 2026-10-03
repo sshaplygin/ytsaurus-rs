@@ -215,10 +215,10 @@ impl Transaction {
     ///
     /// False means only that no ping was answered that way yet;
     /// [`Transaction::ping`] asks. It is also false with nothing pinging, when
-    /// the keep-alive thread failed to spawn or panicked, and a ping answers for
-    /// the transaction, not the thread; ping or attach afresh to be sure. Once
-    /// the handle is detached, [`Client::ping_transaction`] on the id is the
-    /// only probe.
+    /// the keep-alive thread failed to spawn or panicked, which the handle
+    /// cannot see. The remedy is to ping, which keeps the transaction alive, or
+    /// to attach afresh, which starts a new keep-alive. Once the handle is
+    /// detached, [`Client::ping_transaction`] on the id is the only probe.
     #[must_use]
     pub fn is_lost(&self) -> bool {
         self.keep_alive.as_ref().is_some_and(KeepAlive::lost)
