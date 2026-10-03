@@ -2351,8 +2351,8 @@ fn tls_unavailable(_base: &str) -> Option<ClientError> {
 /// reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference)
 /// gives the rule:
 ///
-/// > If the command has an input data stream, then PUT. If the command is >
-/// mutating, then POST. Otherwise GET.
+/// > If the command has an input data stream, then PUT. If the command is
+/// > mutating, then POST. Otherwise GET.
 ///
 /// Both properties are declared per command in the cluster's driver registry:
 /// `write_table` takes a data stream and is a PUT, `create` mutates and is a
