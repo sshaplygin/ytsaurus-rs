@@ -132,7 +132,7 @@ python3 scripts/check_prose.py              # the Writing rules' countable part;
 python3 scripts/check_readme_example.py     # README.md's quick start matches
                                             # crates/ytsaurus-client/examples/quickstart.rs
 
-cargo test --workspace            # 941 tests: 863 unit and integration, 78 doc
+cargo test --workspace            # 938 tests: 863 unit and integration, 75 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
