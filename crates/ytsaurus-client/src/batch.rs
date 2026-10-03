@@ -1,14 +1,9 @@
-//! Several commands in one round trip.
+//! Several commands in one round trip: the cluster's
+//! [`execute_batch`](https://ytsaurus.tech/docs/en/api/commands#execute_batch),
+//! which both official clients also expose.
 //!
-//! The cluster command is `execute_batch`, from the
-//! [command reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch):
-//! *"Use a single query to execute the set of commands passed in the
-//! parameters."* Both official clients batch — C++
-//! `IClientBase::CreateBatchRequest()`, Go `Client.NewBatchRequest()` — and a
-//! launcher that creates a dozen tables without it makes a dozen round trips.
-//!
-//! [`BatchRequest`] is the request half; [`Client::execute_batch`] sends one
-//! and is where the answer's shape — a `Result` **per part** — is explained.
+//! [`BatchRequest`] builds a batch; [`Client::execute_batch`] sends it and
+//! answers with a `Result` per part.
 //!
 //! [`Client::execute_batch`]: crate::Client::execute_batch
 
@@ -19,56 +14,26 @@ use crate::retry::Repeatable;
 use crate::schema::TableSchema;
 use crate::yson_build;
 
-/// The `concurrency` the cluster assumes when none is sent.
-///
-/// `Default(50)` in the command's own registration —
-/// `TExecuteBatchCommand::Register` in
-/// [`yt/yt/client/driver/etc_commands.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/etc_commands.cpp)
-/// — and the same 50 the C++ SDK falls back to
-/// (`options.Concurrency_.GetOrElse(50)` in
-/// `yt/cpp/mapreduce/http_client/raw_batch_request.cpp`). Written here because
-/// the default **part size** is derived from it, so the number matters even to
-/// a caller who never sets either option.
+/// The `concurrency` the cluster assumes when none is sent: `Default(50)` in
+/// `TExecuteBatchCommand::Register`
+/// ([`etc_commands.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/etc_commands.cpp)),
+/// and the C++ SDK's fallback. The default part size is derived from it.
 const DEFAULT_CONCURRENCY: i64 = 50;
 
-/// How many parts one HTTP request carries when the caller does not say.
-///
-/// The C++ SDK's rule, from `TExecuteBatchOptions` in
-/// `yt/cpp/mapreduce/interface/client_method_options.h`: *"If not specified it
-/// is set to `Concurrency * 5`"* — 250 at the default concurrency. See
-/// [`BatchRequest::with_max_part_size`].
+/// Parts per HTTP request per unit of concurrency when the caller does not
+/// say: the C++ SDK's `Concurrency * 5` (`TExecuteBatchOptions` in
+/// `yt/cpp/mapreduce/interface/client_method_options.h`).
 const PARTS_PER_CONCURRENCY: usize = 5;
 
-/// Commands the cluster refuses to take as a batch part at all.
+/// Commands the cluster refuses as a batch part. One such part fails the whole
+/// request before any part answers, while the other parts still run.
 ///
-/// **The rule is the part's data types, not `isHeavy`.** The driver checks the
-/// command's registered input and output types and throws
-/// `Command %Qv cannot be part of a batch since it has inappropriate output
-/// type %Qlv` before any part runs — so one such name fails the *whole*
-/// request and costs every other part its answer. Measured against the
-/// registry the cluster serves at `GET /api/v4` (190 commands on the local
-/// cluster) and confirmed name by name through a real batch: a part is refused
-/// when its **output type** is `tabular` or `binary`, or its **input type** is
-/// `binary`. That is the list below, and it is 21 names where `isHeavy` is 7.
-///
-/// `isHeavy` is not merely a smaller list, it is a different one, in both
-/// directions. `get_job_spec` is `is_heavy: true` and was **accepted** as a
-/// part (it came back as an ordinary per-part error), while `alter_query` and
-/// `push_queue_producer` are `is_heavy: false` and are refused. The harm the
-/// check exists to prevent is the measured one: `[create x1, select_rows]` was
-/// answered HTTP 400 `inappropriate output type "tabular"` — and `x1` was
-/// created anyway, so the round trip cost the create its answer and nothing
-/// else.
-///
-/// **A snapshot, and it can only be a snapshot.** These are the names one
-/// cluster refused in one measurement; a cluster of another version registers
-/// other commands, and one not listed here can still be refused on the wire.
-/// [`BatchRequest::raw_with`] says so rather than promising the list is
-/// complete. Two nearby refusals are the cluster's too but are *not* here,
-/// because they depend on the call and not on the name: a part whose command
-/// takes input and is given none fails the whole batch with
-/// `Command %Qv requires input` (measured for `insert_rows`, `write_table` and
-/// seven more), and an unknown name fails it with `Unknown command %Qv`.
+/// The rule is the registered data types, not `isHeavy`: output `tabular` or
+/// `binary`, or input `binary`. This is what one cluster's `GET /api/v4`
+/// registry gave, so a cluster of another version may refuse names not listed.
+/// A part that needs input and has none, and an unknown name, also fail the
+/// whole batch; they depend on the call, so they are not here. See
+/// [Batched commands](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands).
 const NOT_A_BATCH_PART: &[&str] = &[
     "alter_query",
     "get_job_fail_context",
@@ -93,79 +58,44 @@ const NOT_A_BATCH_PART: &[&str] = &[
     "write_file_fragment",
 ];
 
-/// How one part may be repeated, which decides how the whole batch may be.
-///
-/// The whole batch is one HTTP request, so it retries as one — and the safe
-/// answer for the envelope is the most cautious answer among its parts. See
-/// [`BatchRequest::repeatable`].
+/// How one part may be repeated. The batch is one HTTP request, so it retries
+/// as its most cautious part; see [`BatchRequest::repeatable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PartKind {
-    /// `exists`, `get`, `list` — non-mutating, so re-running one is harmless.
+    /// `exists`, `get`, `list`: re-running one is harmless.
     Read,
-    /// `create`, `remove`, `set` — mutating commands the **master's** mutation
-    /// cache covers, which is what makes a replay of the batch safe: the
-    /// driver hands each volatile part a mutation id derived from the batch's
-    /// own, and the master answers a marked replay with the first response.
-    /// See [`Client::execute_batch`](crate::Client::execute_batch).
+    /// `create`, `remove`, `set`: the master's mutation cache covers them, and
+    /// the driver gives each volatile part an id derived from the batch's, so
+    /// a marked replay is answered with the first response.
     MasterMutation,
-    /// A command nobody has classified. It may be mutating somewhere no
-    /// mutation cache covers — the scheduler, say — so a batch carrying one is
-    /// sent once, exactly as [`Client::raw_command`](crate::Client::raw_command)
-    /// is and for the same reason.
-    ///
-    /// Where a [`BatchRequest::raw`] part lands by default. A caller who knows
-    /// the command's registry bits says so with [`BatchRequest::raw_with`],
-    /// and the part is then one of the two above — the *retry* class is the
-    /// cluster's fact about the command, not a property of how this crate
-    /// happened to spell the call.
+    /// Unclassified: it may mutate where no mutation cache covers it, so the
+    /// batch is sent once, as [`Client::raw_command`](crate::Client::raw_command)
+    /// is. Where a [`BatchRequest::raw`] part lands unless
+    /// [`BatchRequest::raw_with`] names the command's retry class.
     Raw,
 }
 
-/// What a part's success is keyed by, which is what its answer can be held to.
+/// What a part's success is keyed by, which [`part_result`] holds its answer
+/// to.
 ///
-/// **Not the registry's output-type bit.** That bit was the first thing tried
-/// here, and under the API version this crate speaks it does not separate
-/// anything: the cluster serves its own v4 registry at `GET /api/v4`, and
-/// there `remove` and `set` are `output_type: structured` exactly as `create`
-/// and `get` are — it is *v3* that registers them `null`
-/// (`REGISTER(TRemoveCommand, "remove", Null, Null, …, ApiVersion3)` beside
-/// `REGISTER(TRemoveCommand, "remove", Null, Structured, …, ApiVersion4)` in
-/// [`driver.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp)).
-/// Measured on a local v4 cluster, one part apiece: `create` →
-/// `{output={node_id=…}}`, `get` → `{output={value=…}}`, `exists` →
-/// `{output={value=%false}}`, `set` → `{output={}}`, `remove` →
-/// `{output={}}`. **No modelled command answers a bare `{}` on v4**, and the
-/// output-type bit calls `set` and `create` the same thing.
-///
-/// So the useful fact is finer than the registry's, and it is the one every
-/// [`BatchRequest`] method already documents: *which key the success carries*.
-/// That is what makes the check bite where it was meant to — a `create` whose
-/// answer has no `node_id` is refused, whether it arrived as `{}` or as the
-/// `{output={}}` that a v4 cluster really can emit. See [`part_result`].
+/// The registry's output-type bit cannot do this: on API v4 `set` and `remove`
+/// are `structured`, as `create` is, and answer `{output={}}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Output {
-    /// The success is a value under this key — `node_id` for `create`,
-    /// `value` for `exists`, `get` and `list`. An answer without it is a shape
-    /// this client refuses rather than reads as a success with nothing in it.
+    /// The success carries this key: `node_id` for `create`, `value` for
+    /// `exists`, `get` and `list`. An answer without it is refused.
     Keyed(&'static str),
-    /// Nothing this crate can hold the answer to, for one of two reasons:
-    /// `set` and `remove`, whose v4 success is measurably an empty `output`
-    /// and so has no key to check; and a [`BatchRequest::raw`] part, whose
-    /// answer only its caller knows the shape of. Both take what comes.
+    /// Anything goes: `set` and `remove`, whose v4 success is an empty
+    /// `output`, and a [`BatchRequest::raw`] part, whose shape only its caller
+    /// knows.
     Unchecked,
 }
 
-/// One command inside a batch, in the shape the cluster takes it.
-///
-/// `{command=…; parameters={…}}` with an optional `input=…`, verified three
-/// ways: the [command reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)
-/// spells out all three fields, `TExecuteBatchCommandRequest::Register` in
-/// [`yt/yt/client/driver/etc_commands.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/etc_commands.cpp)
-/// registers exactly `command`, `parameters` and `input` (the last
-/// `.Default()`), and a local cluster took every part this module builds.
-/// `input` is where a structured-input command's value goes — `set` is the one
-/// modelled here — and the driver encodes it and sets the part's
-/// `input_format` itself.
+/// One command inside a batch: `{command=…; parameters={…}}` with an optional
+/// `input=…`, as `TExecuteBatchCommandRequest::Register` in
+/// [`etc_commands.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/etc_commands.cpp)
+/// registers it. `input` carries a structured-input command's value, such as
+/// `set`'s; the driver encodes it and sets the part's `input_format`.
 #[derive(Debug, Clone)]
 pub(crate) struct BatchPart {
     pub(crate) command: String,
@@ -175,107 +105,30 @@ pub(crate) struct BatchPart {
     output: Output,
 }
 
-/// Commands batched to be sent in one round trip.
+/// Commands sent in one round trip, answered with one `Result` per part.
 ///
-/// A launcher that creates a dozen tables one call at a time pays a dozen
-/// round trips; batched, it pays one, and gets a dozen answers:
+/// Each typed method sends exactly the parameters its [`Client`](crate::Client)
+/// namesake sends. Parts run in parallel, so a part and its consequence belong
+/// in two batches ([Batched commands](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands)).
+/// Executing a batch again runs every part again under new mutation ids; a
+/// replay is [`Client::execute_batch_with`](crate::Client::execute_batch_with)
+/// with the id you kept.
 ///
 /// ```no_run
 /// use ytsaurus_client::{BatchRequest, Client};
-///
-/// # fn main() -> Result<(), ytsaurus_client::ClientError> {
 /// # let client = Client::from_env()?;
+/// let names = ["clicks", "visits", "errors"];
 /// let mut batch = BatchRequest::new();
-/// for name in ["clicks", "visits", "errors"] {
+/// for name in names {
 ///     batch.create("table", &format!("//tmp/pipeline/{name}"));
 /// }
-///
-/// for (name, made) in ["clicks", "visits", "errors"]
-///     .iter()
-///     .zip(client.execute_batch(&batch)?)
-/// {
-///     match made {
-///         Ok(_) => {}
-///         Err(error) => eprintln!("{name}: {error}"),
+/// for (name, made) in names.iter().zip(client.execute_batch(&batch)?) {
+///     if let Err(error) = made {
+///         eprintln!("{name}: {error}");
 ///     }
 /// }
-/// # Ok(())
-/// # }
+/// # Ok::<(), ytsaurus_client::ClientError>(())
 /// ```
-///
-/// # The building shape, and why it is a builder
-///
-/// A batch could equally have been a slice of prepared commands. It is a
-/// builder with a typed method per modelled command because the parts are not
-/// free-form: the cluster refuses a command whose output type is a data stream
-/// (the [command reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)
-/// puts it as *light, with `null` or `structured` input and output*, which
-/// measurably over-states it — `get_job_spec` is heavy and is taken, and
-/// `write_table` has tabular input and is taken; see `NOT_A_BATCH_PART`),
-/// and — the half a slice cannot answer — the
-/// **retry** of the whole batch turns on what the parts are. A typed method
-/// knows its command is a master-side Cypress command, so the batch stays
-/// retriable under a mutation id; [`BatchRequest::raw`] cannot know, so it
-/// makes the batch send-once. A slice of prepared commands would have had to
-/// assume one answer for everything, and the safe assumption would have taken
-/// the retry away from the common case. Each typed method sends **exactly**
-/// the parameters its [`Client`](crate::Client) namesake sends, so a call
-/// moved into a batch does not change meaning.
-///
-/// # Parts run in parallel
-///
-/// From the same reference: *"The command can (and will be) executed in
-/// parallel. It means that if a set includes both writing to and reading from
-/// the node, the reading result can either be the older value or the updated
-/// one."* Watched happening on a local cluster: a batch that created
-/// `//tmp/impl-batch-a` and asked `exists` about it in the same breath was
-/// answered `%false` — both parts succeeded, in order, and the read simply ran
-/// first. Do not put a part and its consequence in one batch.
-///
-/// # Options
-///
-/// [`BatchRequest::with_concurrency`] is the server-side parallelism, and
-/// [`BatchRequest::with_max_part_size`] is a client-side split into several
-/// requests — the same pair the C++ client exposes as
-/// `TExecuteBatchOptions{Concurrency, BatchPartMaxSize}`.
-///
-/// **The two option setters take `self`, and the part adders take `&mut self`.**
-/// They are different jobs and the shapes say so: the options are the request's
-/// settings, chosen once and up front, so they chain off the constructor and
-/// are gone by the time the batch has a name; the adders are the contents,
-/// added in a loop, so they hand the borrow straight back. Set the options
-/// first and the mix never shows:
-///
-/// ```
-/// # use ytsaurus_client::BatchRequest;
-/// let mut batch = BatchRequest::new().with_concurrency(8).with_max_part_size(64);
-/// for index in 0..3 {
-///     batch.create("table", &format!("//tmp/pipeline/t{index}"));
-/// }
-/// assert_eq!(batch.len(), 3);
-/// ```
-///
-/// # Executing one twice sends everything twice
-///
-/// [`Client::execute_batch`](crate::Client::execute_batch) borrows the batch,
-/// so it is still there afterwards and can be sent again — and doing so is
-/// **new work, not a replay**. The parts are unchanged, but each execution
-/// mints its own mutation ids, so the cluster has nothing to deduplicate
-/// against and runs every part a second time. What that looks like is the
-/// part's own business, and measured: a batch of [`BatchRequest::create_table`]
-/// answers `501 already exists` throughout the second run, a batch of
-/// [`BatchRequest::remove`] answers `500`, and a batch of
-/// [`BatchRequest::create`] answers **with the same node ids as the first run**
-/// — because `create` sends `ignore_existing`, not because anything was
-/// deduplicated. Do not read that last one as a replay: an unchanged answer
-/// from a second execution is the least informative signal here, which is why
-/// a real replay wants [`Client::execute_batch_with`](crate::Client::execute_batch_with)
-/// and a part that has no `ignore_existing` in it.
-/// The reuse worth having is a batch of reads, or one
-/// rebuilt from [`BatchRequest::new`] for the second pass. A *replay* — the
-/// same mutation deduplicated against the first send — is
-/// [`Client::execute_batch_with`](crate::Client::execute_batch_with) with the
-/// id you kept.
 #[derive(Debug, Clone, Default)]
 pub struct BatchRequest {
     parts: Vec<BatchPart>,
@@ -291,55 +144,49 @@ impl BatchRequest {
         Self::default()
     }
 
-    /// Caps how many parts the cluster works on at once.
+    /// Caps how many parts the cluster runs at once: the command's
+    /// [`concurrency`](https://ytsaurus.tech/docs/en/api/commands#execute_batch),
+    /// lowered to avoid exhausting a request rate limit. Unset, nothing is sent
+    /// and the cluster's default of 50 applies. Zero is clamped to one, since
+    /// the cluster refuses `concurrency=0`.
     ///
-    /// A parameter of the command itself — `concurrency`, default 50, refused
-    /// unless positive (`TExecuteBatchCommand::Register` in the cluster's
-    /// [driver](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/etc_commands.cpp);
-    /// the [reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)
-    /// documents both). The documentation's reason to lower it: *"Use this
-    /// parameter to avoid exhausting your request rate limit."* Left unset,
-    /// nothing is sent and the cluster's own default applies.
+    /// The option setters take `self` and chain off the constructor; the part
+    /// adders take `&mut self`, for use in a loop:
     ///
-    /// Zero is clamped to one, as [`RetryPolicy::new`](crate::RetryPolicy::new)
-    /// clamps attempts: the cluster refuses `concurrency=0` outright, and a
-    /// builder that quietly built a refused request would fail at the wrong
-    /// end.
+    /// ```
+    /// # use ytsaurus_client::BatchRequest;
+    /// let mut batch = BatchRequest::new().with_concurrency(8).with_max_part_size(64);
+    /// for index in 0..3 {
+    ///     batch.create("table", &format!("//tmp/pipeline/t{index}"));
+    /// }
+    /// assert_eq!(batch.len(), 3);
+    /// ```
     #[must_use]
     pub fn with_concurrency(mut self, concurrency: u32) -> Self {
         self.concurrency = Some(i64::from(concurrency.max(1)));
         self
     }
 
-    /// Caps how many parts travel in one HTTP request.
+    /// Caps how many parts travel in one HTTP request. A bigger batch is split
+    /// client-side into requests sent one after another, with the results
+    /// stitched back in order.
     ///
-    /// A bigger batch is split **client-side** into several `execute_batch`
-    /// requests, sent one after another with the results stitched back in
-    /// order. This is the C++ client's `BatchPartMaxSize`, defaults included:
-    /// unset, it is `concurrency × 5` — 250 when concurrency is unset too
-    /// (`yt/cpp/mapreduce/interface/client_method_options.h`: *"If not
-    /// specified it is set to `Concurrency * 5`"*).
-    ///
-    /// The trade is the ordinary one. One request is one round trip and one
-    /// retryable unit; a split spends a round trip per piece, and a piece that
-    /// fails wholesale fails [`Client::execute_batch`](crate::Client::execute_batch)
-    /// wholesale with the earlier pieces already run — which that method's
-    /// documentation spells out. Zero is clamped to one, because a part size
-    /// of nothing sends nothing forever.
+    /// Unset, it is `concurrency × 5`, 250 at the default concurrency: the C++
+    /// client's `BatchPartMaxSize`. A piece that fails wholesale fails
+    /// [`Client::execute_batch`](crate::Client::execute_batch) with the earlier
+    /// pieces already run. Zero is clamped to one.
     #[must_use]
     pub fn with_max_part_size(mut self, parts: usize) -> Self {
         self.max_part_size = Some(parts.max(1));
         self
     }
 
-    /// Adds a `create` — the same request [`Client::create`](crate::Client::create)
-    /// sends: parents are created and an existing node is accepted.
+    /// Adds a `create`, as [`Client::create`](crate::Client::create) sends it:
+    /// parents are created and an existing node is accepted.
     ///
-    /// The part's answer is `{node_id=…}`. With `ignore_existing` in it, a
-    /// node that already existed answers with the **old** node's id and any
-    /// attributes are silently ignored — the same trap
-    /// [`Client::create_table`](crate::Client::create_table) documents, and
-    /// the reason [`BatchRequest::create_table`] exists beside this.
+    /// The part answers `{node_id=…}`. Because it sends `ignore_existing`, an
+    /// existing node answers with the old node's id; a schema needs
+    /// [`BatchRequest::create_table`].
     pub fn create(&mut self, node_type: &str, path: &str) -> &mut Self {
         self.push(
             "create",
@@ -355,22 +202,15 @@ impl BatchRequest {
         )
     }
 
-    /// Adds a table creation with a schema — the same request
-    /// [`Client::create_table`](crate::Client::create_table) sends, refusals
-    /// included.
-    ///
-    /// The schema goes **inside `attributes`**, where `create` reads it; a
-    /// top-level `schema` would be accepted and silently ignored. And unlike
-    /// [`BatchRequest::create`] this part **fails on a path that already
-    /// exists**, deliberately: the cluster ignores the attributes of a create
-    /// it skips, so an `ignore_existing` spelling would leave the old table
-    /// with the old schema under a per-part `Ok`.
+    /// Adds a table creation with a schema, as
+    /// [`Client::create_table`](crate::Client::create_table) sends it: the
+    /// schema inside `attributes`, and no `ignore_existing`, so the part fails
+    /// on an existing path instead of keeping the old schema under an `Ok`.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if the schema is one the cluster would
-    /// refuse — checked here, when the part is built, so the mistake is
-    /// reported once rather than as a per-part error after a round trip.
+    /// refuse, checked when the part is built rather than after a round trip.
     pub fn create_table(&mut self, path: &str, schema: &TableSchema) -> Result<&mut Self> {
         schema
             .validate()
@@ -393,10 +233,8 @@ impl BatchRequest {
         ))
     }
 
-    /// Adds an `exists` — as [`Client::exists`](crate::Client::exists).
-    ///
-    /// The part's answer is `{value=%true}` or `{value=%false}` — the key is
-    /// `value`, not the command's name, exactly as it is outside a batch.
+    /// Adds an `exists`, as [`Client::exists`](crate::Client::exists). The part
+    /// answers `{value=%true}` or `{value=%false}`.
     pub fn exists(&mut self, path: &str) -> &mut Self {
         self.push(
             "exists",
@@ -419,11 +257,9 @@ impl BatchRequest {
         )
     }
 
-    /// Adds a `list` — as [`Client::list`](crate::Client::list). The part's
-    /// answer is `{value=[…]}`, unsorted and — unlike
-    /// [`Client::list`](crate::Client::list) — **not checked for the
-    /// `incomplete` marker**: a batch hands back what each part answered, and
-    /// reading the attribute is the caller's to do if the node may be large.
+    /// Adds a `list`, as [`Client::list`](crate::Client::list). The part
+    /// answers `{value=[…]}`, unsorted and not checked for the `incomplete`
+    /// marker that [`Client::list`](crate::Client::list) refuses.
     pub fn list(&mut self, path: &str) -> &mut Self {
         self.push(
             "list",
@@ -466,16 +302,9 @@ impl BatchRequest {
         )
     }
 
-    /// Adds a `set` of one attribute — what
-    /// [`Client::set_attribute`](crate::Client::set_attribute) does.
-    ///
-    /// `set` takes structured input, and inside a batch that input is the
-    /// part's own `input` field rather than a request body — the
-    /// [reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)'s
-    /// own example is a `set` carried this way, and the driver encodes the
-    /// value and sets the part's `input_format` itself
-    /// (`TExecuteBatchCommand::TRequestExecutor::Run`). Verified on a local
-    /// cluster; the part answers `{output={}}`.
+    /// Adds a `set` of one attribute, as
+    /// [`Client::set_attribute`](crate::Client::set_attribute) does. The value
+    /// travels as the part's `input`, and the part answers `{output={}}`.
     pub fn set_attribute(&mut self, path: &str, name: &str, value: YsonValue) -> &mut Self {
         self.push(
             "set",
@@ -486,63 +315,26 @@ impl BatchRequest {
         )
     }
 
-    /// Adds a command this crate does not model.
+    /// Adds a command this crate does not model, as
+    /// [`Client::raw_command`](crate::Client::raw_command) sends one outside a
+    /// batch.
     ///
-    /// The escape hatch, as [`Client::raw_command`](crate::Client::raw_command)
-    /// is outside a batch — and with the same default and the same
-    /// consequence: **a batch carrying a raw part is sent once**, whatever the
-    /// retry policy says, because a command this crate cannot classify may be
-    /// mutating somewhere no mutation cache covers, and a replayed batch would
-    /// apply it twice. [`BatchRequest::raw_with`] is where a caller who knows
-    /// the command's registry bits says otherwise, exactly as
-    /// [`Client::raw_command_with`](crate::Client::raw_command_with) is
-    /// outside a batch; [`Client::execute_batch`](crate::Client::execute_batch)
-    /// documents the retry rule this feeds.
+    /// A batch with a raw part is sent once, whatever the retry policy: the
+    /// command may mutate where no mutation cache covers it.
+    /// [`BatchRequest::raw_with`] declares otherwise. `input` is the value of a
+    /// structured-input command, as in [`BatchRequest::set_attribute`]; other
+    /// commands pass `None`.
     ///
-    /// `input` is for a structured-input command (the rule
-    /// [`BatchRequest::set_attribute`] describes); commands with no input
-    /// stream pass `None`. Only light commands with `null` or `structured`
-    /// input and output can be parts at all — and know that a part naming a
-    /// command the cluster has never heard of fails the **whole batch**, not
-    /// the part: watched on a local cluster, where `{command=frobnicate}` was
-    /// answered HTTP 400 and `Unknown command "frobnicate"` with no per-part
-    /// results at all. (The driver decides per-part errors only after it has
-    /// resolved the command's descriptor — `TRequestExecutor::Run` throws
-    /// before that on an unknown name.)
-    ///
-    /// **A refused batch is not a partly-run batch. Every part runs.** The
-    /// failure destroys the *answers*, not the work: the driver collects the
-    /// sub-requests into callbacks, runs them all through
-    /// `CancelableRunWithBoundedConcurrency`, and only then calls
-    /// `.ValueOrThrow()` on the collected list — which discards every result
-    /// together the moment one of them is the unknown-name throw. Dispatch is
-    /// never aborted. Measured five ways on a local cluster, and it is not a
-    /// race: `[create, frobnicate]` created its node; so did
-    /// `[frobnicate, create]` with the bad part **first**;
-    /// `[create, frobnicate, create]` created **both**; and at
-    /// `concurrency=1`, where a reader would most expect the damage to stop
-    /// early, `[frobnicate, create, create]` still created both and eight
-    /// creates followed by a `frobnicate` created **all eight**. Putting the
-    /// bad part first does not help, and lowering the concurrency does not
-    /// help. A name worth typing here is one you have checked.
-    ///
-    /// The one distinction that does bound the damage is **when** the request
-    /// fails. A batch refused while its *parameters are being read* never runs
-    /// anything: `concurrency=0` was answered `Validation failed at
-    /// /concurrency`, a part missing its `command` field and a part whose
-    /// `parameters` were not a dict were both answered `Error loading parameter
-    /// /requests`, and in every one of those a `create` sitting in the same
-    /// request left **no node behind**. A batch that gets as far as *executing*
-    /// applies all of it. Parse-time failures are total; execution-time
-    /// failures are total the other way.
+    /// A name the cluster does not know fails the whole batch with HTTP 400 and
+    /// no per-part results, and the other parts still run. A batch refused while
+    /// its parameters are parsed runs nothing. See
+    /// [Batched commands](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands).
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if `command` is not a bare command
-    /// name, or if `params` is not a YSON dict — the same refusals, for the
-    /// same reasons, as [`Client::raw_command`](crate::Client::raw_command) —
-    /// or if `command` is one the cluster will not take as a part, by the
-    /// data-type rule [`BatchRequest::raw_with`] describes.
+    /// Returns [`ClientError::Config`] if `command` is not a bare command name,
+    /// if `params` is not a YSON dict, or if the cluster will not take `command`
+    /// as a part (the rule is on [`BatchRequest::raw_with`]).
     pub fn raw(
         &mut self,
         command: &str,
@@ -554,51 +346,25 @@ impl BatchRequest {
 
     /// As [`BatchRequest::raw`], saying how the part may be repeated.
     ///
-    /// The asymmetry this removes: `raw` hard-codes [`Repeatable::Never`], and
-    /// because the batch retries as the most cautious of its parts, **one**
-    /// raw part demotes an otherwise all-read batch to send-once. A raw read —
-    /// `check_permission`, `get_supported_features`, `parse_ypath` — is
-    /// [`Repeatable::Freely`], and saying so leaves the batch as retriable as
-    /// it was. The judgement is the cluster's, from the same `REGISTER_ALL`
-    /// row [`Client::raw_command_with`](crate::Client::raw_command_with) reads
-    /// it from, and the same caution applies: *light and mutating* is not
-    /// enough for [`Repeatable::WithMutationId`], because the mutation cache
-    /// is the **master's** and a scheduler command is not in it. Prefer
-    /// [`Repeatable::Never`] when in doubt — that is why it is what `raw`
-    /// gives you.
-    ///
-    /// A part's class is combined with the others, never applied alone: the
-    /// batch is one HTTP request, so it goes out as the most cautious answer
-    /// among its parts.
+    /// The batch retries as its most cautious part, so one `raw` part
+    /// ([`Repeatable::Never`]) makes the whole batch send-once. A raw read such
+    /// as `check_permission` is [`Repeatable::Freely`].
+    /// [`Repeatable::WithMutationId`] needs a command the master's mutation
+    /// cache covers, which a scheduler command is not; prefer
+    /// [`Repeatable::Never`] when in doubt.
     ///
     /// # Errors
     ///
-    /// As [`BatchRequest::raw`], and additionally [`ClientError::Config`] for
-    /// [`Repeatable::Heavy`], which is not a class a part can have: it asks for
-    /// a heavy proxy, and a batch does not go to one.
+    /// As [`BatchRequest::raw`], and [`ClientError::Config`] when:
     ///
-    /// A name is also refused when the cluster would refuse it as a part. **The
-    /// cluster's rule is the command's data types, not `isHeavy`**: a part is
-    /// refused when its registered output type is `tabular` or `binary`, or its
-    /// input type is `binary`, and the driver throws before any part runs, so
-    /// the **whole** batch fails and every other part loses its answer. That is
-    /// the check `NOT_A_BATCH_PART` makes, whichever class is claimed for the
-    /// name — `select_rows` and `lookup_rows` are on it, and are the ones a
-    /// caller is likeliest to try.
-    ///
-    /// **The list is a snapshot of one cluster's registry, not a promise.** A
-    /// cluster of another version registers other commands, and a name this
-    /// crate has never heard of can still be refused on the wire — as can a
-    /// part whose command takes input and is given none
-    /// (`Command %Qv requires input`), which no list can catch because it
-    /// depends on the call. What the check buys is the common mistake caught
-    /// before the socket, not a guarantee that the batch will be taken.
-    ///
-    /// Separately, this crate refuses the bulk-data commands it lists as heavy
-    /// even where the cluster would take them — `write_table` was measured
-    /// being accepted as a part and applying its rows — because a part's input
-    /// travels inline in the batch body to a light proxy, which is not where
-    /// this crate sends table or file data.
+    /// - `repeatable` is [`Repeatable::Heavy`]: it asks for a heavy proxy, and a
+    ///   batch does not go to one;
+    /// - the cluster refuses `command` as a part: its registered output type is
+    ///   `tabular` or `binary`, or its input type `binary`, as for `select_rows`
+    ///   and `lookup_rows`. The list is one cluster's registry, so the cluster
+    ///   may still refuse a name it lacks;
+    /// - `command` moves bulk data, such as `write_table`: the cluster takes it,
+    ///   but its input would travel inline in the batch body to a light proxy.
     pub fn raw_with(
         &mut self,
         command: &str,
@@ -705,15 +471,9 @@ impl BatchRequest {
         })
     }
 
-    /// How the whole batch may be repeated: the most cautious of its parts.
-    ///
-    /// All reads — repeat freely; the batch mutates nothing, and the
-    /// [reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)
-    /// says as much: *"Mutating if the set includes mutating commands."* Any
-    /// modelled mutation — under a mutation id, which the driver spreads over
-    /// the volatile parts (see
-    /// [`Client::execute_batch`](crate::Client::execute_batch)). Any raw part
-    /// — sent once, because nothing can vouch for what a replay would do.
+    /// How the whole batch may be repeated: as its most cautious part. Reads
+    /// repeat freely; a modelled mutation repeats under a mutation id the driver
+    /// spreads over the parts; a raw part is sent once.
     pub(crate) fn repeatable(&self) -> Repeatable {
         if self.parts.iter().any(|part| part.kind == PartKind::Raw) {
             return Repeatable::Never;
@@ -729,17 +489,12 @@ impl BatchRequest {
     }
 }
 
-/// Renders one chunk of parts as the parameters `execute_batch` takes.
+/// Renders one chunk of parts as `execute_batch`'s parameters.
 ///
-/// `transaction` is the client's bound transaction, stamped into **each
-/// part**: the outer command has no transaction to be in — its options are
-/// `TExecuteBatchOptions : TMutatingOptions`, with no transactional half — and
-/// a local cluster proved the point by dropping an outer `transaction_id` in
-/// silence: the part's create landed *outside* the transaction and survived
-/// its abort. Stamping the parts is the only spelling the cluster honours,
-/// and it follows the transport's own rules: a part that already names a
-/// transaction keeps it, and a command on the no-transaction list is left
-/// alone.
+/// The bound `transaction` is stamped into each part, because the cluster
+/// silently drops an envelope `transaction_id` (`TExecuteBatchOptions` has no
+/// transactional half). A part naming its own transaction, or a command on the
+/// no-transaction list, is left alone.
 pub(crate) fn render_chunk(
     parts: &[BatchPart],
     concurrency: Option<i64>,
@@ -785,36 +540,17 @@ fn names_transaction(parameters: &YsonValue) -> bool {
     )
 }
 
-/// Reads one chunk's response into per-part `Result`s.
+/// Reads one chunk's `{results=[…]}` into per-part `Result`s: one item per
+/// part, in send order (`TRequestExecutor::OnResponse` in the driver).
 ///
-/// The envelope is `{results=[…]}` — `ProduceSingleOutput(context, "results",
-/// …)` in the driver, the ordinary v4 wrapping — with **one item per part, in
-/// the order the parts were sent**. Each item is what
-/// `TRequestExecutor::OnResponse` builds and what a local cluster actually
-/// answered:
+/// - `{error={…}}`: the part failed, with a YTsaurus error document;
+/// - `{output={…}}`: the part's own v4 answer, `{}` for `set` and `remove`;
+/// - `{}`: success with no `output`, which no modelled command sends on v4;
+///   accepted only for an [`Output::Unchecked`] part.
 ///
-/// - `{error={…}}` — the part failed, and the value is a YTsaurus error
-///   document in YSON: `code`, `message`, `attributes`, nested
-///   `inner_errors`;
-/// - `{output={…}}` — the part succeeded, and the value is the part's own
-///   v4 answer, keyed by what that command returns: `{node_id=…}` for
-///   `create`, `{value=…}` for `exists`, `get` and `list`, and `{}` — an
-///   empty `output`, not an absent one — for `set` and `remove`;
-/// - `{}` — the part succeeded and the driver wrote no `output` key at all,
-///   which is what the reference's own example shows for a `set`. **No
-///   modelled command answers this way on API v4**, the version this crate
-///   speaks: measured one part apiece, `set` and `remove` both answer
-///   `{output={}}`. The arm is kept for a [`BatchRequest::raw`] part, whose
-///   command may be registered `null`-output, and is refused for any part
-///   whose success this crate knows a key for. See [`part_result`].
-///
-/// Anything else is refused as [`ClientError::Decode`] rather than read as
-/// one of the three: this crate's envelope rules were learned from `exists`
-/// answering under `value` and the file cache answering with a bare string,
-/// and a shape this parser does not recognise is likelier to be a new answer
-/// than an empty one. A response with the wrong number of items is refused
-/// whole for the same reason — pairing what answers there are against the
-/// wrong parts would hand every caller after the gap somebody else's result.
+/// Any other shape, or a count that differs from the parts sent, is refused as
+/// [`ClientError::Decode`]: pairing answers with the wrong parts would hand
+/// callers each other's results.
 pub(crate) fn parse_results(body: &[u8], parts: &[BatchPart]) -> Result<Vec<Result<YsonValue>>> {
     let envelope: YsonValue =
         ytsaurus_yson::from_slice(body, YsonFormat::Text).map_err(|e| ClientError::Decode {
@@ -856,20 +592,9 @@ pub(crate) fn parse_results(body: &[u8], parts: &[BatchPart]) -> Result<Vec<Resu
     items.iter().zip(parts).map(part_result).collect()
 }
 
-/// One item of the `results` list, read by the rules above.
-///
-/// **The check is on the key, not on the wrapper.** The scenario it exists for
-/// is a `create` whose answer has no `node_id` in it: the access this crate
-/// teaches for a create is `answer["node_id"]`, [`YsonValue`]'s `Index` panics
-/// on a missing key, and a parser that waved the answer through would have
-/// turned a strange response into a panic in caller code one frame away. A
-/// guard on the *wrapper* alone — refusing only a bare `{}` — misses that
-/// scenario entirely on API v4, because the shape a v4 cluster would actually
-/// produce is `{output={}}`, and `set` and `remove` measurably emit exactly
-/// that as their success. So [`Output::Keyed`] is held to its key wherever the
-/// answer arrives, and only [`Output::Unchecked`] — `set`, `remove`, and a
-/// [`BatchRequest::raw`] part whose shape only its caller knows — takes what
-/// comes.
+/// One item of `results`. A [`Output::Keyed`] success is held to its key in
+/// whatever wrapper it arrives: a `create` without `node_id` would make the
+/// `answer["node_id"]` this crate teaches panic in the caller.
 fn part_result((item, part): (&YsonValue, &BatchPart)) -> Result<Result<YsonValue>> {
     let command = &part.command;
 
@@ -923,14 +648,9 @@ fn refused(reason: String) -> ClientError {
     }
 }
 
-/// Builds a part's failure from its error document.
-///
-/// The same flattening as everywhere else in the crate — the outer message is
-/// often a category (`Error resolving path …`) with the cause at the bottom of
-/// `inner_errors`, so both are carried. The document arrives as YSON here
-/// rather than as the JSON of an `X-YT-Error` header, which is why this walk
-/// exists beside [`ClientError::from_yt_error`]; `raw` keeps the whole
-/// document in the shape it arrived, YSON text.
+/// Builds a part's failure from its YSON error document, outer plus innermost
+/// message, as [`ClientError::from_yt_error`] does for the JSON header. `raw`
+/// keeps the whole document as YSON text.
 fn part_error(command: &str, document: &YsonValue) -> ClientError {
     let code = field(document, b"code")
         .and_then(YsonValue::as_i64)

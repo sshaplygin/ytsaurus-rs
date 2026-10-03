@@ -1,38 +1,19 @@
-//! Table schemas: what a table promises about its columns.
-//!
-//! A schematised table is worth the trouble because the cluster then checks
-//! every write against it, stores columns in their own type rather than as
-//! YSON, and can sort and merge them. An unschematised one accepts anything and
-//! finds out later.
-//!
-//! The wire form is a YSON list of column dicts, carrying attributes:
-//!
-//! ```text
-//! <strict=%true;unique_keys=%false>[{name="key";type="string";required=%true};…]
-//! ```
-//!
-//! Build one by hand with [`TableSchema::new`], or derive it from the struct
-//! the rows already have — see [`TableRow`].
-//!
-//! Reference:
-//! <https://ytsaurus.tech/docs/en/user-guide/storage/static-schema>
+//! Table schemas: what a table promises about its columns, which the cluster
+//! then checks on every write. The wire form is a YSON list of column dicts,
+//! with attributes on the list:
+//! `<strict=%true;unique_keys=%false>[{name="key";type="string";required=%true};…]`.
+//! Build one with [`TableSchema::new`], or derive it with [`TableRow`]. See the
+//! [reference](https://ytsaurus.tech/docs/en/user-guide/storage/static-schema)
+//! and [Table schemas](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#table-schemas).
 
 use ytsaurus_yson::YsonValue;
 
 use crate::yson_build::{boolean, list, map, string, with_attributes};
 
-/// A column's type, in the `type` spelling.
-///
-/// The primitives a job's row can hold. Composite types — lists, structs,
-/// tuples — are out of scope here; a column holding one is described as
-/// [`ColumnType::Any`], which is what YTsaurus stores an arbitrary YSON value
-/// as.
-///
-/// These are the **`type`** names. YTsaurus has a second, newer spelling,
-/// `type_v3`, and exactly two names differ between them: `boolean` is `bool`
-/// there, and `any` is `yson`. Sending a `type_v3` name in a `type` field is
-/// refused — `Error parsing ESimpleLogicalValueType value "bool"` — so the two
-/// vocabularies must not be mixed. Every other name is the same string in both.
+/// A column's type, in the `type` spelling. Composite types are out of scope;
+/// describe such a column as [`ColumnType::Any`]. The `type_v3` spelling differs
+/// in two names, `bool` for `boolean` and `yson` for `any`, and a `type`
+/// field refuses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     /// 8-bit signed integer.
@@ -61,16 +42,10 @@ pub enum ColumnType {
     String,
     /// A string the cluster checks is valid UTF-8.
     Utf8,
-    /// Any YSON value, stored as-is.
-    ///
-    /// Never required: the cluster answers `Column of type "any" cannot be
-    /// "required"`.
+    /// Any YSON value, stored as-is. Never required.
     Any,
 
-    // The temporal and tagged types. Nothing maps to them automatically — a
-    // Rust `i64` is an `int64`, and turning it into an `interval` because it
-    // looks like one is how a schema comes to lie about the data. Ask for them
-    // by name.
+    // Temporal and tagged types: nothing maps to them automatically.
     /// Days since the Unix epoch, unsigned.
     Date,
     /// Seconds since the Unix epoch, unsigned.
@@ -91,10 +66,7 @@ pub enum ColumnType {
     Json,
     /// A 16-byte UUID.
     Uuid,
-    /// A column that holds nothing.
-    ///
-    /// Reads back as `required=%false` without an `optional` wrapper, unlike
-    /// every other type.
+    /// A column that holds nothing; reads back `required=%false` with no `optional` wrapper.
     Void,
     /// The type with no values at all.
     Null,
@@ -134,26 +106,15 @@ impl ColumnType {
         }
     }
 
-    /// Whether a column of this type may be declared required.
-    ///
-    /// Three types may not, and the cluster says so in as many words —
-    /// `Column of type "any" cannot be "required"`, `Null type cannot be
-    /// required`, and the same for `void`. Each of them already means "there
-    /// may be nothing here", so promising a value would contradict the type.
+    /// Whether a column of this type may be required: all but `any`, `null` and `void`.
     #[must_use]
     pub fn can_be_required(self) -> bool {
         !matches!(self, ColumnType::Any | ColumnType::Null | ColumnType::Void)
     }
 
-    /// Parses a wire name, for the derive's `#[yt(column_type = "…")]` escape
-    /// hatch and for anyone building a schema from configuration.
-    ///
-    /// Accepts either vocabulary — `bool` and `yson` are understood as the
-    /// `type_v3` spellings of `boolean` and `any` — but what comes back is
-    /// always the `type` spelling, which is the one this crate sends.
-    ///
-    /// Not `FromStr`: an unknown type name is not an error worth a type of its
-    /// own, and every caller here wants the `Option`.
+    /// Parses a wire name in either spelling (`bool` and `yson` included) into
+    /// the `type` spelling, for `#[yt(column_type = "…")]` and configuration.
+    /// Not `FromStr`: callers want the `Option`.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -167,11 +128,9 @@ impl ColumnType {
             "uint64" => ColumnType::Uint64,
             "float" => ColumnType::Float,
             "double" => ColumnType::Double,
-            // "bool" is the type_v3 spelling of the same type.
             "boolean" | "bool" => ColumnType::Boolean,
             "string" => ColumnType::String,
             "utf8" => ColumnType::Utf8,
-            // "yson" is the type_v3 spelling of the same type.
             "any" | "yson" => ColumnType::Any,
             "date" => ColumnType::Date,
             "datetime" => ColumnType::Datetime,
@@ -195,13 +154,9 @@ impl ColumnType {
 pub enum SortOrder {
     /// Smallest first. The only order a cluster accepts today.
     Ascending,
-    /// Largest first.
-    ///
-    /// **A cluster is likely to refuse this.** The order exists in the
-    /// protocol, but creating a table with it was answered with
-    /// `Descending sort order is not available in this context yet`; it is
-    /// gated behind `//sys/@config/enable_descending_sort_order`, off by
-    /// default. It is here because the protocol has it, not because it works.
+    /// Largest first. **A cluster is likely to refuse it**: `Descending sort order
+    /// is not available in this context yet`, unless
+    /// `//sys/@config/enable_descending_sort_order` is on.
     Descending,
 }
 
@@ -237,31 +192,22 @@ impl Column {
         }
     }
 
-    /// Marks the column as one every row must have.
-    ///
-    /// A required column is what `i64` means and an optional one is what
-    /// `Option<i64>` means: the cluster rejects a row that leaves a required
-    /// column out.
+    /// Marks the column as one every row must have, as `i64` is to
+    /// `Option<i64>`; the cluster rejects a row that leaves it out.
     #[must_use]
     pub fn required(mut self) -> Self {
         self.required = true;
         self
     }
 
-    /// Makes this an ascending key column.
-    ///
-    /// Key columns must be the *first* columns of the schema, in order: the
-    /// cluster refuses a schema whose keys are not a prefix with
-    /// `Key columns must form a prefix of schema`.
+    /// Makes this an ascending key column. Key columns must come first, or the
+    /// cluster answers `Key columns must form a prefix of schema`.
     #[must_use]
     pub fn key(self) -> Self {
         self.sorted(SortOrder::Ascending)
     }
 
-    /// Makes this a key column, sorted the given way.
-    ///
-    /// See [`SortOrder::Descending`] before reaching for anything but
-    /// ascending.
+    /// Makes this a key column sorted the given way; see [`SortOrder::Descending`].
     #[must_use]
     pub fn sorted(mut self, order: SortOrder) -> Self {
         self.sort_order = Some(order);
@@ -314,11 +260,8 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
-    /// A strict schema: the listed columns and nothing else.
-    ///
-    /// Strict is the default because it is the one that catches mistakes — a
-    /// non-strict table quietly accepts a misspelled column name and stores it
-    /// as an unschematised extra.
+    /// A strict schema: the listed columns and nothing else, so a misspelled
+    /// column is refused rather than stored.
     #[must_use]
     pub fn new(columns: impl IntoIterator<Item = Column>) -> Self {
         Self {
@@ -335,10 +278,8 @@ impl TableSchema {
         self
     }
 
-    /// Promises that no two rows share a key.
-    ///
-    /// Only meaningful when the schema has key columns; the cluster enforces it
-    /// on write.
+    /// Promises that no two rows share a key. Needs key columns; the cluster
+    /// enforces it on write.
     #[must_use]
     pub fn with_unique_keys(mut self, unique: bool) -> Self {
         self.unique_keys = unique;
@@ -351,11 +292,8 @@ impl TableSchema {
         &self.columns
     }
 
-    /// Checks what the cluster would otherwise reject with error 314.
-    ///
-    /// Every rule here was watched being enforced by a cluster; catching them
-    /// locally turns a round trip and a nested error document into one
-    /// sentence naming the column.
+    /// Checks locally, naming the column, what a create would refuse with error
+    /// 314: column count and names, required types, key prefix and unique keys.
     ///
     /// # Errors
     ///
@@ -445,20 +383,17 @@ impl TableSchema {
     }
 }
 
-/// A Rust type that describes a table's rows.
-///
-/// Implement it by hand, or derive it — the derive reads the struct's fields
-/// and their types, which is the same information a schema carries:
+/// A Rust type that describes a table's rows. Implement it, or derive it from
+/// the struct's fields:
 ///
 /// ```ignore
 /// use ytsaurus_client::TableRow;
-///
 /// #[derive(TableRow)]
 /// struct Visit<'a> {
 ///     #[yt(key)]
 ///     host: &'a str,
 ///     size: i64,
-///     referrer: Option<&'a str>,   // optional, because the Rust type says so
+///     referrer: Option<&'a str>, // optional, because the Rust type says so
 /// }
 ///
 /// client.create_table("//tmp/visits", &Visit::table_schema())?;

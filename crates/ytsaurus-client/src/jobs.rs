@@ -1,22 +1,12 @@
-//! Job-level diagnostics for a failed operation.
-//!
-//! An operation that fails reports a state and a category — `failed`, "User job
-//! failed". The reason is in what the job itself printed before it died, and
-//! that takes two more commands: `list_jobs` names the jobs that failed, and
-//! `get_job_stderr` returns what each one wrote. Without them the only way to
-//! learn anything is the web UI.
-//!
-//! Both are documented in the
-//! [command reference](https://ytsaurus.tech/docs/en/api/commands): `list_jobs`
-//! is light and returns a structured `{jobs=[…]}`, `get_job_stderr` is heavy and
-//! returns the stderr as raw bytes.
+//! Job-level diagnostics: a failed operation reports only a category, and the
+//! reason is in what its jobs printed. `list_jobs` names the failed jobs and
+//! `get_job_stderr` returns their stderr
+//! ([command reference](https://ytsaurus.tech/docs/en/api/commands)).
 
 use ytsaurus_yson::{YsonNode, YsonValue};
 
-/// One job of an operation, as `list_jobs` reports it.
-///
-/// A subset of the cluster's `TJob`: the fields needed to name a job and say
-/// why it failed.
+/// One job of an operation, as `list_jobs` reports it: enough to name it and
+/// say why it failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobInfo {
     /// Job ID, in the form [`Client::get_job_stderr`](crate::Client::get_job_stderr) expects.
@@ -27,11 +17,8 @@ pub struct JobInfo {
     pub address: Option<String>,
     /// The error that ended the job, flattened to one line.
     pub error: Option<String>,
-    /// How much stderr the cluster says it saved.
-    ///
-    /// A hint, not a fact: a local cluster reported `1` for a job whose stderr
-    /// was several hundred bytes, so this is not a length to size anything by.
-    /// `None` means the field was absent.
+    /// How much stderr the cluster says it saved: a hint, not a length (a local
+    /// cluster reported `1` for several hundred bytes). `None` if absent.
     pub stderr_size: Option<u64>,
 }
 
@@ -49,10 +36,7 @@ pub struct JobFailure {
     pub stderr: Option<String>,
 }
 
-/// Reads the `jobs` list of a `list_jobs` response.
-///
-/// A job whose ID is missing or unreadable is dropped: there is nothing to ask
-/// the cluster about it, and an anonymous entry in an error message is noise.
+/// Reads the `jobs` list of a `list_jobs` response, dropping a job with no ID.
 pub(crate) fn parse_jobs(jobs: &YsonValue) -> Vec<JobInfo> {
     let YsonNode::List(items) = &jobs.node else {
         return Vec::new();
@@ -60,13 +44,9 @@ pub(crate) fn parse_jobs(jobs: &YsonValue) -> Vec<JobInfo> {
     items.iter().filter_map(parse_job).collect()
 }
 
-/// Reads one job, from either `list_jobs` or `get_job`.
-///
-/// `get_job` answers the job document **unwrapped** — no `{jobs=[…]}` around it
-/// — and calls the id `job_id` where `list_jobs` calls it `id`. Both are read
-/// here, so one parser serves both commands.
+/// Reads one job from `list_jobs`, or from `get_job`, which answers unwrapped
+/// and calls the id `job_id`.
 pub(crate) fn parse_job(job: &YsonValue) -> Option<JobInfo> {
-    // `list_jobs` calls it `id`, `get_job` calls it `job_id`. Same value.
     let id = text(field(job, "id").or_else(|| field(job, "job_id"))?)?;
 
     Some(JobInfo {
@@ -78,31 +58,19 @@ pub(crate) fn parse_job(job: &YsonValue) -> Option<JobInfo> {
     })
 }
 
-/// Flattens a YTsaurus error document to one line.
+/// Flattens a YTsaurus error document to one line: the outer message, which is
+/// a category, and the innermost of `inner_errors`, which is the cause. For a
+/// [`Client::raw_command`](crate::Client::raw_command) answer; [`JobInfo::error`]
+/// and the operation errors are built the same way.
 ///
-/// The outer message is a category — `User job failed`, `Failed to run query` —
-/// and the cause is at the bottom of `inner_errors`. Both are useful, so both
-/// are kept, and everything between them is dropped along with the attributes:
-/// a cluster error tree is mostly pids, thread names and trace ids, and the one
-/// thing a reader needs is the sentence at the bottom of it.
-///
-/// This is what [`JobInfo::error`](crate::JobInfo::error) and the operation
-/// errors are built from. It is public because a caller using
-/// [`Client::raw_command`](crate::Client::raw_command) gets the same shape of
-/// answer from any command the crate does not model, and had no way to read it
-/// — every escape-hatch caller was reinventing this, worse. Printing the tree
-/// instead is how a failed command costs an hour.
-///
-/// `None` when the document has no `message` at all, which is not the same as
-/// an empty one: a successful query answers `{code=0;message=""}`, and that
-/// summarises to `Some("")` rather than to nothing.
+/// `None` when the document has no `message`; `{code=0;message=""}` gives
+/// `Some("")`.
 ///
 /// # Examples
 ///
 /// ```
 /// use ytsaurus_client::error_summary;
 /// use ytsaurus_yson::{YsonFormat, from_slice};
-///
 /// let answer = br#"{code=1;message="Failed to run query";
 ///     attributes={host=localhost;pid=693};
 ///     inner_errors=[{code=1;message="Execution";
@@ -147,8 +115,7 @@ pub(crate) fn text(value: &YsonValue) -> Option<String> {
     }
 }
 
-/// A byte count, which the cluster sends unsigned but which nothing forbids
-/// arriving signed.
+/// A byte count, unsigned on the wire and accepted signed.
 fn count(value: &YsonValue) -> Option<u64> {
     match value.node {
         YsonNode::Int64(v) => u64::try_from(v).ok(),

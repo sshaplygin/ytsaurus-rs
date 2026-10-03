@@ -1,14 +1,8 @@
 //! The trace a request belongs to, carried to the cluster in a `traceparent`
 //! header.
 //!
-//! The cluster is already instrumented: the proxy opens a span for every
-//! request it serves, and each of those spans either starts a trace of its own
-//! or continues one the caller named. Naming it is this whole module — a
-//! request sent with a `traceparent` shows up under the caller's trace rather
-//! than as an orphan, so a launch that took four minutes can be looked at
-//! beside whatever asked for it.
-//!
-//! The header is the
+//! The proxy opens a span for every request; with a `traceparent` it joins the
+//! caller's trace. The header is the
 //! [W3C one](https://www.w3.org/TR/trace-context/#traceparent-header):
 //!
 //! ```text
@@ -16,38 +10,12 @@
 //!              ^^ ^^ 32 hex: the trace  ^^ 16 hex: the caller's span  ^^ flags
 //! ```
 //!
-//! All three official clients send exactly that: `FormatTraceParentHeader` in
-//! the C++ wrapper (`yt/cpp/mapreduce/http/helpers.cpp`), `injectTracing` in
-//! the Go SDK (`yt/go/yt/internal/httpclient/client.go`), and
-//! `generate_traceparent` in the Python wrapper (`yt/python/yt/wrapper/`).
-//! What the proxy accepts is `TryParseTraceParent` in
-//! `yt/yt/core/http/helpers.cpp`, and it is slightly wider than the standard:
-//! the version may be left off entirely — which is what the Go SDK does — and
-//! the flags are read as a byte with **bit 0 sampled, bit 1 debug**.
-//!
-//! # Finding the trace afterwards
-//!
-//! The cluster spells a trace id as one of its own GUIDs —
-//! `8e9bcc43-5c2be9b4-56f18c4e-117ea314` — and the header spells the same 128
-//! bits as 32 hex digits. They are the same four 32-bit groups in the same
-//! order, so the only difference is the dashes and the leading zeros the
-//! cluster drops (`WriteGuidToBuffer` in `library/cpp/yt/misc/guid.cpp`, and
-//! `FormatTraceParentHeader`, which pads them back). [`TraceContext::yt_trace_id`]
-//! does that conversion, so the id can be pasted into the cluster's own log
-//! search rather than translated by hand.
-//!
-//! # Watched rather than assumed
-//!
-//! A proxy puts the trace id it decided on into the `X-YT-Trace-Id` of the
-//! response, which makes every question above answerable with one request. On a
-//! local cluster, sending
-//! `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01` to
-//! `/api/v4/exists` comes back with
-//! `X-YT-Trace-Id: 4bf92f35-77b34da6-a3ce929d-e0e4736` — the same id, the
-//! cluster's spelling, a leading zero dropped. The version-less form and
-//! uppercase hex are adopted the same way; a header that does not parse is
-//! answered 200 with an id the proxy invented, which is the whole reason
-//! [`TraceContext::parse`] refuses one rather than passing it on.
+//! The proxy (`TryParseTraceParent` in `yt/yt/core/http/helpers.cpp`) also
+//! accepts it without the version, and reads the flags as bit 0 sampled, bit 1
+//! debug. The cluster spells a trace id as a GUID, `8e9bcc43-5c2be9b4-…`, and
+//! [`TraceContext::yt_trace_id`] converts to that spelling. Observed behaviour
+//! is in the
+//! [protocol reference](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#tracing).
 
 use crate::error::{ClientError, Result};
 use crate::unique::word;
@@ -57,10 +25,9 @@ const SAMPLED: u8 = 0x01;
 
 /// The trace a request belongs to.
 ///
-/// Two ways in. [`TraceContext::parse`] continues a trace that already exists,
-/// which is the usual one: a service that received a `traceparent` of its own
-/// passes it on, and the cluster's work appears under the same trace as the
-/// request that caused it.
+/// [`TraceContext::parse`] continues a trace a caller passed on, so the
+/// cluster's work appears under the request that caused it.
+/// [`TraceContext::new`] starts one, for a program that is nobody's callee.
 ///
 /// ```
 /// use ytsaurus_client::{Client, TraceContext};
@@ -69,42 +36,29 @@ const SAMPLED: u8 = 0x01;
 /// let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 /// let client = Client::new("http://localhost:8000")
 ///     .with_trace_context(&TraceContext::parse(incoming)?);
-/// # Ok(())
-/// # }
-/// ```
-///
-/// [`TraceContext::new`] starts one, for a program that is nobody's callee.
-/// Print the id it made and the cluster's copy of the trace can be found by
-/// it:
-///
-/// ```
-/// use ytsaurus_client::{Client, TraceContext};
 ///
 /// let trace = TraceContext::new();
 /// eprintln!("trace {}", trace.yt_trace_id());
-///
 /// let client = Client::new("http://localhost:8000").with_trace_context(&trace);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceContext {
     /// 32 lowercase hex digits.
     trace_id: String,
-    /// 16 lowercase hex digits: the span this client's requests are children
-    /// of.
+    /// 16 lowercase hex digits: the parent span of this client's requests.
     span_id: String,
     flags: u8,
-    /// The `tracestate` that arrived beside the `traceparent`, if any, carried
-    /// unmodified. See [`TraceContext::with_tracestate`].
+    /// Carried unmodified; see [`TraceContext::with_tracestate`].
     tracestate: Option<String>,
 }
 
 impl TraceContext {
     /// Starts a trace, sampled.
     ///
-    /// Sampled because a caller who asked for a trace wants it kept: the C++
-    /// wrapper's `EnableClientTracing` and the Python wrapper's
-    /// `generate_traceparent` both do the same. An unsampled context is one
-    /// that arrived that way — see [`TraceContext::parse`].
+    /// The C++ and Python wrappers also start traces sampled. An unsampled
+    /// context is one that arrived that way through [`TraceContext::parse`].
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -117,53 +71,38 @@ impl TraceContext {
 
     /// Continues the trace a `traceparent` header names.
     ///
-    /// Both spellings the proxy accepts are accepted here: the standard
-    /// `00-<trace>-<span>-<flags>` and the version-less three-part form the Go
-    /// SDK sends. Hex digits may be upper or lower case on the way in; what
-    /// this client sends is always lowercase, as the standard requires.
+    /// Accepts `00-<trace>-<span>-<flags>` and the version-less form the Go SDK
+    /// sends, in either case of hex.
     ///
-    /// The span id is carried through **as it arrived**, so the cluster's spans
-    /// hang under the span the *caller* named rather than under one belonging
-    /// to this process. That is what a client with nothing of its own to point
-    /// at can honestly do: the W3C wording asks a forwarder to substitute the
-    /// id of its own current span, and this crate emits no spans the collector
-    /// would know about — an invented id would name a parent that does not
-    /// exist. The work still lands in the right trace, one level up from where
-    /// a fully instrumented service would put it.
+    /// The span id is kept as it arrived, so the cluster's spans hang under the
+    /// span the caller named. The W3C rule is to substitute the forwarder's own
+    /// span, but this crate emits no spans a collector knows, so an invented id
+    /// would name a parent that does not exist.
     ///
-    /// A `tracestate` that arrived beside the header is not in it, and is
-    /// passed on separately — see [`TraceContext::with_tracestate`].
+    /// A `tracestate` goes through [`TraceContext::with_tracestate`].
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if the header is not a traceparent.
-    /// Refusing is the point: a malformed header is dropped by the proxy
-    /// without complaint, and the trace would then be silently missing the
-    /// half that mattered.
+    /// Returns [`ClientError::Config`] if the header is not a traceparent. The
+    /// proxy drops a malformed header without complaint, so it is refused here.
     pub fn parse(header: &str) -> Result<Self> {
         let header = header.trim();
         let parts: Vec<&str> = header.split('-').collect();
 
         let [version, trace_id, span_id, flags] = match parts[..] {
-            // The three-part form has no version, and the proxy reads it as
-            // zero. Recognised by the trace id rather than by the count, so
-            // that a four-part header with its flags cut off is not silently
-            // read as this one — see the arm below.
+            // The version-less form, which the proxy reads as version 00.
+            // Recognised by the trace id rather than the count, so a header
+            // with its flags cut off falls through to the arm below.
             [trace_id, span_id, flags] if is_hex(trace_id, 32) => ["00", trace_id, span_id, flags],
-            // Version, trace, span, and nothing where the flags should be.
-            // Destructured as the version-less form this would report the
-            // *version* as a bad trace id, sending whoever is debugging a
-            // truncated header to a field that is perfectly well formed.
+            // Version, trace and span with the flags missing: say so, rather
+            // than blame the version as a bad trace id.
             [version, trace_id, _] if is_hex(version, 2) && is_hex(trace_id, 32) => {
                 return Err(malformed(header, "the flags are missing"));
             }
             [version, trace_id, span_id, flags] => [version, trace_id, span_id, flags],
-            // A version this client does not know may define fields after the
-            // flags, and the standard's versioning rule is to read the four
-            // that version 00 defines and ignore the rest — that rule is the
-            // only reason a version-00 parser keeps working against a
-            // version-01 sender. Version 00 itself defines exactly four, so a
-            // fifth group there is malformed rather than from the future.
+            // A later version may add fields after the flags; the standard
+            // says to read the first four and ignore the rest. Version 00
+            // defines exactly four, so a fifth group there is malformed.
             [version, trace_id, span_id, flags, ..] if !version.eq_ignore_ascii_case("00") => {
                 [version, trace_id, span_id, flags]
             }
@@ -178,8 +117,7 @@ impl TraceContext {
         if !is_hex(version, 2) {
             return Err(malformed(header, "the version is not two hex digits"));
         }
-        // `ff` is reserved by the standard as "no version will ever be this",
-        // so a header carrying it is malformed rather than from the future.
+        // The standard reserves `ff` as never a valid version.
         if version.eq_ignore_ascii_case("ff") {
             return Err(malformed(header, "ff is not a valid version"));
         }
@@ -209,15 +147,9 @@ impl TraceContext {
 
     /// Carries a `tracestate` header alongside the `traceparent`.
     ///
-    /// The standard pairs the two, and asks a participant that forwards one to
-    /// forward the other unmodified: `tracestate` is where a vendor puts the
-    /// sampling decision or the correlation key that its own backend reads, and
-    /// dropping it on this hop loses that for everything downstream. The proxy
-    /// itself has no opinion about it — this is for the caller's backend, not
-    /// the cluster's.
-    ///
-    /// Not modified on the way through, deliberately: rewriting the list means
-    /// claiming a vendor entry of one's own, and this client has none.
+    /// The standard asks a forwarder to pass `tracestate` on unmodified; it
+    /// carries vendor data for the caller's tracing backend, not the cluster's.
+    /// This client has no vendor entry of its own, so it never rewrites it.
     ///
     /// ```
     /// use ytsaurus_client::{Client, TraceContext};
@@ -248,13 +180,10 @@ impl TraceContext {
         &self.trace_id
     }
 
-    /// The trace, as the **cluster** spells it: four hyphenated hex groups,
-    /// leading zeros dropped.
-    ///
-    /// This is the form that appears in the proxy log, in the `X-YT-Trace-Id`
-    /// header of a response, and in the cluster's UI — the same 128 bits as
-    /// [`TraceContext::trace_id`], punctuated the way every other YTsaurus id
-    /// is.
+    /// The trace, as the cluster spells it: [`TraceContext::trace_id`]'s four
+    /// 32-bit groups, hyphenated, leading zeros dropped (an all-zero group keeps
+    /// one digit). This is the form in the proxy log, the `X-YT-Trace-Id`
+    /// response header and the cluster's UI.
     ///
     /// ```
     /// use ytsaurus_client::TraceContext;
@@ -269,18 +198,12 @@ impl TraceContext {
     /// ```
     #[must_use]
     pub fn yt_trace_id(&self) -> String {
-        // Sliced from the string rather than reassembled from its bytes: the
-        // trace id is 32 ASCII hex digits by construction — `parse` checks it
-        // and `new` formats it — so there is no decoding to fail. Going
-        // through `from_utf8` needed a fallback for a case that cannot happen,
-        // and the only cheap fallback was a wrong id, which is worse than an
-        // error: an id that is off by one group matches nothing in the proxy
-        // log and says nothing about why.
+        // The cluster's spelling is `WriteGuidToBuffer` in
+        // `library/cpp/yt/misc/guid.cpp`. Slicing cannot fail: `parse` checks
+        // and `new` formats the trace id as 32 ASCII hex digits.
         let groups: Vec<&str> = (0..4)
             .map(|group| {
                 let group = &self.trace_id[group * 8..group * 8 + 8];
-                // The cluster prints one to eight digits per group, so a group
-                // that is all zeros keeps a single one.
                 let trimmed = group.trim_start_matches('0');
                 if trimmed.is_empty() { "0" } else { trimmed }
             })
@@ -298,8 +221,7 @@ impl TraceContext {
     /// Whether the trace is being recorded.
     ///
     /// A context that arrived unsampled is passed on unsampled: the decision
-    /// belongs to whoever started the trace, and overriding it here would
-    /// record half a trace.
+    /// belongs to whoever started the trace.
     #[must_use]
     pub fn is_sampled(&self) -> bool {
         self.flags & SAMPLED != 0
