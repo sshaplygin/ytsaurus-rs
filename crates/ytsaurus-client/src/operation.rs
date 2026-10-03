@@ -123,7 +123,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, as when not suspended (code 201).
+    /// Returns [`ClientError`] if the request fails, or code 201 if it was not suspended.
     pub fn resume(&self) -> Result<()> {
         self.client.resume_operation(&self.id)
     }
@@ -132,7 +132,7 @@ impl Operation {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, as a second complete does.
+    /// Returns [`ClientError`] if the request fails; a second complete gets `No such operation`.
     pub fn complete(&self) -> Result<()> {
         self.client.complete_operation(&self.id)
     }
