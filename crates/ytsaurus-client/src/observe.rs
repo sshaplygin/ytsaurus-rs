@@ -1,34 +1,20 @@
-//! What the client says about itself while it works.
+//! What the client says about itself while it works: a command is being sent
+//! again, the file cache will not take this caller's worker, or `/hosts` named
+//! no usable heavy proxy.
 //!
-//! Two things are worth saying — a command is being sent again, and the file
-//! cache will not have this caller's worker — and two ways of saying either,
-//! with the `tracing` feature deciding which is compiled in:
+//! - With the `tracing` feature **off** (the default), each is a line on
+//!   stderr. No dependency.
+//! - With it **on**, every attempt runs in a span carrying the command, the
+//!   attempt number and its duration, and each message is a `WARN` event with
+//!   the same facts as fields. With no subscriber installed the stderr line is
+//!   still printed: Cargo unifies features across the graph, so a launcher may
+//!   get the feature without asking for it.
 //!
-//! - **off**, the default: both announce themselves on stderr and nothing else
-//!   is said. No dependency, and a launcher that pauses for fifteen seconds
-//!   still explains the pause.
-//! - **on**: every attempt runs inside a span carrying the command, the attempt
-//!   number and how long it took, and both messages become `WARN` events
-//!   carrying the same facts as fields. The subscriber decides where any of it
-//!   goes — and if there is no subscriber, the stderr line is printed after
-//!   all. The feature adds a way of saying this; it does not take the old one
-//!   away, because whether it is on is not entirely up to whoever built the
-//!   program. Cargo unifies features across the graph.
-//!
-//! The retry event is *not* inside the attempt's span, and cannot be: the
-//! attempt it is complaining about has already ended, and the wait it is
-//! announcing happens between two of them. It names the command itself for
-//! that reason.
-//!
-//! The feature is off by default because this crate is linked into worker
-//! binaries that cross-compile to musl with nothing but the Rust toolchain —
-//! the same reason `tls` is off there. Nothing here is optional at the call
-//! site: [`attempt`], [`retrying`] and [`cache_refused`] exist in both builds,
-//! and in the default one they compile to the call they wrap and an
-//! `eprintln!`.
-//!
-//! What the *cluster* records is a separate question with a separate answer,
-//! and it needs no dependency at all: see [`TraceContext`](crate::TraceContext).
+//! The retry event is outside the attempt's span, because the attempt has
+//! ended, so it names the command itself. The feature is off by default for the
+//! reason `tls` is: worker binaries cross-compile to musl with only the Rust
+//! toolchain. What the cluster records needs no dependency: see
+//! [`TraceContext`](crate::TraceContext).
 
 use std::time::Duration;
 
@@ -36,15 +22,9 @@ use crate::error::{ClientError, Result};
 
 /// Runs one attempt of `command`, timed.
 ///
-/// Wraps an attempt rather than a command, because the attempt is the thing
-/// with a duration: a command that was retried four times took as long as the
-/// four attempts and the waits between them, and a span that hid that would
-/// report the last one as the whole story.
-///
-/// The streaming commands are the honest exception. Their span ends when the
-/// response headers arrive, because the body is handed to the caller to read at
-/// its own pace — the transfer outlives the call, and there is nothing here to
-/// close the span around.
+/// One span per attempt, not per command, so a retried command shows each
+/// attempt's duration. For a streaming command the span ends when the response
+/// headers arrive; the caller reads the body afterwards.
 #[cfg(feature = "tracing")]
 pub(crate) fn attempt<T>(
     command: &str,
@@ -64,10 +44,8 @@ pub(crate) fn attempt<T>(
     span.record("elapsed_ms", started.elapsed().as_secs_f64() * 1e3);
 
     if let Err(error) = &result {
-        // `DEBUG`, not `WARN`: a failure that will be retried is reported by
-        // `retrying`, and one that will not is returned to a caller who is
-        // about to say so itself. This is the record of the attempt, not the
-        // complaint about it.
+        // `DEBUG`: a failure that will be retried is reported by `retrying`,
+        // and one that will not is returned to the caller.
         tracing::debug!(error = %error, "the attempt failed");
     }
 
@@ -85,15 +63,12 @@ pub(crate) fn attempt<T>(
 
 /// Announces that `command` failed and is about to be sent again.
 ///
-/// `attempt` is the one that just failed and `of` is how many are allowed, the
-/// same counting the span's `attempt` field uses — so an event and the span
-/// beside it never disagree about which try this was, and `attempt == of` means
-/// what it says.
+/// `attempt` is the one that just failed and `of` is how many are allowed,
+/// counted as the span's `attempt` field is.
 ///
-/// Called only when the policy says to — see [`RetryPolicy::quiet`], and the
-/// muting it does inside a job. That muting covers both spellings of this: a
-/// job's stderr is a bounded buffer the cluster shows in its UI, and a
-/// subscriber installed in a job is likely to be writing to exactly that.
+/// Not called under [`RetryPolicy::quiet`], which is the default inside a job:
+/// a job's stderr is a bounded buffer, and a subscriber there likely writes to
+/// it.
 ///
 /// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
 #[cfg(feature = "tracing")]
@@ -114,21 +89,9 @@ pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attem
 
 /// What to print on stderr after emitting the event, if anything.
 ///
-/// A feature is supposed to add, and this one would otherwise take something
-/// away. Cargo unifies features across the whole graph, so any crate anywhere
-/// in a build can turn `tracing` on for everybody: a launcher that never asked
-/// for it, and so installed no subscriber, would find the stderr message simply
-/// gone and a fifteen-second pause looking like a hang — with nothing in its
-/// own manifest to explain why. Falling back keeps the default build's
-/// behaviour available in every build.
-///
-/// `None` when a subscriber is installed. The event is the message then, and
-/// saying it twice would be worse than either way of saying it once.
-///
-/// Returns the line rather than printing it so that the decision is something a
-/// test can hold: `eprintln!` writes to a file descriptor no test in this
-/// process can read back, so a fallback that printed directly could be deleted
-/// wholesale and every test would still pass.
+/// `Some` when no subscriber is installed, since the feature may have been
+/// turned on by another crate in the graph; `None` when one is, so the message
+/// is not said twice. Returned rather than printed so a test can check it.
 #[cfg(feature = "tracing")]
 fn stderr_fallback(
     command: &str,
@@ -142,9 +105,8 @@ fn stderr_fallback(
 
 /// Whether the event just emitted went nowhere.
 ///
-/// `NoSubscriber` is what `tracing` falls back to when none was set, so asking
-/// whether the current dispatcher is that one — globally or for this thread —
-/// is asking whether anybody was listening.
+/// True when the current dispatcher, global or thread-local, is `tracing`'s
+/// `NoSubscriber`.
 #[cfg(feature = "tracing")]
 fn unheard() -> bool {
     tracing::dispatcher::get_default(tracing::Dispatch::is::<tracing::subscriber::NoSubscriber>)
@@ -158,33 +120,9 @@ pub(crate) fn retrying(command: &str, error: &ClientError, wait: Duration, attem
 /// Announces that the file cache will not have this caller's worker, and that
 /// it is going up uncached.
 ///
-/// Said rather than passed over because the state is invisible otherwise and
-/// permanent until someone acts: every launch re-sends the whole binary, and
-/// the fix is one line — [`Client::with_file_cache`] pointed somewhere this
-/// caller may write. A launch that is merely slower than it should be is
-/// exactly the kind of thing nobody investigates without being told.
-///
-/// Not routed through [`RetryPolicy::quiet`], unlike [`retrying`]: this is said
-/// once per upload rather than once per attempt, and it is said by a launcher —
-/// a job does not upload workers.
-///
-/// **One body, not two `#[cfg]` arms.** This used to be written twice, and the
-/// default build's copy was an `eprintln!` and nothing else — a descriptor no
-/// test in this process can read back, in the half of the file the test module
-/// below is not compiled for. It could be emptied to `{}` with every test in
-/// the workspace green, and it is the whole of what a default build says about
-/// a cache it has given up on.
-///
-/// Written once, the *decision* is held in both configurations by
-/// [`cache_fallback`], and with `tracing` on, emptying this body also takes the
-/// `WARN` event the tests assert. **What is still not held is the `eprintln!`
-/// itself in the default build.** Replacing it with `let _ = cache_fallback(…)`
-/// leaves the suite green and clippy quiet, and no test here can catch that:
-/// stderr is a descriptor this process cannot read back, so observing it means
-/// a subprocess rather than a unit test. What was won is that the line's
-/// *content* and the choice to emit it are pinned; what is left unguarded is
-/// one call, which is a smaller hole than the one it replaced but is not no
-/// hole. Do not read the tests below as covering it.
+/// Otherwise every launch re-sends the whole binary with no sign of why; the
+/// fix is [`Client::with_file_cache`] pointed somewhere this caller may write.
+/// Said once per upload by a launcher, so not muted by [`RetryPolicy::quiet`].
 ///
 /// [`Client::with_file_cache`]: crate::Client::with_file_cache
 /// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
@@ -203,13 +141,8 @@ pub(crate) fn cache_refused(cache: &str, error: &ClientError) {
 
 /// What to say on stderr about the cache, if anything.
 ///
-/// [`stderr_fallback`]'s shape and, with the feature on, its reason: a build
-/// where Cargo turned `tracing` on for a launcher that never asked has no
-/// subscriber to hear the event, and must still say this somewhere.
-///
-/// Returning the decision rather than printing it is what makes it testable at
-/// all — and this one is tested in **both** feature configurations, because the
-/// default build is where the whole announcement lives.
+/// The same rule as [`stderr_fallback`], in both feature configurations, and
+/// tested in both.
 #[cfg(feature = "tracing")]
 fn cache_fallback(cache: &str, error: &ClientError) -> Option<String> {
     unheard().then(|| cache_message(cache, error))
@@ -217,22 +150,14 @@ fn cache_fallback(cache: &str, error: &ClientError) -> Option<String> {
 
 #[cfg(not(feature = "tracing"))]
 fn cache_fallback(cache: &str, error: &ClientError) -> Option<String> {
-    // There is no subscriber in this build to have heard it, so the line is
-    // always owed.
+    // No subscriber exists in this build.
     Some(cache_message(cache, error))
 }
 
 /// The fallback announcement as a line of text.
 ///
-/// Split out for the reason [`retry_message`] is: this is the whole of what a
-/// default build says, and a message no test can reach is a message that can be
-/// emptied without anything noticing.
-///
-/// It names three things, and each earns its place: the path that was refused,
-/// so the reader knows which cache; the cluster's own words, so an ACL failure
-/// is not mistaken for a network one; and the setter, because a caller who has
-/// just been told the default path does not work still has nothing to do about
-/// it otherwise.
+/// Names the refused path, the cluster's error (an ACL failure is not a network
+/// one), and the setter that fixes it.
 fn cache_message(cache: &str, error: &ClientError) -> String {
     format!(
         "ytsaurus-client: the file cache at {cache} cannot be written to \
@@ -244,11 +169,7 @@ fn cache_message(cache: &str, error: &ClientError) -> String {
 
 /// The retry announcement as a line of text.
 ///
-/// Split from the `eprintln!` so that it can be asserted on. It used to be
-/// inlined into the `#[cfg(not(feature = "tracing"))]` arm, where no test could
-/// reach it: the tests below are compiled exactly when that arm is not, so the
-/// message every default build prints was checked by nothing at all, and
-/// swapping `attempt` for `of` or dropping the reason left CI green.
+/// Split from the `eprintln!` so that a test can assert on it.
 fn retry_message(
     command: &str,
     error: &ClientError,
@@ -268,18 +189,10 @@ const NAMED_REFUSALS: usize = 3;
 
 /// Says that `/hosts` named heavy proxies and this client used none of them.
 ///
-/// **Once per client**, because the state it announces is resolved once: the
-/// answer settles as "the configured address serves heavy commands", and is
-/// never asked about again. Without this the only symptom is a cluster error
-/// arriving from the control proxy much later — `Control proxy may not serve
-/// heavy requests with input data`, which names neither `/hosts` nor the
-/// decision this client made about its answer. A configured address that
-/// misses the discovered names by one label is then indistinguishable from a
-/// cluster with no heavy proxies at all.
-///
-/// `refused` is one rendered clause per name, already carrying the reason.
-/// Muted by [`RetryPolicy::quiet`], and therefore inside a job, for the same
-/// reason [`retrying`] is.
+/// Said once per client. Otherwise the only symptom is a later `Control proxy
+/// may not serve heavy requests with input data`, which names neither `/hosts`
+/// nor the names this client refused. `refused` is one rendered clause per
+/// name, with its reason. Muted by [`RetryPolicy::quiet`], as [`retrying`] is.
 ///
 /// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
 #[cfg(feature = "tracing")]
@@ -291,8 +204,7 @@ pub(crate) fn declined(configured: &str, refused: &[String]) {
         "no proxy from /hosts was used; heavy commands stay on the configured address"
     );
 
-    // As with a retry: the event is the message when somebody is listening,
-    // and the line is still owed when nobody is.
+    // As for a retry: stderr only when no subscriber is listening.
     let listening = !tracing::dispatcher::get_default(
         tracing::Dispatch::is::<tracing::subscriber::NoSubscriber>,
     );
@@ -306,7 +218,7 @@ pub(crate) fn declined(configured: &str, refused: &[String]) {
     eprintln!("{}", declined_message(configured, refused));
 }
 
-/// The announcement as a line of text, split out so a test can hold it.
+/// The announcement as a line of text, split out for tests.
 fn declined_message(configured: &str, refused: &[String]) -> String {
     let named = refused
         .iter()
@@ -338,11 +250,8 @@ fn declined_message(configured: &str, refused: &[String]) -> String {
     )
 }
 
-/// The stderr spelling, which is what a default build prints.
-///
-/// Not gated on the feature — that is the whole point. The module below is
-/// compiled only with `tracing` on, so everything it asserts is about the half
-/// of this file that most users never build.
+/// The stderr spelling, which a default build prints. Not gated on the
+/// feature, unlike the module below.
 #[cfg(test)]
 mod message_tests {
     use super::*;
@@ -408,13 +317,9 @@ mod message_tests {
 
     #[test]
     fn the_cache_warning_is_owed_to_stderr_when_nothing_else_carries_it() {
-        // The default build's entire announcement, and until this existed it
-        // was an `eprintln!` in a `#[cfg(not(feature = "tracing"))]` arm — a
-        // descriptor no test in this process can read back, in the half of the
-        // file this module is not compiled for. Emptying that body left every
-        // test green while a deployment uploading uncached for ever went back
-        // to being silent. Asserted here rather than in the module below
-        // because *here* is where the default build's copy is compiled.
+        // The default build's entire announcement. Asserted here rather than
+        // in the module below because this module is compiled without
+        // `tracing` too.
         let denied = ClientError::Cluster {
             command: "create".to_owned(),
             code: 901,
@@ -448,11 +353,8 @@ mod message_tests {
         assert!(line.contains("n0008-sas.hume.yt.example.net"), "{line}");
         assert!(line.contains("not under the domain of hume"), "{line}");
         // And what to do about it — all three answers, because this line is
-        // the only place an operator meets them. The middle one is the one an
-        // installation whose proxies live in a second domain actually wants,
-        // and a message that offered only "write out all 79 names" and "take
-        // the rule away" is what sent the first such installation to patch the
-        // source instead.
+        // the only place an operator meets them. The middle one is what an
+        // installation whose proxies live in a second domain needs.
         assert!(line.contains("with_heavy_proxies_under"), "{line}");
         assert!(line.contains("with_heavy_proxies_in"), "{line}");
         assert!(line.contains("with_heavy_proxies_anywhere"), "{line}");
@@ -713,8 +615,8 @@ mod tests {
 
     #[test]
     fn a_retry_says_so_through_tracing_instead_of_on_stderr() {
-        // The seam the issue asks for: with the feature on, the message that
-        // used to be an `eprintln!` is an event with the same facts in fields.
+        // With the feature on, the stderr message is an event with the same
+        // facts in fields.
         let lines = recorded(|| {
             crate::retry::run(
                 RetryPolicy::new(3, Duration::ZERO, Duration::ZERO),
