@@ -365,7 +365,7 @@ impl OperationFilter {
         self.set("from_time", yson_build::string(time.as_ref()))
     }
 
-    /// Only operations that started at or before this time; see `with_from_time`.
+    /// Only operations that started at or before this time; see [`OperationFilter::with_from_time`].
     #[must_use]
     pub fn with_to_time(self, time: impl AsRef<str>) -> Self {
         self.set("to_time", yson_build::string(time.as_ref()))
