@@ -2532,11 +2532,9 @@ impl Client {
 
     /// Lets a suspended operation run again.
     ///
-    /// **Sent once, and never retried.** Where [`Client::suspend_operation`] is
-    /// idempotent, this is not: an operation that is not suspended answers code
-    /// 201, `Operation is in "running" state`. A retry after a lost answer would
-    /// therefore report a resume that worked as a failure — the same trap
-    /// [`Client::abort_operation`] describes.
+    /// **Sent once, never retried**: an operation that is not suspended
+    /// answers code 201, `Operation is in "running" state`, so a retry would
+    /// report a resume that worked as a failure.
     ///
     /// # Errors
     ///
@@ -2556,14 +2554,10 @@ impl Client {
 
     /// Finishes an operation early, keeping what it has produced.
     ///
-    /// The difference from [`Client::abort_operation`]: an aborted operation's
-    /// output tables are discarded, a completed one's are published. This is how
-    /// a long-running vanilla operation is stopped *successfully* — it ends as
-    /// `completed`, and [`Client::wait_for_operation`] returns `Ok`.
-    ///
-    /// **Sent once, and never retried**, for the reason
-    /// [`Client::abort_operation`] gives: the second one is answered `No such
-    /// operation`, so a retry turns a completion that worked into an error.
+    /// Unlike [`Client::abort_operation`], the output is published: the
+    /// operation ends as `completed` and [`Client::wait_for_operation`] returns
+    /// `Ok`. **Sent once, never retried**: a second one is answered `No such
+    /// operation`.
     ///
     /// # Errors
     ///
@@ -2583,9 +2577,7 @@ impl Client {
 
     /// Changes a running operation's scheduling parameters.
     ///
-    /// The pool it competes in and the share it gets, while it runs — the one
-    /// thing about a started operation that is not fixed. See
-    /// [`OperationParameters`].
+    /// See [`OperationParameters`].
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, OperationParameters};
@@ -2600,23 +2592,15 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// The parameters go in the request's parameters, not its body: the
-    /// cluster's registry declares this command's input as `null`, whatever the
-    /// command reference says. It answers with an empty body rather than the
-    /// `{}` its neighbours send.
-    ///
-    /// Repeated freely, because it assigns rather than increments: sending the
-    /// same update twice leaves the operation where the first one put it. As
-    /// with [`Client::suspend_operation`], that holds only while the scheduler
-    /// still has the operation — if the answer to the first send is lost and
-    /// the operation ends during the backoff, the retry is answered `No such
-    /// operation` and this returns an error for an update that was applied.
+    /// Retried, since it assigns rather than increments. If the operation ends
+    /// before a retry, the retry is answered `No such operation` and this
+    /// returns an error for an update that was applied.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if `parameters` would change nothing —
-    /// the cluster accepts an empty update and does nothing, which hides the
-    /// mistake where it was made — and [`ClientError`] if the request fails.
+    /// Returns [`ClientError::Config`] if `parameters` would change nothing
+    /// (the cluster accepts an empty update and does nothing), and
+    /// [`ClientError`] if the request fails.
     pub fn update_operation_parameters(
         &self,
         id: &str,
@@ -2662,10 +2646,8 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// The scheduler only holds operations it has not let go of. Anything older
-    /// lives in the operations archive, which
-    /// [`OperationFilter::with_archive`] asks for — and which a local cluster
-    /// does not have.
+    /// Older operations are only in the operations archive, which
+    /// [`OperationFilter::with_archive`] asks for and a local cluster lacks.
     ///
     /// # Errors
     ///
@@ -2680,17 +2662,13 @@ impl Client {
             Repeatable::Freely,
         )?;
 
-        // No `{value=…}` envelope, and no one-key envelope either: the answer
-        // is a dict of `operations` plus counters, which is why this reads the
-        // document rather than unwrapping it.
+        // No one-key envelope: the answer is `operations` plus counters.
         operation::parse_operations(&self.strip_envelope(&body, "list_operations")?)
     }
 
     /// An operation's event log.
     ///
-    /// **Empty on a cluster with no operations archive.** The command is
-    /// registered everywhere and answers with an empty list there, rather than
-    /// with an error — verified on a local cluster, where it is always empty.
+    /// **Empty, not an error, on a cluster with no operations archive.**
     ///
     /// # Errors
     ///
@@ -2706,19 +2684,16 @@ impl Client {
             Repeatable::Freely,
         )?;
 
-        // A bare list, with none of the one-key envelope the rest of API v4
-        // uses — the same surprise the file-cache commands hold. An envelope
-        // is read too; see `operation::parse_events` for why that is not
-        // over-caution.
+        // A bare list, with no envelope; `operation::parse_events` accepts one
+        // too.
         operation::parse_events(&self.strip_envelope(&body, "list_operation_events")?)
     }
 
     /// A handle on an operation that is already running.
     ///
-    /// The reattach door — C++'s `AttachOperation`, Go's `Track(id)`. Nothing is
-    /// sent: an id and a client is all an [`Operation`] is, so this cannot fail
-    /// and does not check that the operation exists. The first command through
-    /// the handle finds that out.
+    /// Like C++'s `AttachOperation` and Go's `Track(id)`. Nothing is sent, so
+    /// this cannot fail; the first command through the handle finds out
+    /// whether the operation exists.
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2731,10 +2706,7 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// **The id is trimmed**, for the reason the token file is: the documented
-    /// way to get one here is out of a file, `echo $ID > run.id` writes a
-    /// newline, and an id carrying one is answered `No such operation` by an
-    /// error that never mentions whitespace.
+    /// **The id is trimmed**, so one read from a file written by `echo` works.
     #[must_use]
     pub fn attach_operation(&self, id: impl Into<String>) -> Operation {
         let mut id = id.into();
@@ -2746,14 +2718,9 @@ impl Client {
 
     /// The whole document the cluster keeps about an operation.
     ///
-    /// `attributes` names what to fetch — `state`, `progress`, `result`,
-    /// `runtime_parameters`, `spec`. **An empty slice asks for everything**,
-    /// which is rarely what anyone wants: the full document for a trivial
-    /// vanilla operation measured 119 KB on a local cluster, most of it the
-    /// resolved spec and the progress tree. Naming attributes is the normal
-    /// case, and the narrow readers — [`Client::operation_state`],
-    /// [`Client::job_statistics`], [`Client::operation_result_error`] — are each
-    /// one attribute of this.
+    /// `attributes` names what to fetch, such as `state`, `progress`,
+    /// `result`, `runtime_parameters` or `spec`. **An empty slice asks for
+    /// everything**, which is large: 119 KB for a trivial vanilla operation.
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2778,17 +2745,11 @@ impl Client {
 
     /// The same, for an operation found by the alias its spec gave it.
     ///
-    /// An alias is a name a launcher chooses — `*nightly-load` — set in the
-    /// spec's `alias` field, and the leading `*` is the cluster's requirement,
-    /// not this crate's. Without it, an alias set at launch could never be
-    /// looked up again.
-    ///
-    /// The request carries `include_runtime`, because the cluster refuses the
-    /// lookup without it: *"Operation alias cannot be resolved without using
-    /// runtime information"*. That also bounds what this can find — an alias is
-    /// resolved from what the scheduler still holds, falling back to the
-    /// operations archive, so an alias whose operation finished long ago is
-    /// found only on an installation that has an archive.
+    /// An alias is set in the spec's `alias` field and must start with `*`,
+    /// such as `*nightly-load`. It is resolved from what the scheduler holds,
+    /// then from the operations archive, so an alias of an operation finished
+    /// long ago is found only where there is an archive. Sent with
+    /// `include_runtime`, without which the cluster refuses the lookup.
     ///
     /// # Errors
     ///
@@ -2812,12 +2773,9 @@ impl Client {
     /// The bytes of a `get_operation` answer, before they are parsed.
     ///
     /// Split out for [`Client::operation_error`], which reports the raw body
-    /// when it cannot be parsed — the one caller for which a decode failure is
-    /// not the end of the story.
+    /// when it cannot be parsed.
     fn get_operation_body(&self, mut params: YsonValue, attributes: &[&str]) -> Result<Vec<u8>> {
-        // Omitted rather than sent empty: `attributes=[]` is a request for no
-        // attributes at all, and the cluster answers `{}` to it. Leaving the
-        // parameter out is how the whole document is asked for.
+        // Omitted rather than sent empty: `attributes=[]` asks for nothing.
         if !attributes.is_empty() {
             yson_build::insert(
                 &mut params,
@@ -2850,15 +2808,9 @@ impl Client {
 
     /// Whether an operation is paused.
     ///
-    /// The question [`Client::operation_state`] does not answer: the cluster
-    /// keeps suspension in its own attribute and leaves the state at `running`,
-    /// so a loop that watches the state alone will wait out a paused operation
-    /// without ever saying why.
-    ///
-    /// **An operation whose document does not carry the attribute is not
-    /// suspended**, rather than an error: the scheduler reports it for what it
-    /// still holds, and one resolved out of the operations archive may not
-    /// carry it at all.
+    /// [`Client::operation_state`] says `running` for a paused operation too.
+    /// A document without the attribute, as from the operations archive, means
+    /// not suspended.
     ///
     /// # Errors
     ///
@@ -2869,11 +2821,6 @@ impl Client {
     }
 
     /// An operation's state and whether it is paused, in one request.
-    ///
-    /// The pair a poll loop actually needs. Asking them separately is two
-    /// round trips for two attributes of one document, and a loop that asks
-    /// only for the state cannot tell a running operation from a paused one —
-    /// they both say `running`.
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -2902,13 +2849,10 @@ impl Client {
 
     /// The custom statistics an operation's jobs reported.
     ///
-    /// Returns the `custom` subtree of the operation's job statistics, keyed by
-    /// the names the jobs used. Each leaf is an aggregate — `sum`, `count`,
-    /// `min`, `max` — over the jobs that reported it, so a per-row counter
-    /// comes back as one number for the whole operation.
-    /// [`Client::statistic_sum`] pulls a single total out of it.
-    ///
-    /// Empty if no job reported anything.
+    /// The `custom` subtree of the job statistics, keyed by the names the jobs
+    /// used, each leaf an aggregate (`sum`, `count`, `min`, `max`) over the
+    /// jobs. Empty if no job reported anything. [`Client::statistic_sum`] reads
+    /// one total.
     ///
     /// # Errors
     ///
@@ -2924,9 +2868,7 @@ impl Client {
     /// Everything the scheduler recorded about an operation's jobs.
     ///
     /// The whole `job_statistics` tree, custom and built-in alike.
-    /// [`Client::job_statistic_sum`] is the way to read one number out of it;
-    /// this is for looking around, which is how anyone finds out what a cluster
-    /// actually reports.
+    /// [`Client::job_statistic_sum`] reads one number.
     ///
     /// # Errors
     ///
@@ -2939,23 +2881,18 @@ impl Client {
 
     /// The total of one **built-in** job statistic, e.g. `time/exec`.
     ///
-    /// The cluster's own statistics **nest** by path component, where a custom
-    /// name keeps its slash as one key — the two are stored differently, which
-    /// is why they are read differently:
+    /// Built-in statistics nest by path component, with `$$` as the state
+    /// separator; custom ones keep the slash in one key, with `$`. Both
+    /// separators are accepted:
     ///
     /// ```text
     /// custom:    {"rows/rejected" = {"$"  = {completed = {map = {sum=3}}}}}
     /// built-in:  {time = {exec    = {"$$" = {completed = {map = {sum=744}}}}}}
     /// ```
     ///
-    /// Note the separator differs too — `$$` rather than `$`. Both are
-    /// accepted here, because that difference is not something a caller should
-    /// have to know.
-    ///
     /// Totalled over `completed` jobs across job types, as
-    /// [`Client::statistic_sum`] does, and `None` when the cluster reports
-    /// nothing under that path — which is not the same as zero. A local cluster
-    /// reports nothing under `user_job/cpu`, for instance.
+    /// [`Client::statistic_sum`] does. `None`, not zero, when the cluster
+    /// reports nothing under the path (a local cluster has no `user_job/cpu`).
     ///
     /// # Errors
     ///
@@ -2975,15 +2912,10 @@ impl Client {
 
     /// The total of one custom statistic over an operation's completed jobs.
     ///
-    /// `name` is exactly what the job called it, slashes included: the cluster
-    /// keeps `rows/rejected` as one key rather than nesting it.
-    ///
-    /// Only `completed` jobs are counted. An aborted job's work is done again
-    /// by its replacement, so including it would count the same rows twice.
-    /// Job *types* are summed together, so a map-reduce reporting one name from
-    /// both phases gives the operation's total.
-    ///
-    /// `None` means no job reported that name — which is not the same as zero.
+    /// `name` is exactly what the job called it, slashes included
+    /// (`rows/rejected`). Only `completed` jobs count, since an aborted job's
+    /// work is redone by its replacement; job types are summed together.
+    /// `None`, not zero, if no job reported the name.
     ///
     /// # Errors
     ///
@@ -2995,26 +2927,30 @@ impl Client {
 
     /// Polls until the operation reaches a terminal state.
     ///
-    /// **A suspended operation never reaches one**, and this says so rather
-    /// than sitting there: suspension is not a state, so a paused operation
-    /// goes on answering `running` for as long as it is paused. The progress
-    /// line reports it, which is the difference between a wait that looks hung
-    /// and one that names what it is waiting for. Resuming it — from another
-    /// process, or from the one that paused it — is what ends the wait.
+    /// Prints a progress line to stderr when the state changes. A suspended
+    /// operation waits until it is resumed, and the progress line says it is
+    /// suspended.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::OperationFailed`] if it ends as anything other
-    /// than `completed`, or [`ClientError`] if polling itself fails.
+    /// than `completed`, or [`ClientError`] if polling itself fails. Unless
+    /// [`Client::with_job_diagnostics`] turned it off, the error carries the
+    /// first few failed jobs and the tail of their stderr:
+    ///
+    /// ```text
+    /// operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
+    ///   job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
+    ///   stderr:
+    ///     thread 'main' panicked at crates/ytsaurus-job/examples/boom.rs:37:17:
+    /// ```
     pub fn wait_for_operation(&self, id: &str) -> Result<()> {
         let started = Instant::now();
         let mut last_reported = String::new();
 
         loop {
-            // Both attributes, in one request: a loop that watched the state
-            // alone could not tell a paused operation from a running one, and
-            // waiting for a resume that nobody knows is needed is the failure
-            // this whole pair of readers exists to prevent.
+            // Both attributes in one request: the state alone says `running`
+            // for a paused operation.
             let OperationStatus { state, suspended } = self.operation_status(id)?;
 
             let reported = if suspended {
@@ -3033,14 +2969,9 @@ impl Client {
             match state.as_str() {
                 "completed" => return Ok(()),
                 "failed" | "aborted" => {
-                    // The diagnostics go through a client that does not retry.
-                    // Up to four more requests are about to be sent to explain
-                    // a failure the caller already knows about, and an
-                    // unhealthy cluster is exactly when they fail: under the
-                    // default policy `list_jobs` alone can spend ten minutes on
-                    // backoff before giving up, and every step here is
-                    // best-effort, so the wait buys nothing but a program that
-                    // looks hung after the operation has already ended.
+                    // The diagnostics are best-effort and sent once: on an
+                    // unhealthy cluster the default backoff would delay a
+                    // failure that is already known.
                     let quick = self.without_retries();
                     return Err(ClientError::OperationFailed {
                         id: id.to_owned(),
@@ -3056,23 +2987,17 @@ impl Client {
 
     /// Why an operation ended as it did, in the cluster's words.
     ///
-    /// `None` for one that succeeded, and for one that has not finished. This
-    /// is what [`ClientError::OperationFailed`] carries, and what reads back
-    /// the `reason` given to [`Client::abort_operation`]: the reason is folded
-    /// into the operation's error document rather than kept beside it, so this
-    /// is how to find out who stopped an operation and why.
-    ///
-    /// Flattened to the outer message plus the innermost one, because the outer
-    /// message of a YTsaurus error is a category and the cause is at the bottom.
+    /// `None` for one that succeeded or has not finished. Includes the `reason`
+    /// given to [`Client::abort_operation`]. Flattened to the outer message
+    /// plus the innermost one, since the outer one is only a category.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the operation cannot be looked up, or if its
     /// answer cannot be decoded.
     pub fn operation_result_error(&self, id: &str) -> Result<Option<String>> {
-        // Asked for through `get_operation`, not through Cypress: an operation
-        // is not a node under //sys/operations on every cluster, and a local
-        // one answers `has no child with key` for an id that certainly exists.
+        // Through `get_operation`, not Cypress: an operation is not a node
+        // under //sys/operations on every cluster.
         Ok(operation::result_error_of(
             &self.get_operation(id, &["result"])?,
         ))
@@ -3080,19 +3005,12 @@ impl Client {
 
     /// Best-effort fetch of a failed operation's error document.
     ///
-    /// Prefers the flattened message. Falls back to the raw document, because a
-    /// clumsy error still beats an empty one if the response shape ever moves.
-    ///
-    /// Used while building [`ClientError::OperationFailed`], where a failure to
-    /// fetch must never replace the failure being reported — which is why this
-    /// swallows errors and [`Client::operation_result_error`], which has a
-    /// caller to answer to, does not.
+    /// Prefers the flattened message, falling back to the raw body. Swallows
+    /// errors: it runs while building [`ClientError::OperationFailed`], whose
+    /// failure it must not replace.
     fn operation_error(&self, id: &str) -> Option<String> {
-        // The raw body, not the parsed document: the fallback below is for the
-        // case where the shape moved, and a body that does not parse at all —
-        // an HTML page from an intermediary, a truncated stream — is the
-        // farthest it can move. Parsing first would throw away the only
-        // evidence in exactly the case the fallback exists for.
+        // The raw body, so a body that does not parse at all can still be
+        // reported.
         let body = self
             .get_operation_body(
                 yson_build::map([("operation_id", yson_build::string(id))]),
@@ -3108,8 +3026,6 @@ impl Client {
                     .and_then(|result| jobs::error_summary(jobs::field(result, "error")?))
             });
 
-        // Whatever the cluster said, rather than nothing: a clumsy error beats
-        // an empty one if the response shape ever moves.
         summary.or_else(|| Some(crate::error::truncate(&String::from_utf8_lossy(&body), 600)))
     }
 
@@ -3120,10 +3036,9 @@ impl Client {
     /// `state` filters by job state — `failed`, `completed`, `running`, … — and
     /// `limit` caps how many come back.
     ///
-    /// The YTsaurus documentation warns that `list_jobs` can put significant
-    /// load on a cluster and asks that it not be part of a workflow without an
-    /// administrator's approval. This client calls it once per failed
-    /// operation, with a small limit; keep to that shape.
+    /// The YTsaurus documentation asks that `list_jobs`, which can load a
+    /// cluster heavily, not be part of a workflow without an administrator's
+    /// approval.
     ///
     /// # Errors
     ///
@@ -3157,13 +3072,7 @@ impl Client {
 
     /// Fetches one job of an operation.
     ///
-    /// What [`Client::list_jobs`] reports for a job it lists, asked for by id —
-    /// and the way to look at a job whose id came from somewhere else, a log
-    /// line or the web interface, without listing every job of the operation.
-    ///
-    /// The cluster answers with the job document **unwrapped**, and calls the id
-    /// `job_id` where `list_jobs` calls it `id`; both are read here, so the
-    /// [`JobInfo`] that comes back is the same shape either way.
+    /// The [`JobInfo`] [`Client::list_jobs`] would report for it, by id.
     ///
     /// # Errors
     ///
@@ -3191,19 +3100,11 @@ impl Client {
 
     /// Streams the input a job was given.
     ///
-    /// The rows the cluster fed to that one job, in the format its spec asked
-    /// for — which is how a job that failed on one row is reproduced on a
-    /// desk rather than on the cluster.
+    /// The rows the cluster fed to that job, in the format its spec asked for.
+    /// A heavy command, streamed.
     ///
-    /// This is a *heavy* command whose answer is the data, so it streams:
-    /// nothing here holds the job's input, and on an installation that
-    /// separates light and heavy proxies it is sent to the heavy one.
-    ///
-    /// **A job with no input never answers.** Measured against a local cluster:
-    /// the request for a vanilla job's input sat for 30 seconds without a byte.
-    /// A vanilla operation has no input tables, so there is nothing for the
-    /// cluster to send and it does not say so; ask this only of a job that reads
-    /// something.
+    /// **A job with no input, such as a vanilla job's, never answers**: the
+    /// request waits without a byte.
     ///
     /// # Errors
     ///
@@ -3220,12 +3121,9 @@ impl Client {
 
     /// Fetches what a job wrote to stderr.
     ///
-    /// Returns raw bytes: stderr is whatever the process wrote, not necessarily
-    /// UTF-8. Empty if the cluster saved nothing — stderr is kept for failed
-    /// jobs and, when the spec asks for it, for successful ones.
-    ///
-    /// This is a *heavy* command, so on an installation that separates light
-    /// and heavy proxies it goes to the heavy one, like a table read.
+    /// Raw bytes, not necessarily UTF-8; empty if the cluster saved nothing.
+    /// Stderr is kept for successful jobs as well as failed ones. A heavy
+    /// command.
     ///
     /// # Errors
     ///
@@ -3246,9 +3144,7 @@ impl Client {
 
     /// Best-effort report of why an operation's jobs failed.
     ///
-    /// Every step here may fail quietly. This runs while an error is being
-    /// built, and a diagnostic that replaces the failure it was explaining is
-    /// worse than no diagnostic at all.
+    /// Every step may fail quietly, so the failure being reported survives.
     fn failed_jobs(&self, operation_id: &str) -> Vec<JobFailure> {
         if !self.job_diagnostics {
             return Vec::new();
@@ -3269,11 +3165,7 @@ impl Client {
 
     /// The tail of a job's stderr, bounded and decoded lossily.
     ///
-    /// Asks unconditionally rather than skipping jobs whose `stderr_size` is
-    /// zero: the local cluster reported `1` for a job whose stderr was several
-    /// hundred bytes, so the field cannot be trusted to mean "nothing to
-    /// fetch". One request against losing the whole diagnostic is a good trade
-    /// on a path that only runs when an operation has already failed.
+    /// Asks even when `stderr_size` is zero, which is only a hint.
     fn stderr_excerpt(&self, operation_id: &str, job: &JobInfo) -> Option<String> {
         let raw = self.get_job_stderr(operation_id, &job.id).ok()?;
         if raw.is_empty() {
@@ -3289,29 +3181,16 @@ impl Client {
 
     /// Sends a command this crate does not model, and hands back the answer.
     ///
-    /// Every other method here is a command the crate has an opinion about:
-    /// parameters built for you, the response decoded into a type. This is the
-    /// door to the rest of API v4 — the commands this crate has not grown yet,
-    /// and the ones it never will. It is the same door
-    /// [`Client::start_operation`] opens for a hand-built spec, widened from
-    /// one command to all of them, and it means the answer to "can I do X
-    /// against my cluster?" stops being "fork the crate".
-    ///
-    /// `params` is the `X-YT-Parameters` dict — build it with [`yson_build`].
-    /// `payload` is the request body, for a command that takes one. What comes
-    /// back is the response body, exactly as the proxy sent it; API v4 wraps a
-    /// structured answer in a one-key dict, so most commands answer
-    /// `{key=…}` in text YSON.
+    /// `params` is the `X-YT-Parameters` dict, built with [`yson_build`];
+    /// `payload` is the request body, if any. Returns the response body as
+    /// sent: most commands answer a one-key dict, `{key=…}`, in text YSON.
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Method, yson_build};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Client::from_env()?;
     ///
-    /// // `get_supported_features` is not modelled here and takes no
-    /// // parameters. It answers with what this cluster's build can do —
-    /// // codecs, compression, primitive types — which is exactly the question
-    /// // a crate that models a quarter of the API cannot answer for you.
+    /// // Not modelled here; takes no parameters.
     /// let body = client.raw_command(
     ///     Method::Get,
     ///     "get_supported_features",
@@ -3324,49 +3203,24 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// # What this still does for you
+    /// The token, timeout, TLS, header encoding and `X-YT-Error` check
+    /// ([`ClientError::Cluster`]) apply as for any command, and so does the
+    /// client's transaction, except for scheduler commands and a command that
+    /// names its own. [`Method`] gives the rule for picking the verb.
     ///
-    /// Everything that is not about the command's meaning: the token, the
-    /// timeout, TLS, the header encoding, the `X-YT-Error` check that turns a
-    /// cluster failure into a [`ClientError::Cluster`] with the innermost
-    /// message — and the client's transaction. A raw command is stamped with
-    /// `transaction_id` like every other, so a command sent through
-    /// [`Transaction`] is *in* that transaction rather than quietly outside it.
-    /// The exceptions are the same: a command that names its own transaction
-    /// keeps it, and the scheduler commands are not stamped at all.
-    ///
-    /// # What it does not
-    ///
-    /// **It is sent once, and to the configured address.** A command this crate
-    /// does not model cannot be assumed non-mutating, and a retry that applied
-    /// an unknown mutation twice would be a far worse failure than one lost to
-    /// a flaky proxy — so the default is [`Repeatable::Never`] and the retry
-    /// policy is ignored here, whatever it says.
-    ///
-    /// `Never` is the safe answer for *repeating*, and it is the wrong answer
-    /// for *routing*: it sends the command to the address the client was
-    /// configured with, which on an installation that separates proxy roles is
-    /// a control proxy that will not serve a heavy one. A raw `write_file` sent
-    /// this way is refused with `Control proxy may not serve heavy requests
-    /// with input data`, and a raw `read_file` is answered with a 307 to a data
-    /// proxy. [`Client::raw_command_with`] is where a caller who knows the
-    /// command is heavy says [`Repeatable::Heavy`] and gets both halves of that
-    /// answer at once.
-    ///
-    /// The streaming doors need no such care:
+    /// **Sent once, to the configured address** ([`Repeatable::Never`]),
+    /// whatever the retry policy: the command may mutate. A heavy command sent
+    /// this way reaches a control proxy where proxy roles are separate; say
+    /// [`Repeatable::Heavy`] through [`Client::raw_command_with`].
     /// [`Client::raw_command_streaming`] and [`Client::raw_command_upload`] are
-    /// heavy by construction, because streaming *is* the heavy shape.
-    ///
-    /// Nor does it know the verb: see [`Method`] for the cluster's own rule for
-    /// picking one.
+    /// heavy already.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if `command` is not a bare command name,
-    /// if `params` is not a YSON dict — every command's parameters are one, and
-    /// the client adds to them — or if a body is passed with [`Method::Get`],
-    /// which carries none, so it would be dropped in silence. Otherwise
-    /// [`ClientError`] as any command fails.
+    /// if `params` is not a YSON dict, or if a body is passed with
+    /// [`Method::Get`], which would drop it. Otherwise [`ClientError`] as any
+    /// command fails.
     pub fn raw_command(
         &self,
         method: Method,
@@ -3379,34 +3233,17 @@ impl Client {
 
     /// As [`Client::raw_command`], saying how the command may be repeated.
     ///
-    /// The judgement this needs is the cluster's, not a guess: a command
-    /// declares whether it mutates and whether it is heavy, and [`Repeatable`]
-    /// is how that reaches the retry policy. [`Repeatable::Freely`] for a read,
-    /// [`Repeatable::WithMutationId`] for a light mutation the master's
-    /// mutation cache covers, [`Repeatable::Heavy`] for one that moves table or
-    /// file data — which also sends it to a proxy that will accept one —
-    /// [`Repeatable::Never`] otherwise.
+    /// Follow the command's declaration in the cluster's registry:
+    /// [`Repeatable::Freely`] for a read, [`Repeatable::WithMutationId`] for a
+    /// light mutation the master's mutation cache covers, [`Repeatable::Heavy`]
+    /// for table or file data (which also routes it to a heavy proxy), and
+    /// [`Repeatable::Never`] otherwise. Scheduler commands are not covered by
+    /// the master's cache (verified for `abort_operation`); prefer `Never` when
+    /// in doubt.
     ///
-    /// "Light and mutating" is not by itself enough for a mutation ID: the
-    /// cache lives in the master, and a command that goes to the **scheduler**
-    /// is not covered by it. Verified for `abort_operation` — a second send of
-    /// the same ID, flagged as a retry, is answered `No such operation` rather
-    /// than with the first response, so the retry turns an abort that worked
-    /// into an error the caller believes. Whether every scheduler command
-    /// behaves that way was not checked; treat it as the working assumption
-    /// and prefer `Never` when in doubt.
-    ///
-    /// `mutation_id` is for the guarantee a single process cannot give itself:
-    /// persist it, and after a crash the same call is deduplicated against the
-    /// one that already ran instead of applying twice. See [`MutationId`].
-    ///
-    /// An ID given here is stamped on the request **whatever `repeatable`
-    /// says**, including under [`Repeatable::Never`] — the two answer different
-    /// questions. `repeatable` decides whether *this* call may be sent twice;
-    /// a mutation ID decides whether a *later* call, from a process that has
-    /// since restarted, is recognised as the same mutation. A command that must
-    /// not be retried in-process can still be worth making replayable across
-    /// one, and this is how.
+    /// `mutation_id`, if given, is stamped whatever `repeatable` says:
+    /// `repeatable` decides whether this call may be resent, the id whether a
+    /// later call after a restart is the same mutation. See [`MutationId`].
     ///
     /// # Errors
     ///
@@ -3436,20 +3273,13 @@ impl Client {
     /// Sends a command this crate does not model and hands back its response
     /// **unread**.
     ///
-    /// For a command whose answer is the data — `read_blob_table`, anything
-    /// the cluster declares heavy on the way out. [`Client::raw_command`]
-    /// would put all of it in memory first, which for those is the thing worth
-    /// avoiding.
+    /// For a command whose answer is the data, such as `read_blob_table`.
     ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Method, yson_build};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let client = Client::from_env()?;
-    /// // `read_file` has a method now — `Client::read_file_streaming` is
-    /// // this call with the parameters written down — and it stays as the
-    /// // example because its wire shape is verified against a cluster, where
-    /// // an unmodelled command's here would be a guess. The door sends any
-    /// // command the same way.
+    /// // `Client::read_file_streaming` is this call; any command goes the same way.
     /// let mut file = client.raw_command_streaming(
     ///     Method::Get,
     ///     "read_file",
@@ -3461,23 +3291,16 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// Sent once, and never retried: this is the shape a heavy command takes,
-    /// and the documentation is explicit that heavy commands are not repeated.
-    /// It is also sent **to a heavy proxy**, for the same reason and without
-    /// asking — a response that is the data is [`Repeatable::Heavy`] whatever
-    /// the command turns out to be called. The request carries no body —
-    /// [`Client::raw_command_upload`] is the other direction.
-    ///
-    /// The streaming timeout applies, so the transfer itself is not on the
-    /// request clock; see [`Client::with_timeout`].
+    /// Treated as [`Repeatable::Heavy`]: sent once, to a heavy proxy, with no
+    /// request body ([`Client::raw_command_upload`] sends one). The transfer is
+    /// not on the request clock; see [`Client::with_timeout`].
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Config`] if `command` is not a bare command name,
-    /// and [`ClientError`] if the request fails. Failures *during* the read
-    /// arrive from the reader, not from here — and a body cut short by a
-    /// mid-stream failure ends quietly, for the reason [`ResponseReader`]
-    /// describes.
+    /// Returns [`ClientError::Config`] if `command` is not a bare command name
+    /// or `params` is not a dict, and [`ClientError`] if the request fails.
+    /// Failures during the read come from the reader, and a body cut short
+    /// ends quietly; see [`ResponseReader`].
     pub fn raw_command_streaming(
         &self,
         method: Method,
@@ -3492,20 +3315,14 @@ impl Client {
 
     /// Sends a command this crate does not model, streaming its request body.
     ///
-    /// The counterpart of [`Client::raw_command_streaming`], for a command that
-    /// takes an input data stream — the PUT commands, in the cluster's own
-    /// rule. `body` is read to its end and sent as it is read, so what is
-    /// uploaded never has to fit in memory.
-    ///
-    /// This is one attempt and can never be more: a reader that has been
-    /// consumed cannot be sent again. A transaction is what makes such a write
-    /// safe to fail. And it goes to a heavy proxy, as
-    /// [`Client::raw_command_streaming`] does and for the same reason.
+    /// For a command with an input data stream (a PUT command). `body` is sent
+    /// as it is read, once, to a heavy proxy; a transaction makes such a write
+    /// safe to fail.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if `command` is not a bare command name,
-    /// or if the verb is [`Method::Get`], which carries no body. Otherwise
+    /// `params` is not a dict, or the verb is [`Method::Get`]. Otherwise
     /// [`ClientError`] if the request fails, including when `body` itself fails
     /// to read.
     pub fn raw_command_upload(
@@ -3525,9 +3342,7 @@ impl Client {
 
     /// A copy of this client that sends each request once.
     ///
-    /// For best-effort work — the diagnostics on a failed operation — where
-    /// waiting out a backoff cannot improve the answer, and where the delay
-    /// lands after the caller's real result is already decided.
+    /// For best-effort work, where a backoff only delays a decided result.
     fn without_retries(&self) -> Self {
         self.clone().with_retries(RetryPolicy::none())
     }
