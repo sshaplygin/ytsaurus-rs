@@ -1628,9 +1628,10 @@ fn is_port(port: &str) -> bool {
 /// Whether `discovered` sits under the same domain as `configured`.
 ///
 /// The shared domain is the configured host minus its leftmost label, never
-/// below two labels: `cluster.example.net` admits anything under `example.net`,
-/// and `example.net` only itself and what is under it. See [`heavy_base`] for
-/// what the rule is worth.
+/// below two labels: `cluster.example.net` admits `n0132-sas.example.net` and
+/// `n0132-sas.cluster.example.net` and refuses `cluster.example.net.evil.com`,
+/// and `example.net` admits only itself and what is under it. See
+/// [`heavy_base`] for what the rule is worth.
 ///
 /// A configured name with no dot, such as `YT_PROXY=hume` or a short Kubernetes
 /// service name, has no parent domain, so it is matched as a label of the
@@ -2450,8 +2451,8 @@ fn has_scheme(url: &str) -> bool {
 /// What a credential-carrying redirect turns on. Userinfo is not part of an
 /// origin, so `http://real.example.net@evil.example.net/` is
 /// `evil.example.net`. A missing port is the scheme's default: `https://h` and
-/// `https://h:443` are one origin. Fails closed: a URL that cannot be split is
-/// not the same origin as anything.
+/// `https://h:443` are one origin, and `http://h` is another. Fails closed: a
+/// URL that cannot be split is not the same origin as anything.
 fn same_origin(one: &str, other: &str) -> bool {
     match (origin(one), origin(other)) {
         (Some(one), Some(other)) => one == other,

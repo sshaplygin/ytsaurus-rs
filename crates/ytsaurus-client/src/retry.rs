@@ -117,8 +117,8 @@ const CERTIFICATE_VERDICT: &str = "invalid peer certificate: ";
 /// Everything else stays retriable, because the next answer may differ:
 /// `Other(..)` is how `rustls-platform-verifier` reports a failed revocation
 /// lookup or an unreadable trust store; `Expired` and `NotValidYet` belong to
-/// one proxy of a fleet that may be mid-rotation; a bad CRL and `peer sent no
-/// certificates` are transient. See the
+/// one proxy of a fleet that may be mid-rotation; `invalid certificate
+/// revocation list` and `peer sent no certificates` are transient. See the
 /// [protocol reference](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#tls).
 const SETTLED_REJECTIONS: &[&str] = &[
     "UnknownIssuer",
@@ -193,7 +193,7 @@ impl RetryPolicy {
 
     /// The same policy, announcing each retry.
     ///
-    /// The default outside a job.
+    /// The default outside a job; inside one, it puts the messages back.
     #[must_use]
     pub fn loud(mut self) -> Self {
         self.report = true;
@@ -332,15 +332,15 @@ fn rejected_the_certificate(error: &ureq::Error) -> bool {
 
 /// Which settled verdict the TLS layer returned, if it returned one.
 ///
-/// `rustls` wraps its error in an `io::Error` of kind `InvalidData`, which
-/// `ureq` passes through as `ureq::Error::Io`; neither `ureq` nor `ureq-proto`
-/// produces that kind itself. This crate does not depend on `rustls`, so the
-/// rendered text is matched, narrowed three ways: the kind (the TLS layer), the
+/// `rustls` wraps its error in an `io::Error` of kind `InvalidData`
+/// (`ConnectionCommon::complete_io`), which `ureq` passes through as
+/// `ureq::Error::Io`; neither `ureq` nor `ureq-proto` produces that kind
+/// itself. This crate does not depend on `rustls`, so the rendered text is
+/// matched, narrowed three ways: the kind (the TLS layer), the
 /// [`CERTIFICATE_VERDICT`] prefix (the certificate, not the handshake), and
 /// [`SETTLED_REJECTIONS`]. It answers which verdict because
-/// `error::certificate_advice` treats `UnknownIssuer` and
-/// `NotValidForName` differently; that caller shares this match rather than
-/// writing its own.
+/// `error::certificate_advice` treats `UnknownIssuer` and `NotValidForName`
+/// differently; that caller shares this match rather than writing its own.
 pub(crate) fn settled_certificate_verdict(error: &ureq::Error) -> Option<&'static str> {
     let ureq::Error::Io(io) = error else {
         return None;
