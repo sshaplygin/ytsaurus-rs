@@ -520,10 +520,10 @@ impl KeepAlive {
         self.raise();
     }
 
-    /// Asks the thread to stop and waits for it, up to [`DETACH_JOIN_TIMEOUT`],
-    /// so no ping lands after [`Transaction::detach`] returns. The wait is a
-    /// `recv_timeout` on `exited`, since a plain `join()` would wait out the
-    /// ping's whole budget.
+    /// Asks the thread to stop and waits for it, up to [`DETACH_JOIN_TIMEOUT`];
+    /// only within that bound does no ping land after [`Transaction::detach`]
+    /// returns. The wait is a `recv_timeout` on `exited`, since a plain `join()`
+    /// would wait out the ping's whole budget.
     fn stop_and_join(self) {
         self.raise();
         if matches!(
