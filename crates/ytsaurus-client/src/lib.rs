@@ -1,201 +1,67 @@
-//! A thin [YTsaurus](https://ytsaurus.tech) client: enough of the HTTP API v4
-//! to run a Rust worker without a Python installation.
+//! A [YTsaurus](https://ytsaurus.tech) client over HTTP API v4: static tables,
+//! Cypress, transactions, files, batched commands and operations, with no
+//! Python installation needed. Dynamic tables are reached through
+//! [`create_client`] (or [`create_rpc_client`] for the RPC proxy), which both
+//! return the transport-independent [`ytsaurus_api::TableClient`].
 //!
-//! It is deliberately small. It does what launching a job needs — create a
-//! node, upload the worker, write and read tables, start an operation and wait
-//! for it — and nothing else. For everything beyond that, the `yt` CLI remains
-//! the right tool.
-//!
-//! # Launching a job
+//! # Example
 //!
 //! ```no_run
-//! use ytsaurus_client::{Client, MapSpec};
+//! use ytsaurus_client::{Client, Column, ColumnType, MapSpec, TableSchema};
 //!
+//! # #[derive(serde::Serialize, serde::Deserialize)]
+//! # struct Contact { name: String, age: i64 }
 //! # fn main() -> Result<(), ytsaurus_client::ClientError> {
-//! let client = Client::from_env()?;
+//! let client = Client::from_env()?; // YT_PROXY, and the yt CLI's token
 //!
-//! // Upload the worker, marked executable so the node can run it.
+//! // A static table, as Rust values.
+//! let schema = TableSchema::new([
+//!     Column::new("name", ColumnType::Utf8),
+//!     Column::new("age", ColumnType::Int64),
+//! ]);
+//! client.create_table("//tmp/contacts", &schema)?;
+//! client.write_table_rows("//tmp/contacts", &[Contact { name: "Ann".into(), age: 31 }])?;
+//! let rows: Vec<Contact> = client.read_table_rows("//tmp/contacts")?;
+//!
+//! // A map operation running a Rust worker.
 //! client.upload_worker("target/.../my_job", "//tmp/my_job")?;
-//!
-//! let spec = MapSpec::new("./my_job", ["//tmp/input"], ["//tmp/output"])
-//!     .with_local_file("//tmp/my_job")
-//!     .with_memory_limit(512 * 1024 * 1024);
-//!
+//! let spec = MapSpec::new("./my_job", ["//tmp/contacts"], ["//tmp/output"])
+//!     .with_local_file("//tmp/my_job");
 //! let id = client.start_map(&spec)?;
 //! client.wait_for_operation(&id)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # Configuration
+//! [`Client::from_env`] lists the environment variables it reads.
+//! [`Client::wait_for_operation`] reports which jobs failed and the tail of
+//! their stderr in [`ClientError::OperationFailed`]. [`Client::start_transaction`]
+//! makes a sequence of commands visible all at once or not at all. Table and
+//! file data go to the heavy proxies the cluster names in `/hosts`; see
+//! [`Client::with_proxy_discovery`].
 //!
-//! [`Client::from_env`] reads `YT_PROXY` for the cluster address, and finds a
-//! token the way the `yt` CLI does: `YT_TOKEN`, then the file named by
-//! `YT_TOKEN_PATH`, then `~/.yt/token`. A machine where the CLI already works
-//! needs nothing else. A bare host is assumed to be HTTPS; a local cluster is
-//! reached as `http://localhost:8000`.
+//! # Features
 //!
-//! `YT_CA_BUNDLE` names a PEM file of root certificates, for an installation
-//! whose certificate chains to a CA the Mozilla bundle has never heard of. It
-//! is read by any build with the `tls` feature — which is the default, and the
-//! only kind that has a handshake to configure — and the `platform-verifier`
-//! feature is the same answer without a variable to set. Every block in the
-//! file must be an X.509 certificate: one that is not, a `.p7b` re-armoured
-//! under a `BEGIN CERTIFICATE` label being the usual case, refuses the whole
-//! file rather than becoming a root store quietly shorter than the caller
-//! wrote down. Without it, and without that feature, a cluster behind a private
-//! CA fails its very first request with `invalid peer certificate:
-//! UnknownIssuer` — the refusal names both ways out, because on a machine where
-//! `curl` reaches the same cluster nothing else about it suggests whose roots
-//! were consulted.
+//! | Feature | Default | |
+//! | --- | --- | --- |
+//! | `tls` | on | `rustls`, and so `https://` proxies. Off where a worker binary is cross-compiled to musl. |
+//! | `platform-verifier` | off | Trust the operating system's certificate store instead of the Mozilla bundle. |
+//! | `derive` | off | `#[derive(TableRow)]`: a table schema read off the row struct. |
+//! | `rpc` | off | [`create_rpc_client`], the RPC proxy as a second transport. Pulls in tokio and prost. |
+//! | `tracing` | off | A span per attempt, and retry messages as `WARN` events. |
 //!
-//! **An installation differs from a local cluster in ways a caller of
-//! [`Client::from_env`] cannot otherwise reach**, so it reads four more:
-//! `YT_PROXY_SUFFIX` completes a bare cluster name, `YT_HEAVY_PROXY_DOMAINS`
-//! names another domain its heavy proxies live in, `YT_HEAVY_PROXIES_ANYWHERE`
-//! removes that rule outright, and `YT_FILE_CACHE` moves the worker cache. Each
-//! is inert when unset, and each but the first has a builder method beside it —
-//! see [`Client::from_env`] for the table.
+//! `rpc` and `tracing` must stay off in worker builds: a worker should carry
+//! only what it runs on. Sending a `traceparent` ([`TraceContext`]) needs no
+//! feature.
 //!
-//! # When an operation fails
+//! # See also
 //!
-//! [`Client::wait_for_operation`] does not stop at the state. It asks the
-//! cluster which jobs failed and what they wrote to stderr, and carries both in
-//! [`ClientError::OperationFailed`], so a failure explains itself without a
-//! trip to the web UI:
-//!
-//! ```text
-//! operation 1ba94195-… finished as failed: Failed jobs limit exceeded: Process terminated by signal 6
-//!   job 24c164af-… on localhost:24403: User job failed: Process terminated by signal 6
-//!   stderr:
-//!     thread 'main' panicked at crates/ytsaurus-job/examples/boom.rs:37:17:
-//!     boom: this job fails on purpose (row 1, 23 bytes)
-//! ```
-//!
-//! That costs one [`Client::list_jobs`] and a few [`Client::get_job_stderr`]
-//! calls per failed operation; [`Client::with_job_diagnostics`] turns it off.
-//!
-//! # After it has started
-//!
-//! An operation can be paused, given more of its pool, finished early, found by
-//! the alias its spec gave it, and — the one that matters for a pipeline that
-//! restarts — picked up again by a process that did not start it:
-//!
-//! ```no_run
-//! # use ytsaurus_client::{Client, OperationParameters};
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! # let client = Client::from_env()?;
-//! let op = client.attach_operation(std::fs::read_to_string("run.id")?);
-//!
-//! op.suspend(false)?;
-//! op.update_parameters(&OperationParameters::new().with_weight(2.0))?;
-//! op.resume()?;
-//! op.wait()?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! Everything on [`Operation`] is also on [`Client`], taking the id. See the
-//! [`operation`] module for what the cluster does and does not promise about
-//! each of those commands — some of it is surprising, and all of it was
-//! measured.
-//!
-//! # All at once, or not at all
-//!
-//! Each step above can fail halfway and leave something behind — an empty
-//! table, a stale worker, an output table holding neither the old result nor
-//! the new one. [`Client::start_transaction`] makes the whole sequence one
-//! event: nothing it does is visible until [`Transaction::commit`], and
-//! dropping the handle aborts it, so a `?` on any line leaves the cluster as it
-//! was.
-//!
-//! A transaction can also outlive its handle: [`Transaction::detach`] stops
-//! the keep-alive and leaves it running, [`Client::attach_transaction`] turns
-//! the id back into a handle elsewhere, and [`Client::ping_transaction`],
-//! [`Client::commit_transaction`] and [`Client::abort_transaction`] finish one
-//! from a process that holds nothing but the id.
-//!
-//! # Seeing what it did
-//!
-//! The cluster traces itself, so joining its trace costs a header and no
-//! dependency: [`Client::with_trace_context`] puts every request into the
-//! trace a [`TraceContext`] names, and the proxy's own span for that request
-//! is placed inside it rather than starting an orphan.
-//!
-//! This process's own side is the `tracing` feature, off by default: with it,
-//! each attempt runs in a span carrying the command, the attempt number and
-//! the elapsed time, and the message a retry prints on stderr becomes a `WARN`
-//! event instead. It is off because this crate is linked into worker binaries
-//! cross-compiled to musl — the same reason `tls` is.
-//!
-//! # Heavy commands go where the cluster says
-//!
-//! Table and file data — [`Client::write_table`], [`Client::read_table`],
-//! [`Client::write_file`], [`Client::read_file`], [`Client::upload_worker`]
-//! and the streaming forms of each — is what YTsaurus calls a *heavy* command,
-//! and a large installation serves those on a separate set of proxies. This
-//! client asks `/hosts` the first time it sends a heavy command, keeps the
-//! whole answer as a **pool**, and sends each heavy command to a member
-//! **picked at random** — the way both official SDKs pick, because `/hosts`
-//! is ordered by load and a client that keeps one pick for its lifetime never
-//! rebalances: a draining host keeps every client that ever picked it. The
-//! answer is **refreshed** when it outlives
-//! [`Client::with_host_list_refresh_interval`] — a minute by default, the
-//! documentation's own advice — lazily, by the heavy command that finds it
-//! stale; there is no background thread, and a client that stops uploading
-//! stops asking. Light commands stay on the address it was configured with.
-//!
-//! **A proxy that fails is dropped from the pool, not committed to.** A heavy
-//! command that fails for a reason attributable to the host it went to — a
-//! refused connection, a 503, a certificate that does not match that host's
-//! own name — takes that host out of the pool, and the next command picks
-//! from what remains; a later refresh that still names the host puts it back.
-//! Only a pool with nobody left in it sends the client back to the configured
-//! address — and then only until it asks the cluster again, a few seconds
-//! later ([`Client::with_hosts_retry_after`]). That order matters: on a
-//! deployment with separate proxy roles the configured address is a *control*
-//! proxy, and going back there on the first hiccup is the failure this
-//! feature exists to prevent.
-//!
-//! **A cluster that names no heavy proxy is answered by using the configured
-//! address**, which is what leaves a single-node installation working exactly
-//! as it did — asked about again one refresh interval later, so a first
-//! lookup that landed during a rolling restart is not a verdict for life.
-//! Nor is such a cluster asked in the first place when its address
-//! is on loopback: `localhost` is this machine's own cluster or a tunnel to
-//! one, and the address a far-side proxy publishes for itself is not reachable
-//! from either. [`Client::with_proxy_discovery`] overrides that in both
-//! directions, and [`Client::heavy_proxy`] answers the question directly.
-//!
-//! **A discovered host is used only if it shares the configured address's own
-//! domain**, and the scheme and port come from that address rather than from
-//! the answer. That rule is a guard against a typo in a configuration and
-//! against an obviously foreign name — not a promise about where a token can
-//! end up. Steering it with a `/hosts` body means controlling that body, which
-//! over `https://` means owning the proxy (which has the token already) and
-//! over `http://` means being a man-in-the-middle (who reads it out of every
-//! light command anyway). Where the rule does bite is a proxy registering
-//! itself in the cluster's coordinator under an unintended name, and even there
-//! it is coarse: sharing a parent domain on a hosting platform means sharing it
-//! with every other tenant of that platform.
-//! [`Client::with_heavy_proxies_in`] is the version that is a boundary — a list
-//! written out on purpose — [`Client::with_heavy_proxies_under`] names one more
-//! domain for an installation that publishes its heavy proxies in a second zone,
-//! and [`Client::with_heavy_proxies_anywhere`] removes the rule. When a whole
-//! answer is declined the client says so once, naming what it refused and why,
-//! rather than leaving it to be deduced from a cluster error later on.
-//!
-//! Getting this wrong does not look like a routing problem, which is why it is
-//! worth spelling out what it does look like. The refusal arrives as a
-//! structured YTsaurus error — `cluster error 1: Control proxy may not serve
-//! heavy requests with input data` — and this crate's own error rendering does
-//! not print the status beside it, which is how the status came to be recorded
-//! here as 200. The cluster's own rule, from
-//! `TContext::TryRedirectHeavyRequests`, turns on whether the request carries
-//! input data: a heavy **write** gets **503** with `Retry-After: 60`, and a
-//! heavy **read** gets a **307** to a data proxy. And a deployment **behind a
-//! balancer is the case that breaks**, not the case that works: the balancer
-//! fronts the control proxies, so every upload arrives at one.
+//! - [The crate README](https://github.com/sshaplygin/ytsaurus-rs/blob/main/crates/ytsaurus-client/README.md),
+//!   which covers each area with an example.
+//! - [The protocol reference](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md):
+//!   the cluster behaviour this client relies on, observed on a cluster.
+//! - [`ytsaurus-job`](https://docs.rs/ytsaurus-job), the runtime for the worker
+//!   side of an operation.
 
 #![warn(missing_docs)]
 
@@ -208,11 +74,8 @@ mod dynamic;
 // One interface, two transports
 // ---------------------------------------------------------------------------
 
-/// Connects over **HTTP API v4**.
-///
-/// The counterpart of `CreateClient` in the C++ client, and returns the same
-/// interface [`create_rpc_client`] does — so which transport a program uses is
-/// one line, and nothing below it changes.
+/// Connects over HTTP API v4, returning the same interface as
+/// [`create_rpc_client`]. The counterpart of `CreateClient` in the C++ client.
 ///
 /// ```no_run
 /// # fn main() -> Result<(), ytsaurus_api::Error> {
@@ -224,12 +87,6 @@ mod dynamic;
 /// # Ok(())
 /// # }
 /// ```
-///
-/// HTTP is the right default. It reaches everything, it is what the rest of
-/// this crate speaks, and it carries none of the pre-release gates the RPC
-/// crate does. Reach for [`create_rpc_client`] when per-request latency under
-/// concurrency is measurably the bottleneck — and read
-/// `docs/rpc-compatibility.md` first.
 pub fn create_client(
     proxy: &str,
 ) -> std::result::Result<Box<dyn ytsaurus_api::TableClient>, ytsaurus_api::Error> {
@@ -244,13 +101,10 @@ pub fn create_client_with_token(
     Ok(Box::new(Client::with_token(proxy, token)))
 }
 
-/// Connects to an **RPC proxy**, returning the same interface as
-/// [`create_client`].
-///
-/// The counterpart of `CreateRpcClient` in the C++ client. Needs the `rpc`
-/// feature, which is off by default: it pulls in tokio and prost, and this
-/// crate is a dev-dependency of `ytsaurus-job`, whose examples are the static
-/// musl worker binaries.
+/// Connects to an RPC proxy, returning the same interface as
+/// [`create_client`]. The counterpart of `CreateRpcClient` in the C++ client;
+/// needs the `rpc` feature. The RPC client is pre-release: see
+/// [rpc-compatibility.md](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/rpc-compatibility.md).
 ///
 /// ```no_run
 /// # #[cfg(feature = "rpc")]
@@ -268,13 +122,9 @@ pub fn create_client_with_token(
 /// # fn main() {}
 /// ```
 ///
-/// The address is an RPC proxy's, which is not the HTTP proxy's: ask the
-/// cluster for one with the `discover_proxies` command, or read
-/// `crates/ytsaurus-rpc/README.md`.
-///
-/// **This gives up the multiplexing.** The facade drives one call at a time on
-/// a private runtime; the concurrency the RPC proxy exists for needs
-/// `ytsaurus_rpc::Client` directly, and an async caller.
+/// The address is an RPC proxy's, not the HTTP proxy's; the cluster's
+/// `discover_proxies` command lists them. This blocking facade runs one call at
+/// a time; concurrent calls need the async `ytsaurus_rpc::Client` directly.
 #[cfg(feature = "rpc")]
 pub fn create_rpc_client(
     address: &str,
@@ -332,8 +182,7 @@ pub use crate::operation::{
 pub use crate::path::{Key, RowRange, TablePath};
 pub use crate::retry::{MutationId, Repeatable, RetryPolicy};
 pub use crate::schema::{Column, ColumnType, SortOrder, TableRow, TableSchema};
-// The derive and the trait share a name, as `serde::Serialize` does: they live
-// in different namespaces, and a user wants both under one import.
+// The derive and the trait share a name, as `serde::Serialize` does.
 pub use crate::spec::{
     EraseSpec, MapReduceSpec, MapSpec, MergeMode, MergeSpec, OperationType, ReduceSpec,
     RemoteCopySpec, SortSpec, VanillaSpec, VanillaTask,
@@ -359,44 +208,27 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often [`Client::wait_for_operation`] asks the cluster for progress.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How many failed jobs a failed operation reports.
-///
-/// Jobs of one operation usually fail the same way, so the first few explain
-/// the failure and the rest only make the message longer.
+/// How many failed jobs a failed operation reports: jobs of one operation
+/// usually fail the same way.
 const REPORTED_JOBS: u32 = 3;
 
-/// How much of a job's stderr goes into the error message.
-///
-/// The cluster caps saved stderr at megabytes; an error a user reads in a
-/// terminal wants the tail of it, not all of it.
+/// How much of a job's stderr, from its tail, goes into the error message.
 const STDERR_EXCERPT: usize = 4096;
 
-/// Where the cluster's file cache lives.
-///
-/// The path the Python wrapper uses, so a cache an installation already
-/// maintains — and already expires entries from — is the one this client uses
-/// too.
+/// Where the cluster's file cache lives: the Python wrapper's path, so an
+/// installation's existing cache is shared.
 const DEFAULT_FILE_CACHE: &str = "//tmp/yt_wrapper/file_storage/new_cache";
 
-/// Where a worker goes when the file cache will not have it.
-///
-/// `//tmp` because it is the scratch directory an installation gives its users
-/// — the cache itself lives under it — so a caller refused the cache can still
-/// be expected to have this. There is nowhere further to fall: a cluster that
-/// refuses this too is reported rather than worked around.
+/// Where a worker goes when the file cache refuses it: the users' scratch
+/// directory. A refusal here is reported, not worked around.
 const UNCACHED_UPLOAD_DIR: &str = "//tmp";
 
-/// `Access denied` — the cluster's code for a request no matching ACE allows.
-///
-/// What an installation-managed file cache answers a write with, and the whole
-/// of what [`Client::upload_worker_cached`] treats as "no cache for you".
+/// `Access denied`: the code [`Client::upload_worker_cached`] treats as "the
+/// file cache refuses this caller".
 const ACCESS_DENIED: i64 = 901;
 
-/// The `{value=…}` API v4 wraps a structured answer in.
-///
-/// Deserialised rather than walked, so [`Client::get_as`] reads the response
-/// once. Keys the type does not mention are ignored, which is what lets the
-/// envelope grow a field without breaking this.
+/// The `{value=…}` API v4 wraps a structured answer in. Unknown keys are
+/// ignored.
 #[derive(serde::Deserialize)]
 struct Envelope<T> {
     value: T,
@@ -415,20 +247,13 @@ pub struct CachedFile {
     pub name: String,
     /// Whether this call had to upload it. `false` is a cache hit.
     pub uploaded: bool,
-    /// Whether [`CachedFile::path`] is inside the shared file cache.
-    ///
-    /// `true` for a cache hit and for an upload the cache accepted; `false`
+    /// Whether [`CachedFile::path`] is inside the shared file cache: `false`
     /// only when the cache refused this caller and the worker went up under
-    /// `//tmp` instead — see [`Client::upload_worker_cached`].
+    /// `//tmp` instead.
     ///
-    /// **This is the field to branch on before removing anything.** The two
-    /// are not the same question and neither answers the other: `uploaded`
-    /// alone says the bytes were sent, which is true of both destinations, so
-    /// a caller that tidies up after itself on that signal deletes the *shared
-    /// cache entry* on an ordinary cluster and evicts the binary for everyone
-    /// else. A caller that never tidies up leaks a node per launch on the
-    /// cluster where this is `false`, since nothing expires `//tmp` uploads —
-    /// which is the other half of why the fallback warns.
+    /// **Branch on this, not on `uploaded`, before removing the node.**
+    /// Removing a cached one evicts a shared entry for everyone; an uncached
+    /// one under `//tmp` never expires and is the caller's to remove.
     pub cached: bool,
 }
 
@@ -436,9 +261,8 @@ pub struct CachedFile {
 enum Cached {
     /// It is in the cache, at this path.
     At(String),
-    /// The cache refused this caller, in the cluster's own words. Carried back
-    /// rather than returned as an error: see [`Client::upload_worker_cached`],
-    /// which uploads outside the cache instead and says so.
+    /// The cache refused this caller; [`Client::upload_worker_cached`] then
+    /// uploads outside it.
     Refused(ClientError),
 }
 
@@ -479,30 +303,13 @@ impl Client {
 
     /// Connects using `YT_PROXY`, and whatever token the environment offers.
     ///
-    /// The token is looked for the way the `yt` CLI looks for it, and stops at
-    /// the first that has one:
+    /// The token is looked for as the `yt` CLI does, stopping at the first
+    /// source that has one: `YT_TOKEN`, the file named by `YT_TOKEN_PATH`, then
+    /// `~/.yt/token`. A token read from a file is trimmed, so a trailing
+    /// newline does not fail authentication; an unreadable file means no token.
     ///
-    /// 1. `YT_TOKEN`;
-    /// 2. the file named by `YT_TOKEN_PATH`;
-    /// 3. `~/.yt/token`.
-    ///
-    /// So a machine where the CLI already works needs no extra setup. A token
-    /// read from a file is **trimmed**: one written with `echo` ends in a
-    /// newline, and sending that produces an authentication failure that says
-    /// nothing about a newline. An unreadable file is treated as no token
-    /// rather than as an error, because that is what it means on a cluster that
-    /// wants none.
-    ///
-    /// # What else it reads
-    ///
-    /// Everything a cluster can differ in that a *caller* cannot reach from
-    /// here. Every example in this repository builds its client with this one
-    /// method, so a policy settable only in Rust is a policy an example cannot
-    /// be run under — which is how an installation that publishes its heavy
-    /// proxies in another domain came to be unrunnable by any configuration at
-    /// all, and had to be answered with a patch. Each of these is inert when
-    /// unset, so a client built on a machine that sets none behaves exactly as
-    /// [`Client::new`] does.
+    /// The other variables are inert when unset, so with none set this behaves
+    /// as [`Client::new`]:
     ///
     /// | Variable | Effect |
     /// | --- | --- |
@@ -513,20 +320,9 @@ impl Client {
     /// | `YT_FILE_CACHE` | Where [`Client::upload_worker_cached`] keeps its files, for an installation whose shared cache is read-only. [`Client::with_file_cache`]. |
     ///
     /// `YT_HEAVY_PROXIES_ANYWHERE` is applied after `YT_HEAVY_PROXY_DOMAINS`, so
-    /// a machine that sets both is one where the rule is off — the wider of the
-    /// two wins, rather than the order they happen to be exported in.
-    ///
-    /// **The environment can widen the heavy-proxy rule and cannot narrow it**,
-    /// which is deliberate: [`Client::with_heavy_proxies_in`] is the one mode
-    /// that is a boundary rather than a heuristic, and a boundary that a
-    /// variable could set is a boundary that a variable could move. Write that
-    /// one in Rust.
-    ///
-    /// A variable **set to nothing counts as unset**, all of them alike:
-    /// `export YT_FILE_CACHE=` in a shell profile is how a knob gets turned back
-    /// off, and reading it literally would point the cache at `""`. `YT_PROXY`
-    /// included — an empty one earns the same message as a missing one, which is
-    /// the message that says what to export.
+    /// the wider wins. The environment can widen the heavy-proxy rule but not
+    /// narrow it: [`Client::with_heavy_proxies_in`] is set only in Rust. Values
+    /// are trimmed, and a variable set to the empty string counts as unset.
     ///
     /// # Errors
     ///
@@ -536,24 +332,10 @@ impl Client {
         Self::from_lookup(environment_value)
     }
 
-    /// [`Client::from_env`], with the environment handed in.
-    ///
-    /// Everything that method does except reading the process environment, so a
-    /// test can pin **which variable does what** — that a typo in one of the
-    /// five names, or the two heavy-proxy knobs applied in the other order, is
-    /// caught by something other than review. Writing the process environment is
-    /// global, and unsafe in edition 2024; the same split is why
-    /// `http::roots_for` exists beside `http::configured_bundle`.
-    ///
-    /// **Except the token**, which finds its own way in through
-    /// [`token_from_environment`] — `YT_TOKEN`, then `YT_TOKEN_PATH`, then
-    /// `~/.yt/token`, the last of which is a file and not a variable at all. A
-    /// caller of this seam is configuring the five above and nothing else.
-    ///
-    /// The trimming and the empty-is-unset rule live **here** rather than in the
-    /// lookup, so they are on the path every caller takes: a test that
-    /// reimplemented them in its own fake would be pinning the fake, and
-    /// deleting them from [`environment_value`] would leave everything green.
+    /// [`Client::from_env`] with the variables handed in, so tests need not
+    /// write the process environment. The token still comes from
+    /// [`token_from_environment`]. Trimming and empty-is-unset live here, on
+    /// the path every caller takes, rather than in the lookup.
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let value = |name: &str| {
             lookup(name)
@@ -597,33 +379,24 @@ impl Client {
 
     /// Overrides the request timeout, which defaults to two minutes.
     ///
-    /// For a buffered command the limit is end to end, **redirects included**:
-    /// an attempt takes its deadline once and the hops it makes share what is
-    /// left of it, so a proxy that redirects cannot multiply the limit by the
-    /// length of the chain. A retry is a fresh attempt and gets a fresh budget,
-    /// which is what [`Client::with_retries`] bounds.
-    ///
-    /// A streaming transfer — [`Client::read_table_streaming`],
-    /// [`Client::write_table_rows`] and their kin — is not cut off mid-table:
-    /// there the timeout bounds each wait *around* the data (connecting,
-    /// sending the request, the response headers), and the data itself moves
-    /// for as long as it takes.
+    /// For a buffered command the limit is per attempt and end to end: the
+    /// redirects of one attempt share it, and a retry gets a fresh one. A
+    /// streaming transfer ([`Client::read_table_streaming`],
+    /// [`Client::write_table_rows`] and their kin) is not cut off mid-table:
+    /// the timeout bounds connecting, sending the request and receiving the
+    /// response headers, not the data.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.transport.set_timeout(timeout);
         self
     }
 
-    /// Overrides how a failed request is repeated.
+    /// Overrides how a failed request is repeated. The default is five attempts
+    /// with a doubling delay; [`RetryPolicy::none`] turns it off.
     ///
-    /// The default is five attempts with a doubling delay, which covers the
-    /// transient failures a shared cluster produces — a restarting proxy, a
-    /// scheduler that has lost the master. [`RetryPolicy::none`] turns it off.
-    ///
-    /// This applies to light commands only. Heavy ones — table and file I/O —
-    /// are sent once whatever the policy says, because the documentation is
-    /// explicit that they cannot be retried; a transaction is the way to make
-    /// one atomic.
+    /// Applies to light commands only. Heavy ones (table and file I/O) are sent
+    /// once whatever the policy, because the documentation says they cannot be
+    /// retried; use a transaction to make one atomic.
     #[must_use]
     pub fn with_retries(mut self, policy: RetryPolicy) -> Self {
         self.transport.set_retries(policy);
@@ -632,15 +405,11 @@ impl Client {
 
     /// Overrides where [`Client::upload_worker_cached`] keeps its files.
     ///
-    /// Defaults to the path the Python wrapper uses, so the cache is shared
-    /// with whatever else the installation runs — and whatever expiry its
-    /// administrators have set applies here too.
-    ///
-    /// That default is **read-only for an ordinary user** on a managed
-    /// installation, which the client itself handles — a refused cache degrades
-    /// to a plain upload and says so — but which anything that needs to *clear*
-    /// an entry cannot. `YT_FILE_CACHE` sets the same thing for a client built
-    /// by [`Client::from_env`].
+    /// Defaults to the Python wrapper's `//tmp/yt_wrapper/file_storage/new_cache`,
+    /// shared with the rest of the installation and subject to its expiry. On a
+    /// managed installation that default is read-only to an ordinary user: an
+    /// upload then degrades to a plain one, but nothing can clear an entry.
+    /// `YT_FILE_CACHE` sets this for [`Client::from_env`].
     #[must_use]
     pub fn with_file_cache(mut self, path: impl Into<String>) -> Self {
         self.file_cache = path.into();
@@ -649,22 +418,29 @@ impl Client {
 
     /// Overrides whether heavy commands ask the cluster where to go.
     ///
-    /// They do by default, which is what makes an upload work on an
-    /// installation that separates proxy roles — unless the address this client
-    /// was given is on loopback, where the lookup can only cost a round trip or
-    /// name a host this process cannot reach. See the module documentation.
+    /// Heavy commands are table and file data: [`Client::write_table`],
+    /// [`Client::read_table`], [`Client::write_file`], [`Client::read_file`],
+    /// [`Client::upload_worker`] and their streaming forms. A control proxy
+    /// refuses them, so by default the first one asks `/hosts`, keeps the
+    /// answer as a pool and sends each heavy command to a member picked at
+    /// random. Light commands stay on the configured address.
     ///
-    /// Both overrides have a use:
+    /// - The pool is refreshed lazily once older than
+    ///   [`Client::with_host_list_refresh_interval`].
+    /// - A host that fails a command for a reason of its own is dropped from
+    ///   the pool. Only an empty pool falls back to the configured address,
+    ///   until [`Client::with_hosts_retry_after`] has passed.
+    /// - A cluster that names no heavy proxy, or whose address is on loopback,
+    ///   uses the configured address for everything.
+    /// - A discovered name must share the configured address's domain, and
+    ///   takes its scheme and port from it; see
+    ///   [`Client::with_heavy_proxies_anywhere`].
     ///
-    /// - `true` for a cluster reached at `localhost` that really does have
-    ///   heavy proxies this process can reach — a port-forward into a real
-    ///   installation, where the discovered addresses resolve;
-    /// - `false` to pin every command to the address given, which is what a
-    ///   balancer that already routes by role wants, and what to reach for if
-    ///   the lookup itself is the thing misbehaving.
-    ///
-    /// This does not disturb what a client it was cloned from has already
-    /// resolved.
+    /// `true` asks even on loopback, as through a port-forward into a real
+    /// installation; `false` pins every command to the configured address, as
+    /// behind a balancer that routes by role. Neither disturbs what a client
+    /// this was cloned from has resolved. [`Client::heavy_proxy`] shows the
+    /// result. Details: [Where a heavy command goes](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#where-a-heavy-command-goes).
     #[must_use]
     pub fn with_proxy_discovery(mut self, enabled: bool) -> Self {
         self.transport.set_proxy_discovery(enabled);
@@ -674,42 +450,24 @@ impl Client {
     /// Lets `/hosts` name a heavy proxy outside the configured address's own
     /// domain.
     ///
-    /// **Off by default.** A discovered name is used only if it is the
-    /// configured host itself or sits under that host's parent domain —
-    /// `https://cluster.example.net` will follow `n0132-sas.example.net` and
-    /// will not follow `n0132-sas.somewhere-else.net`. A configured name with
-    /// no dots in it, which is how `YT_PROXY` is usually written, is matched as
-    /// a label instead: `hume` follows `n0008-sas.hume.yt.example.net`. A name
-    /// that is refused is passed over; a `/hosts` answer that is refused
-    /// entirely leaves the upload going to the configured address, which is
-    /// where it went before this client routed anything, and the client says so
-    /// once rather than leaving it to be deduced.
+    /// Off by default: a discovered name is used only if it is the configured
+    /// host or under its parent domain, so `https://cluster.example.net`
+    /// follows `n0132-sas.example.net` and not `n0132-sas.somewhere-else.net`.
+    /// A dotless configured name is matched as a non-leftmost label: `hume`
+    /// follows `n0008-sas.hume.yt.example.net`. Refused names are passed over;
+    /// if a whole `/hosts` answer is refused, heavy commands go to the
+    /// configured address and the client says so once.
     ///
-    /// **What that rule is worth**, since it was once written down here as more
-    /// than it is: it guards against a typo in a configuration and against an
-    /// obviously foreign name. It is not what keeps a token where you put it.
-    /// Steering a heavy command with a `/hosts` body means controlling that
-    /// body — over `https://` that is owning the proxy, which has the token
-    /// already, and over `http://` that is being a man-in-the-middle, who reads
-    /// the token out of every light command without coming near this. Where the
-    /// rule does bite is a proxy registering itself in the coordinator under an
-    /// unintended name, and even there a shared parent domain on a hosting
-    /// platform is shared with every tenant of it. Use
-    /// [`Client::with_heavy_proxies_in`] where a real boundary is wanted.
+    /// The domain rule guards against a typo and an obviously foreign name; it
+    /// is not a boundary for the token. [`Client::with_heavy_proxies_in`] is.
+    /// With the rule off, the scheme and port still come from the configured
+    /// address, and a name carrying `://`, `/`, `@` or whitespace is still
+    /// refused.
     ///
-    /// Turn it on for an installation whose `/hosts` genuinely names another
-    /// domain — a cluster fronted by a vanity address, or one whose data proxies
-    /// live under a separate zone. Nothing else in the client changes; the
-    /// scheme still comes from the configured address, a name carrying `://`,
-    /// `/`, `@` or whitespace is still refused, and the configured port still
-    /// carries through.
-    ///
-    /// The symptom of needing it is an upload that reaches the *configured*
-    /// address and is refused there — `Control proxy may not serve heavy
-    /// requests with input data` — while [`Client::heavy_proxy`] shows a
-    /// perfectly good address the client declined to use. The client says so
-    /// itself, once, when it declines a whole `/hosts` answer, and the refusal
-    /// it then collects carries the same sentence.
+    /// The symptom of needing a wider rule is `Control proxy may not serve
+    /// heavy requests with input data` while [`Client::heavy_proxy`] shows an
+    /// address the client declined. [`Client::with_heavy_proxies_under`] names
+    /// one more domain instead of removing the rule.
     ///
     /// ```
     /// use ytsaurus_client::Client;
@@ -718,37 +476,22 @@ impl Client {
     ///     .with_heavy_proxies_anywhere(true);
     /// ```
     ///
-    /// **This is all or nothing**, which is why
-    /// [`Client::with_heavy_proxies_under`] and
-    /// [`Client::with_heavy_proxies_in`] exist beside it: a domain rule that
-    /// misses by one label should not have to be answered by removing the rule
-    /// — name the other domain, or the proxies themselves. The last of the
-    /// three called is the one that decides.
-    ///
-    /// This does not disturb what a client it was cloned from has already
-    /// resolved.
+    /// The last of this, `with_heavy_proxies_under` and `with_heavy_proxies_in`
+    /// to be called decides. None disturbs what a client this was cloned from
+    /// has resolved.
     #[must_use]
     pub fn with_heavy_proxies_anywhere(mut self, enabled: bool) -> Self {
         self.transport.set_heavy_proxies_anywhere(enabled);
         self
     }
 
-    /// Restricts heavy commands to a list of proxies written out by hand.
+    /// Restricts heavy commands to a list of proxies written out by hand: the
+    /// one setting that is a boundary for the token rather than a heuristic.
     ///
-    /// The third answer to "which of the names `/hosts` gives may this client
-    /// send a token to", and the only one that is a boundary rather than a
-    /// heuristic. The domain rule is a guard against a typo and against an
-    /// obviously foreign name — it cannot be more than that without a
-    /// public-suffix list, and on a shared platform a shared parent domain
-    /// means very little: `yt-1234.us-east-1.elb.amazonaws.com` and every other
-    /// load balancer in that region share one. A list somebody wrote on purpose
-    /// does not have that problem.
-    ///
-    /// Names are compared **without their ports and without case**; the port a
-    /// command is sent to still comes from the configured address, or from the
-    /// `/hosts` entry when it carries one. Everything else in the client is
-    /// unchanged: the scheme comes from the configured address, and a name
-    /// carrying `://`, `/`, `@` or whitespace is still not a name.
+    /// Names are compared without their ports and without case. The port still
+    /// comes from the configured address, or from the `/hosts` entry when it
+    /// carries one; the scheme comes from the configured address; a name
+    /// carrying `://`, `/`, `@` or whitespace is refused.
     ///
     /// ```
     /// use ytsaurus_client::Client;
@@ -758,11 +501,10 @@ impl Client {
     /// ```
     ///
     /// An empty list admits nothing, so every heavy command stays on the
-    /// configured address — [`Client::with_proxy_discovery`] is the plainer way
-    /// to say that. The last of this and
-    /// [`Client::with_heavy_proxies_anywhere`] to be called is the one that
-    /// decides, and neither disturbs what a client this was cloned from has
-    /// already resolved.
+    /// configured address, as `with_proxy_discovery(false)` would. The last of
+    /// this, [`Client::with_heavy_proxies_anywhere`] and
+    /// [`Client::with_heavy_proxies_under`] to be called decides. None disturbs
+    /// what a client this was cloned from has resolved.
     #[must_use]
     pub fn with_heavy_proxies_in<I, S>(mut self, names: I) -> Self
     where
@@ -777,15 +519,10 @@ impl Client {
     /// Lets `/hosts` name a heavy proxy under a domain given here, as well as
     /// under the configured address's own.
     ///
-    /// The middle setting, and on a large installation the only one that fits.
-    /// A cluster addressed as `cluster.example.net` may publish its heavy
-    /// proxies as `n0132-sas.rack7.proxy-zone.net` — a different domain, so the
-    /// default rule refuses every one of them and no upload can leave the
-    /// control proxy: `Control proxy may not serve heavy requests with input
-    /// data`. The two answers that existed for that were writing all
-    /// seventy-nine names out by hand, which goes stale the moment a proxy
-    /// rotates, and [`Client::with_heavy_proxies_anywhere`], which removes the
-    /// rule. What such an installation actually has is one more domain.
+    /// For an installation that publishes its heavy proxies in another zone,
+    /// such as `n0132-sas.rack7.proxy-zone.net` for `cluster.example.net`:
+    /// the default rule refuses them all, and a hand-written list goes stale
+    /// when a proxy rotates.
     ///
     /// ```
     /// use ytsaurus_client::Client;
@@ -794,37 +531,18 @@ impl Client {
     ///     .with_heavy_proxies_under(["proxy-zone.net"]);
     /// ```
     ///
-    /// A domain is matched as a suffix and as itself, without case: the entry
-    /// above admits `proxy-zone.net` and anything under it, and nothing else.
-    /// Every way a person writes one is accepted — surrounding space, a leading
-    /// or trailing dot, a leading `*`, a scheme, a port — so a value read out of
-    /// a configuration file works as written. An entry left with **no dot in
-    /// it** is dropped rather than honoured: `net` would admit every `.net` host
-    /// the cluster could name, which is
-    /// [`Client::with_heavy_proxies_anywhere`] by accident.
+    /// A domain matches itself and anything under it, without case. Surrounding
+    /// space, a leading or trailing dot, a leading `*`, a scheme and a port are
+    /// all accepted. An entry with no dot (`net`) is dropped, since it would
+    /// admit a whole top-level domain.
     ///
-    /// The configured address's own domain still applies — this widens the
-    /// rule, it does not replace it — and an empty list therefore means exactly
-    /// the default. A **second call replaces the first**, like every other
-    /// setter here; it does not accumulate. And note the shape of the family
-    /// rather than the reading of one word:
-    /// `with_heavy_proxies_anywhere(false)` after this means *the default rule*
-    /// and so discards these domains, which is not "stop widening".
-    ///
-    /// **It is still a suffix rule**, so it is worth what the domain rule is
-    /// worth: a guard against a typo and against an obviously foreign name, not
-    /// a boundary that holds a credential — see
-    /// [`Client::with_heavy_proxies_anywhere`] for why that is, and
-    /// [`Client::with_heavy_proxies_in`] for the version that is a boundary.
-    /// A domain somebody wrote on purpose is a narrower statement than removing
-    /// the rule, and it survives proxy rotation, which is the whole of what it
-    /// claims.
-    ///
-    /// The last of this,
-    /// [`Client::with_heavy_proxies_anywhere`] and
-    /// [`Client::with_heavy_proxies_in`] to be called is the one that decides,
-    /// and none of them disturbs what a client this was cloned from has already
-    /// resolved.
+    /// The configured address's own domain still applies, so an empty list is
+    /// the default. A second call replaces the first.
+    /// `with_heavy_proxies_anywhere(false)` after this restores the default
+    /// rule and discards these domains. This is still a suffix rule, not a
+    /// boundary; see [`Client::with_heavy_proxies_in`]. The last of the three
+    /// setters to be called decides, and none disturbs what a client this was
+    /// cloned from has resolved.
     #[must_use]
     pub fn with_heavy_proxies_under<I, S>(mut self, domains: I) -> Self
     where
@@ -838,17 +556,10 @@ impl Client {
 
     /// Overrides the budget for the `/hosts` lookup, which defaults to 800 ms.
     ///
-    /// The lookup sits in front of the first heavy command and gets its own
-    /// budget rather than the client's, because not getting an answer costs
-    /// nothing worse than the routing this crate had none of a release ago —
-    /// see [`Client::with_timeout`] for the one that bounds a command.
-    ///
-    /// **Raising it is the point.** The budget used to be the smaller of 800 ms
-    /// and the client's own timeout, so it could only ever be lowered: a
-    /// cluster that answers `/hosts` in 900 ms could not be routed to by any
-    /// configuration at all. And 800 ms is not always generous — the first
-    /// heavy command is often a client's first request, which puts DNS, TCP and
-    /// a TLS handshake inside the same budget.
+    /// Independent of [`Client::with_timeout`], and may be set above it. A
+    /// lookup that runs out of budget leaves heavy commands on the configured
+    /// address. The first heavy command is often a client's first request, so
+    /// DNS, TCP and a TLS handshake fall inside this budget.
     ///
     /// ```
     /// use std::time::Duration;
@@ -866,19 +577,12 @@ impl Client {
     /// Overrides how long routing stays off after it falls back, which defaults
     /// to ten seconds.
     ///
-    /// Two things end up here: a `/hosts` lookup that failed for a reason that
-    /// might pass, and a pool whose every host has been dropped. Both mean
-    /// "use the address the caller gave, and ask the cluster again in a
-    /// moment"; this is the moment. A lookup that *settled* — no such endpoint,
-    /// an answer that is not a list of names, a cluster that names no heavy
-    /// proxy — runs on the other clock instead: it is asked about again one
-    /// [`Client::with_host_list_refresh_interval`] later, like any other
-    /// answer that has grown old. So does a failed *refresh*, deliberately —
-    /// a pool in hand still routes, so nothing there is urgent enough for
-    /// this window.
-    ///
-    /// Shorter brings routing back sooner after a cluster recovers, and costs a
-    /// lookup more often while it is broken. Longer is the other trade.
+    /// Applies after a `/hosts` lookup fails for a reason that may pass, and
+    /// after every host in the pool has been dropped: heavy commands use the
+    /// configured address and the cluster is asked again after this long. A
+    /// settled answer (no such endpoint, not a list of names, no heavy proxy)
+    /// and a failed refresh wait [`Client::with_host_list_refresh_interval`]
+    /// instead.
     #[must_use]
     pub fn with_hosts_retry_after(mut self, after: Duration) -> Self {
         self.transport.set_hosts_retry_after(after);
@@ -888,19 +592,12 @@ impl Client {
     /// Overrides how old a `/hosts` answer may grow before a heavy command
     /// re-asks, which defaults to one minute.
     ///
-    /// The default is the documentation's own advice — "a good strategy is to
-    /// re-query the `/hosts` list every minute or every few queries" — and
-    /// the refresh is lazy, the way the C++ SDK does it: the heavy command
-    /// that finds the list stale asks first, and a client that stops
-    /// uploading stops asking. There is no background thread. A refresh that
-    /// fails keeps the previous answer in use rather than dropping routing on
-    /// the floor, and waits out another interval before asking again.
-    ///
-    /// The refresh is also what restores a proxy the client dropped: a heavy
-    /// command that fails for a reason attributable to the host it went to —
-    /// a refused connection, a 503, a certificate that does not match that
-    /// host's name — takes that host out of the pool, and the next fresh
-    /// answer that still names it puts it back.
+    /// The default follows the documentation's advice. The refresh is lazy, as
+    /// in the C++ SDK: the heavy command that finds the list stale asks first,
+    /// with no background thread. A failed refresh keeps the previous answer
+    /// for another interval. A refresh also restores a host dropped after a
+    /// failure of its own (a refused connection, a 503, a certificate not
+    /// matching its name).
     ///
     /// ```
     /// use std::time::Duration;
@@ -910,11 +607,9 @@ impl Client {
     ///     .with_host_list_refresh_interval(Duration::from_secs(300));
     /// ```
     ///
-    /// Shorter follows the cluster's load-ordering more closely and costs a
-    /// lookup more often — `Duration::ZERO` re-asks before every heavy
-    /// command. `Duration::MAX` disables the refresh: the first answer is
-    /// then kept as long as it keeps working, though a failed host is still
-    /// dropped and an emptied pool still falls back and re-asks.
+    /// `Duration::ZERO` re-asks before every heavy command. `Duration::MAX`
+    /// disables the refresh; a failed host is still dropped, and an emptied
+    /// pool still falls back and re-asks.
     #[must_use]
     pub fn with_host_list_refresh_interval(mut self, interval: Duration) -> Self {
         self.transport.set_host_list_refresh_interval(interval);
@@ -923,12 +618,10 @@ impl Client {
 
     /// Turns the failed-job report in [`Client::wait_for_operation`] on or off.
     ///
-    /// On by default: when an operation fails, the client asks the cluster
-    /// which jobs failed and what they printed, and puts that in the error.
-    /// That costs one `list_jobs` and a few `get_job_stderr` calls per failed
-    /// operation. The YTsaurus documentation asks that `list_jobs` not be used
-    /// without an administrator's approval, so this is the way to switch it
-    /// off on an installation where that approval was not given.
+    /// On by default: a failed operation costs one `list_jobs` and a few
+    /// `get_job_stderr` calls. The YTsaurus documentation asks that `list_jobs`
+    /// not be used without an administrator's approval; switch this off where
+    /// that approval was not given.
     #[must_use]
     pub fn with_job_diagnostics(mut self, enabled: bool) -> Self {
         self.job_diagnostics = enabled;
@@ -937,18 +630,11 @@ impl Client {
 
     /// Binds this client to an existing transaction.
     ///
-    /// Every command it then sends happens inside that transaction. This is the
-    /// low-level door: [`Client::start_transaction`] is the one that starts a
-    /// transaction, keeps it alive and aborts it if the work does not finish,
-    /// and [`Client::attach_transaction`] is the one that turns an id from
-    /// elsewhere into such a handle — pinging, able to commit and abort.
-    ///
-    /// This binding does neither: nothing pings the transaction on this path,
-    /// so it expires on the cluster's schedule unless its owner — or
-    /// [`Client::ping_transaction`] — is pinging it, and finishing it takes
-    /// [`Client::commit_transaction`] or [`Client::abort_transaction`] with
-    /// the id. What it buys over `attach_transaction` is costlessness: no
-    /// round trip, no thread.
+    /// Every command it then sends happens inside that transaction. Nothing
+    /// pings it on this path, so it expires unless its owner or
+    /// [`Client::ping_transaction`] keeps it alive; finish it with
+    /// [`Client::commit_transaction`] or [`Client::abort_transaction`]. No round
+    /// trip and no thread, unlike [`Client::attach_transaction`].
     #[must_use]
     pub fn with_transaction(mut self, id: impl Into<String>) -> Self {
         self.transport.set_transaction(Some(id.into()));
@@ -961,13 +647,9 @@ impl Client {
         self.transport.transaction()
     }
 
-    /// Puts every request this client sends into `context`'s trace.
-    ///
-    /// The cluster traces itself: the proxy opens a span for each request, and
-    /// a request that names a trace has its span put inside that one instead of
-    /// starting an orphan. So this is the cheap half of making a launch
-    /// visible — nothing is emitted from this process, and the work the cluster
-    /// does on its behalf turns up under the caller's own trace.
+    /// Puts every request this client sends into `context`'s trace, by sending
+    /// a `traceparent` header: the proxy's span for each request is placed
+    /// inside that trace. Nothing is emitted from this process.
     ///
     /// ```
     /// use ytsaurus_client::{Client, TraceContext};
@@ -986,8 +668,7 @@ impl Client {
     /// cluster's own logs and UI do.
     ///
     /// A [`Transaction`] started from this client inherits the context, pings
-    /// included — the transaction is part of the same piece of work, and a
-    /// commit that hung is one of the things a trace is for.
+    /// included.
     #[must_use]
     pub fn with_trace_context(mut self, context: &TraceContext) -> Self {
         self.transport.set_trace(context);
@@ -1027,10 +708,10 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// The transaction lasts 30 seconds without a ping — the cluster's own
-    /// default — and the handle pings it every ten, so an operation that runs
-    /// for an hour is fine. [`Client::start_transaction_with`] changes the
-    /// timeout.
+    /// The transaction expires 30 seconds after its last ping, the cluster's
+    /// default, and the handle pings it every ten.
+    /// [`Client::start_transaction_with`] changes the timeout. Dropping the
+    /// handle aborts the transaction.
     ///
     /// # Errors
     ///
@@ -1041,10 +722,8 @@ impl Client {
 
     /// Starts a transaction that expires `timeout` after its last ping.
     ///
-    /// The handle pings three times per timeout, so this is about what happens
-    /// when the handle is *gone*: how long the transaction holds its locks
-    /// after the process holding it dies without aborting. Shorter frees them
-    /// sooner; longer survives a longer pause.
+    /// The handle pings three times per timeout, so `timeout` decides how long
+    /// the locks outlive a process that dies without aborting.
     ///
     /// # Errors
     ///
@@ -1055,51 +734,20 @@ impl Client {
 
     /// Attaches to a transaction something else started, and keeps it alive.
     ///
-    /// The receiving half of [`Transaction::detach`]: one process starts a
-    /// transaction and detaches, hands the id over, and this turns the id back
-    /// into a real [`Transaction`] — a bound client, a pinging thread, and
-    /// `commit`/`abort`/`ping` that work. Two things differ from a handle the
-    /// same process started, and both follow from not being the owner:
+    /// The receiving half of [`Transaction::detach`]: turns an id from another
+    /// process into a [`Transaction`] that pings, commits and aborts. Unlike a
+    /// handle this process started:
     ///
-    /// - **Dropping it detaches rather than aborts** — the pings stop and
-    ///   nothing is sent. The C++ client's destructor draws the same line, and
-    ///   for the same reason: an attacher's `?` must not destroy work the
-    ///   process that started the transaction is still counting on. An
-    ///   explicit [`Transaction::abort`] still aborts; only the drop differs.
-    /// - **The ping interval is read, not chosen.** Pinging needs the
-    ///   transaction's timeout and the id alone does not carry it, so this
-    ///   asks the cluster for `#<id>/@timeout` — one round trip, which is also
-    ///   what makes attaching to a transaction that is gone fail *here*,
-    ///   rather than on the first command sent through the handle.
+    /// - **dropping it detaches rather than aborts**, as in the C++ client; an
+    ///   explicit [`Transaction::abort`] still aborts;
+    /// - the ping interval comes from the cluster: this reads `#<id>/@timeout`,
+    ///   then pings once before returning, since the timeout says nothing
+    ///   about how much of it is left.
     ///
-    /// **It pings before it returns**, one more round trip. `@timeout` is the
-    /// *configured* lifetime and says nothing about how much of it is left:
-    /// the id carries no hint of when its last holder pinged, so a handoff
-    /// that took longer than two thirds of the timeout would otherwise hand
-    /// back a handle whose first ping is already too late. That ping restarts
-    /// the cluster's clock at the attach, and doubles as the liveness probe
-    /// this call reports on.
-    ///
-    /// So this is **two retryable round trips**, both on this client and so
-    /// under its retry policy — five attempts of two minutes by default,
-    /// backoff between — where the keep-alive's own pings run one attempt on a
-    /// budget of half the ping interval. A ping the caller is waiting on
-    /// should not fail over one dropped packet; a keep-alive ping is retried
-    /// by being sent again next interval.
-    ///
-    /// **Nothing stops two attaches to the same id.** Each is a real handle
-    /// with a thread of its own, and they simply ping the same transaction
-    /// twice as often; whichever commits or aborts first decides it, and the
-    /// other's next command fails with `No such transaction`. There is no
-    /// registry, on purpose — a second process attaching is the whole point,
-    /// and this process is not in a position to know about it.
-    ///
-    /// The handle always pings. One that did not would be
-    /// [`Client::with_transaction`] — the plain binding, which already exists —
-    /// plus [`Client::ping_transaction`], [`Client::commit_transaction`] and
-    /// [`Client::abort_transaction`], which take the bare id; reach for those
-    /// where a thread per transaction is not wanted. (The Go SDK spells that
-    /// choice `AttachTx(id, &AttachTxOptions{AutoPingable: false})`.)
+    /// Both round trips use this client's retry policy. Two attaches to one id
+    /// are two independent handles; whichever commits or aborts first decides,
+    /// and the other then fails with `No such transaction`. For no ping
+    /// thread, use [`Client::with_transaction`] and the bare-id commands.
     ///
     /// ```no_run
     /// # use ytsaurus_client::Client;
@@ -1116,29 +764,19 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the transaction does not exist or the
-    /// timeout cannot be read. The error names the id and the operation
-    /// itself, because the cluster's own answer does not always do either.
-    /// Both spellings were observed on a local cluster: an expired id earns
-    /// `Error resolving path #<id>/@timeout` around `No such object <id>` —
-    /// object, not transaction, since the id is addressed as one — while an
-    /// id that never named anything is refused as `Unknown cell tag 0`, with
-    /// no id in it at all. A transaction that expires between the two round
-    /// trips fails the same way, on the ping: `No such transaction`.
+    /// Returns [`ClientError`] if the transaction does not exist, has expired,
+    /// or its timeout cannot be read. The error names the id, which the
+    /// cluster's answer may not ([transaction errors](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#handing-a-transaction-to-another-process)).
     pub fn attach_transaction(&self, id: &str) -> Result<Transaction> {
         Transaction::attach(self, id.to_owned())
     }
 
     /// Tells the cluster a transaction is still wanted, by bare id.
     ///
-    /// A held [`Transaction`] does this on its own thread; this is for a
-    /// process that has nothing but the id — between a [`Transaction::detach`]
-    /// in one process and the commit in another, *somebody* must say the
-    /// transaction is still wanted, or it expires its timeout after its last
-    /// ping (30 seconds by default; verified on a local cluster with a
-    /// two-second timeout left alone for four). A ping is also the cheapest
-    /// liveness probe: the cluster answers one for a transaction that is gone
-    /// with `No such transaction`.
+    /// For a process holding only the id, such as between a
+    /// [`Transaction::detach`] and the commit elsewhere: a transaction expires
+    /// its timeout (30 seconds by default) after its last ping. Also the
+    /// cheapest liveness probe.
     ///
     /// # Errors
     ///
@@ -1150,14 +788,9 @@ impl Client {
 
     /// Publishes everything done in a transaction, by bare id.
     ///
-    /// What lets a process finish a transaction it did not start — the other
-    /// end of a [`Transaction::detach`], without the round trip and the ping
-    /// thread of [`Client::attach_transaction`].
-    ///
-    /// Sent under a mutation ID, because **a commit is not idempotent**: the
-    /// second commit of the same transaction is refused with `No such
-    /// transaction`, which reads like the first one failed. The mutation ID
-    /// makes a retried commit the same commit rather than a second one.
+    /// Sent under a mutation ID, because **a commit is not idempotent**: a
+    /// second commit is refused with `No such transaction`. The mutation ID
+    /// makes a retried commit the same commit.
     ///
     /// # Errors
     ///
@@ -1170,11 +803,9 @@ impl Client {
 
     /// Discards everything done in a transaction, by bare id.
     ///
-    /// **Forgiving, unlike [`Client::abort_operation`]**: aborting a
-    /// transaction that already committed, aborted or expired — or one that
-    /// never existed — answers `{}`, verified on a local cluster. So this is
-    /// safe to send on any cleanup path, and it is retried freely on the same
-    /// grounds.
+    /// Unlike [`Client::abort_operation`], idempotent: aborting a transaction
+    /// that committed, aborted, expired or never existed succeeds. Safe on any
+    /// cleanup path, and retried freely.
     ///
     /// # Errors
     ///
@@ -1186,38 +817,21 @@ impl Client {
 
     /// Asks the cluster for the least-loaded heavy proxy, if it has one.
     ///
-    /// **The client already does this for itself.** Heavy commands — table and
-    /// file data, in either direction — resolve a heavy proxy on their own and
-    /// go there; see the module documentation for when, and for how long the
-    /// answer is kept. So this is no longer the way to make an upload work: it
-    /// is the way to *see* the address, or to hand it to something that is not
-    /// this client — a second [`Client`], another process, a `curl`.
-    ///
-    /// It asks every time and shares nothing with what the client resolved for
-    /// itself, so calling it neither costs nor changes anything the next
-    /// command does. It also reports the name **as the cluster gave it**,
-    /// before the checks automatic routing puts it through — which is what
-    /// makes it the way to see why a host was declined. A name here that the
-    /// uploads are not using is the symptom
-    /// [`Client::with_heavy_proxies_anywhere`] exists for.
-    ///
-    /// It shares the lookup's budget, though: one attempt bounded by
-    /// [`Client::with_hosts_timeout`] — 800 ms unless that says otherwise —
-    /// rather than the client's retry policy and request timeout. The budget
-    /// belongs to the question, not to whoever asked it.
+    /// Heavy commands already route themselves (see
+    /// [`Client::with_proxy_discovery`]); this shows the address, or hands it
+    /// to something else. It asks every time, shares nothing with the client's
+    /// own routing, and reports the name as the cluster gave it, before the
+    /// domain checks: a name here that uploads do not use is the symptom
+    /// [`Client::with_heavy_proxies_anywhere`] describes. One attempt, bounded
+    /// by [`Client::with_hosts_timeout`].
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails, or if `/hosts` does not
-    /// answer with the documented list of host names. `Ok(None)` means the
-    /// cluster answered and named no heavy proxy — which a failure must not be
-    /// allowed to look like, since the caller's next move is to stop looking.
+    /// answer with a list of host names. `Ok(None)` means the cluster named no
+    /// heavy proxy.
     pub fn heavy_proxy(&self) -> Result<Option<String>> {
-        // Through the transport, so this carries the token and the TLS guard
-        // like every other request, and so that the automatic routing and this
-        // read the same answer with the same parser. Not the timeout and not
-        // the retry policy: `Transport::fetch` gives this question its own
-        // budget, which is the whole point of it having one.
+        // The transport's parser and budget, shared with automatic routing.
         Ok(self.transport.heavy_hosts()?.into_iter().next())
     }
 
@@ -1237,10 +851,7 @@ impl Client {
             Payload::None,
             Repeatable::Freely,
         )?;
-        // `{"value"=%false;}` — the envelope key is `value`, as it is for
-        // `get`, not the command's own name. Asking for `exists` here failed
-        // every call with a decode error, and nothing in the crate called this
-        // until transactions needed to ask whether a node had survived one.
+        // `{"value"=%false;}`: the key is `value`, not the command's name.
         Ok(matches!(
             self.value_field(&body, "value")?.node,
             YsonNode::Boolean(true)
@@ -1273,10 +884,6 @@ impl Client {
 
     /// Creates a table with a schema.
     ///
-    /// A schematised table is checked on every write, stores its columns in
-    /// their own types, and can be sorted and merged; an unschematised one
-    /// takes anything and finds out later.
-    ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
     /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
@@ -1290,19 +897,16 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// Unlike [`Client::create`], this **fails if the path already exists**.
-    /// That is deliberate: the cluster ignores the attributes of a create it
-    /// skips, so an `ignore_existing` version of this would quietly leave the
-    /// old table with the old schema and report success. Changing the schema of
-    /// a table that exists is `alter_table`'s job.
+    /// Unlike [`Client::create`], this **fails if the path already exists**:
+    /// the cluster ignores the attributes of a create it skips, so the old
+    /// schema would survive. [`Client::alter_table`] changes an existing one.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Config`] if the schema is one the cluster would
     /// refuse, or [`ClientError`] if the request fails.
     pub fn create_table(&self, path: &str, schema: &TableSchema) -> Result<()> {
-        // Locally first: the same rules, but as one sentence naming the column
-        // rather than a nested error document from the cluster.
+        // Locally first, so the error names the column in one sentence.
         schema
             .validate()
             .map_err(|reason| ClientError::Config(format!("{path}: {reason}")))?;
@@ -1311,10 +915,8 @@ impl Client {
             ("path", yson_build::string(path)),
             ("type", yson_build::string("table")),
             ("recursive", yson_build::boolean(true)),
-            // The schema goes *inside* `attributes`. A top-level `schema` here
-            // is accepted, answered with 200 and a node id, and silently
-            // ignored — the table comes back with an empty weak schema. This
-            // is the single worst mistake available in this command.
+            // The schema goes inside `attributes`: a top-level `schema` is
+            // answered 200 and silently ignored.
             (
                 "attributes",
                 yson_build::map([("schema", schema.to_yson())]),
@@ -1333,9 +935,6 @@ impl Client {
 
     /// Changes the schema of a table that already exists.
     ///
-    /// The other half of [`Client::create_table`]: a table outlives the program
-    /// that made it, and the rows it holds gain columns.
-    ///
     /// ```no_run
     /// # use ytsaurus_client::{Client, Column, ColumnType, TableSchema};
     /// # fn main() -> Result<(), ytsaurus_client::ClientError> {
@@ -1350,34 +949,13 @@ impl Client {
     /// # }
     /// ```
     ///
-    /// **A table with rows in it accepts only changes that ask less of the
-    /// rows already written.** Watched on a cluster, on a table holding two
-    /// rows — and each refusal says which column and why:
-    ///
-    /// | Change | |
-    /// | --- | --- |
-    /// | add an **optional** column, anywhere in the order | allowed |
-    /// | make a required column optional | allowed |
-    /// | `strict` → non-strict | allowed |
-    /// | add a **required** column | `Cannot insert a new required column "must" into a non-empty table` |
-    /// | remove a column | `Cannot remove column "size" from a strict schema` |
-    /// | change a column's type | `Type … is modified in non backward compatible manner` |
-    /// | rename a column | read as a removal, and refused as one |
-    /// | make the table sorted | `Cannot change schema from unsorted to sorted` |
-    /// | non-strict → `strict` | `Changing "strict" from "false" to "true" is not allowed` |
-    ///
-    /// Two consequences worth knowing before either becomes permanent:
-    ///
-    /// - **An empty table accepts all of it** — dropping columns, changing types,
-    ///   becoming sorted. So a schema change tried out on an empty table proves
-    ///   nothing about the same change on a full one.
-    /// - **A non-strict schema can never gain a named column**:
-    ///   `Cannot insert a new column "note" into non-strict schema`. Relaxing
-    ///   `strict` is a one-way door out of schema evolution.
-    ///
-    /// Unlike `create`, the schema here is a **top-level parameter** rather than
-    /// an attribute — the two commands are exact opposites on this, and `create`
-    /// silently ignores the spelling `alter_table` requires.
+    /// **A table with rows accepts only changes that ask less of them**: adding
+    /// an optional column anywhere, making a column optional, and `strict` to
+    /// non-strict. Adding a required column, removing or renaming one, changing
+    /// a type, becoming sorted and non-strict to `strict` are refused, naming
+    /// the column. An empty table accepts every change, so a rehearsal on one
+    /// proves nothing. A non-strict schema can never gain a named column.
+    /// [Details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#changing-a-schema).
     ///
     /// # Errors
     ///
@@ -1391,8 +969,7 @@ impl Client {
 
         let params = yson_build::map([
             ("path", yson_build::string(path)),
-            // Top-level, where `create` wants it inside `attributes`. Getting
-            // this the wrong way round fails loudly here and silently there.
+            // Top-level here; `create` wants it inside `attributes`.
             ("schema", schema.to_yson()),
         ]);
         self.transport.call(
@@ -1407,9 +984,8 @@ impl Client {
 
     /// The schema of a table, as the cluster stores it.
     ///
-    /// Returns the raw YSON: the cluster answers with more than it was given —
-    /// every column carries `required`, `type` *and* `type_v3` whichever was
-    /// written, and the keys come back in alphabetical order.
+    /// Returns the raw YSON, in which every column carries `required`, `type`
+    /// and `type_v3` whichever was written, with keys in alphabetical order.
     ///
     /// # Errors
     ///
@@ -1420,10 +996,8 @@ impl Client {
 
     /// Removes a Cypress node.
     ///
-    /// The node must exist, and a map node must be empty — the cluster's own
-    /// defaults, and the safe ones: a mistyped path fails instead of deleting
-    /// whatever it happened to name. [`Client::remove_tree`] is the deliberate
-    /// spelling for a subtree.
+    /// The node must exist, and a map node must be empty, so a mistyped path
+    /// fails. [`Client::remove_tree`] removes a subtree.
     ///
     /// # Errors
     ///
@@ -1436,9 +1010,7 @@ impl Client {
     /// Removes a Cypress node and everything under it. Succeeds if it is
     /// already absent.
     ///
-    /// This is `recursive` plus `force`: the spelling for "make this path not
-    /// exist", whatever is there now — which is also why it deserves a moment
-    /// of care with the argument.
+    /// `recursive` plus `force`: makes the path not exist, whatever is there.
     ///
     /// # Errors
     ///
@@ -1465,18 +1037,13 @@ impl Client {
 
     /// The names of a node's children.
     ///
-    /// **Not sorted.** The order is the cluster's own and has no meaning; a
-    /// listing of three dated tables came back as the second, the third and
-    /// then the first. Sort it if the order matters.
-    ///
-    /// A path that is not a map node is an error rather than an empty list —
-    /// `"List" method is not supported` — and so is a path that does not exist.
+    /// **Not sorted**: the order is the cluster's own.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the request fails, or if the cluster marks
-    /// the answer `incomplete`: a listing that is silently short is worse than
-    /// no listing.
+    /// Returns [`ClientError`] if the request fails, if the path does not exist
+    /// or is not a map node (`"List" method is not supported`), or if the
+    /// cluster marks the answer `incomplete`.
     pub fn list(&self, path: &str) -> Result<Vec<String>> {
         let params = yson_build::map([("path", yson_build::string(path))]);
         let body = self.transport.call(
@@ -1513,12 +1080,9 @@ impl Client {
 
     /// Moves a node, creating missing parents.
     ///
-    /// Fails if `destination` exists; [`Client::move_replacing`] is the one that
-    /// overwrites, and the pair is how a result is published: write a staging
-    /// table, then move it over the live one.
-    ///
-    /// Named `move_node` because `move` is a Rust keyword, and `client.r#move`
-    /// at every call site would be a worse tax than the four extra characters.
+    /// Fails if `destination` exists; [`Client::move_replacing`] overwrites,
+    /// which publishes a staging table over the live one. Named `move_node`
+    /// because `move` is a Rust keyword.
     ///
     /// # Errors
     ///
@@ -1555,13 +1119,11 @@ impl Client {
 
     /// Creates a link at `link_path` pointing at `target`.
     ///
-    /// A link resolves to its target, so `//tmp/latest/@row_count` reads the
-    /// target's row count. To ask about the link itself, put `&` after its path:
-    /// `//tmp/latest&/@target_path`. Without the `&` the question goes through
-    /// to the target and is answered as if the link were not there.
+    /// A link resolves to its target, attributes included:
+    /// `//tmp/latest/@row_count` is the target's. A `&` after the path asks
+    /// about the link itself: `//tmp/latest&/@target_path`.
     ///
-    /// Fails if `link_path` exists; [`Client::link_replacing`] is what points an
-    /// existing link somewhere else.
+    /// Fails if `link_path` exists; [`Client::link_replacing`] repoints one.
     ///
     /// # Errors
     ///
@@ -1572,9 +1134,8 @@ impl Client {
 
     /// Points a link at `target`, replacing whatever is at `link_path`.
     ///
-    /// The `//tmp/thing/latest` pattern: publish under a dated name, then move
-    /// the link. Readers that follow the link see the old version until this
-    /// call and the new one after it, and never a half-written table.
+    /// Publish under a dated name, then repoint `//tmp/thing/latest`: readers
+    /// see the old version until this call and the new one after it.
     ///
     /// # Errors
     ///
@@ -1602,11 +1163,8 @@ impl Client {
 
     /// Takes a lock, or fails because somebody else holds one.
     ///
-    /// Only inside a transaction: a lock lives as long as the transaction that
-    /// took it, and there is nothing else for it to belong to. A client that is
-    /// not in one is told so here rather than by the cluster.
-    ///
-    /// The failure is worth reading — it names the transaction that won:
+    /// Only inside a transaction, which the lock lives as long as. A refusal
+    /// names the transaction that holds the lock:
     ///
     /// ```text
     /// Cannot take "exclusive" lock for node //tmp/live since "exclusive" lock
@@ -1625,17 +1183,10 @@ impl Client {
 
     /// Queues for a lock, and waits until it is held.
     ///
-    /// A waitable lock is **granted later, or never** — the cluster answers
-    /// immediately with a lock that is `pending`, and it becomes `acquired` when
-    /// the transactions ahead of it end. Returning that lock as though it were
-    /// held is the mistake this command exists to make impossible: this polls
-    /// until the cluster says `acquired`, and gives up after `wait_for`.
-    ///
-    /// The deadline is not a nicety. A request can queue for something that will
-    /// never happen and the cluster will not say so: a transaction that already
-    /// holds a snapshot lock on the node is refused an exclusive one outright,
-    /// but the *waitable* version of the same request is queued behind a lock
-    /// only that transaction's own end will release.
+    /// The cluster answers a waitable lock at once as `pending`; this polls
+    /// until it is `acquired`, and gives up after `wait_for`. A lock can wait
+    /// forever without the cluster saying so: a transaction holding a snapshot
+    /// lock on the node queues behind itself for an exclusive one.
     ///
     /// # Errors
     ///
