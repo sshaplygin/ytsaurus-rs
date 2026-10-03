@@ -35,10 +35,12 @@
 //!
 //! [`Client::from_env`] lists the environment variables it reads.
 //! [`Client::wait_for_operation`] reports which jobs failed and the tail of
-//! their stderr in [`ClientError::OperationFailed`]. [`Client::start_transaction`]
-//! makes a sequence of commands visible all at once or not at all. Table and
-//! file data go to the heavy proxies the cluster names in `/hosts`; see
-//! [`Client::with_proxy_discovery`].
+//! their stderr in [`ClientError::OperationFailed`].
+//! [`Client::attach_operation`] returns an [`Operation`] handle that can pause,
+//! reprice, finish or wait on an operation another process started.
+//! [`Client::start_transaction`] makes a sequence of commands visible all at
+//! once or not at all. Table and file data go to the heavy proxies the cluster
+//! names in `/hosts`; see [`Client::with_proxy_discovery`].
 //!
 //! # Features
 //!
