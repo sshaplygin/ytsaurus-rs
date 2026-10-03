@@ -165,7 +165,6 @@ pub enum ClientError {
         state: String,
         /// The operation's error document, when it has one.
         error: Option<String>,
-        /// The jobs that failed, with what they printed.
         /// The failed jobs, with what they printed. Empty if none were reported,
         /// if [`Client::with_job_diagnostics`](crate::Client::with_job_diagnostics)
         /// is off, or if fetching them failed.
