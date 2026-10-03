@@ -313,7 +313,7 @@ impl Client {
     /// | Variable | Effect |
     /// | --- | --- |
     /// | `YT_PROXY_SUFFIX` | Completes a bare cluster name: `YT_PROXY=hume` with `YT_PROXY_SUFFIX=.yt.example.net` addresses `hume.yt.example.net`. Off unless set, and applied only to a name with no dot, no colon and no `localhost` in it — the gate the Go SDK uses. There is no builder for this one: in Rust, spell the address out. |
-    /// | `YT_CA_BUNDLE` | A PEM file of roots, for a cluster behind a private CA. Read by the transport rather than here, and by [`Client::new`] too. |
+    /// | `YT_CA_BUNDLE` | A PEM file of roots, for a cluster behind a private CA, which otherwise fails with `invalid peer certificate: UnknownIssuer`. Every block must be an X.509 certificate, or the whole file is refused. Read by the transport, so by [`Client::new`] too. |
     /// | `YT_HEAVY_PROXY_DOMAINS` | One more domain — or several, comma- or space-separated — that `/hosts` may name a heavy proxy under. [`Client::with_heavy_proxies_under`]. |
     /// | `YT_HEAVY_PROXIES_ANYWHERE` | `1`, `true` or `yes` removes the domain rule outright. [`Client::with_heavy_proxies_anywhere`]. |
     /// | `YT_FILE_CACHE` | Where [`Client::upload_worker_cached`] keeps its files, for an installation whose shared cache is read-only. [`Client::with_file_cache`]. |
@@ -1267,18 +1267,18 @@ impl Client {
     /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
-    /// Parts run in parallel. A mutating batch is retried under a mutation id
-    /// unless a [`BatchRequest::raw`] part makes it send-once; a bound
-    /// transaction is stamped on each part. Parts past
-    /// [`BatchRequest::with_max_part_size`] go as further requests, with no
-    /// rollback ([details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands)).
+    /// Parts run in parallel. Read-only batches retry freely, mutating ones under
+    /// a mutation id, ones with a [`BatchRequest::raw`] part never; a bound
+    /// transaction is stamped on each part. Parts past [`BatchRequest::with_max_part_size`]
+    /// go as further requests, with no rollback ([details](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#batched-commands)).
     ///
     /// # Errors
     ///
     /// [`ClientError::Config`] for an empty batch; [`ClientError::BatchInterrupted`]
     /// when a split batch stops after earlier requests ran, with their answers
     /// (sending it again reapplies them); [`ClientError::Decode`] for a
-    /// malformed answer; [`ClientError::Redirected`] on a cross-origin redirect.
+    /// malformed answer; [`ClientError::Redirected`] on a cross-origin redirect;
+    /// otherwise as any command. Per-part failures are the `Err` items.
     pub fn execute_batch(&self, batch: &BatchRequest) -> Result<Vec<Result<YsonValue>>> {
         self.execute_batch_with(batch, None)
     }
@@ -1340,10 +1340,13 @@ impl Client {
         let mut results = Vec::with_capacity(batch.len());
 
         for chunk in batch.parts().chunks(max_part_size) {
-            // The parts go in the body, not the `X-YT-Parameters` header: the
-            // proxy merges a POST's body parameters with the header's
-            // (`TContext::CaptureParameters`), and the C++ client's
-            // `THttpRawBatchRequest::ExecuteBatch` sends them the same way.
+            // The parts go in the body as `requests=[{command=…; parameters={…};
+            // input=…}]`, answered `{results=[{output=…}|{error=…}]}`
+            // ([reference](https://ytsaurus.tech/docs/en/api/commands#execute_batch)).
+            // Not in the `X-YT-Parameters` header: the proxy merges a POST's
+            // body parameters with the header's (`TContext::CaptureParameters`),
+            // and the C++ client's `THttpRawBatchRequest::ExecuteBatch` does
+            // the same.
             let answered = batch::render_chunk(chunk, batch.concurrency(), self.transaction_id())
                 .and_then(|body| {
                     self.transport.call_with(
@@ -1699,7 +1702,8 @@ impl Client {
     ///
     /// Returns [`ClientError`] if the request fails, including a missing path
     /// (`Error getting basic attributes of user objects`);
-    /// [`ClientError::ResponseTooLarge`], never retried, past 512 MiB; and
+    /// [`ClientError::ResponseTooLarge`] past 512 MiB, never retried or blamed
+    /// on the proxy; and
     /// [`ClientError::Decode`] if the node's size cannot be read or differs
     /// from the body's length.
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
@@ -2922,9 +2926,10 @@ impl Client {
 
     /// Why an operation ended as it did, in the cluster's words.
     ///
-    /// `None` for one that succeeded or has not finished. Includes the `reason`
-    /// given to [`Client::abort_operation`]. Flattened to the outer message
-    /// plus the innermost one, since the outer one is only a category.
+    /// `None` for one that succeeded or has not finished. What
+    /// [`ClientError::OperationFailed`] carries, including the `reason` given to
+    /// [`Client::abort_operation`]. Flattened to the outer message plus the
+    /// innermost one, since the outer one is only a category.
     ///
     /// # Errors
     ///
@@ -3129,8 +3134,8 @@ impl Client {
     /// # Ok::<(), ytsaurus_client::ClientError>(())
     /// ```
     ///
-    /// The token, timeout, TLS, the `X-YT-Error` check and the client's
-    /// transaction apply (scheduler commands and one naming its own
+    /// The token, timeout, TLS, the `X-YT-Error` check ([`ClientError::Cluster`])
+    /// and the client's transaction apply (scheduler commands and one naming its own
     /// transaction are not stamped). [`Method`] gives the rule for the verb.
     /// **Sent once, to the configured address** ([`Repeatable::Never`]); for a
     /// heavy command, pass [`Repeatable::Heavy`] to [`Client::raw_command_with`].
