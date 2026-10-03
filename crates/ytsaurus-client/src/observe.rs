@@ -2,9 +2,9 @@
 //! again, the file cache will not take this caller's worker, or `/hosts` named
 //! no usable heavy proxy.
 //!
-//! - With the `tracing` feature **off** (the default), each is a line on
+//! - With the `tracing` feature off (the default), each is a line on
 //!   stderr. No dependency.
-//! - With it **on**, every attempt runs in a span carrying the command, the
+//! - With it on, every attempt runs in a span carrying the command, the
 //!   attempt number and its duration, and each message is a `WARN` event with
 //!   the same facts as fields. With no subscriber installed the stderr line is
 //!   still printed: Cargo unifies features across the graph, so a launcher may
@@ -189,10 +189,11 @@ const NAMED_REFUSALS: usize = 3;
 
 /// Says that `/hosts` named heavy proxies and this client used none of them.
 ///
-/// Said once per client. Otherwise the only symptom is a later `Control proxy
-/// may not serve heavy requests with input data`, which names neither `/hosts`
-/// nor the names this client refused. `refused` is one rendered clause per
-/// name, with its reason. Muted by [`RetryPolicy::quiet`], as [`retrying`] is.
+/// Said at most once per client, when its first lookup refuses every name.
+/// Otherwise the only symptom is a later `Control proxy may not serve heavy
+/// requests with input data`, which names neither `/hosts` nor the names this
+/// client refused. `refused` is one rendered clause per name, with its reason.
+/// Muted by [`RetryPolicy::quiet`], as [`retrying`] is.
 ///
 /// [`RetryPolicy::quiet`]: crate::RetryPolicy::quiet
 #[cfg(feature = "tracing")]

@@ -305,7 +305,7 @@ fn generate() -> String {
     )
 }
 
-/// Whether **waiting** and sending the same request again could plausibly
+/// Whether waiting and sending the same request again could plausibly
 /// succeed.
 ///
 /// The retry loop's question. Whether asking somewhere else would help is
@@ -387,7 +387,7 @@ fn contains_code(value: &serde_json::Value, wanted: &[i64]) -> bool {
         .is_some_and(|inner| inner.iter().any(|error| contains_code(error, wanted)))
 }
 
-/// Whether putting the **question** to the cluster again could plausibly get a
+/// Whether putting the question to the cluster again could plausibly get a
 /// different answer.
 ///
 /// [`is_retriable`] asks whether waiting would help; this asks whether asking
@@ -405,21 +405,22 @@ pub(crate) fn worth_asking_again(error: &ClientError) -> bool {
         || matches!(error, ClientError::Redirected { .. })
 }
 
-/// Whether a heavy command's failure is plausibly about the **host** it went
+/// Whether a heavy command's failure is plausibly about the host it went
 /// to rather than about the request itself.
 ///
 /// Asked by `Transport::after_heavy`, deciding whether to drop a discovered
-/// proxy from the pool. It is [`worth_asking_again`] plus a settled
-/// certificate rejection: `NotValidForName`, or `UnknownIssuer` from a
-/// misissued chain, is about one host, and other proxies may present good
-/// certificates. A request's own fault (a resolve error, a schema mismatch)
-/// keeps the host.
+/// proxy from the pool. It is [`worth_asking_again`] plus every settled
+/// certificate rejection: `NotValidForName` is about one host's name, and other
+/// proxies may present good certificates. Dropping on `UnknownIssuer` too is
+/// safe: a fleet-wide one costs one host per command until the pool is empty,
+/// and then fallback and re-asking take over. A request's own fault (a resolve
+/// error, a schema mismatch) keeps the host.
 pub(crate) fn attributable_to_the_host(error: &ClientError) -> bool {
     matches!(error, ClientError::Transport { source, .. } if rejected_the_certificate(source))
         || worth_asking_again(error)
 }
 
-/// Whether the proxy refused this because of the **role it has**.
+/// Whether the proxy refused this because of the role it has.
 ///
 /// `Control proxy may not serve heavy requests with input data` is a cluster
 /// error with code 1: hopeless to resend to the same proxy, which
@@ -751,14 +752,14 @@ mod tests {
 
     #[test]
     fn a_rejected_certificate_is_the_hosts_fault_though_not_worth_waiting_or_asking() {
-        // The three predicates part company exactly here. Waiting cannot mend
-        // a verdict this client's own roots and URL
-        // decided, so `is_retriable` says no; the coordinator's list is not
-        // what was wrong, so `worth_asking_again` inherits the no. But
-        // `NotValidForName` is a verdict about *one host's name* — the rest
-        // of the fleet matches its own names fine — so the pool must drop
-        // that host and pick another. Gating the drop on either other
-        // predicate is the mutation this test exists to fail.
+        // The three predicates part company exactly here. Waiting cannot mend a
+        // verdict this client's own roots and URL decided, so `is_retriable`
+        // says no; the coordinator's list is not what was wrong, so
+        // `worth_asking_again` inherits the no. But `NotValidForName` is a
+        // verdict about *one host's name* (the rest of the fleet matches its
+        // own names fine), so the pool must drop that host and pick another.
+        // Gating the drop on either other predicate is the mutation this test
+        // exists to fail.
         for spelling in [
             "invalid peer certificate: UnknownIssuer",
             "invalid peer certificate: certificate not valid for name \"n0132.example.net\"; \

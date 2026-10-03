@@ -60,9 +60,11 @@ const MAX_REDIRECTS: usize = 10;
 /// limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits).
 ///
 /// It covers [`Transport::send`] and [`Transport::upload`], which read through
-/// [`read_capped`]. The non-2xx branch of [`Transport::open`] and the `/hosts`
-/// lookup in [`Transport::fetch`] take `ureq`'s wire-only limit and are not
-/// bounded in memory; both read an answer the client is about to fail on.
+/// [`read_capped`]. Two reads take `ureq`'s wire-only limit and are not bounded
+/// in memory: the non-2xx branch of [`Transport::open`], which reads an answer
+/// the client is about to fail on, and the `/hosts` read in
+/// [`Transport::fetch`], which is the lookup's normal answer, taken from the
+/// configured address.
 const RESPONSE_LIMIT: u64 = 512 * 1024 * 1024;
 
 /// The commands the cluster declares heavy: they carry a data stream.
@@ -242,9 +244,10 @@ const HOSTS_TIMEOUT: Duration = Duration::from_millis(800);
 /// A failed heavy command does not come here: it drops its host from the pool
 /// ([`Transport::after_heavy`]), and only an empty pool falls back. Falling
 /// back at once would send the next uploads to a control proxy that refuses
-/// them. A failed refresh does not come here either: the pool still routes, and
+/// them. A failed refresh does not come here either: the pool still routes, so
 /// the question waits another [`HOST_LIST_REFRESH_INTERVAL`]
-/// ([`Transport::base_for`]).
+/// ([`Transport::base_for`]) rather than putting a lookup stall, under the
+/// mutex, in front of heavy traffic several times a minute.
 ///
 /// Short, because it is how quickly routing returns; long enough that a broken
 /// `/hosts` costs [`HOSTS_TIMEOUT`] a few times a minute rather than per
@@ -317,8 +320,8 @@ struct HeavyPool {
     /// caller turns it into [`HeavyProxy::FellBack`].
     hosts: Vec<String>,
     /// When the answer these came from arrived. Age is judged against each
-    /// transport's own interval when it asks, since clones share this state,
-    /// and an interval of `Duration::MAX` never elapses rather than panicking.
+    /// transport's own interval when it asks, since clones share this state
+    /// and may configure different intervals, and an interval of `Duration::MAX` never elapses rather than panicking.
     fetched: Instant,
 }
 
@@ -831,12 +834,14 @@ impl Transport {
     /// pool; each heavy command picks a member at random, as `THostManager`
     /// (C++) and `ProxySet` (Go) do, and a failed host is dropped until a
     /// refresh ([`Transport::after_heavy`]). A refresh with no usable list
-    /// keeps the pool for another interval rather than retrying on
-    /// [`HOSTS_RETRY_AFTER`].
+    /// keeps the pool for another interval: retrying on [`HOSTS_RETRY_AFTER`]
+    /// would stall heavy traffic under the mutex several times a minute, for an
+    /// answer the pool already makes unnecessary.
     ///
     /// A cluster naming nobody usable is [`HeavyProxy::Configured`] until an
     /// interval passes, which keeps a local cluster working; a refused answer
-    /// is said once ([`crate::observe::declined`]).
+    /// is said at most once per client, when the first lookup refuses every
+    /// name ([`crate::observe::declined`]).
     ///
     /// The mutex is held across the lookup, refresh included, so concurrent
     /// heavy commands wait for one answer. Every outcome sets a clock, so the
@@ -1563,7 +1568,7 @@ fn lock(heavy: &Mutex<HeavyProxy>) -> MutexGuard<'_, HeavyProxy> {
 /// of a hosting platform. `HeavyHosts::Only` is the boundary ([which names are
 /// used](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#which-names-from-hosts-are-used)).
 /// A refused name is passed over; a wholly refused answer means the configured
-/// address, said once by [`crate::observe::declined`].
+/// address, said at most once per client by [`crate::observe::declined`].
 fn heavy_base(
     configured: &str,
     host: &str,
@@ -2918,11 +2923,10 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
 
     #[test]
     fn a_hosts_answer_cannot_send_the_token_somewhere_else() {
-        // The `/hosts` body decides where every
-        // heavy command goes, and a heavy command carries the caller's OAuth
-        // token — so on a plain-http base, forging this body is exactly as easy
-        // as forging a `Location` header, which this client already refuses to
-        // follow.
+        // The `/hosts` body decides where every heavy command goes, and a heavy
+        // command carries the caller's OAuth token, so on a plain-http base,
+        // forging this body is exactly as easy as forging a `Location` header,
+        // which this client already refuses to follow.
 
         // 1. The scheme downgrade. `http://n0132` from an `https://` client
         //    would strip TLS and put the token on the wire in cleartext.
@@ -3066,9 +3070,9 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         // leftmost label to take off, so the parent-domain rule degenerated to
         // "the name itself" and refused the real answer of a real installation:
         // `["n0008-sas.hume.yt.example.net"]` was declined in full, the state
-        // settled as "this cluster has no heavy proxies", and it is never asked
-        // again, leaving the operator with a control proxy's refusal and
-        // nothing to connect it to.
+        // settled as "this cluster has no heavy proxies" until the next
+        // refresh interval, leaving the operator with a control proxy's refusal
+        // and nothing to connect it to.
         assert!(same_domain("hume", "n0008-sas.hume.yt.example.net"));
         // The documentation's own example shape, which is the same rule.
         assert!(same_domain("cluster-name", "n0008-sas.cluster-name"));
@@ -3752,11 +3756,12 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
 
     #[test]
     fn a_rejected_certificate_drops_the_host_and_a_wrong_command_does_not() {
-        // Without a TLS listener presenting a bad certificate. A cert rejected
-        // `NotValidForName` is a per-host verdict, but it is not retriable and
-        // not `worth_asking_again`, so a drop gated on either predicate would
-        // pin the client to the one bad host until the window elapsed. Dropping
-        // must not need the lookup's predicate to agree.
+        // Checked here because it needs no TLS listener presenting a bad
+        // certificate. A cert rejected `NotValidForName` is a per-host verdict,
+        // but it is not retriable and not `worth_asking_again`, so a drop gated
+        // on either predicate would pin the client to the one bad host until
+        // the window elapsed. Dropping must not need the lookup's predicate to
+        // agree.
         let mut transport =
             Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
         transport.set_proxy_discovery(true);

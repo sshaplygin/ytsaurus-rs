@@ -12,8 +12,9 @@
 //!
 //! The proxy (`TryParseTraceParent` in `yt/yt/core/http/helpers.cpp`) also
 //! accepts it without the version, and reads the flags as bit 0 sampled, bit 1
-//! debug. The cluster spells a trace id as a GUID, `8e9bcc43-5c2be9b4-…`:
-//! [`TraceContext::yt_trace_id`]. Observed behaviour is in the
+//! debug. The cluster spells a trace id as a GUID, `8e9bcc43-5c2be9b4-…`, and
+//! [`TraceContext::yt_trace_id`] converts to that spelling. Observed behaviour
+//! is in the
 //! [protocol reference](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#tracing).
 
 use crate::error::{ClientError, Result};
