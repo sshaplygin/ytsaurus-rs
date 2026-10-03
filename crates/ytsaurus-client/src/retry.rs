@@ -338,7 +338,7 @@ fn rejected_the_certificate(error: &ureq::Error) -> bool {
 /// rendered text is matched, narrowed three ways: the kind (the TLS layer), the
 /// [`CERTIFICATE_VERDICT`] prefix (the certificate, not the handshake), and
 /// [`SETTLED_REJECTIONS`]. It answers which verdict because
-/// [`crate::error::certificate_advice`] treats `UnknownIssuer` and
+/// `error::certificate_advice` treats `UnknownIssuer` and
 /// `NotValidForName` differently; that caller shares this match rather than
 /// writing its own.
 pub(crate) fn settled_certificate_verdict(error: &ureq::Error) -> Option<&'static str> {
