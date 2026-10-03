@@ -233,12 +233,12 @@ impl Transaction {
     /// [`Client::commit_transaction`] or [`Client::abort_transaction`].
     ///
     /// The keep-alive is stopped and waited for, up to five seconds; one last
-    /// ping may restart the clock, and within the bound none is in flight once
-    /// this returns. A ping's budget is `clamp(interval / 2, 1 s, 120 s)` with
-    /// `interval = max(timeout / 3, 1 s)`, which five seconds covers while the
-    /// timeout is at most the 30 s default. Above it, a stalled ping can land
-    /// after this returns, and the transaction then lives a full timeout from
-    /// there; the thread exits when that ping ends. See [Handing a transaction
+    /// ping may restart the clock. A ping's budget is
+    /// `clamp(interval / 2, 1 s, 120 s)` with `interval = max(timeout / 3, 1 s)`:
+    /// under the five-second wait for a timeout below 30 s, and equal to it at
+    /// the 30 s default. Above the default, a stalled ping can land after this
+    /// returns, and the transaction then lives a full timeout from there; the
+    /// thread exits when that ping ends. See [Handing a transaction
     /// to another process](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#handing-a-transaction-to-another-process).
     ///
     /// `mem::forget` on a [`Transaction`] instead leaks a thread that pings,
