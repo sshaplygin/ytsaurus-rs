@@ -3,13 +3,10 @@
   "README.md": {
     "bold": 4
   },
-  "crates/ytsaurus-api/CHANGELOG.md": {
-    "bold": 6
-  },
+  "crates/ytsaurus-api/CHANGELOG.md": {},
   "crates/ytsaurus-api/README.md": {},
   "crates/ytsaurus-client/CHANGELOG.md": {
-    "em_dash": 289,
-    "bold": 259
+    "bold": 16
   },
   "crates/ytsaurus-client/README.md": {
     "bold": 15
@@ -102,17 +99,12 @@
   "crates/ytsaurus-client/tests/transaction_lifecycle.rs": {
     "history": 3
   },
-  "crates/ytsaurus-helpers/CHANGELOG.md": {
-    "em_dash": 5
-  },
+  "crates/ytsaurus-helpers/CHANGELOG.md": {},
   "crates/ytsaurus-helpers/README.md": {},
   "crates/ytsaurus-helpers/src/lib.rs": {
     "longest_doc": 57
   },
-  "crates/ytsaurus-job/CHANGELOG.md": {
-    "em_dash": 24,
-    "bold": 25
-  },
+  "crates/ytsaurus-job/CHANGELOG.md": {},
   "crates/ytsaurus-job/README.md": {},
   "crates/ytsaurus-job/src/lib.rs": {
     "longest_doc": 26
@@ -131,30 +123,19 @@
     "issue_refs": 1,
     "history": 1
   },
-  "crates/ytsaurus-proto/CHANGELOG.md": {
-    "em_dash": 6
-  },
+  "crates/ytsaurus-proto/CHANGELOG.md": {},
   "crates/ytsaurus-proto/README.md": {},
-  "crates/ytsaurus-rpc/CHANGELOG.md": {
-    "em_dash": 14,
-    "bold": 27
-  },
+  "crates/ytsaurus-rpc/CHANGELOG.md": {},
   "crates/ytsaurus-rpc/README.md": {},
   "crates/ytsaurus-rpc/src/connection.rs": {
     "history": 1
   },
-  "crates/ytsaurus-skiff/CHANGELOG.md": {
-    "em_dash": 4,
-    "bold": 7
-  },
+  "crates/ytsaurus-skiff/CHANGELOG.md": {},
   "crates/ytsaurus-skiff/src/schema.rs": {
     "history": 1
   },
   "crates/ytsaurus-yson/BENCHMARKS.md": {},
-  "crates/ytsaurus-yson/CHANGELOG.md": {
-    "em_dash": 18,
-    "bold": 13
-  },
+  "crates/ytsaurus-yson/CHANGELOG.md": {},
   "crates/ytsaurus-yson/README.md": {},
   "crates/ytsaurus-yson/src/de.rs": {
     "history": 1
