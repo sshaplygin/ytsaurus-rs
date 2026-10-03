@@ -7,12 +7,11 @@ use crate::jobs::JobFailure;
 /// Shorthand for a client result.
 pub type Result<T, E = ClientError> = std::result::Result<T, E>;
 
-/// Something went wrong talking to the cluster.
+/// Something went wrong talking to the cluster. Each variant says when it is
+/// returned.
 ///
-/// **Non-exhaustive.** A `match` over this must carry a `_` arm: the ways a
-/// cluster can refuse are the cluster's to add, not this crate's to freeze, and
-/// every release so far has added one. Naming a variant, constructing one and
-/// destructuring one all work as before.
+/// Non-exhaustive: a `match` needs a `_` arm, since the ways a cluster can
+/// refuse are the cluster's to add.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientError {
@@ -26,12 +25,10 @@ pub enum ClientError {
         source: Box<ureq::Error>,
     },
 
-    /// The cluster reported an error.
-    ///
-    /// YTsaurus returns a structured error in the `X-YT-Error` header; the
-    /// message and code are lifted out of it so the common case reads well,
-    /// and the whole thing is kept in `raw` because the nested `inner_errors`
-    /// are often where the real cause is.
+    /// The cluster answered with an error document: the `X-YT-Error` header,
+    /// or a batch part's `error`. `code` and `message` are lifted out of it,
+    /// the message joined with the innermost of `inner_errors`; `raw` keeps it
+    /// whole.
     #[error("{command}: cluster error {code}: {message}")]
     Cluster {
         /// The API command that failed.
@@ -55,28 +52,15 @@ pub enum ClientError {
         body: String,
     },
 
-    /// A redirect was refused rather than followed.
+    /// A redirect was refused rather than followed; `refusal` says which rule
+    /// it met.
     ///
-    /// A control proxy does not refuse a heavy *read*: it answers `307
-    /// Temporary Redirect` naming a data proxy on another host — the
-    /// [HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)
-    /// gives that row as *"307 | Redirecting heavy queries from light to heavy
-    /// proxies"*. Following it *without* the `Authorization` header — which is
-    /// what `ureq` does by default — makes the request arrive unauthenticated,
-    /// and the cluster then reports `Client is missing credentials` about a
-    /// token that may be perfectly valid. Re-attaching it and going would
-    /// follow an instruction the client never asked for, on a request already
-    /// addressed elsewhere. This error is the third answer: go nowhere, and say
-    /// where the proxy pointed.
-    ///
-    /// The message stops short of declaring the token good. It cannot know
-    /// that — a gateway in front of the cluster may answer an expired token
-    /// with a redirect of its own — so it reports the one thing this client is
-    /// certain of: the credentials never reached the host that answered.
-    ///
-    /// Not every redirect ends here. One that stays on the origin the request
-    /// was addressed to is followed, credentials and all, because nothing new
-    /// learns the token by it; `refusal` says which rule this redirect met.
+    /// A control proxy answers a heavy read with a cross-host `307` to a data
+    /// proxy ([HTTP proxy reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes)).
+    /// Followed without `Authorization`, it ends in `Client is missing
+    /// credentials` about a token that may be fine, so this client goes nowhere
+    /// and says where the proxy pointed. A redirect that stays on the request's
+    /// origin is followed, credentials and all. See [Redirects](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#redirects).
     #[error(
         "{command}: the proxy answered HTTP {status} and redirected to {location}, \
          which this client did not follow: {refusal}{}",
@@ -93,11 +77,8 @@ pub enum ClientError {
         location: String,
         /// Which rule the redirect met.
         refusal: RedirectRefusal,
-        /// Whether the redirected command reads or writes a data stream.
-        ///
-        /// Only those belong on a heavy proxy, so only those are told to go to
-        /// one: a `create` that met a balancer's `301` cannot use that advice
-        /// and is not given it.
+        /// Whether the command reads or writes a data stream; only then does the
+        /// message advise a heavy proxy.
         heavy: bool,
     },
 
@@ -110,27 +91,15 @@ pub enum ClientError {
         reason: String,
     },
 
-    /// A buffered response ran past what this client will hold in memory.
+    /// A buffered response ran past what this client will hold in memory,
+    /// `limit` bytes after decompression. Refused rather than truncated, and
+    /// never retried or blamed on the host; the message names the streaming
+    /// method where the command has one.
     ///
-    /// Its own variant rather than a [`ClientError::Decode`], which is what it
-    /// was first written as. Every other `Decode` in this crate means *the
-    /// bytes were read and were not the shape expected* — a YSON document that
-    /// does not parse, a Skiff frame that ends early, an envelope missing the
-    /// key the command answers under. This body was never read at all, and the
-    /// difference is the whole of what the caller can do next: a `Decode`
-    /// invites a look at the data, and this invites the streaming half of the
-    /// same command, which the message names.
-    ///
-    /// Refused rather than truncated, and never retried — no amount of waiting
-    /// shrinks a response, and the host that served it did nothing wrong. That
-    /// second half is not this caller's concern alone: a heavy read blamed on
-    /// its host takes a healthy data proxy out of the pool, and enough of them
-    /// empty it. See `http::body_failure`.
-    ///
-    /// `limit` counts bytes **after** decompression, which is where they are
-    /// actually held — and it is what this client *holds*, not what the
-    /// process needs: the buffer grows by doubling and copies, so peak
-    /// residency runs above the number. See `http::RESPONSE_LIMIT`.
+    /// Not a [`ClientError::Decode`], which means bytes were read and had the
+    /// wrong shape. `limit` is what is held, not what the process needs: the
+    /// buffer grows by doubling, so peak residency runs above it
+    /// ([Response size limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits)).
     #[error(
         "{command}: the response ran past the {} this client will hold in \
          memory{}",
@@ -145,37 +114,21 @@ pub enum ClientError {
     },
 
     /// A split batch stopped part of the way through, and the requests before
-    /// the failure have **already run on the cluster**.
+    /// the failure have already run on the cluster.
     ///
-    /// [`Client::execute_batch`](crate::Client::execute_batch) sends a batch
-    /// larger than [`BatchRequest::with_max_part_size`](crate::BatchRequest::with_max_part_size)
-    /// as several `execute_batch` requests. There is no rollback: when a later
-    /// request fails wholesale, the earlier ones have run and whichever of
-    /// their parts succeeded have taken effect. Reporting only the failure
-    /// would hide that, and re-running the same
-    /// [`BatchRequest`](crate::BatchRequest) is not a recovery either — a
-    /// second execution mints fresh mutation ids, so the parts that already
-    /// landed are applied a second time rather than deduplicated.
+    /// Returned only when [`Client::execute_batch`](crate::Client::execute_batch)
+    /// split a batch larger than
+    /// [`BatchRequest::with_max_part_size`](crate::BatchRequest::with_max_part_size)
+    /// and a later request failed wholesale; an unsplit batch fails with the
+    /// underlying error. There is no rollback, and re-running the
+    /// [`BatchRequest`](crate::BatchRequest) applies the landed parts again
+    /// under fresh mutation ids.
     ///
-    /// So the prefix comes back with the failure: `answered` holds one entry
-    /// per part of every request that completed, in part order, with exactly
-    /// the per-part `Ok`/`Err` split [`Client::execute_batch`](crate::Client::execute_batch)
-    /// would have handed back. `answered.len()` is where the batch stopped, and
-    /// `parts` is how many there were, so the parts never attempted are
-    /// `batch[answered.len()..]`.
-    ///
-    /// Only for a batch that **was** split: a batch that fits in one request
-    /// fails with the underlying error itself, since there is no prefix to
-    /// report. Put the sequence in a transaction, or keep it inside one
-    /// request, if a partial application is not something the caller can act
-    /// on.
-    ///
-    /// The rendered message says the same thing, deliberately. It is the
-    /// sentence that reaches a log line and an `unwrap()` panic, so it must not
-    /// draw a line the cluster does not honour: `answered.len()` is where the
-    /// *answers* stop, not where the effects stop. The request that failed runs
-    /// its parts whatever it answers — measured — and `answered` itself holds
-    /// `Err` entries, which applied nothing at all.
+    /// `answered` holds the per-part results of every completed request, in
+    /// part order, so the parts never attempted are `batch[answered.len()..]`.
+    /// That is where the answers stop, not the effects: the failed request
+    /// still ran its parts, and an `Err` among the answers applied nothing. Use
+    /// a transaction, or one request, where partial application matters.
     #[error(
         "execute_batch: {} of {parts} parts were answered for before the batch stopped — \
          that is where the answers stop, not where the effects do: the request that failed \
@@ -213,12 +166,9 @@ pub enum ClientError {
         /// The operation's error document, when it has one.
         error: Option<String>,
         /// The jobs that failed, with what they printed.
-        ///
-        /// Empty if the cluster reported none, if job diagnostics are turned
-        /// off (see
-        /// [`Client::with_job_diagnostics`](crate::Client::with_job_diagnostics)),
-        /// or if asking for them failed — collecting them must never replace
-        /// the failure being reported.
+        /// The failed jobs, with what they printed. Empty if none were reported,
+        /// if [`Client::with_job_diagnostics`](crate::Client::with_job_diagnostics)
+        /// is off, or if fetching them failed.
         jobs: Vec<JobFailure>,
     },
 
@@ -231,24 +181,19 @@ pub enum ClientError {
         reason: String,
     },
 
-    /// The environment did not describe a cluster to talk to.
+    /// Refused by this client before anything was sent: the environment did
+    /// not describe a cluster, or a call or its arguments failed a local check.
     #[error("{0}")]
     Config(String),
 }
 
-/// Why a redirect was refused rather than followed.
-///
-/// The rules live with the transport that applies them; this is the half of
-/// them a caller can branch on. Each variant renders the clause the error
-/// message carries, so `refusal.to_string()` is what the user is told.
+/// Why a redirect was refused. Each variant renders the clause the error
+/// message carries.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RedirectRefusal {
-    /// The request carries credentials, and the redirect leaves the origin
-    /// they were addressed to.
-    ///
-    /// The one this crate exists to report. A same-origin redirect is followed
-    /// instead: the token reaches no host it was not already going to.
+    /// The request carries credentials, and the redirect leaves the origin they
+    /// were addressed to.
     #[error(
         "the request carries credentials and the redirect leaves the host they \
          were addressed to. Following it drops the `Authorization` header — \
@@ -259,19 +204,9 @@ pub enum RedirectRefusal {
     )]
     Credentials,
 
-    /// The request body cannot be sent a second time.
-    ///
-    /// A redirect is followed by sending the same request to the address it
-    /// named: same method, same payload. So a body is no reason to refuse one
-    /// — a bodiless `POST`, which is most of API v4, goes wherever it is
-    /// pointed, and a body held in memory goes with it.
-    ///
-    /// A body that is a **stream** cannot. `write_table` from an iterator and
-    /// every `raw_command_upload` read their body as it is sent, so by the
-    /// time the `3xx` arrives some of it has already gone and there is nothing
-    /// to rewind. Sending what is left would be a different request; sending
-    /// nothing is the expensive failure this refuses — a `write_table` that
-    /// arrived carrying no rows is answered much like one that succeeded.
+    /// The request body is a stream already partly sent (`write_table` from an
+    /// iterator, `raw_command_upload`), so it cannot be sent again, wherever the
+    /// redirect points. A body held in memory is resent.
     #[error(
         "the request body is read as it is sent, so this client cannot send it \
          to the address the redirect named — a reader that has already begun \
@@ -282,18 +217,7 @@ pub enum RedirectRefusal {
     Body,
 
     /// The request carries data, and the redirect leaves the origin it was
-    /// addressed to.
-    ///
-    /// [`RedirectRefusal::Credentials`] asked again about the other thing a
-    /// caller chooses a host for. A token is not the only thing worth
-    /// withholding from a host nobody named: a table's rows are the caller's
-    /// own data, and a `Location` header is the far end of the connection
-    /// asking for them to be sent somewhere else. So this one does not wait
-    /// for a token to be present.
-    ///
-    /// A redirect that stays on the origin is followed, body and all — the
-    /// bytes were already going there. And a body of length zero is not data:
-    /// `Content-Length: 0` gives nothing away, so most of API v4 is unaffected.
+    /// addressed to, token or not. A zero-length body is not data.
     #[error(
         "the request carries data and the redirect leaves the host it was \
          addressed to. Sending it on would hand the body to a host the caller \
@@ -304,10 +228,7 @@ pub enum RedirectRefusal {
     )]
     Payload,
 
-    /// The redirects did not end.
-    ///
-    /// This client follows a bounded number of same-origin hops; a balancer
-    /// pointing at itself is a loop, not a route.
+    /// The redirects did not end: past a bounded number of hops it is a loop.
     #[error(
         "the redirects did not end. This client follows a bounded number of \
          them and that bound was reached, which is a loop rather than a route."
@@ -315,30 +236,14 @@ pub enum RedirectRefusal {
     TooMany,
 }
 
-/// The sentence a rejected root store needs, and nothing else does.
+/// The advice an `UnknownIssuer` rejection needs: this client trusts the
+/// compiled-in Mozilla bundle, not the machine's store, so it names
+/// `YT_CA_BUNDLE` and the `platform-verifier` feature.
 ///
-/// `invalid peer certificate: UnknownIssuer` is the whole of what a cluster
-/// behind a private CA says on its first request, and it names neither the two
-/// things that fix it nor the fact that this client's roots are not the
-/// machine's. Every internal installation begins there — the `yt` CLI and the Go
-/// SDK read the system store, so the machine where `curl` works is exactly the
-/// machine where this fails — and the message that arrives is one word about a
-/// certificate.
-///
-/// Classified by [`crate::retry::settled_certificate_verdict`] rather than by
-/// looking for the word here. That function narrows three times — an
-/// `ureq::Error::Io` of kind `InvalidData`, carrying `rustls`'s `invalid peer
-/// certificate: ` prefix, whose reason **starts with** a settled verdict — and
-/// every one of them matters to this message. A plain `contains("UnknownIssuer")`
-/// would fire on `Other(OtherError("UnknownIssuer lookup failed"))`, which
-/// `retry` deliberately treats as retriable: it is `rustls-platform-verifier`
-/// reporting a passing condition of *this machine*, so the advice would tell a
-/// build that already has the platform verifier to go and enable it.
-///
-/// Only `UnknownIssuer` gets this. `NotValidForName` is a certificate that does
-/// not cover the host asked for, which no root store mends, and pointing its
-/// reader at a CA bundle would send them to rewrite the one thing that is
-/// working.
+/// Classified by [`crate::retry::settled_certificate_verdict`], not by a
+/// substring: `rustls-platform-verifier` can report a retriable
+/// `Other(… "UnknownIssuer …")`. `NotValidForName` gets no advice, since no
+/// root store mends a certificate for another host.
 fn certificate_advice(source: &ureq::Error) -> &'static str {
     if crate::retry::settled_certificate_verdict(source) == Some("UnknownIssuer") {
         " The chain does not end in a root this client trusts, which is the \
@@ -363,13 +268,8 @@ fn redirect_advice(heavy: &bool) -> &'static str {
     }
 }
 
-/// The cap, written the way the caller thinks about it.
-///
-/// `536870912` is the number a matcher wants and not the one a reader wants;
-/// `512 MiB` is the reverse. Both, then — the round one first, because the
-/// question the message answers is *how big is too big*, and nobody sizes a
-/// machine in bytes. Only a whole number of mebibytes gets the treatment: a
-/// test's cap of 4 096 reads better as itself than as `0.00390625 MiB`.
+/// The cap as `512 MiB (536870912 bytes)` when it is a whole number of
+/// mebibytes, else in bytes.
 fn cap_size(limit: &u64) -> String {
     const MIB: u64 = 1024 * 1024;
 
@@ -380,18 +280,11 @@ fn cap_size(limit: &u64) -> String {
     }
 }
 
-/// The way past the cap, for a command that has one. See
+/// The streaming method that avoids the cap, for a command that has one. See
 /// [`ClientError::ResponseTooLarge`].
-///
-/// `the response body is larger than request limit: 536870912` — what `ureq`
-/// says — names neither the number a caller can plan around nor the method
-/// that makes the number irrelevant, and the streaming half of a read is a
-/// method a caller may not know exists. A command with no streaming half
-/// promises nothing.
 fn streaming_advice(command: &str) -> &'static str {
     match command {
-        // Every `read_table` shape — `_with_format`, `_skiff_table`, `_rows` —
-        // sends this one command name.
+        // Every `read_table` variant sends this command name.
         "read_table" => " — Client::read_table_streaming moves the same bytes without holding them",
         "read_file" => " — Client::read_file_streaming moves the same bytes without holding them",
         _ => "",
@@ -413,10 +306,8 @@ fn failure_hint(error: &Option<String>) -> String {
     }
 }
 
-/// Renders the failed jobs under the operation's own line.
-///
-/// Deliberately multi-line: a job's stderr is what the user came for, and
-/// squeezing a panic message onto one line is how it becomes unreadable.
+/// Renders the failed jobs under the operation's line, multi-line so that a
+/// job's stderr stays readable.
 fn jobs_hint(jobs: &[JobFailure]) -> String {
     let mut out = String::new();
 
@@ -445,11 +336,8 @@ fn jobs_hint(jobs: &[JobFailure]) -> String {
 }
 
 impl ClientError {
-    /// Builds a [`ClientError::Cluster`] from an `X-YT-Error` document.
-    ///
-    /// Falls back to [`ClientError::Http`] if the document is not the shape
-    /// YTsaurus documents — better a slightly clumsy error than a panic while
-    /// reporting one.
+    /// Builds a [`ClientError::Cluster`] from an `X-YT-Error` document, or a
+    /// [`ClientError::Http`] if it is not the documented shape.
     pub(crate) fn from_yt_error(command: &str, status: u16, raw: &str) -> Self {
         let parsed: Option<serde_json::Value> = serde_json::from_str(raw).ok();
 
@@ -511,11 +399,8 @@ pub(crate) fn truncate(s: &str, limit: usize) -> String {
     format!("{}… ({} bytes total)", &s[..end], s.len())
 }
 
-/// Keeps the **last** `limit` bytes of `s`, saying what was dropped.
-///
-/// The tail rather than the head, because this is used on a job's stderr: a job
-/// that logs as it works and then dies puts the reason last, and cutting from
-/// the front would keep the startup chatter and throw away the panic.
+/// Keeps the last `limit` bytes of `s`, saying what was dropped: a job's
+/// stderr puts the reason last.
 pub(crate) fn tail(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_owned();
