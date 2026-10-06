@@ -48,7 +48,7 @@ MapReduce workers in Rust, is secondary to the clients.
 | Operation launch | `ytsaurus-client` (this repo), or the `yt` CLI. |
 | Repo layout | single Cargo workspace |
 | Python tooling | ruff lints and formats; ty type-checks; uv runs (all three from astral). No `venv`, no bare `pip install`, no second formatter. The root `pyproject.toml` configures ruff and ty and declares no package; pass `--no-project` to `uv run`. |
-| Language for automation | Python for everything that computes, parses or asserts. bash for glue only: sequencing external commands, with no source of another language embedded in it and none inlined into a workflow. Rust (`xtask`) only where required: `generate-protos`, because `prost-build` is a Rust library API; nothing else qualifies. Go only in `tests/*-go-interop/`, as an oracle this project did not write. `tests/skiff-cpp-interop/cpp_reference.py` stays Python: `yt_yson_bindings` is a compiled C extension over upstream's own Skiff. No new language without a human; JavaScript is not coming back. |
+| Language for automation | Python for everything that computes, parses or asserts, except the Go benchmark input producer `scripts/benchmark_report_inputs.go` and its tests. bash for glue only: sequencing external commands, with no source of another language embedded in it and none inlined into a workflow. Rust (`xtask`) only where required: `generate-protos`, because `prost-build` is a Rust library API; nothing else qualifies. Other Go code is limited to `tests/*-go-interop/`, as an oracle this project did not write. `tests/skiff-cpp-interop/cpp_reference.py` stays Python: `yt_yson_bindings` is a compiled C extension over upstream's own Skiff. No new language without a human; JavaScript is not coming back. |
 
 ## Hard rules
 

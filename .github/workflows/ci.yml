@@ -11,6 +11,24 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  benchmark-inputs:
+    name: Go benchmark input producer
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Validate complete benchmark suite inputs
+        run: |
+          test -z "$(gofmt -l scripts/benchmark_report_inputs.go scripts/benchmark_report_inputs_test.go)"
+          go test scripts/benchmark_report_inputs.go scripts/benchmark_report_inputs_test.go
+
   python-checks:
     name: ruff + ty
     runs-on: ubuntu-latest

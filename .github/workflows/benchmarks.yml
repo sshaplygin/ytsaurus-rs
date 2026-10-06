@@ -17,13 +17,11 @@ on:
       - "!crates/*/tests/**"
       - ".cargo/config.toml"
       - "rust-toolchain.toml"
-      - "scripts/compare_criterion.py"
+      - "scripts/benchmark_report_inputs.go"
+      - ".github/benchmark-report.json"
 
-# A pull request from a fork still receives a read-only token, so its benchmark
-# result is available in the job summary but cannot be posted as a comment.
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: benchmarks-${{ github.event.pull_request.number }}
@@ -62,22 +60,27 @@ jobs:
       # PR-vs-main delta meaningful; GitHub-hosted runners are still noisy, so
       # the report is advisory rather than a merge gate.
       - name: Check out the PR base
-        uses: actions/checkout@v5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
+          persist-credentials: false
 
       - name: Check out the PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr
+          persist-credentials: false
 
       # Use the PR's pinned compiler for both revisions. A toolchain change is
       # then not mistaken for a source-level performance change.
       - name: Install toolchain
         working-directory: pr
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          toolchain=$(rustup show active-toolchain)
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "${toolchain%% *}" >> "$GITHUB_ENV"
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
@@ -100,59 +103,96 @@ jobs:
           cargo bench --locked -p "${{ matrix.package }}" \
             --bench "${{ matrix.bench }}" -- --noplot 2>&1 | tee benchmarks.txt
 
+      - name: Install the input-producer runner
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Record the shared compiler and runner environment
+        run: go run pr/scripts/benchmark_report_inputs.go record
+
       - name: Upload benchmark logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: criterion-main-vs-pr-${{ matrix.suite }}
           path: |
             base/benchmarks.txt
             pr/benchmarks.txt
+            environment.json
           retention-days: 14
 
   report:
     name: "Criterion: aggregate PR comparison"
     needs: compare
     runs-on: ubuntu-24.04
+    outputs:
+      gate: ${{ steps.report.outputs.gate }}
     steps:
-      - name: Check out the PR head
-        uses: actions/checkout@v5
+      - name: Check out PR reporting configuration and input assembly
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Download benchmark logs
-        uses: actions/download-artifact@v4
+          path: pr
+          persist-credentials: false
+      - name: Download all four completed suites
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: criterion-main-vs-pr-*
           path: benchmark-logs
-
-      # The per-suite concatenation used to be a shell loop here; the script
-      # takes the download directory and does it itself, so this is one command.
-      - name: Render comparison
-        run: |
-          python3 scripts/compare_criterion.py --logs benchmark-logs \
-            "${{ github.event.pull_request.base.sha }}" \
-            "${{ github.event.pull_request.head.sha }}" \
-            > benchmark-report.md
-          cat benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
-
-      # `gh` is authenticated from GH_TOKEN exactly as actions/github-script's
-      # client was; the matching is on the report's HTML marker rather than on
-      # the comment's author, which is what `gh pr comment --edit-last` would
-      # do and why that is not used. See the script.
-      - name: Post comparison on the pull request
-        if: github.event.pull_request.head.repo.full_name == github.repository
+      - name: Install the input-producer runner
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Assemble explicit suite manifests
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 scripts/post_benchmark_comment.py \
-            --repo "${{ github.repository }}" \
-            --pr "${{ github.event.pull_request.number }}" \
-            --body-file benchmark-report.md
-
-      - name: Upload benchmark report
-        uses: actions/upload-artifact@v4
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: go run pr/scripts/benchmark_report_inputs.go assemble --logs benchmark-logs --output manifests
+      - name: Generate complete report and bounded comment
+        id: report
+        uses: sshaplygin/benchmark-report/report@f71129f2bebcf57f953b27607b7d8bb8c23afae9 # v0.1.0
+        with:
+          parser: criterion
+          base-manifest: manifests/base.json
+          head-manifest: manifests/head.json
+          config: pr/.github/benchmark-report.json
+          comment-header: benchmark-report-criterion
+      - name: Upload complete report and replay inventory
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: criterion-main-vs-pr-report
-          path: benchmark-report.md
+          path: ${{ steps.report.outputs.artifact-path }}
+          if-no-files-found: error
           retention-days: 14
+
+  publish:
+    name: "Criterion: publish comparison"
+    needs: report
+    if: ${{ !cancelled() && needs.report.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download the generated report bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: criterion-main-vs-pr-report
+          path: bundle
+      - name: Append the complete summary
+        uses: sshaplygin/benchmark-report@f71129f2bebcf57f953b27607b7d8bb8c23afae9 # v0.1.0
+        with:
+          report-path: bundle/report.md
+          header: benchmark-report-criterion
+          publish: 'false'
+      - name: Publish the bounded comment when eligible
+        uses: sshaplygin/benchmark-report@f71129f2bebcf57f953b27607b7d8bb8c23afae9 # v0.1.0
+        with:
+          report-path: bundle/comment.md
+          header: benchmark-report-criterion
+          summary: 'false'
+      - name: Apply the configured gate after publication
+        if: needs.report.outputs.gate == 'failed'
+        run: exit 1

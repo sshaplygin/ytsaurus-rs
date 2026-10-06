@@ -25,14 +25,29 @@ and a Skiff gate is still [open](#what-5-does-not-close). See [Decision criteria
 Every pull request that changes Rust code runs the four Criterion suites at its
 current `main` base commit and at its head. The suites run in parallel; each
 `main`/PR pair runs sequentially on one GitHub-hosted VM with the PR's pinned
-Rust toolchain. Raw logs are kept as an artifact for 14 days. One comment on a
-same-repository PR carries every benchmark's middle time estimate and relative
-change; a fork PR, whose read-only token cannot post a comment, gets the same in
-the job summary.
+Rust toolchain. [Benchmark Report](https://github.com/sshaplygin/benchmark-report)
+generates the comparison using [.github/benchmark-report.json](../.github/benchmark-report.json).
+Raw logs and the complete report bundle are kept as artifacts for 14 days.
+One sticky comment on a same-repository PR carries each benchmark's middle time
+estimate and relative change, grouped by suite. Fork and Dependabot PRs receive
+the report in the job summary and artifacts. Publication runs in a separate job
+that consumes report data and does not execute PR code.
 
 Time is lower-is-better. A change of 20% or more is flagged as an improvement or
 regression but does not fail the PR, since shared runners are noisy; re-run
 before trusting a borderline result.
+
+Download the `criterion-main-vs-pr-report` artifact to reproduce the comparison
+locally with the matching `benchreport` version:
+
+```sh
+benchreport replay --reproduction bundle/reproduction.json --output-dir replay
+```
+
+Replay uses the archived inputs and needs no GitHub token or Rust compilation.
+The comment header is `benchmark-report-criterion`; older formatter comments
+are retained. Revert the migration commit to restore the previous workflow;
+the legacy formatter and publisher scripts remain in the repository.
 
 ## What has been measured
 
