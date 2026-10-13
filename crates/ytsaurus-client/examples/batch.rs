@@ -173,7 +173,8 @@ fn run() -> Result<(), ClientError> {
     // request still ran every part it did not answer for. The driver runs all
     // sub-requests and then discards the results because one is the unknown
     // name; neither ordering nor `concurrency` changes that. Reported, not
-    // asserted, since a cluster that stopped doing it would be fixed.
+    // asserted: a cluster that stopped doing this would be a fix, not a
+    // regression, so the example must not fail on it.
     done(&format!(
         "the create beside the unknown command {} — a refused request runs anyway",
         if client.exists(&format!("{BASE}/never"))? {
