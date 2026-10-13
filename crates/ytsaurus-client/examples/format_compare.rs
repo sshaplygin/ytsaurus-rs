@@ -15,15 +15,14 @@
 //!   the query. It shuffles, so its numbers are about plan shape and job
 //!   startup; the format is the same in all three legs.
 //!
-//! What is compared is an idiomatic Rust worker against a query that needs no
-//! code, and a difference decomposes into the runtime, the plan and the format.
-//! Measured on `wordcount` on a local cluster: YQL was about 1.8× faster on
-//! summed `time/exec`, because its planner combines in the map stage and 3 750
-//! rows crossed its shuffle against 3 114 964 for `map`. Charged only for what
-//! the worker's reduce cost, YQL's 4650 ms becomes 3396 against 2787, 1.22×,
-//! and the stage that touches every row is within a few per cent per byte. A
-//! job-level combiner is worth about 3×; the rest is plan shape and job startup
-//! (about 640 ms a job).
+//! A difference between a worker and the query decomposes into the runtime,
+//! the plan and the format. Measured on `wordcount` on a local cluster: YQL was
+//! about 1.8× faster on summed `time/exec`, because its planner combines in the
+//! map stage and 3 750 rows crossed its shuffle against 3 114 964 for `map`.
+//! Charged only for what the worker's reduce cost, YQL's 4650 ms becomes 3396
+//! against 2787, 1.22×, and the stage that touches every row is within a few
+//! per cent per byte. A job-level combiner is worth about 3×; the rest is plan
+//! shape and job startup (about 640 ms a job).
 //!
 //! ```sh
 //! tests/cluster-e2e/run_local_cluster.sh
@@ -55,12 +54,12 @@
 //!   and the pipe. CPU is asked for anyway and printed where it is reported.
 //!   Fixed costs dominate a local run (`docs/benchmarking.md` §3 and §4), so its
 //!   result is a direction, not a throughput claim.
-//! - **Fairness, enforced:** one input table; every leg reads every column; the
-//!   query must contain an `INSERT`, since a bare `SELECT` is capped at Query
-//!   Tracker's result rows, and must disable the query cache, without which a
-//!   repeat spawns no operations; both memory limits are printed, 640 MB for
-//!   the query (576 MB fails on this cluster) against the worker's 512 MB. On
-//!   `project`, `data_weight_per_job` is pinned, so every leg runs as many jobs.
+//! - **Fairness.** One input table; every leg reads every column. A query
+//!   without an `INSERT` (a bare `SELECT` is capped at Query Tracker's result
+//!   rows) or without the query cache disabled (a repeat spawns no operations)
+//!   is refused. Both memory limits are printed: 640 MB for the query (576 MB
+//!   fails on this cluster) against the worker's 512 MB. On `project`,
+//!   `data_weight_per_job` is pinned, so every leg runs as many jobs.
 //! - **Not enforced.** On `wordcount`: the worker takes the controller's
 //!   default job count while YQL's spec asks for 1 GiB per job (three map jobs
 //!   against one); the vocabulary stays at 3 750 words whatever the input size,
@@ -87,10 +86,9 @@ const BASE: &str = "//tmp/ytsaurus_rs_compare";
 /// Where `scripts/build-worker.sh` leaves the workers.
 const WORKER_DIR: &str = "target/x86_64-unknown-linux-musl/release-worker";
 
-/// Pinned so every `project` leg runs the same number of jobs.
-///
-/// `time/exec` sums over jobs and a job start costs ~640 ms on a local cluster.
-/// 1 GiB is what YQL's own spec asks for, and puts a 16 MiB task in one job.
+/// Pinned so every `project` leg runs the same number of jobs: `time/exec`
+/// sums over jobs, and a job start costs ~640 ms on a local cluster. 1 GiB is
+/// what YQL's own spec asks for, and puts a 16 MiB task in one job.
 const DATA_WEIGHT_PER_JOB: i64 = 1024 * 1024 * 1024;
 
 /// What the worker is given, and what the query is told to match.
@@ -136,8 +134,6 @@ fn run() -> Result<(), ClientError> {
         }
     };
 
-    // -------------------------------------------------------- correctness
-
     step("Correctness — the same computation, or nothing to time");
     for leg in &legs {
         let measure = run_leg(&client, &input, leg)?;
@@ -179,8 +175,6 @@ fn run() -> Result<(), ClientError> {
             );
         }
     }
-
-    // ------------------------------------------------------------ timings
 
     step(&format!(
         "Timing — one warm-up, then {rounds} rounds, fastest counts"
@@ -234,8 +228,6 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
-// ------------------------------------------------------------------- tasks
-
 /// Uploads a worker, refusing early if it was not built.
 fn upload(client: &Client, name: &str) -> Result<(), ClientError> {
     let local = format!("{WORKER_DIR}/{name}");
@@ -288,11 +280,9 @@ fn prepare_wordcount(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), 
     ))
 }
 
-/// `project`: the pilot's map at three depths over one table.
-///
-/// No shuffle and one output. The three stops differ only in how far into each
-/// row they go, so their differences are what framing, decoding and the work
-/// cost, by the subtraction `profile.rs` uses.
+/// `project`: the pilot's map at three depths over one table. The stops differ
+/// only in how far into each row they go, so their differences are what
+/// framing, decoding and the work cost, by the subtraction `profile.rs` uses.
 fn prepare_project(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), ClientError> {
     let input = format!("{BASE}/events");
 
@@ -358,10 +348,8 @@ fn prepare_project(client: &Client, mib: usize) -> Result<(String, Vec<Leg>), Cl
     ))
 }
 
-/// The nine columns `sessionize`'s `RawEvent` expects.
-///
-/// Byte columns are `String` rather than `Utf8`: real user agents are not
-/// always valid UTF-8, and the cluster enforces `Utf8`.
+/// The nine columns `sessionize`'s `RawEvent` expects. Byte columns are
+/// `String`, not `Utf8`, which the cluster enforces: user agents may not be UTF-8.
 fn events_schema() -> TableSchema {
     TableSchema::new([
         Column::new("user_id", ColumnType::String).required(),
@@ -392,10 +380,8 @@ struct EventRow {
     latency_ms: f64,
 }
 
-/// Deterministic events, the same shape `profile.rs` measures the pilot on.
-///
-/// Sized at about 122 bytes of data weight a row, as measured; the actual
-/// weight is read back off the cluster and printed.
+/// Deterministic events, the shape `profile.rs` measures the pilot on, sized at
+/// a measured ~122 bytes a row; the actual weight is read back and printed.
 fn events(mib: usize) -> Vec<EventRow> {
     /// Not valid UTF-8, as real user agents frequently are not.
     const AGENT: &[u8] = b"Mozilla/5.0 (\xff\xfe compatible) Gecko/20100101";
@@ -426,18 +412,12 @@ fn events(mib: usize) -> Vec<EventRow> {
         .collect()
 }
 
-// ----------------------------------------------------------------- the legs
-
 /// What one side of one round cost.
 struct Measure {
     /// Wall clock as the launcher sees it, including waiting for the scheduler.
     wall: Duration,
-    /// The cluster's own `time/exec`, summed over every operation this side ran.
-    ///
-    /// Per-job wall time including process start, summed over jobs, so a leg
-    /// split into more jobs pays startup once per job. A job's fixed cost is
-    /// ~640 ms on a local cluster, most of this for a 16 MiB task; read it with
-    /// `stages`.
+    /// The cluster's `time/exec` over every operation this side ran: per-job
+    /// wall time including startup (~640 ms a job locally), summed over jobs.
     exec_ms: Option<i64>,
     /// `time/prepare`, which `time/exec` does not include.
     prepare_ms: Option<i64>,
@@ -511,12 +491,9 @@ fn run_leg(client: &Client, input: &str, leg: &Leg) -> Result<Measure, ClientErr
 
 /// The input table's nine columns as Skiff, spelled here a second time.
 ///
-/// The worker declares the same schema in
-/// `crates/ytsaurus-job/examples/sessionize.rs`; two independent spellings must
-/// agree, where one shared constant would agree with itself however wrong.
-///
-/// Positional: swap two columns of the same width here and the job reads one
-/// as the other without an error.
+/// `crates/ytsaurus-job/examples/sessionize.rs` declares it independently; the
+/// two spellings must agree. Positional: swapping two columns of one width
+/// makes the job read one as the other without an error.
 fn skiff_input() -> DataFormat {
     DataFormat::skiff(
         SkiffFormat::new(vec![SkiffSchemaRef::Inline(SkiffSchema::tuple([
@@ -552,10 +529,8 @@ fn skiff_output() -> DataFormat {
     )
 }
 
-/// One stop of the depth series: `sessionize` as a plain map.
-///
-/// `data_weight_per_job` is pinned to [`DATA_WEIGHT_PER_JOB`], so every leg
-/// runs the same number of jobs.
+/// One stop of the depth series: `sessionize` as a plain map, with
+/// `data_weight_per_job` pinned to [`DATA_WEIGHT_PER_JOB`].
 fn run_map(
     client: &Client,
     input: &str,
@@ -608,11 +583,9 @@ impl Measure {
     }
 }
 
-/// Leg 1: the `wordcount` worker, binary YSON in and out.
-///
-/// `mapper` is `map`, which sums within a row, or `map-combine`, which sums
-/// within the job. Both produce the same table; they differ in how much goes
-/// through the shuffle.
+/// Leg 1: the `wordcount` worker, binary YSON in and out. `mapper` is `map`
+/// (sums within a row) or `map-combine` (within the job); they differ only in
+/// how much goes through the shuffle.
 fn run_worker(
     client: &Client,
     input: &str,
@@ -638,15 +611,12 @@ fn run_worker(
 /// Leg 4: the same computation as a query.
 ///
 /// The worker splits on any byte that is not an ASCII letter, digit or
-/// apostrophe; `Re2::FindAndConsume` of the complementary class is the same
-/// tokenisation written the other way round, and the corpus is ASCII so the two
-/// cannot diverge on encoding. `CAST(… AS Int64)` because `COUNT(*)` is a
-/// `Uint64` and the worker's column is an `int64`.
+/// apostrophe; `Re2::FindAndConsume` matches the runs of that class. `COUNT(*)`
+/// is a `Uint64` and the worker's column an `int64`, hence the `CAST`.
 ///
 /// **The capture group is required.** `FindAndConsume` returns the capture
-/// groups, not the whole match, so `"[A-Za-z0-9']+"` without the parentheses
-/// yields an empty list per row and the query writes nothing. The correctness
-/// check catches that before any timing.
+/// groups, so without the parentheses every row yields an empty list and the
+/// query writes nothing.
 fn wordcount_query(input: &str, output: &str) -> String {
     format!(
         "{PRAGMAS}\
@@ -661,13 +631,10 @@ fn wordcount_query(input: &str, output: &str) -> String {
 
 /// Leg 4 for the depth-series task: the same map, as a query.
 ///
-/// No grouping, so the query runs as one map operation, the same shape as
-/// every worker leg; the wordcount query needs two, and 42 % of its time went
-/// to the second.
-///
-/// The five rules are `sessionize`'s `validate`, and `is_external` is its
-/// referer test. This input has no rejected rows, so no leg pays for the
-/// reject branch.
+/// No grouping, so the query runs as one map operation like every worker leg;
+/// the wordcount query needs two, and 42 % of its time went to the second. The
+/// five rules are `sessionize`'s `validate`, and `is_external` its referer test.
+/// This input has no rejected rows.
 fn project_query(input: &str, output: &str) -> String {
     format!(
         "{PRAGMAS}INSERT INTO `{output}` WITH TRUNCATE\n\
@@ -682,12 +649,10 @@ fn project_query(input: &str, output: &str) -> String {
     )
 }
 
-/// Why a query that did not complete did not complete, in one line.
-///
-/// Uses the crate's `error_summary`, which keeps the category as well as the
-/// innermost cause. An error with code 0 is a success document,
-/// `{code=0;message=""}`, which `error_summary` summarises to `Some("")`; the
-/// guard reports it as no message, as the crate's own operation code does.
+/// Why a query did not complete, in one line: the category and the innermost
+/// cause, from `error_summary`. A code-0 error,
+/// `{code=0;message=""}`, summarises to `Some("")` and is reported as no
+/// message, as the crate's own operation code does.
 fn query_failure(state: &str, answer: &YsonValue) -> String {
     let cause = field_ref(answer, "error")
         .filter(|error| field_ref(error, "code").and_then(YsonValue::as_i64) != Some(0))
@@ -851,14 +816,10 @@ fn measure(client: &Client, wall: Duration, ids: &[String]) -> Measure {
     }
 }
 
-/// A leg's operations folded into one row per job type.
-///
-/// Separate from [`measure`] because it needs no `Client`, so the tests can
-/// drive it with fixtures.
-///
-/// `jobs` is summed over operations, and under `time/exec` alone: each of the
-/// three statistics carries the same job count for one operation, so adding
-/// all three would treble it.
+/// A leg's operations folded into one row per job type, with no `Client`, so
+/// the tests drive it with fixtures. `jobs` is summed
+/// over operations under `time/exec` alone: each of the three statistics
+/// carries the same job count, so adding all three would treble it.
 fn fold_stages(documents: &[YsonValue]) -> Vec<Stage> {
     let mut stages: BTreeMap<String, Stage> = BTreeMap::new();
 
@@ -913,10 +874,8 @@ fn by_job_type(statistics: &YsonValue, path: &str) -> BTreeMap<String, (i64, i64
     by_job_type_of(node, "")
 }
 
-/// As [`by_job_type`], from a subtree that is already at the right place.
-///
-/// `leaf` is one more path component to descend first, or `""` to stay put,
-/// as reading `data/output/<index>/data_weight` needs.
+/// As [`by_job_type`], from a subtree already in place. `leaf` is one more
+/// component to descend first, or `""`, for `data/output/<index>/data_weight`.
 fn by_job_type_of(node: &YsonValue, leaf: &str) -> BTreeMap<String, (i64, i64)> {
     let node = if leaf.is_empty() {
         node
@@ -948,8 +907,6 @@ fn by_job_type_of(node: &YsonValue, leaf: &str) -> BTreeMap<String, (i64, i64)> 
         })
         .collect()
 }
-
-// ------------------------------------------------------------------ reporting
 
 fn report(legs: &[Leg]) {
     row("", legs.iter().map(|leg| leg.label.to_owned()));
@@ -1040,13 +997,9 @@ fn report(legs: &[Leg]) {
     guard(legs, "time/exec", exec);
 }
 
-/// What each layer of the depth series cost, by subtraction.
-///
-/// Paired by round, not by minimum: round `i` of each stop met the same
-/// cluster, while two legs' minima can come from different rounds.
-///
-/// The method is `profile.rs`'s, and so is the refusal: a round whose stops do
-/// not come out in order is dropped, and with none left no share is reported.
+/// What each layer of the depth series cost, by subtraction paired by round,
+/// as in `profile.rs`. A round whose stops are out of order is dropped; with
+/// none left, no share is reported.
 fn subtraction(legs: &[Leg]) {
     let [frames, parse, full, ..] = legs else {
         return;
@@ -1130,11 +1083,8 @@ fn subtraction(legs: &[Leg]) {
 }
 
 /// Every pair of legs, as the ratio each round gave rather than the ratio of
-/// the minima.
-///
-/// The absolute numbers scatter by hundreds of milliseconds, but the two legs
-/// of one round met the same cluster, so their ratio is stable when neither
-/// number is. A pair whose sign flips between rounds is reported as not
+/// the minima: two legs of one round met the same cluster, so their ratio is
+/// stable when the absolute numbers scatter. A pair whose sign flips is not
 /// separable.
 fn paired_ratios(legs: &[Leg]) {
     println!("\n   Paired by round, on time/exec — the ratio each round gave:");
@@ -1215,10 +1165,8 @@ fn ratios(legs: &[Leg], of: impl Fn(&Measure) -> Option<i64> + Copy) -> Vec<Stri
         .collect()
 }
 
-/// Says so when a gap is smaller than the noise it was measured against.
-///
-/// Every pair, not just each leg against the first: a reader may quote any two
-/// legs.
+/// Says so when a gap between any two legs is smaller than the noise it was
+/// measured against.
 fn guard(legs: &[Leg], metric: &str, of: impl Fn(&Measure) -> Option<i64> + Copy) {
     let noise = legs
         .iter()
@@ -1266,10 +1214,8 @@ fn fastest(runs: &[Measure], of: impl Fn(&Measure) -> Option<i64>) -> Option<i64
     runs.iter().filter_map(of).min()
 }
 
-/// Where one leg's time and rows went, from its fastest round.
-///
-/// A stage reading far more rows than the input table holds is reading a
-/// shuffle, which says whether a difference is about the code or the plan.
+/// Where one leg's time and rows went, from its fastest round. A stage reading
+/// far more rows than the input holds is reading a shuffle.
 fn stage_table(label: &str, runs: &[Measure]) {
     let Some(best) = runs
         .iter()
@@ -1322,8 +1268,6 @@ fn bytes(value: Option<i64>) -> String {
     )
 }
 
-// -------------------------------------------------------------------- corpus
-
 #[derive(serde::Serialize)]
 struct Line {
     text: String,
@@ -1335,10 +1279,8 @@ struct Total {
     count: i64,
 }
 
-/// Deterministic ASCII text, skewed so the word counts are not uniform.
-///
-/// ASCII, so the worker's and the query's tokenisers cannot diverge on
-/// encoding.
+/// Deterministic ASCII text, skewed so the word counts are not uniform. ASCII,
+/// so the worker's and the query's tokenisers cannot diverge on encoding.
 fn corpus(mib: usize) -> Vec<Line> {
     const VOCABULARY: usize = 5000;
     let target = mib * 1024 * 1024;
@@ -1425,12 +1367,9 @@ fn answer(client: &Client, path: &str, rows: bool) -> Result<Answer, ClientError
     }
 }
 
-/// Turns rows into a comparison key independent of a table's physical order.
-///
-/// `YsonValue` keeps map keys in a `BTreeMap`, so binary YSON gives every row
-/// a canonical representation. Sorting those representations compares the two
-/// outputs as multisets: a query may reorder rows, but it cannot hide a
-/// missing, extra, or duplicated one.
+/// Turns rows into a comparison key independent of table order: `YsonValue`
+/// keeps map keys in a `BTreeMap`, so binary YSON gives every row a canonical
+/// encoding, and sorted they compare the outputs as multisets.
 fn canonical_rows(rows: Vec<YsonValue>) -> Result<Vec<Vec<u8>>, ClientError> {
     let mut canonical = rows
         .into_iter()
@@ -1473,8 +1412,6 @@ fn disagreement(left: &BTreeMap<String, i64>, right: &BTreeMap<String, i64>) -> 
     }
     None
 }
-
-// ------------------------------------------------------------------ plumbing
 
 fn decode(body: &[u8], command: &str) -> Result<YsonValue, ClientError> {
     from_slice(body, YsonFormat::Text).map_err(|e| ClientError::Decode {

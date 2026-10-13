@@ -56,10 +56,8 @@ const PRAGMAS: &str = "PRAGMA yt.QueryCacheMode = \"disable\";\n\
 /// How long to wait for one query before giving up on it and aborting it.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// States a query does not leave.
-///
-/// Observed on the way there: `pending`, `running`, `completing`, `failing`.
-/// An unknown state is treated as non-terminal and waited on.
+/// States a query does not leave. Observed on the way: `pending`, `running`,
+/// `completing`, `failing`; an unknown state is waited on.
 const TERMINAL: [&str; 3] = ["completed", "failed", "aborted"];
 
 fn main() -> ExitCode {
@@ -102,8 +100,6 @@ fn run() -> Result<bool, ClientError> {
     };
     println!("   cluster_name = {cluster:?}");
 
-    // ------------------------------------------------------------ SELECT 1
-
     step("1. SELECT 1 — does this installation run YQL?");
     let trivial = match wait_for_agent(&client) {
         Ok(outcome) => outcome,
@@ -118,8 +114,6 @@ fn run() -> Result<bool, ClientError> {
         return Ok(false);
     }
     answers.push(("YQL runs", "yes".to_owned()));
-
-    // --------------------------------------------------------- UDF modules
 
     // Before anything that needs a table, so a table failure cannot lose it.
     step("2. Which UDF modules the agent loads");
@@ -155,8 +149,6 @@ fn run() -> Result<bool, ClientError> {
             loaded.join(", ")
         },
     ));
-
-    // ---------------------------------------------------- table references
 
     step("3. How a table is referred to");
     let input = format!("{BASE}/lines");
@@ -214,8 +206,6 @@ fn run() -> Result<bool, ClientError> {
             format!("{reference} after {}", prefix.trim_end())
         },
     ));
-
-    // ------------------------------------------------------ table to table
 
     step("4. INSERT INTO … SELECT …, and the operations it spawns");
     let insert = format!(
@@ -298,15 +288,12 @@ fn cluster_or_guess(cluster: &str) -> &str {
     }
 }
 
-// --------------------------------------------------------------- the loop
-
 /// What one query did.
 struct Outcome {
     id: String,
     state: String,
-    /// Whether the wait ran out before the query reached a terminal state.
-    ///
-    /// Separate from `state`, so comparisons against `completed` stay exact.
+    /// Whether the wait ran out before a terminal state; separate from `state`,
+    /// so comparisons against `completed` stay exact.
     timed_out: bool,
     answer: YsonValue,
     error: Option<Vec<String>>,
@@ -319,9 +306,7 @@ impl Outcome {
         self.state == "completed"
     }
 
-    /// One line: the state, and what went wrong.
-    ///
-    /// The category and the innermost cause, from
+    /// One line: the state, and the category and innermost cause from
     /// [`ytsaurus_client::error_summary`]. `run_query` prints the whole chain.
     fn summary(&self) -> String {
         let mut line = if self.timed_out {
@@ -462,10 +447,8 @@ fn wait_for_agent(client: &Client) -> Result<Outcome, ClientError> {
     run_query(client, "SELECT 1;", true)
 }
 
-/// Stops a query this program has given up on.
-///
-/// Best effort: a failure is printed, not propagated, since the caller is
-/// already handling one. POST and `Repeatable::Never`, as for `start_query`.
+/// Stops a query this program has given up on. Best effort: a failure is
+/// printed, not propagated. POST and `Repeatable::Never`, as for `start_query`.
 fn abort_query(client: &Client, id: &str) {
     let params = yson_build::map([("query_id", yson_build::string(id))]);
     match client.raw_command(Method::Post, "abort_query", &params, None) {
@@ -493,8 +476,6 @@ fn operations_of(
         .map(|operation| (operation.id, operation.kind, operation.state))
         .collect())
 }
-
-// ---------------------------------------------------------------- fixtures
 
 /// One small schematised table. YQL needs a schema, and so will the Skiff leg.
 fn prepare_input(client: &Client, path: &str) -> Result<(), ClientError> {
@@ -527,12 +508,8 @@ fn prepare_input(client: &Client, path: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
-// ------------------------------------------------------------------ digging
-
-/// The messages inside a cluster error tree, outermost first.
-///
-/// The tree is mostly attributes (pids, thread names, trace ids); `attributes`
-/// is skipped.
+/// The messages inside a cluster error tree, outermost first. `attributes`
+/// (pids, thread names, trace ids) is skipped.
 fn error_messages(error: &YsonValue) -> Vec<String> {
     let mut found = Vec::new();
     collect_messages(error, &mut found);
@@ -599,8 +576,6 @@ fn walk(value: &YsonValue, path: String, needle: &str, found: &mut Vec<(String, 
         _ => {}
     }
 }
-
-// ------------------------------------------------------------------ plumbing
 
 fn decode(body: &[u8], command: &str) -> Result<YsonValue, ClientError> {
     from_slice(body, YsonFormat::Text).map_err(|e| ClientError::Decode {
