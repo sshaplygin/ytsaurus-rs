@@ -1,4 +1,4 @@
-//! The same code, run twice: once over HTTP and once over the RPC proxy.
+//! `both_transports`: the same code over HTTP and over the RPC proxy.
 //!
 //! The same `TableClient` calls (insert, lookup, select, delete, and a tablet
 //! transaction where the transport has one) run over each transport, and the

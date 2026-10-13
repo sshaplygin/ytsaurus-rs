@@ -1,4 +1,4 @@
-//! `streaming` — a table larger than the program that moves it.
+//! `streaming`: a table larger than the program that moves it.
 //!
 //! `read_table` and `write_table` hold a whole table at once. This writes a
 //! table from a generator with `write_table_streaming`, reads it back as a

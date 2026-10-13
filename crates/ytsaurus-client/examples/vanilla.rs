@@ -1,4 +1,4 @@
-//! `vanilla` — an operation with no input tables at all.
+//! `vanilla`: an operation with no input tables at all.
 //!
 //! Three jobs, no input, each computing its own slice of a sum and writing one
 //! row; the rows must add up to the whole sum. The shape for gang jobs,

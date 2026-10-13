@@ -1,4 +1,4 @@
-//! `cypress` — the rest of the tree: list, copy, move, link and lock.
+//! `cypress`: the rest of the tree (list, copy, move, link and lock).
 //!
 //! A pipeline's results kept side by side in Cypress: dated runs, a `latest`
 //! link to the newest, and locks so two launchers do not publish over each

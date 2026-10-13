@@ -1,4 +1,4 @@
-//! `transaction` — several commands, one all-or-nothing outcome.
+//! `transaction`: several commands, one all-or-nothing outcome.
 //!
 //! Creating a table, uploading a worker and running an operation can each
 //! fail halfway and leave something behind. This runs that sequence inside a

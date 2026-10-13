@@ -1,4 +1,4 @@
-//! `statistics` — a job counts its own work, the operation adds it up.
+//! `statistics`: a job counts its own work, the operation adds it up.
 //!
 //! Runs the `counted` worker, which drops rows without a `key` column and
 //! reports how many it read and dropped as custom job statistics, and checks

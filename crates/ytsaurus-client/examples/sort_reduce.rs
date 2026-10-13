@@ -1,4 +1,4 @@
-//! `sort_reduce` — sort a table, then reduce over it.
+//! `sort_reduce`: sort a table, then reduce over it.
 //!
 //! Once a table is sorted, a plain reduce runs over it directly, with no
 //! shuffle, and the sorted table can be reduced again. Checks that the sort

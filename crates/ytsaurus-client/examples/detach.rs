@@ -1,4 +1,4 @@
-//! `detach` — hand a live transaction to another client.
+//! `detach`: hand a live transaction to another client.
 //!
 //! One client starts a transaction, creates a table only it can see, and
 //! detaches: the handle is gone and the transaction is not. A second client —
