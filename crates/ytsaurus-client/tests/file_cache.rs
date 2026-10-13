@@ -2,8 +2,8 @@
 //!
 //! A local Docker cluster runs as `root`, where every path is writable and
 //! nothing answers `Access denied`, so the cluster here is an in-process socket
-//! that answers each command as told. What is under test is the sequence of up
-//! to seven commands: which one was refused, and what the client did next.
+//! that answers each command as told. What is under test is the sequence of
+//! commands: which one was refused, and what the client did next.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -90,8 +90,9 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
 #[test]
 fn a_refusal_the_cluster_wrapped_is_still_the_cache_refusing() {
     // An outer error is often a category (`Error creating node`) with the
-    // reason in `inner_errors`. The refusal is recognised one level down, as
-    // the crate's other error classifiers do.
+    // reason in `inner_errors`. The refusal code is looked for anywhere in the
+    // error document, as the crate's other error classifiers do; this stub
+    // nests it one level down.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
         _ if sent.mentions(CACHE) => Answer::DeniedInside,
