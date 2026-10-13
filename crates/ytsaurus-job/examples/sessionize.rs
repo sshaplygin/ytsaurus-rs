@@ -625,7 +625,7 @@ fn map() -> Result<(), JobError> {
     while let Some(event) = reader.next_event()? {
         let Event::Row(row) = event else { continue };
 
-        // Both failure modes now yield a cheap, stable `&'static str`:
+        // Both failure modes yield a cheap, stable `&'static str`:
         // `JobError::kind` for a decode failure, our own reason for an invalid
         // row. Nothing is formatted and nothing is allocated per bad row, and
         // the values are stable enough to group a rejects table by.

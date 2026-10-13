@@ -154,8 +154,9 @@ impl JobWriter {
 
     /// Declares output tables by name, returning a handle for each.
     ///
-    /// The names are for the reader, not the cluster — YTsaurus knows tables by
-    /// position. What they buy is a call site that says which table it means:
+    /// The names are for the reader, not the cluster: YTsaurus knows tables by
+    /// position. Handles come out in the order declared, so table 0 is the
+    /// first name, and a call site says which table it means:
     ///
     /// ```no_run
     /// # use serde::Serialize;
@@ -170,9 +171,8 @@ impl JobWriter {
     /// # Ok::<(), ytsaurus_job::JobError>(())
     /// ```
     ///
-    /// Handles come out in the order declared, so table 0 is the first name.
-    /// A write through one of them cannot be out of range; only a [`TableId`]
-    /// converted from a `usize` can.
+    /// A handle used with the writer that issued it cannot be out of range; a
+    /// [`TableId`] converted from a `usize`, or used with another writer, can.
     ///
     /// # Errors
     ///
