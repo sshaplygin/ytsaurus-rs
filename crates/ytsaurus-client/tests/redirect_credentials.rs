@@ -690,7 +690,8 @@ const PATIENCE: Duration = Duration::from_millis(1_500);
 #[test]
 fn a_redirect_chain_spends_the_commands_timeout_and_not_one_each() {
     // `with_timeout` is end to end for a buffered command; a fresh timeout per
-    // hop would allow eleven times it (docs/protocol-reference.md).
+    // hop would allow eleven times it (docs/protocol-reference.md,
+    // *Redirects*).
     let (proxy, seen) = stub_answering_after(
         HOP,
         vec![redirect_with(

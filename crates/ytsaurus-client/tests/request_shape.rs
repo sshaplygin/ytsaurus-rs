@@ -348,7 +348,8 @@ fn a_skiff_read_merges_a_row_range_with_its_schema_columns() {
 fn a_skiff_read_refuses_a_column_selection_spelled_into_the_string() {
     // A Skiff read synthesises `columns` from the format's fields, so
     // `//tmp/t{n}` would be two column selections; the cluster keeps the
-    // attribute and discards the string's at 200 (docs/protocol-reference.md).
+    // attribute and discards the string's at 200 (docs/protocol-reference.md,
+    // *Selecting columns and rows on a path*).
     // A leading `<…>` is refused because the client cannot parse it to know
     // whether it names `columns`.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
@@ -401,9 +402,10 @@ fn a_skiff_read_refuses_a_second_column_selection() {
 #[test]
 fn a_write_with_a_read_selection_is_refused_before_anything_is_sent() {
     // A cluster ignores columns and ranges on a write and replaces the whole
-    // table with a 200 (docs/protocol-reference.md), so they are refused
-    // locally. Nothing answers at this address, so an attempted request would
-    // be a Transport error, not Config.
+    // table with a 200 (docs/protocol-reference.md, *Selecting columns and
+    // rows on a path*), so they are refused locally. Nothing answers at this
+    // address, so an attempted request would be a Transport error, not
+    // Config.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
     let row = std::collections::BTreeMap::from([("n", 1_i64)]);
 
@@ -546,8 +548,8 @@ fn a_read_refuses_a_selection_spelled_twice() {
 #[test]
 fn a_read_refuses_a_range_asking_for_rows_no_table_has() {
     // A backwards range is answered 200 with no rows, and a negative
-    // `row_index` is clamped to 0 (docs/protocol-reference.md); neither is
-    // reported, so both are refused.
+    // `row_index` is clamped to 0 (docs/protocol-reference.md, *Selecting
+    // columns and rows on a path*); neither is reported, so both are refused.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
     // From variables, since clippy rejects the literal `5..3`.
     let (from, to) = (5_i64, 3_i64);
@@ -681,7 +683,8 @@ fn an_abort_without_a_reason_sends_no_empty_message() {
 #[test]
 fn every_request_asks_for_a_compressed_answer() {
     // `ureq` asks for compression because its `gzip` feature is on
-    // (docs/protocol-reference.md); a cluster answers either way, only larger.
+    // (docs/protocol-reference.md, *Authentication and compression*); a
+    // cluster answers either way, only larger.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         assert_eq!(client.exists("//tmp").ok(), Some(true));
