@@ -170,9 +170,9 @@ impl io::Write for SharedBuffer {
 /// A runnable copy of one of the `examples/` workers, built by this function.
 ///
 /// End-to-end tests exec the worker as a cluster does (rows in on fd 0, tables
-/// out on fds 1 and 4), because what the cluster runs is a process. Cargo has
-/// no `CARGO_BIN_EXE_<name>` for examples, so the path is derived: the test
-/// binary is `<profile>/deps/<name>-<hash>` and the runnable example
+/// out on fds 1 and 4), because what the cluster runs is a process. Cargo sets
+/// `CARGO_BIN_EXE_<name>` only for `[[bin]]` targets, so the path is derived:
+/// the test binary is `<profile>/deps/<name>-<hash>` and the runnable example
 /// `<profile>/examples/<name>`, under `--release` and `--target` alike.
 ///
 /// No ordinary test command reliably builds the runnable example:
