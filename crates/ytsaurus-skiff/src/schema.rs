@@ -163,7 +163,7 @@ impl std::fmt::Display for WireType {
 pub struct Schema {
     /// How this node is encoded.
     pub wire_type: WireType,
-    /// Optional name used to map a table field to a table column.
+    /// Optional name that maps a table field to a table column.
     pub name: Option<String>,
     /// Child schema nodes, in wire order.
     pub children: Vec<Schema>,
