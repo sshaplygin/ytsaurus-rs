@@ -4,7 +4,8 @@
 //! the cluster. This times the client's part: Rust values into a request body,
 //! and a response body back into Rust values. The server is a loopback socket
 //! that reads the body and discards it, so what is timed is serialisation,
-//! HTTP framing and one loopback round trip. It checks two claims:
+//! HTTP framing and one loopback round trip. It is the evidence for two
+//! claims:
 //!
 //! - `write_table_rows` encodes inside the request body, a bufferful at a
 //!   time, at no cost against encoding the whole table into a `Vec` first;
