@@ -1,23 +1,18 @@
-//! `table_usage` — the Go SDK's table example, with rows as Rust values.
+//! `table_usage`: the Go SDK's table example, with rows as Rust values.
 //!
 //! `yt/go/examples/table-usage` infers a schema from a struct, creates a table
 //! with it, writes a hundred structs, reads the row count back out of the
-//! table's attributes and scans every row into the struct again. This is the
-//! same journey, command for command.
+//! table's attributes and scans every row into the struct again. This does the
+//! same, command for command, through `write_table_rows` and `read_table_rows`,
+//! with no YSON in the example. It checks that the schema derived from
+//! `Contact` is the one the cluster stored and enforces, that the rows come back
+//! in order, and that `Name`, a struct naming one of the four columns, reads as
+//! a projection. Tables are left under `//tmp/ytsaurus_rs_table_usage`.
 //!
-//! What it does not contain is the point. Every example here used to build its
-//! rows as YSON bytes and push a `;` between them — the same dozen lines,
-//! eleven times over, which is how the loop came to be `write_table_rows`
-//! instead. This is the example that exists to show the result: Rust values in,
-//! Rust values out, and the encoding never appears. Two things the type system
-//! is doing, both checked below: the schema is derived from `Contact`, so the
-//! cluster is the one enforcing the shape `Contact` promises; and a struct
-//! naming a subset of the columns is a projection, so `Name` reads one column
-//! of a four-column table without mentioning the other three.
-//!
-//! The Go example carries a dead branch that would write the same rows as
-//! Skiff rather than YSON; this crate has no Skiff, and `docs/benchmarking.md`
-//! holds the measurements that keep that parked.
+//! The Go example carries a dead branch that writes the same rows as Skiff.
+//! Skiff table I/O here is `write_table_with_format` with `DataFormat::skiff`,
+//! or `write_skiff_table`, and takes an encoded Skiff stream rather than typed
+//! rows, so this example stays with YSON.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -51,17 +46,14 @@ fn run() -> Result<(), ClientError> {
     let contacts = format!("{BASE}/contacts");
 
     step("Preparing Cypress");
-    // Go names its table after a fresh guid, so every run leaves a new one. A
-    // fixed path is easier to go and look at afterwards, and the remove is
-    // what makes a second run behave like the first.
+    // A fixed path where Go uses a fresh guid; the remove makes reruns alike.
     client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     done(BASE);
 
     step("Creating a table from the struct its rows have");
-    // `schema.Infer(Contact{})` in Go, the derive here. Neither writes the
-    // column list out a second time, which is the only arrangement in which it
-    // cannot disagree with the rows.
+    // `schema.Infer(Contact{})` in Go, the derive here: the column list is not
+    // written out a second time, so it cannot disagree with the rows.
     let schema = Contact::table_schema();
     println!("   {}", render(&schema.to_yson()));
     client.create_table(&contacts, &schema)?;
@@ -71,10 +63,9 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step(&format!("Writing {ROWS} rows, as Rust values"));
-    // Go opens a writer and pushes one struct at a time, then commits. This
-    // hands over an iterator: the encoder runs inside the request body, so the
-    // hundred contacts are never all in memory, and no line of this file
-    // produces a byte of YSON.
+    // Go pushes one struct at a time into a writer. This hands over an
+    // iterator, encoded inside the request body, so the rows are never all in
+    // memory.
     client.write_table_rows(&contacts, (0..ROWS).map(contact))?;
     done(&format!("{ROWS} contacts written"));
 
@@ -83,9 +74,7 @@ fn run() -> Result<(), ClientError> {
     check(&format!("row_count is {counted}"), counted == ROWS as i64)?;
 
     // The same attribute, read the way Go reads it: `@` is the whole attribute
-    // map, `GetNode` deserialises it into a struct with one field, and the
-    // dozens of attributes that struct does not name are dropped. A projection,
-    // over attributes rather than columns.
+    // map, deserialised into a one-field struct that drops the rest.
     let attrs: Attrs = client.get_as(&format!("{contacts}/@"))?;
     check(
         "and the attribute map agrees, read into a one-field struct",
@@ -99,9 +88,8 @@ fn run() -> Result<(), ClientError> {
         read.len() == ROWS,
     )?;
 
-    // Not "as many rows, near enough". A static unsorted table keeps the order
-    // it was written in, so the round trip is either the identity or a
-    // regression, and this says which row broke it.
+    // A static unsorted table keeps the order it was written in, so the round
+    // trip must be the identity; a failure names the first differing row.
     let written: Vec<Contact> = (0..ROWS).map(contact).collect();
     if let Some(n) = read
         .iter()
@@ -122,10 +110,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("A struct naming one column is a projection");
-    // Nothing declares `Name` to be a subset of `Contact`. Columns the type
-    // does not mention are ignored on the way in, and that is the whole
-    // mechanism. The cluster still sent all four: the projection is in the
-    // type, not in the request.
+    // Columns `Name` does not mention are ignored on the way in. The cluster
+    // still sends all four: the projection is in the type, not the request.
     let names = client.read_table_rows::<Name>(&contacts)?;
     let first = names.first().map(|row| row.name.as_str());
     check(
@@ -134,10 +120,9 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("The same projection, in the other direction");
-    // A projection reads and does not write: three of the columns it leaves
-    // out were promised as required by the schema `Contact` derived, and the
-    // cluster is holding that promise. On its own table, because a refused
-    // write keeps an upload transaction's lock for a moment afterwards.
+    // A projection does not write: the three columns it leaves out are
+    // required by the schema. On its own table, because a refused write keeps
+    // an upload transaction's lock for a moment afterwards.
     let partial = format!("{BASE}/partial");
     client.create_table(&partial, &Contact::table_schema())?;
     match client.write_table_rows(&partial, names.iter().take(1)) {
@@ -166,14 +151,12 @@ fn run() -> Result<(), ClientError> {
 
 /// The rows the table holds — the Go example's `Contact`, field for field.
 ///
-/// One struct doing three jobs: the schema is derived from it, the rows are
-/// serialised from it, and what comes back is deserialised into it. Go needs a
-/// `yson:"name"` tag on each field to get lower-case column names; the field
-/// names here are already the column names.
+/// The schema is derived from it, and rows are serialised from and
+/// deserialised into it. The field names are the column names, where Go needs
+/// a `yson:"name"` tag on each.
 ///
-/// The derive is spelled out rather than imported: with the client's `derive`
-/// feature on, `TableRow` is the trait *and* the macro, and importing the
-/// macro from `ytsaurus-helpers` as well would be the same name twice.
+/// The derive path is spelled out: with the client's `derive` feature on,
+/// `TableRow` is the trait and the macro, and importing both is a name clash.
 #[derive(Serialize, Deserialize, PartialEq, Debug, ytsaurus_helpers::TableRow)]
 struct Contact {
     name: String,
@@ -185,9 +168,8 @@ struct Contact {
 
 /// A projection: the same table, seen as one column.
 ///
-/// Deserialised from four columns and serialised back into one, which is why
-/// it is both — the write below is what shows the difference between the two
-/// directions.
+/// Both `Deserialize` and `Serialize`: the write below shows the difference
+/// between the two directions.
 #[derive(Serialize, Deserialize)]
 struct Name {
     name: String,
@@ -201,8 +183,8 @@ struct Attrs {
 
 /// The `n`th contact.
 ///
-/// Go fills all hundred with the same values. These vary, because a round trip
-/// of a hundred identical rows cannot tell you the order survived it.
+/// The values vary, unlike Go's, so the round trip shows whether order
+/// survived.
 fn contact(n: usize) -> Contact {
     Contact {
         name: format!("Gopher {n}"),

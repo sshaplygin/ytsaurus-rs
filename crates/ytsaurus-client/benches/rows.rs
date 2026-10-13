@@ -1,19 +1,15 @@
 //! What the client costs to move typed rows, with the cluster taken out of it.
 //!
-//! `examples/append.rs` measures the thing that matters to a user — how long a
-//! write takes against a real cluster — and is therefore mostly measuring the
-//! cluster. This measures the part this crate is responsible for: turning Rust
-//! values into a request body, and a response body back into Rust values.
+//! `examples/append.rs` times a write against a real cluster, which is mostly
+//! the cluster. This times the client's part: Rust values into a request body,
+//! and a response body back into Rust values. The server is a loopback socket
+//! that reads the body and discards it, so what is timed is serialisation,
+//! HTTP framing and one loopback round trip. It checks two claims:
 //!
-//! The server is a socket on loopback that reads the body and throws it away,
-//! so what is timed is serialisation, HTTP framing and one loopback round trip.
-//! It exists to defend two claims that would otherwise be assertions:
-//!
-//! - `write_table_rows` encodes **inside** the request body, a bufferful at a
-//!   time, and that this costs nothing against encoding the whole table into a
-//!   `Vec` first — the shape every example used before it existed;
-//! - reading rows back into a type is not so much dearer than taking the bytes
-//!   that a caller should hesitate over it.
+//! - `write_table_rows` encodes inside the request body, a bufferful at a
+//!   time, at no cost against encoding the whole table into a `Vec` first;
+//! - reading rows into a type is not so much dearer than taking the bytes that
+//!   a caller should hesitate over it.
 //!
 //! ```sh
 //! cargo bench -p ytsaurus-client
@@ -51,10 +47,8 @@ fn row(n: usize) -> Row {
     }
 }
 
-/// The rows encoded the way every example used to encode them.
-///
-/// One `Vec` per row, then a copy into the buffer. This is the baseline the
-/// streaming encoder has to beat, or at least match, to be worth having.
+/// The whole table encoded up front: one `Vec` per row, then a copy into the
+/// buffer. The baseline the streaming encoder must match.
 fn encoded_by_hand(rows: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for n in 0..rows {
@@ -66,12 +60,11 @@ fn encoded_by_hand(rows: usize) -> Vec<u8> {
 
 /// A socket that answers every request the same way, until told to stop.
 ///
-/// Connections are **kept alive** and one connection serves any number of
-/// requests, because the alternative measures the wrong thing: with a fresh
+/// Connections are kept alive and serve any number of requests. With a fresh
 /// connection per iteration, the TCP handshake and teardown were about half the
-/// time at a thousand rows, and one arm at criterion's default settings left
-/// tens of thousands of sockets in `TIME_WAIT` — enough to exhaust the
-/// ephemeral port range on macOS partway through the suite.
+/// time at a thousand rows, and one arm at criterion's defaults left tens of
+/// thousands of sockets in `TIME_WAIT`, exhausting the ephemeral port range on
+/// macOS.
 struct NullCluster {
     address: String,
     stop: Arc<AtomicBool>,
@@ -90,9 +83,8 @@ impl NullCluster {
                     return;
                 }
                 let Ok(stream) = connection else { return };
-                // One thread per connection: `ureq`'s pool keeps one open, but
-                // a second would otherwise wait behind the first for as long as
-                // the benchmark runs.
+                // One thread per connection: `ureq`'s pool keeps one open, and
+                // a second would otherwise wait behind it for the whole run.
                 let body = reply_body.clone();
                 std::thread::spawn(move || serve(stream, &body));
             }
@@ -129,10 +121,8 @@ fn serve(mut stream: TcpStream, body: &[u8]) {
             return;
         }
 
-        // The request body is the thing being measured, so it has to be read:
-        // a reply sent before the client has finished writing would time a
-        // broken pipe rather than an upload. It also has to be read *whole*, or
-        // the next request on this connection starts mid-body.
+        // The body is read whole before replying: an early reply would time a
+        // broken pipe, and a partial read leaves the next request mid-body.
         let lowercase = head.to_lowercase();
         if let Some(length) = lowercase
             .lines()
@@ -164,17 +154,16 @@ fn serve(mut stream: TcpStream, body: &[u8]) {
 
 /// Consumes a chunked body up to its terminating zero-length chunk.
 ///
-/// `false` if the body could not be read to its end, which on a kept-alive
-/// connection means the next request would start mid-body — better to drop the
-/// connection than to answer nonsense.
+/// `false` if the body could not be read to its end; the caller then drops the
+/// connection, since the next request would start mid-body.
 fn drain_chunked(reader: &mut BufReader<TcpStream>) -> bool {
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() {
             return false;
         }
-        // A chunk size may carry extensions after a `;`. `ureq` sends none
-        // today; treating one as a terminator would silently truncate the body.
+        // A chunk size may carry extensions after a `;`; treating one as a
+        // terminator would truncate the body.
         let size = header.trim().split(';').next().unwrap_or("");
         let Ok(size) = usize::from_str_radix(size, 16) else {
             return false;
@@ -218,9 +207,8 @@ fn writing(c: &mut Criterion) {
             },
         );
 
-        // What every example did before it existed: encode the whole table into
-        // a `Vec`, then send that. The comparison is the point — if this were
-        // faster, the streaming encoder would be paying for elegance.
+        // The whole table encoded into a `Vec`, then sent. If this were faster,
+        // the streaming encoder would not be worth having.
         group.bench_with_input(
             BenchmarkId::new("encode_then_write_table", rows),
             &rows,
@@ -255,8 +243,7 @@ fn reading(c: &mut Criterion) {
             });
         });
 
-        // The floor: the same bytes, undecoded. The gap between the two is what
-        // asking for a type costs.
+        // The floor: the same bytes, undecoded. The gap is what a type costs.
         group.bench_with_input(BenchmarkId::new("read_table", rows), &rows, |b, _| {
             let cluster = NullCluster::new(table.clone());
             let client = client_for(&cluster);
