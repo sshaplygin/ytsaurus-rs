@@ -643,7 +643,7 @@ mod tests {
         .unwrap();
         buffer[4] = 9;
         // The header checksum no longer matches either, and that is what is
-        // reported first; blank it so the type check is what runs.
+        // reported first; recompute it so the type check is what runs.
         let checksum = crc64::checksum(&buffer[..28]);
         buffer[28..36].copy_from_slice(&checksum.to_le_bytes());
         assert_eq!(

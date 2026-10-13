@@ -6,6 +6,12 @@ All notable changes to this fork are recorded here.
 Recording modifications is a condition of the Apache-2.0 licence (section 4b), and the
 list below is that record: everything that differs from upstream `ba2044c`.
 
+## Unreleased
+
+Comments reworded in `src/{de,lib,scan,varint}.rs` and
+`tests/{attribute,coverage,ytsaurus_protocol}_tests.rs`: history restated as what the
+code does, and `scan_value`'s doc shortened. No code changed.
+
 ## 0.3.1 - 2026-08-16
 
 No changes to this crate beyond the version, which tracks the workspace.
