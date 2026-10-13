@@ -114,8 +114,9 @@ fn detach_with_a_ping_in_flight_waits_for_it() {
     let waited = waited.elapsed();
     assert_eq!(id, TX);
 
-    // Half the delay: the polling loop notices the ping 10 ms or more after it
-    // arrived. Without the join this is single-digit milliseconds.
+    // Half the delay: the polling loop sleeps 10 ms between checks, so it
+    // notices the ping up to 10 ms after it arrived, more on a loaded machine.
+    // Without the join this is single-digit milliseconds.
     assert!(
         waited >= ANSWERED_AFTER / 2,
         "detach returned in {waited:?} with a ping being answered {ANSWERED_AFTER:?} late: \
