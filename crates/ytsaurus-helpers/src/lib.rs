@@ -18,6 +18,25 @@
 //! client.create_table("//tmp/visits", &Visit::table_schema())?;
 //! ```
 //!
+//! The attributes [`macro@TableRow`] reads, on the struct and on its fields:
+//!
+//! ```ignore
+//! #[derive(TableRow)]
+//! #[yt(unique_keys)]
+//! struct Session {
+//!     #[yt(key)]
+//!     user_id: i64,
+//!     #[yt(key)]
+//!     started_at: i64,
+//!     #[yt(name = "duration_s")]
+//!     duration: i64,
+//!     #[yt(column_type = "any")]
+//!     details: ytsaurus_client::yson_build::YsonValue,
+//!     #[yt(skip)]
+//!     cached: usize,
+//! }
+//! ```
+//!
 //! Nothing here runs on a cluster: a procedural-macro crate is loaded by the
 //! compiler and contributes nothing to the binary a worker ships.
 
@@ -29,59 +48,27 @@ use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse
 ///
 /// One column per field, in declaration order, named after the field. The
 /// Rust type decides the column type, and `Option<T>` is the *only* thing that
-/// makes a column optional — a bare `T` is required.
+/// makes a column optional. Any other type is a compile error naming the
+/// field; give it `#[yt(column_type = "…")]`.
 ///
 /// | Rust | column type |
 /// | --- | --- |
-/// | `i8` `i16` `i32` `i64` | `int8` … `int64` |
-/// | `u8` `u16` `u32` `u64` | `uint8` … `uint64` |
-/// | `f32` / `f64` | `float` / `double` |
-/// | `bool` | `boolean` |
+/// | `i8` `i16` `i32` `i64` / `u8` `u16` `u32` `u64` | `int8` … `int64` / `uint8` … `uint64` |
+/// | `f32` / `f64` / `bool` | `float` / `double` / `boolean` |
 /// | `String`, `&str`, `Cow<str>` | `utf8` |
-/// | `Vec<u8>`, `&[u8]` | `string` — YTsaurus strings are arbitrary bytes |
+/// | `Vec<u8>`, `&[u8]` | `string` (YTsaurus strings are arbitrary bytes) |
 /// | `YsonValue` | `any` |
 /// | `Option<T>` | `T`, not required |
 ///
-/// Anything else is a compile error naming the field: guessing a column type
-/// from an unknown Rust type is how a schema comes to disagree with the data.
-/// Say what you mean with `#[yt(column_type = "…")]`.
-///
-/// # Attributes
-///
-/// On the struct:
-///
-/// - `#[yt(non_strict)]` — let rows carry columns the schema does not mention.
-/// - `#[yt(unique_keys)]` — promise no two rows share a key. Requires a key.
-/// - `#[yt(crate_path = "::path::to::ytsaurus_client")]` — for a renamed
-///   dependency.
-///
-/// On a field:
-///
-/// - `#[yt(key)]` — a key column, sorted ascending. Key fields must come first:
-///   the cluster refuses a schema whose keys are not a prefix, so the macro
-///   refuses it earlier and names the field.
-/// - `#[yt(name = "…")]` — the column name, when it differs from the field's.
-/// - `#[yt(column_type = "…")]` — the column type, by its wire name.
-/// - `#[yt(skip)]` — not a column at all.
-///
-/// # Example
-///
-/// ```ignore
-/// #[derive(TableRow)]
-/// #[yt(unique_keys)]
-/// struct Session {
-///     #[yt(key)]
-///     user_id: i64,
-///     #[yt(key)]
-///     started_at: i64,
-///     #[yt(name = "duration_s")]
-///     duration: i64,
-///     #[yt(column_type = "any")]
-///     details: ytsaurus_client::yson_build::YsonValue,
-///     #[yt(skip)]
-///     cached: usize,
-/// }
-/// ```
+/// On the struct (examples in the [crate docs](crate)): `#[yt(non_strict)]`
+/// lets rows carry columns the schema does not mention; `#[yt(unique_keys)]`
+/// promises no two rows share a key, and requires a key;
+/// `#[yt(crate_path = "::path::to::ytsaurus_client")]` is for a renamed
+/// dependency. On a field: `#[yt(key)]` makes a key column, sorted ascending.
+/// Key fields must come first: the cluster refuses a schema whose keys are not
+/// a prefix, so the macro refuses it earlier and names the field.
+/// `#[yt(name = "…")]` sets the column name, `#[yt(column_type = "…")]` the
+/// column type by its wire name, and `#[yt(skip)]` makes the field no column.
 #[proc_macro_derive(TableRow, attributes(yt))]
 pub fn derive_table_row(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
