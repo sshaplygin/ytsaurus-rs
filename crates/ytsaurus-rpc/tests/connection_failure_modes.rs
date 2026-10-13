@@ -41,9 +41,9 @@ fn handshake_reply(id: Guid) -> Vec<u8> {
 /// new calls rather than accept them into a void.
 ///
 /// The reader is what delivers every response, so once it stops nothing can
-/// ever complete. Before this was fixed, a call issued afterwards with no
-/// timeout waited for ever: the request was queued, the writer sent it
-/// happily, and no reader remained to route the answer. Rejecting a malformed
+/// ever complete. Without the refusal, a call issued afterwards with no
+/// timeout would wait for ever: the request is queued, the writer sends it,
+/// and no reader remains to route the answer. Rejecting a malformed
 /// packet is deliberate behaviour, so anything that corrupts a byte on the
 /// wire reaches this.
 #[tokio::test]
@@ -126,9 +126,9 @@ async fn a_call_after_the_reader_dies_fails_rather_than_hanging() {
 /// The outbound channel is bounded, which is what makes backpressure real. But
 /// a peer that stops reading backs the writer up until that channel is full,
 /// and then `send` blocks — so a deadline applied only to the reply is no
-/// deadline at all in precisely the case a caller most needs one. Before this
-/// was fixed, 134 of these 200 calls were still stuck three seconds into a
-/// 100 ms deadline.
+/// deadline at all in precisely the case a caller most needs one. With the
+/// deadline on the reply only, 134 of these 200 calls were still stuck three
+/// seconds into a 100 ms deadline.
 #[tokio::test]
 async fn a_stalled_peer_does_not_outlast_the_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
