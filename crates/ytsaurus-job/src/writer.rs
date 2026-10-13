@@ -97,7 +97,7 @@ pub struct JobWriter {
     scratch: Vec<u8>,
     finished: bool,
     /// Declared table names, when built with [`JobWriter::named`]. Empty
-    /// otherwise; used to make an out-of-range write explain itself.
+    /// otherwise. An out-of-range write names them in its error.
     names: Vec<String>,
 }
 
@@ -171,9 +171,8 @@ impl JobWriter {
     /// ```
     ///
     /// Handles come out in the order declared, so table 0 is the first name.
-    /// Because they are the only way to get a [`TableId`] other than converting
-    /// a `usize`, an out-of-range write is impossible when using this
-    /// constructor.
+    /// A write through one of them cannot be out of range; only a [`TableId`]
+    /// converted from a `usize` can.
     ///
     /// # Errors
     ///

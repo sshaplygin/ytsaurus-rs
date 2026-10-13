@@ -199,9 +199,8 @@ fn map_parse() -> Result<(), JobError> {
 ///
 /// The comparison task of `docs/format-comparison.md`: read nine mixed-type
 /// columns, validate, derive one, write the survivors — and **no shuffle**, so
-/// nothing about plan shape can get into the measurement. That was the lesson
-/// of the wordcount comparison, where the whole of a 1.8× gap turned out to be
-/// a combiner.
+/// nothing about plan shape can get into the measurement. In the wordcount
+/// comparison the whole of a 1.8× gap was a combiner.
 ///
 /// One output rather than two for the same reason as the reduce is absent: a
 /// second output descriptor is outside the single shape Skiff is
@@ -942,10 +941,10 @@ mod tests {
 
     /// A row short one column is a rejected row, not a row written short.
     ///
-    /// The regression this pins: the loop [`carried`] replaced skipped the
-    /// missing *column* and wrote the other eight, so the dynamic leg emitted a
-    /// row the typed leg had rejected outright — a disagreement between two
-    /// legs of a format comparison, manufactured by the comparison itself.
+    /// A loop that skipped the missing *column* and wrote the other eight would
+    /// make the dynamic leg emit a row the typed leg rejects outright: a
+    /// disagreement between two legs of a format comparison, manufactured by the
+    /// comparison itself. [`carried`] rejects the whole row.
     #[test]
     fn a_row_missing_a_carried_column_is_rejected_whole() {
         let string = |text: &str| YsonValue {

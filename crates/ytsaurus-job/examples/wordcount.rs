@@ -46,13 +46,13 @@
 //! format or the language, and both are dominated by per-job process startup
 //! (~640 ms per job here, against 150–500 ms of actual wordcount).
 //!
-//! The reason it was not written this way to begin with is visible in the
-//! signature: `map`'s keys are `&[u8]` borrowed from the reader's buffer, and
-//! a borrow cannot outlive the row it points into — which is the zero-copy
-//! design working exactly as intended, and also the reason a mapper cannot
-//! accumulate across rows without owning its keys. `map-combine` pays one
-//! allocation per **distinct** word rather than one per occurrence, and bounds
-//! the map so a high-cardinality input cannot exhaust the job's memory.
+//! Why `map` does not combine is visible in its signature: its keys are
+//! `&[u8]` borrowed from the reader's buffer, and a borrow cannot outlive the
+//! row it points into. That is the zero-copy design working as intended, and
+//! the reason a mapper cannot accumulate across rows without owning its keys.
+//! `map-combine` pays one allocation per **distinct** word rather than one per
+//! occurrence, and bounds the map so a high-cardinality input cannot exhaust
+//! the job's memory.
 
 use std::collections::HashMap;
 

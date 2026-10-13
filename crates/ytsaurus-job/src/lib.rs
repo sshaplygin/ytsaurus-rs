@@ -192,7 +192,8 @@ pub fn job_cookie() -> Option<u64> {
 
 /// Runs `job` if this process is a job, and returns otherwise.
 ///
-/// The whole of the one-binary pattern:
+/// Inside a job this behaves exactly like [`run`] and never returns; the
+/// process exits with the job's status. The whole one-binary pattern:
 ///
 /// ```no_run
 /// use ytsaurus_job::{Event, JobReader, JobWriter};
@@ -213,9 +214,6 @@ pub fn job_cookie() -> Option<u64> {
 /// }
 /// # fn launch() {}
 /// ```
-///
-/// Inside a job this behaves exactly like [`run`] and never returns; the
-/// process exits with the job's status.
 pub fn run_if_inside_job<F, E>(job: F)
 where
     F: FnOnce() -> std::result::Result<(), E>,
