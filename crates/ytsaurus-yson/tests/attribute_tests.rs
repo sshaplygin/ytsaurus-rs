@@ -163,11 +163,12 @@ mod unit_tests {
         assert!(matches!(back.node, YsonNode::Map(_)), "{back:?}");
     }
 
-    /// Three struct shapes serialize to valid YSON or an error, not structural
+    /// Four struct shapes serialize to valid YSON or an error, not structural
     /// garbage. An `@`-field declared after a plain field (which would give
     /// `{a=1<x=2>}`) is an error, because YSON attributes stand strictly before
-    /// their value. An empty struct produces `{}`, not zero bytes. An
-    /// all-attribute struct produces `<…>#`, not `<x=1>` with no value node.
+    /// their value; a `$value` field beside a plain field is an error too. An
+    /// empty struct produces `{}`, not zero bytes. An all-attribute struct
+    /// produces `<x=1>#`, not `<x=1>` with no value node.
     #[test]
     fn struct_shapes_serialize_to_valid_yson_or_error() {
         use ytsaurus_yson::{YsonFormat, YsonValue, to_vec};
