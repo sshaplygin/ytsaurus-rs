@@ -1,12 +1,12 @@
-//! `abort` — stopping an operation, and what stopping one costs.
+//! `abort`: stopping an operation, and what stopping one costs.
 //!
-//! A launcher that starts an operation and then gives up — an interrupted
-//! wait, a failed step further down the script — used to leave that operation
-//! running on the cluster, spending quota on a result nobody would read. This
-//! is the other end of `start_map`: the one that says never mind.
+//! A launcher that gives up on an operation should abort it rather than leave
+//! it spending quota. This aborts a running operation and checks that its job
+//! stops and that the reason is kept; aborts a finished one, which is an error;
+//! aborts one before it runs, with a reason that needs escaping; and aborts one
+//! from another thread while a wait is on it.
 //!
-//! It needs no worker binary. A vanilla task runs whatever command it is
-//! given, and `sleep` is the shortest way to have something worth stopping.
+//! It needs no worker binary: a vanilla task runs `sleep`.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -47,16 +47,13 @@ fn run() -> Result<(), ClientError> {
     let id = sleeper.id.clone();
     println!("   operation {id}");
 
-    // Aborting before the scheduler has started it would test a different
-    // thing: an operation still in `starting` has no jobs to stop.
-    // `wait_for_state` is the check: it returns an error if the state never
-    // arrives, so reaching this line is the fact being reported.
+    // An operation still in `starting` has no jobs to stop, so wait for
+    // `running`. `wait_for_state` returns an error if the state never arrives.
     let waited = wait_for_state(&client, &id, "running", PATIENCE)?;
     done(&format!("it is running, {:.1}s in", waited.as_secs_f64()));
 
-    // A running operation has a running job, and that job is the thing costing
-    // money. Whether the abort reaches it is the question the state does not
-    // answer.
+    // The job is what costs; the operation's state does not say whether the
+    // abort reached it.
     let job = wait_for_a_running_job(&client, &id, PATIENCE)?;
     done(&format!(
         "with a job running on {}",
@@ -73,20 +70,17 @@ fn run() -> Result<(), ClientError> {
         acknowledged.as_secs_f64() * 1000.0
     ));
 
-    // Nothing is waited for here in practice: by the time the call has
-    // returned the operation is already `aborted`, and the `aborting` state
-    // that exists in between is not observable from this side of the request.
+    // In practice the operation is already `aborted` when the call returns;
+    // the `aborting` state in between is not observable from here.
     let stopped = wait_for_state(&client, &id, "aborted", PATIENCE)?;
     done(&format!(
         "and it was already `aborted` — {:.1}s of waiting",
         stopped.as_secs_f64()
     ));
 
-    // The operation's terminal state comes before its job has necessarily
-    // stopped. On a multi-node cluster, the node can still report the job as
-    // `running` while it tears it down. A local scheduler drops aborted jobs
-    // from `list_jobs` instead, which is equally the condition we need: no job
-    // is still costing a node.
+    // The terminal state can come before the job stops: a node may still
+    // report it `running` during teardown. A local scheduler drops aborted jobs
+    // from `list_jobs` instead. Either way the check is that no job is running.
     let drained = wait_for_no_running_jobs(&client, &id, PATIENCE)?;
     done(&format!(
         "and its job stopped {:.1}s after the operation did",
@@ -94,10 +88,8 @@ fn run() -> Result<(), ClientError> {
     ));
 
     step("Reading back why it stopped");
-    // The reason is not kept beside the operation; it is folded into the error
-    // document, under the cluster's own account of what happened. That is what
-    // makes it worth passing: whoever finds this operation tomorrow is told who
-    // stopped it, without having to find the launcher's logs.
+    // The reason is folded into the operation's error document, under the
+    // cluster's own account, so whoever finds the operation later sees it.
     let error = client
         .operation_result_error(&id)?
         .unwrap_or_else(|| "(the cluster recorded no error at all)".to_owned());
@@ -112,9 +104,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Aborting it again");
-    // Unlike a transaction, which forgives a second abort, an operation the
-    // scheduler has finished with is gone from it. A launcher that aborts
-    // defensively after a successful wait gets an error, not a shrug.
+    // Unlike a transaction, which accepts a second abort, an operation the
+    // scheduler has finished with is gone, so aborting it is an error.
     match client.abort_operation(&id, None) {
         Ok(()) => {
             eprintln!("   FAIL a finished operation accepted a second abort");
@@ -132,11 +123,9 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Aborting one that has not started running yet");
-    // There is nothing to stop yet, which is a different thing from nothing to
-    // do: the scheduler still has to be told, or it starts the jobs a moment
-    // later. The reason goes along an HTTP header as YSON, so this one is also
-    // the awkward-text case — a quote would end the string and a newline would
-    // end the header if either reached the wire unescaped.
+    // No jobs yet, but the scheduler must still be told, or it starts them.
+    // The reason travels in an HTTP header as YSON, so a quote or a newline
+    // must be escaped.
     let awkward = "he said \"stop\"\nand meant it";
     let mut sleeper = Sleeper::start(&client)?;
     let id = sleeper.id.clone();
@@ -155,9 +144,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Pulling an operation out from under a wait");
-    // What a launcher sees when somebody else — an operator, a second copy of
-    // the script — stops the operation it is waiting for. The error has to say
-    // more than that the wait ended.
+    // What a launcher sees when someone else stops the operation it is
+    // waiting for: an error that says more than that the wait ended.
     let mut sleeper = Sleeper::start(&client)?;
     let id = sleeper.id.clone();
     sleeper.finished(); // the thread below is what stops this one
@@ -193,11 +181,8 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
-/// A sleeping operation that stops itself if this example gives up.
-///
-/// The thesis of the example is that an operation nobody is waiting for should
-/// not be left running; an example that leaked a five-minute operation whenever
-/// a check failed would be arguing against itself.
+/// A sleeping operation that `Drop` aborts unless `finished` was called, so a
+/// failed check does not leave it running.
 struct Sleeper<'a> {
     client: &'a Client,
     id: String,
@@ -222,8 +207,7 @@ impl<'a> Sleeper<'a> {
 impl Drop for Sleeper<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            // Best effort, and quiet: this runs while an error is on its way
-            // out, and a failure to tidy up must not replace it.
+            // Best effort and quiet: an error is already on its way out.
             let _ = self
                 .client
                 .abort_operation(&self.id, Some("the abort example gave up"));
@@ -234,8 +218,7 @@ impl Drop for Sleeper<'_> {
 /// Starts a vanilla operation whose one job sleeps.
 fn start_sleeping(client: &Client) -> Result<String, ClientError> {
     let spec = VanillaSpec::new(
-        // No worker binary: a vanilla task runs the command it is given, and
-        // this one needs nothing from this repository to be worth stopping.
+        // A vanilla task runs the command it is given; no worker is needed.
         VanillaTask::new("sleeper", format!("sleep {SLEEP_SECONDS}"), 1)
             .with_memory_limit(256 * 1024 * 1024),
     )
@@ -244,10 +227,8 @@ fn start_sleeping(client: &Client) -> Result<String, ClientError> {
     client.start_vanilla(&spec)
 }
 
-/// Waits until the operation has a job actually running.
-///
-/// `running` is the operation's state, not a job's: the scheduler reports it
-/// before the first job has been handed to a node.
+/// Waits until the operation has a job actually running: the scheduler reports
+/// the operation `running` before the first job has been handed to a node.
 fn wait_for_a_running_job(
     client: &Client,
     id: &str,
@@ -272,11 +253,9 @@ fn wait_for_a_running_job(
     )))
 }
 
-/// Waits until `list_jobs` no longer reports a job that is still running.
-///
-/// An operation becomes `aborted` before every node has completed job teardown,
-/// so its terminal state is not this condition. The `running` filter makes the
-/// one-item answer all this vanilla operation needs to inspect.
+/// Waits until `list_jobs` no longer reports a running job; an operation is
+/// `aborted` before every node has torn its job down. With the `running`
+/// filter, a one-item answer is enough.
 fn wait_for_no_running_jobs(
     client: &Client,
     id: &str,

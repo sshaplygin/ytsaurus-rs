@@ -1,9 +1,8 @@
-//! `launch` — runs a whole operation with no Python on the machine.
+//! `launch`: runs a whole operation with no Python on the machine.
 //!
-//! Does end to end what `tests/cluster-e2e/run_e2e.sh` does through the `yt` CLI:
-//! creates tables, uploads the worker, writes input, starts a map, waits for
-//! it, and reads the result back. The point is that the only executable
-//! involved is this one and the worker it uploads.
+//! What `tests/cluster-e2e/run_e2e.sh` does through the `yt` CLI: creates
+//! tables, uploads the worker, writes input, starts a map, waits for it, and
+//! checks that the output reproduces the input.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -11,8 +10,7 @@
 //! cargo run -p ytsaurus-client --example launch
 //! ```
 //!
-//! Note this binary is a *launcher*, not a worker: it runs on your machine and
-//! is built for the host, not for musl.
+//! This binary is a launcher, built for the host; the worker is the musl build.
 
 use std::process::ExitCode;
 
@@ -116,9 +114,9 @@ fn run() -> Result<(), ytsaurus_client::ClientError> {
     done("completed");
 
     step("Checking the result");
-    // `cat` is the identity, so reading both tables back through the same path
-    // must give identical bytes. Comparing against the rows this wrote would
-    // fail for an unrelated reason: the cluster re-encodes them on ingest.
+    // `cat` is the identity, so both tables read back the same way must give
+    // identical bytes. The cluster re-encodes rows on ingest, so the rows this
+    // wrote are not the reference.
     let before = client.read_table(format!("{BASE}/input"))?;
     let after = client.read_table(format!("{BASE}/output"))?;
 
@@ -135,8 +133,7 @@ fn run() -> Result<(), ytsaurus_client::ClientError> {
     done(&format!("identical ({} bytes)", after.len()));
 
     step("Decoding a row, to prove it is real data");
-    // Identical to the input is not the same as correct: two empty tables are
-    // identical too. So the first record has to be there, and has to be a map
+    // Two empty tables are identical too, so the first record must be a map
     // with the columns that went in.
     let first = first_record(&after).ok_or_else(|| {
         ytsaurus_client::ClientError::Config("the output table has no first row".to_owned())
@@ -156,8 +153,7 @@ fn run() -> Result<(), ytsaurus_client::ClientError> {
         .keys()
         .map(|k| String::from_utf8_lossy(k).into_owned())
         .collect();
-    // Compared as a set, because the order columns come back in is the
-    // cluster's name table talking and not anything this wrote.
+    // Compared as a set: column order comes from the cluster's name table.
     let mut found = columns.clone();
     found.sort();
     if found != ["blob", "count", "flag", "key", "ratio"] {
@@ -190,8 +186,7 @@ fn first_record(data: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// A row of the input table. These go in as values and the client serialises
-/// them, which is why nothing here writes YSON by hand.
+/// A row of the input table, serialised by the client.
 #[derive(Serialize)]
 struct Row {
     key: &'static str,

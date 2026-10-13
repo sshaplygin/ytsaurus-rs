@@ -1,5 +1,6 @@
-//! The README's quick start: a static table written and read back as Rust
-//! values over HTTP, then one dynamic-table read through `TableClient`.
+//! `quickstart`: the README's quick start, a static table written and read
+//! back as Rust values over HTTP, then one dynamic-table read through
+//! `TableClient`.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000

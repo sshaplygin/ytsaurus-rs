@@ -1,9 +1,9 @@
-//! `profile` — what a job spends on decoding, measured by the cluster.
+//! `profile`: what a job spends on decoding, measured by the cluster.
 //!
-//! The Skiff question is whether YSON decoding is a large enough share of job
-//! cost to be worth a second wire format. `cargo bench -p ytsaurus-job` answers
-//! it for a job that does nothing else, which is the worst case for YSON and
-//! not a workload. This asks the same question of the pilot, on a cluster.
+//! Whether YSON decoding is a large enough share of job cost to be worth a
+//! second wire format, asked of the pilot on a cluster rather than of a job
+//! that does nothing else (`cargo bench -p ytsaurus-job`). It reports the
+//! decoding share against the 30 % threshold in `docs/benchmarking.md`.
 //!
 //! The method is subtraction. The same mapper runs three times over one table,
 //! stopped at three depths:
@@ -24,15 +24,11 @@
 //! ```
 //!
 //! `YT_PROFILE_MIB` sets the table size (default 48) and `YT_PROFILE_ROUNDS`
-//! how many times to run each mode (default 5, of which the **fastest** counts
-//! — a slow round is interference, a fast one cannot be).
-//!
-//! The default was 3, and on a shared production cluster 3 was not enough to
-//! produce an answer at all: the modes came out in the wrong order and the
-//! example correctly refused to report a number. A busy cluster is a noisier
-//! instrument than a quiet local one, and the rounds are what buys the quiet
-//! back — raise it further, rather than believing a run that says it could not
-//! separate the phases.
+//! how many times to run each mode (default 5); the fastest round counts, since
+//! a slow round is interference and a fast one cannot be. If the modes come out
+//! in the wrong order, the run says it cannot separate the phases and draws no
+//! conclusion. On a busy cluster, raise the rounds: three were not enough on a
+//! shared production cluster.
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -109,8 +105,7 @@ fn run() -> Result<(), ClientError> {
             )
             .with_local_file_named(&worker.path, &worker.name)
             .with_memory_limit(2 * 1024 * 1024 * 1024)
-            // One job, so `time/exec` is one number about one process rather
-            // than a sum over however many the scheduler felt like starting.
+            // One job, so `time/exec` is about one process, not a sum over jobs.
             .with_raw("job_count", yson_build::int(1))
             .with_raw("max_failed_job_count", yson_build::int(1));
 
@@ -147,12 +142,9 @@ fn run() -> Result<(), ClientError> {
         return Ok(());
     }
 
-    // Three separate cluster runs, each the best of `rounds`. Scheduler noise
-    // can still make a shallower mode measure slower than a deeper one, and a
-    // phase cannot cost less than nothing: a difference that came out negative
-    // means the modes were not separable on this run, not that the phase was
-    // free. Clamped so the table stays readable, and flagged so the conclusion
-    // below does not pretend the numbers held.
+    // Noise can make a shallower mode measure slower than a deeper one. A
+    // negative difference means the modes were not separable on this run; it
+    // is clamped to 0 for the table and flagged in the conclusion.
     let separable = frames <= parse && parse <= full;
     let decoding = (parse - frames).max(0);
     let writing = (full - parse).max(0);
@@ -200,30 +192,13 @@ fn run() -> Result<(), ClientError> {
 
 /// The sentence under the table, built out of the run that produced it.
 ///
-/// It used to read *"one local cluster, x86-64 under emulation on this
-/// machine"*, which was true of the laptop the example was written on and of
-/// nothing else. On a production cluster it made a real measurement look like a
-/// fabricated one — the caveat was right to be there, it was just describing
-/// somewhere the numbers had not come from.
+/// Names the cluster from `//sys/@cluster_name`; a missing name or a failed
+/// read leaves it out rather than failing a finished measurement.
 ///
-/// The cluster names itself in `//sys/@cluster_name`, which `cluster_info`
-/// already reads, and a cluster is under no obligation to have a name — so a
-/// missing one, or a failure to ask, leaves the sentence describing the run
-/// alone rather than failing a measurement that has already been taken. Asked
-/// without an `exists` in front of it, unlike `cluster_info`'s: there the read
-/// is the thing being demonstrated, here it is a caption, and a cluster with no
-/// name costs one refused request rather than an extra one every time.
-///
-/// The per-mode times are quoted because they are the whole of what "best of"
-/// is worth: a spread of 1395 to 3331 ms on a shared cluster is a noisier
-/// instrument than a quiet local one, and a reader who cannot see the spread
-/// cannot see that. They are the **modes**, not the phases in the table above —
-/// `parse` is everything up to and including decoding, and the table's
-/// `decoding them` is `parse` minus `frames`.
-///
-/// `separable` decides the last sentence. A run that has just said it could not
-/// separate the phases has no number to start an argument with, and offering
-/// one there is how a refusal gets misread as a result.
+/// The per-mode best times are quoted. They are the modes, not the phases in
+/// the table: `parse` is everything up to and including decoding, and the table's
+/// `decoding them` is `parse` minus `frames`. `separable` picks the last
+/// sentence, so a run that could not separate the phases offers no verdict.
 fn caption(
     client: &Client,
     rounds: u64,
@@ -263,9 +238,8 @@ fn number(name: &str, default: u64) -> u64 {
 
 /// Access-log events, encoded on demand.
 ///
-/// The same shape the pilot's `RawEvent` expects, including the byte columns
-/// that are not text — measuring decoding on rows narrower or tidier than the
-/// job's real ones would measure the wrong thing.
+/// The shape the pilot's `RawEvent` expects, including byte columns that are
+/// not text, so decoding is measured on rows like the job's real ones.
 struct Events {
     remaining: u64,
     total: u64,

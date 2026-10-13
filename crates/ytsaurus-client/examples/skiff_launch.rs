@@ -1,4 +1,9 @@
-//! Dynamic Skiff map launched entirely through `ytsaurus-client`.
+//! `skiff_launch`: a map whose job I/O is dynamic Skiff, launched entirely
+//! through `ytsaurus-client`.
+//!
+//! Writes two rows, one of them not UTF-8, as a Skiff stream with
+//! `write_table_with_format`, runs the `skiff_cat` worker with Skiff in and
+//! out, and checks that the output decodes to the same rows and nothing more.
 //!
 //! ```sh
 //! ./scripts/build-worker.sh skiff_cat
@@ -23,9 +28,8 @@ fn main() -> Result<(), ytsaurus_client::ClientError> {
     ];
     let stream = encode_rows(&format, &rows);
 
-    // remove_tree, as every other example does: force, so the first run does
-    // not fail on a path that is not there yet, and recursive, so a second run
-    // does not fail on the non-empty map_node the first one left.
+    // `remove_tree` is forced and recursive, so the first run and a rerun both
+    // start clean.
     client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;

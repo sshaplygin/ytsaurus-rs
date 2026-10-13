@@ -1,8 +1,8 @@
-//! `sort_reduce` — sort a table, then reduce over it.
+//! `sort_reduce`: sort a table, then reduce over it.
 //!
-//! The shape a map-reduce is often used for by mistake. Once a table is sorted,
-//! a plain reduce runs over it directly, without paying for a shuffle that has
-//! already happened — and the sorted table can be reduced again and again.
+//! Once a table is sorted, a plain reduce runs over it directly, with no
+//! shuffle, and the sorted table can be reduced again. Checks that the sort
+//! records its key and that the reduce sums each word correctly.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -77,8 +77,8 @@ fn run() -> Result<(), ClientError> {
     let id = client.start_sort(&sort)?;
     client.wait_for_operation(&id)?;
 
-    // The cluster records what a table is sorted by. A reduce refuses to start
-    // otherwise, so this is the precondition made visible.
+    // The cluster records what a table is sorted by; a reduce refuses to start
+    // otherwise.
     let sorted_by = client.get(&format!("{BASE}/sorted/@sorted_by"))?;
     check(
         &format!("the table is now sorted by {}", render(&sorted_by)),
@@ -104,8 +104,7 @@ fn run() -> Result<(), ClientError> {
     ));
 
     step("Checking the totals");
-    // Keyed by word, because what is being checked is what each group came to
-    // and not the order the reduce emitted its groups in.
+    // Keyed by word: what each group came to is checked, not the order.
     let counts: BTreeMap<String, i64> = client
         .read_table_rows::<Total>(format!("{BASE}/counts"))?
         .into_iter()
@@ -165,9 +164,8 @@ fn input_rows() -> impl Iterator<Item = Row> {
 
 /// A row of the input table: a word, and part of what it comes to.
 ///
-/// `word` is bytes rather than a `&str` because that is how the worker reads
-/// it: a string column holds arbitrary bytes, and a job that insisted on UTF-8
-/// would fail on the first row that was not.
+/// `word` is bytes, as the worker reads it: a string column holds arbitrary
+/// bytes.
 #[derive(Serialize)]
 struct Row {
     #[serde(with = "serde_bytes")]
@@ -177,8 +175,7 @@ struct Row {
 
 /// A row of the reduce's output: a word, and everything counted for it.
 ///
-/// A `String` here rather than the bytes the worker wrote, because these words
-/// came from `INPUT` and the totals are compared against it by name.
+/// A `String`, since these words came from `INPUT` and are compared by name.
 #[derive(Deserialize)]
 struct Total {
     word: String,

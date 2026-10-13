@@ -1,10 +1,12 @@
-//! `append` — adding rows to a table instead of replacing it.
+//! `append`: adding rows to a table instead of replacing it.
 //!
-//! Every write this crate could make used to replace the table, because a path
-//! was sent as a bare string and `<append=%true>` is an *attribute* on it. So a
-//! pipeline that produced its output in pieces had one option: keep everything
-//! written so far and send it again with each piece. That is quadratic, and the
-//! last section of this example measures how quadratic.
+//! `TablePath::append` sets `<append=%true>`, an attribute on the path. This
+//! checks appends to plain and sorted tables, the refusals for a sort-order
+//! violation, a missing table and a file node, an empty append against an
+//! empty replace, all three writers, appends in a transaction, concurrent
+//! appends against concurrent replaces, and what a reader sees before the
+//! commit. The last section compares writing in pieces by append with
+//! rewriting everything written so far for each piece, which is quadratic.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -63,10 +65,8 @@ fn run() -> Result<(), ClientError> {
         client.row_count(&log)? == 6,
     )?;
 
-    // The rows already there are the ones that were there, not a fresh copy:
-    // an append that quietly rewrote would pass a row count and fail this.
-    // Indexed only after the length is known: `&kept[..2]` inside the message
-    // would panic on the very regression this exists to report.
+    // An append that rewrote the table would pass a row count and fail this.
+    // Indexed only after the length is checked, so a short table cannot panic.
     let kept: Vec<Entry> = client.read_table_rows(&log)?;
     let survived = kept.len() == 6 && kept[0].n == 3 && kept[1].n == 4 && kept[5].n == 8;
     check(
@@ -75,9 +75,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Appending to a table that is sorted");
-    // The interesting case. A sorted table stays sorted through an append, and
-    // the cluster is the one holding that: it checks the keys against the ones
-    // already there rather than taking the table's word for it afterwards.
+    // A sorted table stays sorted through an append: the cluster checks the
+    // new keys against the ones already there.
     let sorted = format!("{BASE}/sorted");
     let schema = TableSchema::new([
         Column::new("n", ColumnType::Int64).required().key(),
@@ -108,8 +107,7 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Appending to a table that does not exist");
-    // Not created for you. The error says it in the cluster's own terms, which
-    // are not obvious, so it is worth seeing once.
+    // Not created for you, and the cluster's error does not say so plainly.
     match client.write_table_rows(
         TablePath::new(format!("{BASE}/missing")).append(),
         entries(0..1),
@@ -120,8 +118,7 @@ fn run() -> Result<(), ClientError> {
             ));
         }
         Err(e) => {
-            // Checked, not merely printed: without this a transport blip, a
-            // timeout or a typo in BASE would all read as the feature working.
+            // Checked, so a transport or path error does not pass as this one.
             check(
                 "refused: the table has to exist first",
                 e.to_string()
@@ -132,8 +129,8 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Appending to something that is not a table");
-    // The path is resolved before the rows are looked at, and the cluster says
-    // what it found instead of what it wanted.
+    // The path is resolved before the rows are read, and the cluster says what
+    // it found instead of what it wanted.
     let file = format!("{BASE}/afile");
     client.create("file", &file)?;
     client.write_file(&file, b"not a table")?;
@@ -153,8 +150,7 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Zero rows");
-    // The asymmetry that costs a table: an empty *append* is nothing happening,
-    // an empty *replace* is a truncation. Both are one line of code apart.
+    // An empty append changes nothing; an empty replace truncates the table.
     let empty = format!("{BASE}/empty");
     client.create("table", &empty)?;
     client.write_table_rows(&empty, entries(0..4))?;
@@ -170,9 +166,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("The other two writers");
-    // `write_table_rows` is the one the sections above use. The attribute has to
-    // survive the other two routes into the same command, and the only way to
-    // know it does is to send rows through them.
+    // The sections above use `write_table_rows`; the attribute must survive
+    // the other two routes into the same command.
     let others = format!("{BASE}/others");
     client.create("table", &others)?;
     client.write_table_streaming(&others, std::io::Cursor::new(encoded(entries(0..2))))?;
@@ -191,8 +186,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Appending inside a transaction");
-    // An append is a write like any other, so it belongs to the transaction it
-    // was made in: invisible until the commit, gone if there is none.
+    // An append belongs to its transaction: invisible until the commit, gone
+    // on abort.
     let staged = format!("{BASE}/staged");
     client.create("table", &staged)?;
     client.write_table_rows(&staged, entries(0..3))?;
@@ -226,9 +221,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Four writers at once");
-    // The difference that makes append worth reaching for beyond the wire
-    // saving: a replacing write takes an *exclusive* lock on the table and the
-    // losers fail, while appends take a shared one and all of them land.
+    // A replacing write takes an exclusive lock and the losers fail; appends
+    // take a shared lock and all of them land.
     let shared = format!("{BASE}/shared");
     client.create("table", &shared)?;
     check(
@@ -243,17 +237,15 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("What a reader sees before an append commits");
-    // Nothing, which is the answer that lets a reader poll `@row_count` without
-    // a lock: the rows arrive with the upload transaction's commit, all at once.
+    // Nothing: the rows arrive with the upload transaction's commit, all at
+    // once, so a reader may poll `@row_count` without a lock.
     let inflight = format!("{BASE}/inflight");
     client.create("table", &inflight)?;
     client.write_table_rows(&inflight, entries(0..10))?;
     let body = encoded(entries(10..40));
-    // This outer transaction is the cluster-held boundary for the samples.
-    // The writer may finish while its thread is winding down, but the rows
-    // cannot become visible until `commit` below. `is_finished` therefore only
-    // decides when there are no more useful samples to take; it cannot let the
-    // final one race the commit.
+    // The outer transaction keeps the rows invisible until `commit` below, so
+    // `is_finished` only decides when to stop sampling and the last sample
+    // cannot race the commit.
     let tx = client.start_transaction()?;
     let (path, writing) = (inflight.clone(), tx.client().clone());
     let upload = std::thread::spawn(move || {
@@ -282,14 +274,12 @@ fn run() -> Result<(), ClientError> {
 /// What the pipeline shape costs when the table has to be rewritten each time.
 ///
 /// Both halves write the same rows in the same number of pieces and end with
-/// the same table. The difference is only what goes over the wire: an append
-/// sends each row once, and a rewrite sends everything written so far, every
-/// time.
+/// the same table. An append sends each row once; a rewrite sends everything
+/// written so far, every time.
 fn benchmark(client: &Client) -> Result<(), ClientError> {
     let rows = number("YT_APPEND_ROWS", 60_000);
     let chunks = number("YT_APPEND_CHUNKS", 12).max(1);
-    // At least one row per piece, or both loops write nothing and the
-    // comparison is between two empty tables.
+    // At least one row per piece, or both loops write nothing.
     let per_chunk = (rows / chunks).max(1);
 
     step(&format!(
@@ -316,8 +306,7 @@ fn benchmark(client: &Client) -> Result<(), ClientError> {
     client.create("table", &rewritten)?;
     let by_rewrite = time(|| {
         for chunk in 0..chunks {
-            // Everything from the beginning, every time — which is the only
-            // thing a client without append can do.
+            // Everything from the beginning, every time.
             client.write_table_rows(&rewritten, entries(0..(chunk + 1) * per_chunk))?;
         }
         Ok(())
@@ -341,10 +330,10 @@ fn benchmark(client: &Client) -> Result<(), ClientError> {
         sent_rewriting as f64 / sent_appending as f64
     );
 
-    // The data ratio is arithmetic — a rewrite of k pieces sends (k+1)/2 times
-    // the rows — so it is what gets asserted on. The clock is printed and not
-    // checked: at small sizes per-request overhead dominates, and three
-    // consecutive runs of a working feature disagreed about which was quicker.
+    // The data ratio is arithmetic, (k+1)/2 times the rows for k pieces, so it
+    // is asserted. The clock is printed, not checked: at small sizes
+    // per-request overhead dominates, and three runs disagreed on which was
+    // quicker.
     check(
         &format!("appending sent {sent_appending} rows against {sent_rewriting}"),
         sent_appending < sent_rewriting,
