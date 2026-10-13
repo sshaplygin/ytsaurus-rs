@@ -1,35 +1,23 @@
 //! What becomes of a request that is redirected.
 //!
-//! A control proxy answers a heavy read with a **cross-host** `307`, naming a
-//! data proxy. `ureq` follows that and drops the `Authorization` header on the
-//! way, so the request arrives unauthenticated and the cluster reports `Client
-//! is missing credentials` about a token that is perfectly valid.
+//! A control proxy answers a heavy read with a **cross-host** `307` naming a
+//! data proxy. Following it would drop the `Authorization` header, and the
+//! cluster would report `Client is missing credentials` about a valid token.
 //!
-//! That is the report these begin with, and not all of what they hold. This
-//! client follows redirects itself now, so the rest of the policy is here too.
-//! A redirect that stays on the **same origin** is followed — token, method and
-//! body — so a `POST create` met by a balancer's `301` arrives as a `POST
-//! create`, and a `write_table` sends its rows on rather than losing them.
+//! The client follows redirects itself. A redirect on the **same origin** is
+//! followed with token, method and body, so a `POST create` met by a
+//! balancer's `301` arrives as a `POST create`. Crossing an origin withholds
+//! the **token** and the request's **data**, each on its own: a tokenless
+//! `write_table` does not send its rows to whichever host a `Location` names,
+//! and a zero-length body is not data, so a bodiless command still goes. A
+//! streamed body, which cannot be sent twice, is refused wherever it points.
+//! The chain is bounded by ten hops and by the command's own timeout, which
+//! the hops share.
 //!
-//! Crossing an origin is where things are withheld, and there are two of them:
-//! the **token**, and the request's **data**. Neither waits on the other — a
-//! tokenless `write_table` does not get to send a table to whichever host a
-//! `Location` names — and a body of length zero is not data, so a bodiless
-//! command still goes. Separately, a body this client cannot send a second time
-//! (a *stream*) is refused wherever it points: by the time the `3xx` arrives
-//! some of it has gone, and a write that arrived with no rows comes back
-//! looking like a write that worked.
-//!
-//! And the whole chain is bounded twice over — by ten hops, and by the
-//! command's own timeout, which the hops share rather than each being handed a
-//! copy of.
-//!
-//! None of this can be reproduced against the local cluster this repository
-//! tests with: it runs one proxy and redirects nothing. So it is reproduced
-//! here, the way `request_shape.rs` reproduces the rest of the wire — with
-//! sockets in-process. Two stubs, mostly: one that redirects, and one standing
-//! in for the host it points at, which answers exactly the error the issue
-//! reports and **must never be reached**.
+//! The local cluster runs one proxy and redirects nothing, so the stubs here
+//! are in-process: one that redirects, and one standing in for the host it
+//! points at, which answers `Client is missing credentials` and, in most
+//! tests, **must never be reached**.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -52,26 +40,19 @@ fn stub_answering(replies: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
 
 /// As [`stub_answering`], taking `delay` to think about each request.
 ///
-/// Detached rather than joined: half of what these prove is that nobody
-/// connected at all, and there is nothing to wait for in that case. The thread
-/// ends with the test process.
+/// Detached rather than joined: many tests prove nobody connected at all. The
+/// thread ends with the test process.
 ///
-/// **It keeps a connection open, because the client does.** None of the replies
-/// here says `Connection: close`, so HTTP/1.1 keep-alive applies and `ureq`
-/// returns a socket whose body it has read to its pool — then reuses it for the
-/// next request to the same origin, which for a same-origin redirect is the
-/// very next thing that happens. A stub that answered once and went back to
-/// `accept` left that pooled socket closed under the client, and the second hop
-/// died on `Connection reset by peer` if it lost the race and passed if it won.
-/// That is `a_bodiless_post_follows_a_canonicalising_balancer` failing on CI and
-/// nowhere else. So each connection is served until the client is finished with
-/// it, which is what the client already assumes.
+/// **It keeps a connection open, because the client does.** No reply says
+/// `Connection: close`, so `ureq` pools the socket and reuses it for the next
+/// request to the same origin, a same-origin redirect's second hop included.
+/// A stub that went back to `accept` after one answer would close that socket
+/// under the client, and the hop would fail on `Connection reset by peer`
+/// when it lost the race.
 ///
-/// **A thread per connection**, rather than a loop that serves them in turn: a
-/// client is free to open a second connection while it still holds the first —
-/// after a `Connection: close`, or simply because its pool had none free — and
-/// a single-threaded accept loop would leave that one waiting behind a socket
-/// nobody is going to write to again, for [`STUB_PATIENCE`] and then for ever.
+/// **A thread per connection**: a client may open a second connection while
+/// holding the first, and serving them in turn would leave the second waiting
+/// for [`STUB_PATIENCE`] and then for ever.
 fn stub_answering_after(
     delay: Duration,
     replies: Vec<String>,
@@ -81,8 +62,7 @@ fn stub_answering_after(
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&seen);
     let replies = Arc::new(replies);
-    // Shared, so "the nth request gets the nth reply" survives a client that
-    // spread its requests over more than one connection.
+    // Shared, so the nth request gets the nth reply across connections.
     let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     std::thread::spawn(move || {
@@ -92,24 +72,21 @@ fn stub_answering_after(
             let answered = Arc::clone(&answered);
 
             std::thread::spawn(move || {
-                // So a client that goes away mid-request fails this stub rather
-                // than hanging the suite behind a read that will never finish.
+                // A client gone mid-request must not hang the suite.
                 stream.set_read_timeout(Some(STUB_PATIENCE)).ok();
                 let mut reader = BufReader::new(stream.try_clone().expect("clones"));
 
                 loop {
                     let request = read_request(&mut reader);
-                    // Nothing left to read: the client has closed its end, and
-                    // this connection is done rather than broken.
+                    // The client has closed its end.
                     if request.trim().is_empty() {
                         break;
                     }
 
                     let nth = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let reply = &replies[nth.min(replies.len() - 1)];
-                    // Recorded before the reply goes out, so a client that has
-                    // been answered has already been counted: the assertions run
-                    // after the call returns, and would otherwise race it.
+                    // Recorded before the reply, so assertions made after the
+                    // call returns do not race it.
                     recorded.lock().expect("not poisoned").push(request);
                     std::thread::sleep(delay);
                     if stream.write_all(reply.as_bytes()).is_err() {
@@ -129,18 +106,12 @@ const STUB_PATIENCE: Duration = Duration::from_secs(10);
 
 /// Reads one request **whole** — head and body — and only then returns.
 ///
-/// Whole, and that is the load-bearing word. Answering a request whose body is
-/// still being written closes the connection under the client, and what it sees
-/// then is `EPIPE` rather than the reply: the answer never gets read, and the
-/// decision the test is about is never reached. A body with a `Content-Length`
-/// is small enough here to sit in the socket buffer and survive that; a
-/// **chunked** one is written by `ureq` as the reader produces it, and a Linux
-/// runner loses the race that macOS won. `write_table_rows` sends exactly that,
-/// so the fix is to stop racing rather than to hope for a buffer — the stub
-/// reads to the end of the body in both framings before it says anything.
-///
-/// Reading it also makes it evidence: whether the rows arrived at the second
-/// host is then a question with an answer rather than something taken on trust.
+/// Answering a body still being written closes the connection under the
+/// client, which then sees `EPIPE` instead of the reply. A small
+/// `Content-Length` body fits the socket buffer and survives; a **chunked**
+/// one, as `write_table_rows` sends, is written as it is produced, and a Linux
+/// runner loses the race that macOS wins. So both framings are read to the
+/// end, which also records whether the rows arrived.
 fn read_request(reader: &mut BufReader<TcpStream>) -> String {
     let mut head = String::new();
     loop {
@@ -178,9 +149,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> String {
 
 /// Drains a chunked body to its terminating zero-length chunk.
 ///
-/// Bails on anything it cannot parse rather than looping: a stub that hung on
-/// a malformed chunk would hang the test, and there is nothing here it could
-/// usefully say about one.
+/// Bails on anything it cannot parse rather than hang the test.
 fn read_chunked(reader: &mut BufReader<TcpStream>) -> Vec<u8> {
     let mut body = Vec::new();
     loop {
@@ -194,7 +163,7 @@ fn read_chunked(reader: &mut BufReader<TcpStream>) -> Vec<u8> {
             break;
         };
         if size == 0 {
-            // The trailer section — empty in practice — ends at a blank line.
+            // The trailer section, empty in practice, ends at a blank line.
             loop {
                 let mut end = String::new();
                 match reader.read_line(&mut end) {
@@ -231,8 +200,7 @@ fn redirect_with(status: u16, reason: &str, location: &str, extra: &str) -> Stri
     )
 }
 
-/// The answer the data proxy gives a request that arrived without its token —
-/// the misleading one this whole issue is about.
+/// The data proxy's answer to a request that arrived without its token.
 fn missing_credentials() -> String {
     let error = r#"{"code":111,"message":"Client is missing credentials"}"#;
     format!("HTTP/1.1 401 Unauthorized\r\nX-YT-Error: {error}\r\nContent-Length: 0\r\n\r\n")
@@ -247,8 +215,7 @@ fn exists_answer() -> String {
     )
 }
 
-/// What a proxy answers a write with — and, if a redirect were followed, what
-/// it would answer the emptied `GET` that arrived instead.
+/// What a proxy answers a write with, or an emptied `GET` in its place.
 fn empty_answer() -> String {
     let body = "{}";
     format!(
@@ -263,8 +230,8 @@ fn heads(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 
 #[test]
 fn a_redirected_read_goes_nowhere_and_says_where_it_was_sent() {
-    // The exact shape of the bug: `read_table` against a control proxy, which
-    // answers 307 pointing at a data proxy on another host.
+    // `read_table` against a control proxy that answers 307 pointing at a
+    // data proxy on another host.
     let (data_proxy, data_seen) = stub(missing_credentials());
     let target = format!("{data_proxy}/api/v4/read_table?path=//tmp/t");
     let (control_proxy, control_seen) = stub(redirect_to(&target));
@@ -284,9 +251,8 @@ fn a_redirected_read_goes_nowhere_and_says_where_it_was_sent() {
     assert_eq!(*status, 307);
     assert_eq!(location, &target, "the caller is not told where it pointed");
 
-    // The token went to the proxy the caller named, and to nowhere else. This
-    // is the assertion the fix exists for: a bearer token must not follow a
-    // `Location` header to a host nobody chose.
+    // The token went to the proxy the caller named, and nowhere else: a
+    // bearer token does not follow a `Location` to a host nobody chose.
     let asked = heads(&control_seen);
     assert_eq!(asked.len(), 1, "{asked:?}");
     assert!(
@@ -308,9 +274,8 @@ fn a_redirected_read_goes_nowhere_and_says_where_it_was_sent() {
 
 #[test]
 fn the_message_points_at_the_redirect_and_not_at_the_token() {
-    // The second half of the report, and the more expensive half: `cluster
-    // error 111: Client is missing credentials` sends a user to check their
-    // token, their token file and their permissions, none of which is wrong.
+    // `cluster error 111: Client is missing credentials` would send a user to
+    // check a token that is not wrong; the message names the redirect.
     let (data_proxy, _) = stub(missing_credentials());
     let target = format!("{data_proxy}/api/v4/read_table");
     let (control_proxy, _) = stub(redirect_to(&target));
@@ -325,27 +290,24 @@ fn the_message_points_at_the_redirect_and_not_at_the_token() {
     assert!(message.contains("307"), "{message}");
     assert!(message.contains("redirected to"), "{message}");
     assert!(message.contains(&target), "{message}");
-    // Not a bare `111`: the target carries an ephemeral port, and one in a
-    // hundred of those has those three digits in it.
+    // Not a bare `111`: the target's ephemeral port may contain it.
     assert!(
         !message.contains("missing credentials") && !message.contains("cluster error 111"),
         "the failure is still being blamed on the token: {message}"
     );
-    // What the client is actually certain of, rather than a verdict on a token
-    // it never got an answer about.
+    // What the client is certain of, not a verdict on the token.
     assert!(
         message.contains("was not sent to the host that answered"),
         "{message}"
     );
-    // And what to do instead, since the caller has to do something.
+    // And what to do instead.
     assert!(message.contains("heavy proxy"), "{message}");
 }
 
 #[test]
 fn a_redirected_light_command_is_not_sent_to_a_heavy_proxy() {
-    // The other half of the message: `create` is not a heavy command, there is
-    // no heavy proxy that would have answered it, and telling its caller to go
-    // and find one is advice that cannot be taken.
+    // `create` is not a heavy command, so the message does not send its
+    // caller to a heavy proxy.
     let (elsewhere, elsewhere_seen) = stub(missing_credentials());
     let (proxy, _) = stub(redirect_to(&format!("{elsewhere}/api/v4/create")));
 
@@ -365,10 +327,8 @@ fn a_redirected_light_command_is_not_sent_to_a_heavy_proxy() {
 
 #[test]
 fn a_redirect_is_read_before_the_clusters_own_error() {
-    // A proxy is free to send both, and one that does must not turn the
-    // refusal back into the misleading report it exists to replace: `407`
-    // arrives on the redirect itself here, and the answer is still that this
-    // client went nowhere.
+    // A redirect that also carries `X-YT-Error` (code 111 here) is still
+    // reported as a refused redirect, not as the cluster's error.
     let error = r#"{"code":111,"message":"Client is missing credentials"}"#;
     let (elsewhere, elsewhere_seen) = stub(missing_credentials());
     let target = format!("{elsewhere}/api/v4/read_table");
@@ -398,9 +358,8 @@ fn a_redirect_is_read_before_the_clusters_own_error() {
 
 #[test]
 fn a_302_is_refused_like_a_307() {
-    // 307 is the one the reference names for heavy routing, and it is not the
-    // only redirect a request meets: a balancer in front of the cluster sends
-    // 301 and 302, and a credential does not care which digit moved it.
+    // A balancer sends 301 and 302 as well as the 307 of heavy routing, and
+    // each is refused alike.
     let (elsewhere, elsewhere_seen) = stub(exists_answer());
     let target = format!("{elsewhere}/api/v4/exists");
     let (proxy, _) = stub(redirect_with(302, "Found", &target, ""));
@@ -417,11 +376,8 @@ fn a_302_is_refused_like_a_307() {
 
 #[test]
 fn a_redirect_that_stays_on_the_host_is_followed_with_the_token() {
-    // The rule is about the host the credentials reach, not about redirects. A
-    // balancer canonicalising its own paths sends a relative `Location` back to
-    // itself; refusing that would break every command against such an
-    // installation, and would protect nothing — the token is already going
-    // there.
+    // A balancer canonicalising its own paths sends a relative `Location`
+    // back to itself. The token is already going there, so it is followed.
     let (proxy, seen) = stub_answering(vec![
         redirect_with(301, "Moved Permanently", "/api/v4/exists?path=//tmp", ""),
         exists_answer(),
@@ -443,19 +399,14 @@ fn a_redirect_that_stays_on_the_host_is_followed_with_the_token() {
 
 #[test]
 fn a_redirect_that_never_arrives_anywhere_is_a_loop_and_not_a_route() {
-    // The cost of following redirects here rather than leaving them to `ureq`
-    // is that the bound is ours to keep. A balancer pointing at itself would
-    // otherwise go round until the command's deadline ran out — two minutes by
-    // default, spent on a route that was never going to arrive.
+    // A balancer pointing at itself is refused after `MAX_REDIRECTS` (ten) hops
+    // rather than followed until the command's deadline (two minutes by
+    // default).
     //
-    // The assertions below are what keep it, and they are the only thing that
-    // does. Measured with `MAX_REDIRECTS` raised out of the way: **nothing
-    // hangs**. The stub gives out after about eight seconds of connections it
-    // cannot keep up with, and the run fails with a transport error — `Peer
-    // disconnected` — rather than with the refusal that should have arrived
-    // after ten hops. So read a failure here as "the bound is gone", not as
-    // "the stub is flaky", and do not expect a missing bound to announce
-    // itself by making the suite sit still.
+    // Without the bound **nothing hangs**: measured with `MAX_REDIRECTS`
+    // raised, the stub gives out after about eight seconds and the run fails
+    // with `Peer disconnected`. Read that failure as a missing bound, not a
+    // flaky stub.
     let (proxy, seen) = stub(redirect_with(
         301,
         "Moved Permanently",
@@ -482,15 +433,10 @@ fn a_redirect_that_never_arrives_anywhere_is_a_loop_and_not_a_route() {
 
 #[test]
 fn a_buffered_write_is_sent_again_rather_than_emptied() {
-    // The expensive failure this rule exists for: a redirect that rewrote the
-    // PUT into a GET and dropped the body, so `write_table` returned `Ok(())`
-    // having written no rows at all.
-    //
-    // Following the redirect *ourselves* answers it outright — the same method
-    // and the same rows go where the proxy pointed. On the **same origin**,
-    // which is the case the rule is for: a balancer canonicalising its own
-    // paths. The rows were already going to that host. Crossing to another one
-    // is the test below, and is refused.
+    // A redirect that rewrote the PUT into a GET and dropped the body would
+    // make `write_table` return `Ok(())` with no rows written. On the **same
+    // origin** the client sends the same method and rows again; crossing to
+    // another origin is refused (next test).
     let (proxy, seen) = stub_answering(vec![
         redirect_with(307, "Temporary Redirect", "/api/v4/write_table", ""),
         empty_answer(),
@@ -517,13 +463,9 @@ fn a_buffered_write_is_sent_again_rather_than_emptied() {
 
 #[test]
 fn a_buffered_write_does_not_take_the_rows_to_another_host() {
-    // The other half, and the one following redirects at all put at risk: with
-    // no token there is no credential to refuse over, and the rows are
-    // re-sendable — so nothing but this rule stops a `Location` header from
-    // redirecting a table's contents to whichever host it names. That is not
-    // the silent nothing the rule above prevents; it is the caller's data going
-    // somewhere the caller never chose, which is the same objection the token
-    // gets and deserves the same answer.
+    // With no token and re-sendable rows, only the data rule stops a
+    // `Location` header from sending a table's contents to whichever host it
+    // names.
     let (elsewhere, elsewhere_seen) = stub(empty_answer());
     let (proxy, proxy_seen) = stub(redirect_with(
         302,
@@ -548,8 +490,7 @@ fn a_buffered_write_does_not_take_the_rows_to_another_host() {
         ),
         "{error:?}"
     );
-    // Asked of the second stub rather than of the error: what matters is that
-    // the bytes did not arrive, not that a `Result` said so.
+    // Asked of the second stub: the bytes did not arrive.
     assert!(
         heads(&elsewhere_seen).is_empty(),
         "the rows went to a host nobody named: {:?}",
@@ -560,11 +501,9 @@ fn a_buffered_write_does_not_take_the_rows_to_another_host() {
 
 #[test]
 fn a_bodiless_post_may_still_cross_an_origin() {
-    // The line the data rule draws is around *data*, not around bodies. A
-    // command with no payload — most of API v4 — sends `Content-Length: 0` and
-    // gives nothing away by going, so it keeps the behaviour a tokenless client
-    // has always had. Drawing the line at "has a body" instead would refuse
-    // every POST again, which is the bug this branch spent a commit fixing.
+    // The data rule is about data, not bodies. A command with no payload,
+    // most of API v4, sends `Content-Length: 0` and gives nothing away, so a
+    // tokenless client follows the redirect.
     let (elsewhere, elsewhere_seen) = stub(empty_answer());
     let (proxy, _) = stub(redirect_with(
         307,
@@ -594,17 +533,12 @@ fn a_bodiless_post_may_still_cross_an_origin() {
 
 #[test]
 fn a_streamed_write_is_refused_because_it_cannot_be_sent_twice() {
-    // The half of the old rule that survives, and the only half that was ever
-    // true. `write_table_rows` encodes as it sends: by the time the `3xx`
-    // arrives some of the body has gone, and a reader cannot be rewound. There
-    // is no request left to send to the second host, so nothing is sent.
+    // `write_table_rows` encodes as it sends: by the time the `3xx` arrives
+    // some of the body has gone and cannot be rewound, so nothing is sent on.
     //
-    // Rows enough that the body cannot sit in a socket buffer, which is what
-    // the stub's draining is for: answering a chunked request that is still
-    // being written closes the connection under `ureq`, and it reports the
-    // broken pipe rather than the refusal. A small body wins that race on one
-    // platform and loses it on another — this one loses it everywhere unless
-    // `read_request` really does read to the end of the body before replying.
+    // Enough rows that the body cannot sit in a socket buffer: this passes
+    // only if `read_request` reads the whole chunked body before replying,
+    // otherwise `ureq` reports a broken pipe instead of the refusal.
     let (elsewhere, elsewhere_seen) = stub(empty_answer());
     let (proxy, _) = stub(redirect_with(
         307,
@@ -632,8 +566,7 @@ fn a_streamed_write_is_refused_because_it_cannot_be_sent_twice() {
         ),
         "{error:?}"
     );
-    // And the reason it gives is the reason it has: nothing about a `GET`, and
-    // nothing about a body that does not exist.
+    // The reason given is the stream, not a method or a missing body.
     let message = error.to_string();
     assert!(message.contains("read as it is sent"), "{message}");
     assert!(
@@ -645,15 +578,9 @@ fn a_streamed_write_is_refused_because_it_cannot_be_sent_twice() {
 
 #[test]
 fn a_bodiless_post_follows_a_canonicalising_balancer() {
-    // The promise the same-origin rule makes — "a balancer canonicalising its
-    // own host does not break every command" — was kept for `GET` only: the
-    // refusal tested the *method*, so every POST in the crate met a `301` with
-    // `RedirectRefusal::Body`, about a body that was not there. The head says
-    // `content-length: 0`.
-    //
-    // `307` because it is the code that settles the argument outright: it
-    // preserves the method and the body by definition, so there was never a
-    // body to be rewritten away.
+    // A same-origin redirect of a bodiless POST is followed, not refused as
+    // `RedirectRefusal::Body`: the head says `content-length: 0`. A `307`
+    // preserves the method and body by definition.
     let (proxy, seen) = stub_answering(vec![
         redirect_with(307, "Temporary Redirect", "/api/v4/create", ""),
         empty_answer(),
@@ -671,11 +598,9 @@ fn a_bodiless_post_follows_a_canonicalising_balancer() {
             head.starts_with("POST /api/v4/create"),
             "the command's verb did not survive the hop: {head}"
         );
-        // The head that says there is no body to lose, on both hops. It is
-        // also what the refusal used to be reported about.
+        // No body to lose, on both hops.
         assert!(head.to_lowercase().contains("content-length: 0"), "{head}");
-        // Same origin, so the token goes: there is no host here it was not
-        // already addressed to.
+        // Same origin, so the token goes.
         assert!(
             head.to_lowercase().contains("authorization: oauth"),
             "{head}"
@@ -685,11 +610,9 @@ fn a_bodiless_post_follows_a_canonicalising_balancer() {
 
 #[test]
 fn a_redirected_streaming_read_goes_nowhere() {
-    // `read_table_streaming` is one of exactly two paths that reconfigure the
-    // request before sending it — the streaming timeout override — and so one
-    // of two where the redirect policy is inherited rather than stated. A
-    // `max_redirects` that crept back into that override would leak the token
-    // here and nowhere else.
+    // `read_table_streaming` reconfigures the request (the streaming timeout
+    // override), so it inherits the redirect policy rather than stating it;
+    // a `max_redirects` in that override would leak the token here only.
     let (data_proxy, data_seen) = stub(missing_credentials());
     let target = format!("{data_proxy}/api/v4/read_table?path=//tmp/t");
     let (control_proxy, control_seen) = stub(redirect_to(&target));
@@ -714,9 +637,7 @@ fn a_redirected_streaming_read_goes_nowhere() {
 
 #[test]
 fn a_redirected_job_input_goes_nowhere() {
-    // The other request built through the streaming override, and the one a
-    // launcher reaches for while diagnosing a failure — the worst moment to
-    // hand a token to whichever host answered.
+    // The other request built through the streaming override.
     let (data_proxy, data_seen) = stub(missing_credentials());
     let target = format!("{data_proxy}/api/v4/get_job_input");
     let (control_proxy, _) = stub(redirect_to(&target));
@@ -740,11 +661,8 @@ fn a_redirected_job_input_goes_nowhere() {
 
 #[test]
 fn the_hosts_lookup_refuses_a_redirect_too() {
-    // `/hosts` builds its own request, which is how it once came to carry
-    // neither the token nor the timeout. It carries the token now, so it has
-    // one to lose — and it is the lookup a caller reaches for *because* of this
-    // issue, which would be a poor moment for it to leak the credential it was
-    // finally given.
+    // `/hosts` builds its own request and carries the token, so it refuses a
+    // cross-origin redirect too.
     let (elsewhere, elsewhere_seen) = stub(missing_credentials());
     let target = format!("{elsewhere}/hosts");
     let (proxy, _) = stub(redirect_to(&target));
@@ -761,23 +679,18 @@ fn the_hosts_lookup_refuses_a_redirect_too() {
 
 /// A proxy that redirects to itself, slowly.
 ///
-/// Every hop costs `HOP`, and the client is given a budget it cannot spend
-/// twice. The point of both timeout tests below: the deadline belongs to the
-/// command, not to the request, so a chain of hops shares one.
+/// Every hop costs `HOP`, and the deadline belongs to the command, so a chain
+/// of hops shares one budget.
 const HOP: Duration = Duration::from_millis(300);
 /// Less than two hops, so a second one cannot finish inside it.
 const BUDGET: Duration = Duration::from_millis(400);
-/// Comfortably more than the budget and comfortably less than what eleven hops
-/// would cost — 3.3 s of them, plus whatever the machine is busy with.
+/// Well above the budget and well below eleven hops' 3.3 s.
 const PATIENCE: Duration = Duration::from_millis(1_500);
 
 #[test]
 fn a_redirect_chain_spends_the_commands_timeout_and_not_one_each() {
-    // `with_timeout` promises a limit that is end to end for a buffered
-    // command. Following redirects inside the transport is where that can be
-    // quietly lost: give each hop the full timeout and the real limit becomes
-    // eleven times the one the caller asked for — 22 minutes at the default
-    // two, on an `exists`.
+    // `with_timeout` is end to end for a buffered command; a fresh timeout per
+    // hop would allow eleven times it (docs/protocol-reference.md).
     let (proxy, seen) = stub_answering_after(
         HOP,
         vec![redirect_with(
@@ -802,9 +715,7 @@ fn a_redirect_chain_spends_the_commands_timeout_and_not_one_each() {
          {} requests",
         heads(&seen).len()
     );
-    // And it says so as a timeout, which is what it is — not as a redirect
-    // refusal, which is what it would become if the chain were allowed to run
-    // to its bound.
+    // Reported as a timeout, not as a redirect refusal.
     let message = error.to_string();
     assert!(
         message.contains("timeout"),
@@ -814,10 +725,8 @@ fn a_redirect_chain_spends_the_commands_timeout_and_not_one_each() {
 
 #[test]
 fn the_hosts_lookup_shares_one_budget_across_its_hops_too() {
-    // `/hosts` builds its own request and follows its own redirects, which is
-    // how it has come to miss things the command path had. It is also the
-    // lookup a caller reaches for *because* of a redirect, so a caller already
-    // waiting on one proxy should not wait eleven times over on the next.
+    // `/hosts` builds its own request and follows its own redirects, under
+    // the same one budget.
     let (proxy, _) = stub_answering_after(
         HOP,
         vec![redirect_with(301, "Moved Permanently", "/hosts", "")],
@@ -837,11 +746,8 @@ fn the_hosts_lookup_shares_one_budget_across_its_hops_too() {
 
 #[test]
 fn a_client_with_no_token_still_follows_a_redirect() {
-    // The rule is about credentials, not about redirects: a request with
-    // nothing to lose keeps the behaviour every release so far has had. Making
-    // this conditional is what keeps the change to the thing the report is
-    // about — and this test is what says so out loud, so that a later reader
-    // does not read the refusal as "this client hates redirects".
+    // The refusal is about credentials, not redirects: a tokenless request
+    // with no data follows a cross-origin redirect.
     let (elsewhere, elsewhere_seen) = stub(exists_answer());
     let target = format!("{elsewhere}/api/v4/exists");
     let (proxy, proxy_seen) = stub(redirect_to(&target));
