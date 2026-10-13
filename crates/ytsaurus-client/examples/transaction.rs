@@ -1,10 +1,11 @@
 //! `transaction` — several commands, one all-or-nothing outcome.
 //!
-//! A launcher that creates a table, uploads a worker and runs an operation has
-//! three chances to fail halfway, and each one leaves something behind. This
-//! runs that sequence inside a transaction and watches the cluster: nothing is
-//! visible until the commit, and nothing survives an abort — including the one
-//! a dropped handle sends on its way out of a failing function.
+//! Creating a table, uploading a worker and running an operation can each
+//! fail halfway and leave something behind. This runs that sequence inside a
+//! transaction and checks that nothing is visible until the commit and nothing
+//! survives an abort, including the one a dropped handle sends. It also checks
+//! that a command in an aborted transaction fails and that the handle's pings
+//! keep a short transaction alive.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -83,8 +84,8 @@ fn run() -> Result<(), ClientError> {
     client.create("table", &input)?;
     client.write_table_rows(&input, SAMPLE)?;
     client.create("table", &output)?;
-    // Stands in for last week's result: what everyone reads until the new one
-    // is published, and what they must go on reading if publishing fails.
+    // Stands in for the previous result, which readers keep seeing until the
+    // new one is published.
     client.write_table_rows(&output, PREVIOUS)?;
     done(&format!("{} rows in, an old result in place", SAMPLE.len()));
 
@@ -103,8 +104,8 @@ fn run() -> Result<(), ClientError> {
     let half = format!("{BASE}/half_written");
     let failure = publish_and_fail(&client, &half).expect_err("this one fails on purpose");
     println!("   the launcher failed: {failure}");
-    // No abort was written anywhere in that function. The `?` returned, the
-    // handle dropped, and the drop is the abort.
+    // That function has no abort: the `?` returned, and dropping the handle
+    // aborted it.
     check(
         "the half-written table is gone with it",
         !client.exists(&half)?,
@@ -123,8 +124,8 @@ fn run() -> Result<(), ClientError> {
     tx.wait_for_operation(&id)?;
     done(&format!("operation {id} completed"));
 
-    // The operation has run, its rows are written, and none of it exists yet
-    // for anybody else — the upload included.
+    // The operation has run and written its rows; none of it, the upload
+    // included, is visible outside yet.
     check(
         "outside the transaction the old result is still the result",
         client.read_table(&output)? == previous,
@@ -166,9 +167,9 @@ fn run() -> Result<(), ClientError> {
     let tx = client.start_transaction_with(SHORT)?;
     tx.create("table", &slow)?;
     std::thread::sleep(HELD);
-    // Nothing in this function pinged anything. If the handle's thread were not
-    // doing it, the cluster would have aborted this transaction four seconds
-    // ago and the commit would fail with `No such transaction`.
+    // Nothing here pings: if the handle's thread did not, the cluster would
+    // have aborted this transaction after `SHORT` and the commit would fail
+    // with `No such transaction`.
     tx.commit()?;
     check(
         &format!("committed {:.0}s in", started.elapsed().as_secs_f64()),
@@ -182,9 +183,8 @@ fn run() -> Result<(), ClientError> {
 
 /// A launcher that gets halfway and then fails, the way a real one does.
 ///
-/// The interesting part is what is *not* written here: no abort, no cleanup, no
-/// `if let Err`. The `?` returns, `tx` drops on the way out, and the table it
-/// created never existed as far as the rest of the cluster is concerned.
+/// No abort, no cleanup: `tx` drops on the way out, and the table it created
+/// is never visible to the rest of the cluster.
 fn publish_and_fail(client: &Client, path: &str) -> Result<(), ClientError> {
     let tx = client.start_transaction()?;
 
@@ -196,10 +196,8 @@ fn publish_and_fail(client: &Client, path: &str) -> Result<(), ClientError> {
     ))
 }
 
-/// A row of the tables this publishes. `write_table_rows` serialises these, so
-/// the example never spells out a row's bytes — but it still compares the
-/// tables as raw bytes, which is the only way to say "unchanged" about a table
-/// nobody decoded.
+/// A row of the tables this publishes, serialised by `write_table_rows`. The
+/// tables are still compared as raw bytes, to say "unchanged" without decoding.
 #[derive(Serialize)]
 struct Row {
     key: &'static str,

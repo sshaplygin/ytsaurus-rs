@@ -59,7 +59,6 @@ fn encoded_by_hand(rows: usize) -> Vec<u8> {
 }
 
 /// A socket that answers every request the same way, until told to stop.
-///
 /// Connections are kept alive and serve any number of requests. With a fresh
 /// connection per iteration, the TCP handshake and teardown were about half the
 /// time at a thousand rows, and one arm at criterion's defaults left tens of
@@ -152,10 +151,8 @@ fn serve(mut stream: TcpStream, body: &[u8]) {
     }
 }
 
-/// Consumes a chunked body up to its terminating zero-length chunk.
-///
-/// `false` if the body could not be read to its end; the caller then drops the
-/// connection, since the next request would start mid-body.
+/// Consumes a chunked body up to its terminating zero-length chunk. `false` if
+/// it could not be read to its end; the caller then drops the connection.
 fn drain_chunked(reader: &mut BufReader<TcpStream>) -> bool {
     loop {
         let mut header = String::new();

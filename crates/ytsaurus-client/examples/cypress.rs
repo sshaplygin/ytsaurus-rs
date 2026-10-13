@@ -1,9 +1,8 @@
 //! `cypress` — the rest of the tree: list, copy, move, link and lock.
 //!
-//! Cypress is where a pipeline keeps its results, and keeping them means
-//! naming them: yesterday's run beside today's, a `latest` link that always
-//! points at the newest, and a lock so two launchers do not publish over each
-//! other.
+//! A pipeline's results kept side by side in Cypress: dated runs, a `latest`
+//! link to the newest, and locks so two launchers do not publish over each
+//! other. Each step is checked.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -52,8 +51,7 @@ fn run() -> Result<(), ClientError> {
     step("Listing what is there");
     let listed = client.list(&runs)?;
     println!("   as the cluster gives them: {listed:?}");
-    // Sorted before comparing, because the cluster's order is its own: three
-    // dated tables came back as the second, the third and then the first.
+    // Sorted before comparing: the cluster lists children in its own order.
     let mut sorted = listed.clone();
     sorted.sort();
     check(
@@ -66,8 +64,7 @@ fn run() -> Result<(), ClientError> {
                 "listing a table answered with {names:?} instead of failing"
             )));
         }
-        // Not an empty list: a table has no children, and asking is a mistake
-        // rather than a question with a boring answer.
+        // Not an empty list: listing a table's children is an error.
         Err(e) => done(&format!("and listing a table is an error: {e}")),
     }
 
@@ -175,16 +172,15 @@ fn run() -> Result<(), ClientError> {
         Err(e) => done(&format!("the second is refused, and told who won: {e}")),
     }
 
-    // A snapshot lock asks for something else entirely: not "nobody may write"
-    // but "let me keep reading what I can see now".
+    // A snapshot lock means "let me keep reading what I see now", not "nobody
+    // may write".
     second.lock(&live, LockMode::Snapshot)?;
     done("but it can pin the version it is reading");
 
     step("Waiting for a lock");
-    // This one can never be granted: the transaction is queueing behind its own
-    // snapshot lock, which only ends when the transaction does. The cluster does
-    // not say so — it queues the request and leaves it pending — so the deadline
-    // is the only thing that ends the wait.
+    // This one can never be granted: the transaction queues behind its own
+    // snapshot lock, which ends only with the transaction. The cluster leaves
+    // it pending, so only the deadline ends the wait.
     match second.lock_waiting(&live, LockMode::Exclusive, Duration::from_secs(2)) {
         Ok(_) => {
             return Err(ClientError::Config(
@@ -215,8 +211,7 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
-/// A row with nothing in it but its number: the tables here are told apart by
-/// how many rows they have rather than by what is in them.
+/// A row with nothing in it but its number.
 #[derive(Serialize)]
 struct Row {
     n: i64,
@@ -224,8 +219,7 @@ struct Row {
 
 /// `count` rows, so a table can be told apart by its size.
 ///
-/// An iterator rather than a collection: the client serialises rows as the
-/// connection asks for them, so nothing has to hold them all.
+/// An iterator: the client serialises rows as the connection asks for them.
 fn rows(count: usize) -> impl Iterator<Item = Row> {
     (0..count as i64).map(|n| Row { n })
 }

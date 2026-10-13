@@ -1,22 +1,19 @@
-//! `batch` — a dozen commands in one round trip, and the answers one by one.
+//! `batch`: a dozen commands in one round trip, and the answers one by one.
 //!
-//! A launcher that creates its tables one call at a time pays a round trip
-//! per table. `execute_batch` sends them together — and answers **per part**,
-//! so one table that already exists does not cost the others their creation.
+//! `execute_batch` sends commands together and answers per part, so one table
+//! that already exists does not cost the others their creation. This also
+//! checks a batch in a transaction, a split batch, a split batch that stops
+//! partway, and a replayed mutation id.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
 //! cargo run -p ytsaurus-client --example batch
 //! ```
 //!
-//! **The round trip itself is not something this program can see.** It checks
-//! what the cluster did — every table there, every answer at its own index,
-//! the transaction invisible until the commit — but "one request" is a fact
-//! about the wire, and a client on a cluster has no way to count what it sent.
-//! `a_dozen_creates_are_one_request` in `tests/batch.rs` is where that claim is
-//! checked, against a socket in-process that counts. Measured there and once by
-//! hand through a counting TCP relay: **1** request, 9.16 ms, against 140.77 ms
-//! for the same twelve creates sent one at a time.
+//! It checks what the cluster did, not that one request was sent: that is
+//! `a_dozen_creates_are_one_request` in `tests/batch.rs`, against an in-process
+//! socket that counts. Measured through a counting TCP relay: one request,
+//! 9.16 ms, against 140.77 ms for the same twelve creates one at a time.
 
 use std::process::ExitCode;
 
@@ -135,10 +132,9 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("A split batch that stops says which parts it was answered for");
-    // A part naming a command the cluster has never heard of fails the *whole*
-    // request — so putting one in the second chunk of a split batch is a
-    // mid-sequence failure with the first chunk already committed. There is no
-    // rollback, and the error carries the prefix rather than losing it.
+    // A part naming an unknown command fails the whole request, so one in the
+    // second chunk of a split batch fails after the first chunk is applied.
+    // Nothing is rolled back, and the error carries the answered prefix.
     let mut stopping = BatchRequest::new().with_max_part_size(2);
     stopping
         .create("table", &format!("{BASE}/applied0"))
@@ -173,15 +169,11 @@ fn run() -> Result<(), ClientError> {
         client.exists(&format!("{BASE}/applied0"))?
             && client.exists(&format!("{BASE}/applied1"))?,
     )?;
-    // And the sharper half, which is why `answered` reports what came *back*
-    // rather than claiming what was applied: the request that failed ran
-    // *every* part it never answered for. The driver collects the sub-requests,
-    // runs them all, and then throws the whole result list away because one
-    // entry is the unknown-name throw — dispatch is never aborted, so this is
-    // not a race, and neither putting the bad part first nor lowering
-    // `concurrency` limits it. Reported, not asserted: it is the cluster's
-    // behaviour today, and a version that stopped doing it would be a fix
-    // rather than a regression.
+    // `answered` reports what came back, not what was applied: the failed
+    // request still ran every part it did not answer for. The driver runs all
+    // sub-requests and then discards the results because one is the unknown
+    // name; neither ordering nor `concurrency` changes that. Reported, not
+    // asserted, since a cluster that stopped doing it would be fixed.
     done(&format!(
         "the create beside the unknown command {} — a refused request runs anyway",
         if client.exists(&format!("{BASE}/never"))? {
@@ -192,11 +184,9 @@ fn run() -> Result<(), ClientError> {
     ));
 
     step("One mutation id, replayed, is answered with the first result");
-    // The guarantee a single process cannot give itself: persist the id, and
-    // after a crash the same batch is deduplicated rather than applied twice.
-    // `create_table` deliberately omits `ignore_existing`, so a second send
-    // that was *not* recognised as a replay fails — which is what makes the
-    // identical node ids below mean something.
+    // Persist the id, and after a crash the same batch is deduplicated rather
+    // than applied twice. `create_table` omits `ignore_existing`, so a second
+    // send not recognised as a replay would fail.
     let replayed: Vec<String> = ["replay0", "replay1"]
         .iter()
         .map(|name| format!("{BASE}/{name}"))

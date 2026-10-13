@@ -1,13 +1,12 @@
 //! `vanilla` — an operation with no input tables at all.
 //!
 //! Three jobs, no input, each computing its own slice of a sum and writing one
-//! row. That is a whole category this stack could not reach before: gang jobs,
+//! row; the rows must add up to the whole sum. The shape for gang jobs,
 //! side-car computation, anything that is not a transformation of a table.
 //!
-//! It then reads back what the jobs *printed*, which is the half the Go SDK's
-//! `vanilla-example` is really about: a vanilla job often has no output table
-//! to speak through, so stderr is its only voice, and the cluster keeps it for
-//! jobs that succeeded as well as for jobs that failed.
+//! It then reads back what the jobs printed, as the Go SDK's `vanilla-example`
+//! does: a vanilla job often has no output table, so stderr is how it reports,
+//! and the cluster keeps stderr for jobs that succeeded as well as failed.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -25,7 +24,7 @@ const BASE: &str = "//tmp/ytsaurus_rs_vanilla";
 /// The worker this launches, as produced by `scripts/build-worker.sh shards`.
 const WORKER: &str = "target/x86_64-unknown-linux-musl/release-worker/shards";
 
-/// How many jobs the task runs. More than one is the point.
+/// How many jobs the task runs.
 const JOBS: i64 = 3;
 
 /// What the jobs are between them adding up: 1 + 2 + … + 1000.
@@ -76,11 +75,9 @@ fn run() -> Result<(), ClientError> {
     done(&format!("operation {id} completed"));
 
     step("Reading back what the jobs printed");
-    // The other half of a vanilla operation: its jobs have no output table to
-    // speak through, so stderr is how they say anything at all. Asked for right
-    // after the operation finishes, because the controller agent forgets its
-    // jobs soon afterwards and a cluster with no job archive — a local one, for
-    // instance — then has nothing left to tell.
+    // Asked for right after the operation finishes: the controller agent
+    // forgets its jobs soon afterwards, and a cluster with no job archive, such
+    // as a local one, then has nothing left to tell.
     let jobs = client.list_jobs(&id, None, JOBS as u32)?;
     check(
         &format!("the cluster still lists all {JOBS} jobs"),
@@ -93,14 +90,13 @@ fn run() -> Result<(), ClientError> {
         let text = String::from_utf8_lossy(&stderr);
         let text = text.trim();
         if !text.is_empty() {
-            // Enough of the id to tell three jobs apart, and `get` rather than
-            // a slice because nothing promises a job id is eight characters.
+            // A prefix of the id, through `get` because a job id need not be
+            // eight characters.
             println!("   {}: {text}", job.id.get(..8).unwrap_or(&job.id));
             spoke += 1;
         }
     }
-    // Stderr is kept for jobs that *succeeded* too, which is what makes this a
-    // way to read a job's own account of itself rather than only a post-mortem.
+    // Stderr is kept for jobs that succeeded too, not only for post-mortems.
     check(
         &format!("all {JOBS} succeeded and their stderr survived"),
         spoke == JOBS as usize,
@@ -138,9 +134,8 @@ fn run() -> Result<(), ClientError> {
 
 /// One job's row, named as the worker writes it.
 ///
-/// The worker's own struct has a `shards` column this does not mention, and
-/// that is the point of asking for a type: the columns a reader does not name
-/// are simply not its business.
+/// The worker's struct also has a `shards` column, which this does not name
+/// and so does not read.
 #[derive(serde::Deserialize)]
 struct Shard {
     cookie: i64,

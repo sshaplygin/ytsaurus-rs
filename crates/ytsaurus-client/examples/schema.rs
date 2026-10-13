@@ -1,9 +1,10 @@
-//! `schema` — a derived schema, on a real cluster.
+//! `schema`: a derived schema, on a real cluster.
 //!
-//! The point of inferring a schema from a Rust struct is that the cluster then
-//! enforces it, so the only test that means anything is whether the cluster
-//! accepts what the derive produced — for every column type, not just the easy
-//! ones — and whether it then rejects a row that breaks the promise.
+//! Checks that the cluster accepts the schema `#[derive(TableRow)]` produces,
+//! for every column type, and rejects a row that breaks it. Then evolves a
+//! table with rows in it (an optional column is accepted, stricter changes are
+//! refused, and an empty table accepts them), shows the refusals the client
+//! makes locally, and tries a descending key column.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -73,8 +74,7 @@ fn run() -> Result<(), ClientError> {
     done(&format!("{} column types accepted", ALL_TYPES.len()));
 
     step("The schema is a promise the cluster keeps");
-    // A row missing a required column must be refused. If this were accepted,
-    // the schema would be decoration.
+    // A row missing a required column must be refused.
     let incomplete = yson_build::map([("host", yson_build::string("example.com"))]);
     let mut rows = to_vec(&incomplete, YsonFormat::Binary).map_err(|e| ClientError::Decode {
         command: "write_table".to_owned(),
@@ -100,23 +100,21 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Evolving the schema of a table that already has rows");
-    // Its own table rather than the one above: the refused write left an upload
-    // transaction holding an exclusive lock for a moment, and this example
-    // should demonstrate schema evolution rather than wait out a lock.
+    // Its own table: the refused write left an upload transaction holding an
+    // exclusive lock on the one above for a moment.
     let visits_path = format!("{BASE}/evolving");
     client.create_table(&visits_path, &Visit::table_schema())?;
     client.write_table(&visits_path, &two_visits()?)?;
     done(&format!("{} rows written", client.row_count(&visits_path)?));
 
-    // The struct gained a field, so the table does. Nothing is written out by
-    // hand here either: this is `VisitV2`'s own fields.
+    // The struct gained a field, so the table does: `VisitV2`'s own fields.
     client.alter_table(&visits_path, &VisitV2::table_schema())?;
     check(
         "an optional column can be added to a table with rows in it",
         column_names(&client.table_schema(&visits_path)?) == ["host", "size", "referrer", "note"],
     )?;
 
-    // Everything else asks more of the rows already written than they promised.
+    // These ask more of the rows already written than they promised.
     for (what, schema) in incompatible_changes() {
         match client.alter_table(&visits_path, &schema) {
             Ok(()) => {
@@ -127,8 +125,8 @@ fn run() -> Result<(), ClientError> {
         }
     }
 
-    // The same change, on a table with nothing in it, is allowed. Which is why
-    // trying a migration out on an empty table proves nothing.
+    // The same change is allowed on an empty table, so trying a migration on
+    // one proves nothing.
     let empty = format!("{BASE}/empty_visits");
     client.create_table(&empty, &Visit::table_schema())?;
     client.alter_table(&empty, &incompatible_changes().swap_remove(0).1)?;
@@ -138,8 +136,7 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("What the client refuses before asking");
-    // The same rules, caught locally: one sentence naming the column instead of
-    // a round trip and a nested error document.
+    // The same rules, caught locally with an error naming the column.
     for (what, schema) in local_refusals() {
         match schema.validate() {
             Ok(()) => {
@@ -151,8 +148,8 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("And the one order this cluster will not take");
-    // Documented on `SortOrder::Descending`. Checked rather than asserted, so
-    // the day a cluster enables it, this says so instead of going stale.
+    // Documented on `SortOrder::Descending`. Reported rather than asserted, so
+    // a cluster that accepts it is noted.
     let descending = TableSchema::new([Column::new("k", ColumnType::Int64)
         .required()
         .sorted(SortOrder::Descending)]);
@@ -170,9 +167,8 @@ fn run() -> Result<(), ClientError> {
 
 /// The rows the table holds. The schema is read off this and nothing else.
 ///
-/// Spelled out rather than imported: with the client's `derive` feature on,
-/// `TableRow` is both the trait and the macro, and importing the macro from
-/// `ytsaurus-helpers` as well would be the same name twice.
+/// The derive path is spelled out: with the client's `derive` feature on,
+/// `TableRow` is the trait and the macro, and importing both is a name clash.
 #[derive(ytsaurus_helpers::TableRow)]
 #[expect(dead_code)]
 struct Visit<'a> {
@@ -186,8 +182,8 @@ struct Visit<'a> {
 
 /// The same rows, a release later: the struct gained a field.
 ///
-/// Optional, because the rows already in the table do not have it — which is
-/// also the only kind of column a table with rows will accept.
+/// Optional, because the rows already in the table do not have it; a table
+/// with rows accepts only that kind of new column.
 #[derive(ytsaurus_helpers::TableRow)]
 #[expect(dead_code)]
 struct VisitV2<'a> {

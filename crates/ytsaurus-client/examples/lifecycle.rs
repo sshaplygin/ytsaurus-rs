@@ -327,10 +327,8 @@ fn visits(hosts: &[&str]) -> Vec<Visit> {
         .collect()
 }
 
-/// A sleeping operation that stops itself if this example gives up.
-///
-/// `Drop` aborts it unless [`Sleeper::finished`] was called, so a failed check
-/// does not leave it running.
+/// A sleeping operation that `Drop` aborts unless [`Sleeper::finished`] was
+/// called, so a failed check does not leave it running.
 struct Sleeper<'a> {
     client: &'a Client,
     id: String,
@@ -400,9 +398,7 @@ fn wait_for_state(
 }
 
 /// Waits for the operation to have a job running, and returns the first one.
-///
-/// An operation is `running` before any of its jobs are, so its state does not
-/// say whether there is a job yet.
+/// An operation is `running` before any of its jobs are.
 fn wait_for_running_job(
     op: &ytsaurus_client::Operation,
     patience: Duration,
@@ -431,10 +427,9 @@ fn field<'a>(document: &'a YsonValue, key: &str) -> Option<&'a YsonValue> {
     }
 }
 
-/// The weight the scheduler recorded, from whichever pool tree it landed in.
-///
-/// A weight sent at the top level is spread across every tree the operation
-/// runs in; a local cluster has exactly one, called `default`.
+/// The weight the scheduler recorded, from whichever pool tree it landed in. A
+/// top-level weight applies to every tree the operation runs in; a local
+/// cluster has one, `default`.
 fn weight_in_first_tree(document: &YsonValue) -> Option<f64> {
     let trees = field(
         field(document, "runtime_parameters")?,

@@ -1,10 +1,9 @@
 //! `streaming` — a table larger than the program that moves it.
 //!
-//! `read_table` and `write_table` hold a whole table at once, which is right
-//! for a launcher inspecting a result and wrong for anything the size of the
-//! data. This writes a table from a generator, reads it back as a stream, and
-//! then reads the same table the buffered way — watching peak RSS through all
-//! three, because that is the only number that settles the question.
+//! `read_table` and `write_table` hold a whole table at once. This writes a
+//! table from a generator with `write_table_streaming`, reads it back as a
+//! stream and checks the rows, then reads it the buffered way, printing peak
+//! RSS after each of the three.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -27,8 +26,7 @@ const DEFAULT_MIB: u64 = 64;
 
 /// What the generator hands the transport at a time.
 ///
-/// The whole point of the exercise: this, and not the table, is what the
-/// writing side holds.
+/// This, not the table, is what the writing side holds.
 const CHUNK: usize = 64 * 1024;
 
 fn main() -> ExitCode {
@@ -74,16 +72,16 @@ fn run() -> Result<(), ClientError> {
     ));
 
     step("Reading it back as a stream");
-    // The client hands over bytes; the job runtime decodes them. Same decoder
-    // as a job on a cluster node, on the same wire format.
+    // The client hands over bytes; the job runtime's decoder, the one a job
+    // uses on a cluster node, decodes them.
     let mut reader = JobReader::binary(client.read_table_streaming(&path)?);
     let mut counted = 0_u64;
     let mut total = 0_i64;
     while let Some(event) = reader.next_event().map_err(decoding)? {
         if let Event::Row(row) = event {
             counted += 1;
-            // Only the column this checks: serde ignores the rest, so the
-            // payload is never copied out of the reader's buffer.
+            // Only the column this checks; serde skips the rest, so the
+            // payload is not copied out of the reader's buffer.
             total += row.parse::<Counted>().map_err(decoding)?.n;
         }
     }
@@ -110,10 +108,8 @@ fn run() -> Result<(), ClientError> {
         megabytes(after_buffered)
     ));
 
-    // The high-water mark is what a program is actually charged for, so this is
-    // the comparison that matters. Not an assertion: RSS is the operating
-    // system's business and a run under a profiler or an allocator with
-    // different habits could move it.
+    // The high-water mark is what a program is charged for. Printed, not
+    // asserted: a profiler or another allocator could move it.
     println!(
         "\nStreaming the {} table cost {} of peak RSS; reading it in cost {}.",
         megabytes(whole.len() as u64),
@@ -132,10 +128,8 @@ struct Counted {
 
 /// Rows encoded on demand, never all at once.
 ///
-/// A `Read` rather than a `Vec`, because handing `write_table_streaming` a
-/// `Vec` would defeat the exercise. Each fill produces whole records: a
-/// record split across two fills would still be correct on the wire, but this
-/// keeps what the buffer holds easy to reason about.
+/// A `Read`, not a `Vec`. Each fill produces whole records; a record split
+/// across fills would also be correct on the wire.
 struct Rows {
     remaining: u64,
     total: u64,

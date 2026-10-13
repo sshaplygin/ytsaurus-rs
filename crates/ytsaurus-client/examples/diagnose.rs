@@ -1,9 +1,7 @@
-//! `diagnose` — proves that a failed operation explains itself.
+//! `diagnose`: a failed operation explains itself.
 //!
 //! Runs the `boom` worker, which panics on its first row, and checks that the
-//! [`ClientError`] the launcher gets back carries the job's own stderr. Before
-//! this existed, a failed operation gave you a state string and a trip to the
-//! web UI.
+//! [`ClientError`] the launcher gets back carries the job's own stderr.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -11,8 +9,7 @@
 //! cargo run -p ytsaurus-client --example diagnose
 //! ```
 //!
-//! Exits non-zero if the operation *succeeds* — that would mean the test is no
-//! longer testing anything.
+//! Exits non-zero if the operation succeeds.
 
 use std::process::ExitCode;
 
@@ -25,8 +22,8 @@ const BASE: &str = "//tmp/ytsaurus_rs_diagnose";
 /// The worker this launches, as produced by `scripts/build-worker.sh boom`.
 const WORKER: &str = "target/x86_64-unknown-linux-musl/release-worker/boom";
 
-/// What `boom` panics with. Asserting on it is what makes this a test of *this*
-/// job's stderr rather than of any message that mentions a failure.
+/// What `boom` panics with, so the check is on this job's stderr rather than
+/// any message that mentions a failure.
 const MARKER: &str = "boom: this job fails on purpose";
 
 /// A couple of rows, so the job has something to fail on.
@@ -70,8 +67,8 @@ fn run() -> Result<(), ClientError> {
     )
     .with_local_file(format!("{BASE}/boom"))
     .with_memory_limit(512 * 1024 * 1024)
-    // One attempt. The default lets the cluster retry a failing job several
-    // times, which only makes the wait longer; the failure is deterministic.
+    // One attempt: the failure is deterministic, and retries only lengthen the
+    // wait.
     .with_raw("max_failed_job_count", yson_build::int(1));
 
     let id = client.start_map(&spec)?;
@@ -111,8 +108,7 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
-/// A row of the input table. `write_table_rows` serialises these, so the
-/// example never spells out a row's bytes.
+/// A row of the input table, serialised by `write_table_rows`.
 #[derive(Serialize)]
 struct Row {
     key: &'static str,

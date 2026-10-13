@@ -1,9 +1,9 @@
 //! `statistics` — a job counts its own work, the operation adds it up.
 //!
 //! Runs the `counted` worker, which drops rows without a `key` column and
-//! reports how many it read and dropped. Nothing else would tell you that rows
-//! went missing: the operation succeeded, and the output table is simply
-//! shorter than the input.
+//! reports how many it read and dropped as custom job statistics, and checks
+//! the operation's totals. Nothing else shows the dropped rows: the operation
+//! succeeds and the output is shorter than the input.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -68,8 +68,7 @@ fn run() -> Result<(), ClientError> {
     )
     .with_local_file_named(&worker.path, &worker.name)
     .with_memory_limit(512 * 1024 * 1024)
-    // One job, so the statistic is one job's count rather than a sum over
-    // several — the sum is the same either way, which is the point of them.
+    // One job; the summed statistic would be the same over several.
     .with_job_count(1);
 
     let id = client.start_map(&spec)?;
@@ -137,8 +136,8 @@ fn sample_rows() -> impl Iterator<Item = Row> {
 
 /// A row of the input table: a count, and a key on the rows the job keeps.
 ///
-/// The job rejects a row that has no `key` column, which is not the same thing
-/// as a `key` set to null — so the field is skipped rather than written as one.
+/// The job drops a row with no `key` column, which differs from a null `key`,
+/// so the field is skipped rather than written as null.
 #[derive(Serialize)]
 struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
