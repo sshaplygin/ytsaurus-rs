@@ -20,8 +20,8 @@
 //! about 1.8× faster on summed `time/exec`, because its planner combines in the
 //! map stage and 3 750 rows crossed its shuffle against 3 114 964 for `map`.
 //! Charged only for what the worker's reduce cost, YQL's 4650 ms becomes 3396
-//! against 2787, 1.22×, and the stage that touches every row is within a few
-//! per cent per byte. A job-level combiner is worth about 3×; the rest is plan
+//! against 2787: 1.22×, not 1.67×. The stage that touches every row is within a
+//! few per cent per byte. A job-level combiner is worth about 3×; the rest is plan
 //! shape and job startup (about 640 ms a job).
 //!
 //! ```sh
