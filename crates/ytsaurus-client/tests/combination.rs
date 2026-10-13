@@ -1,14 +1,9 @@
-//! What the four branches do **together**, on the round-3 heads.
+//! Heavy-proxy routing where redirect refusal, `/hosts` re-asking, host
+//! validation and host dropping meet: which lookup failures are asked again,
+//! which discovered hosts are kept, and where the token may go.
 //!
-//! Each of #36, #37, #38 and #39 is tested on its own branch. These are the
-//! questions that only exist once two of them are in the same tree — where one
-//! PR's new error meets another PR's new decision about what an error means.
-//! The headline is the #36 × #38 interaction that round 2 found permanently
-//! disabled heavy routing; round 3 is where the fixes are supposed to have
-//! closed it.
-//!
-//! The stubs are `request_shape.rs`'s, generalised: a listener that stays up,
-//! remembers every request, and answers `/hosts` however the test needs it.
+//! The stub is a listener that stays up, remembers every request, and answers
+//! `/hosts` however the test needs it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -17,18 +12,15 @@ use std::time::Duration;
 
 use ytsaurus_client::{Client, ClientError, RetryPolicy};
 
-// --------------------------------------------------------------- the headline
+// ------------------------------------------------- a redirected /hosts lookup
 
 #[test]
 fn a_cross_origin_hosts_redirect_no_longer_permanently_disables_routing() {
-    // #36 × #38, round 3. A balancer answers `/hosts` with a cross-origin 307,
-    // which #36 refuses (the token would be dropped) as `ClientError::Redirected`.
-    //
-    // Round 2: that error reached `base_for`, was classified non-retriable, and
-    // cached `Configured` **permanently** — `/hosts` was asked exactly once for
-    // the client's whole life. Round 3: #38's `worth_asking_again` now counts
-    // `Redirected` as worth asking again, so it caches `FellBack` (temporary).
-    // With the fallback window set to zero, every heavy command asks again.
+    // A balancer answers `/hosts` with a cross-origin 307, refused because
+    // the token would be dropped (`ClientError::Redirected`).
+    // `worth_asking_again` counts `Redirected` as worth asking again, so
+    // `base_for` caches `FellBack`, not `Configured`; with the fallback window
+    // at zero, every heavy command asks again.
     let control = Proxy::new(Hosts::RedirectCrossOrigin);
 
     let client = Client::with_token(&control.url(), "secret-token")
@@ -37,7 +29,7 @@ fn a_cross_origin_hosts_redirect_no_longer_permanently_disables_routing() {
         .with_hosts_retry_after(Duration::ZERO);
 
     for _ in 0..3 {
-        // The upload still succeeds — it falls back to the configured address.
+        // The upload falls back to the configured address.
         client
             .write_table("//tmp/t", b"")
             .expect("the upload still succeeds");
@@ -49,9 +41,7 @@ fn a_cross_origin_hosts_redirect_no_longer_permanently_disables_routing() {
         .filter(|line| line.starts_with("GET /hosts"))
         .count();
 
-    // The heart of the fix: the cluster is asked again rather than once ever.
-    // Round 2 asserted exactly one lookup across all three commands; here there
-    // is one per command, so routing is *retried*, not disabled for life.
+    // One lookup per command: routing is retried, not disabled for life.
     assert_eq!(
         hosts_lookups,
         3,
@@ -62,11 +52,10 @@ fn a_cross_origin_hosts_redirect_no_longer_permanently_disables_routing() {
 
 #[test]
 fn the_same_permanence_is_gone_with_a_ten_second_default_too() {
-    // The same point without leaning on a zero window: with the default
-    // HOSTS_RETRY_AFTER the client asks once, falls back, and does *not* ask
-    // again within the window — but the state is `FellBack`, not `Configured`,
-    // which is what round 2 got wrong. Proven by the contrast test above (zero
-    // window → re-asks) and this one (default window → one ask, still serving).
+    // With the default `HOSTS_RETRY_AFTER` window, the client asks once,
+    // falls back, and does not ask again within the window, while every
+    // command still succeeds. The zero-window test above shows the cached
+    // verdict is temporary.
     let control = Proxy::new(Hosts::RedirectCrossOrigin);
 
     let client = Client::with_token(&control.url(), "secret-token")
@@ -79,8 +68,8 @@ fn the_same_permanence_is_gone_with_a_ten_second_default_too() {
             .expect("still succeeds via fallback");
     }
 
-    // One lookup within the window, then the configured address serves the
-    // rest — the command never fails, which is what makes the fallback correct.
+    // One lookup within the window; the configured address serves the rest,
+    // and no command fails.
     let hosts_lookups = control
         .requests()
         .iter()
@@ -91,10 +80,9 @@ fn the_same_permanence_is_gone_with_a_ten_second_default_too() {
 
 #[test]
 fn a_same_origin_hosts_redirect_is_now_followed_and_routing_works() {
-    // The other half of #36's new model: a same-origin redirect — a balancer
-    // canonicalising its own `/hosts` URL — is *followed*, token and all. So
-    // the lookup succeeds, the client learns the heavy proxy, and the upload
-    // reaches it. Round 2 refused every redirect and this case broke too.
+    // A same-origin redirect (a balancer canonicalising its own `/hosts` URL)
+    // is followed, token and all: the lookup succeeds, the client learns the
+    // heavy proxy, and the upload reaches it.
     let heavy = Proxy::new(Hosts::naming_itself());
     let control = Proxy::new(Hosts::RedirectSameOriginTo(format!(
         r#"["{}"]"#,
@@ -107,8 +95,8 @@ fn a_same_origin_hosts_redirect_is_now_followed_and_routing_works() {
         .write_table("//tmp/t", b"")
         .expect("writes");
 
-    // The control proxy served the lookup and its same-origin redirect; the
-    // heavy proxy served the upload.
+    // The control proxy served the lookup and its redirect; the heavy proxy
+    // served the upload.
     assert!(
         control
             .requests()
@@ -130,9 +118,9 @@ fn a_same_origin_hosts_redirect_is_now_followed_and_routing_works() {
 
 #[test]
 fn the_redirected_lookup_is_still_reported_as_a_redirect_when_asked_directly() {
-    // #36 still works: `heavy_proxy()` surfaces the cross-origin refusal as
-    // `ClientError::Redirected`, rather than swallowing it. The difference from
-    // round 2 is only what the *router* does with the same error.
+    // `heavy_proxy()` surfaces the cross-origin refusal as
+    // `ClientError::Redirected` rather than swallowing it; only the router
+    // treats the same error as a reason to fall back.
     let control = Proxy::new(Hosts::RedirectCrossOrigin);
 
     let error = Client::with_token(&control.url(), "secret-token")
@@ -147,22 +135,17 @@ fn the_redirected_lookup_is_still_reported_as_a_redirect_when_asked_directly() {
     );
 }
 
-// ----------------------------------------------- #38 × #39, the second edge
+// -------------------------------------- dropping or keeping a discovered host
 
 #[test]
 fn a_discovered_proxy_that_fails_non_retriably_is_not_re_resolved() {
-    // #38 × #39, and the seam #40 then split. Dropping a host from the pool
-    // keys on `attributable_to_the_host` — `worth_asking_again` PLUS a
-    // rejected certificate — precisely so the per-host verdict a certificate
-    // is (`NotValidForName` names one host) drops that host where it used to
-    // pin the client. What this test stands up is the class that stays on the
-    // other side of the line: a failure about the *request* — cluster code
-    // 500, a resolve error — is not the host's fault, the table is missing
-    // everywhere, and the discovered proxy is rightly kept and not
-    // re-resolved. The certificate side of the line is pinned in
+    // A host is dropped from the pool when `attributable_to_the_host` holds:
+    // `worth_asking_again`, or a rejected certificate (`NotValidForName` names
+    // one host). A failure about the request (cluster code 500, a resolve
+    // error) is not the host's fault and would fail at every host, so the
+    // discovered proxy is kept and not re-resolved. The certificate side is pinned in
     // `http::tests::a_rejected_certificate_drops_the_host_and_a_wrong_command_does_not`,
-    // where the error can be built without the TLS handshake a stub cannot
-    // stage.
+    // since a stub cannot stage the TLS handshake.
     let heavy = Proxy::new(Hosts::naming_itself().failing_commands_with(500));
     let control = Proxy::new(Hosts::listing(&heavy.host()));
 
@@ -202,9 +185,8 @@ fn a_discovered_proxy_that_fails_non_retriably_is_not_re_resolved() {
 
 #[test]
 fn a_discovered_proxy_that_fails_retriably_is_re_resolved() {
-    // The contrast that shows the split is about classification: a banned
-    // proxy (cluster code 2100) is retriable, so `worth_asking_again` is true
-    // and the client re-asks.
+    // A banned proxy (cluster code 2100) is retriable, so
+    // `worth_asking_again` is true and the client re-asks.
     let heavy = Proxy::new(Hosts::naming_itself().failing_commands_with(2100));
     let control = Proxy::new(Hosts::listing(&heavy.host()));
 
@@ -229,13 +211,13 @@ fn a_discovered_proxy_that_fails_retriably_is_re_resolved() {
     );
 }
 
-// ----------------------------------------- WP5 option B: the credential path
+// ----------------------------------------------------- where the token may go
 
 #[test]
 fn the_token_reaches_a_validated_discovered_heavy_proxy() {
-    // Option B, half (a): the token *does* travel to a `/hosts`-named host —
-    // intended, matching the C++/Go/Python clients. The safety is that the host
-    // was validated first (half b), not that the token is withheld.
+    // The token travels to a `/hosts`-named host, as in the C++, Go and
+    // Python clients. The safety is that the host is validated first (next
+    // test), not that the token is withheld.
     let heavy = Proxy::new(Hosts::naming_itself());
     let control = Proxy::new(Hosts::listing(&heavy.host()));
 
@@ -259,11 +241,10 @@ fn the_token_reaches_a_validated_discovered_heavy_proxy() {
 
 #[test]
 fn an_at_smuggled_host_is_refused_so_the_token_is_not_sent_to_it() {
-    // Option B, half (b): the discovered host is validated. A `/hosts` answer
-    // whose entry is `real@evil` is a URL whose *host* is `evil`; #38 refuses
-    // it (the `@`), falls back to the configured address, and the token is
-    // never dialled at `evil`. The upload still succeeds against the configured
-    // address, so the refusal is safe rather than fatal.
+    // A `/hosts` entry `real@evil` is a URL whose host is `evil`. It is
+    // refused (the `@`), the client falls back to the configured address, and
+    // `evil` is never dialled. The upload still succeeds, so the refusal is
+    // safe rather than fatal.
     let evil = Proxy::new(Hosts::naming_itself());
     // The configured cluster; the /hosts answer smuggles `evil` behind userinfo.
     let control = Proxy::new(Hosts::listing(&format!(
@@ -298,13 +279,12 @@ fn an_at_smuggled_host_is_refused_so_the_token_is_not_sent_to_it() {
 
 #[test]
 fn a_plain_http_discovered_host_is_refused_from_an_https_client() {
-    // The downgrade guard, still behavioural: an `https://` client will not be
-    // steered onto an `http://` heavy proxy by a `/hosts` body, which would put
-    // the token on the wire in cleartext. `heavy_base` refuses a name that
-    // carries its own scheme, so this falls back to the configured address.
-    // (Configured over https here means the command then fails at the TLS
-    // guard on a stub socket — what matters is only that it did not dial the
-    // http host.)
+    // An `https://` client is not steered onto an `http://` heavy proxy by a
+    // `/hosts` body, which would put the token on the wire in cleartext:
+    // `heavy_base` refuses any name carrying its own scheme. The client here
+    // is configured over http, because a stub cannot serve TLS; the
+    // `http://` entry is refused all the same, and the test checks only that
+    // the http host was never dialled.
     let evil = Proxy::new(Hosts::naming_itself());
     let control = Proxy::new(Hosts::listing(&format!("http://{}", evil.host())));
 
@@ -331,11 +311,10 @@ enum Hosts {
     NamingItself,
     /// `/hosts` names this listener; every command fails with this cluster code.
     NamingItselfFailing(i64),
-    /// `/hosts` answers 307 to a *different* origin — refused by #36 with a
-    /// token.
+    /// `/hosts` answers 307 to a different origin: refused, as the client
+    /// holds a token.
     RedirectCrossOrigin,
-    /// `/hosts` answers 307 to the same origin, then serves this list — followed
-    /// by #36.
+    /// `/hosts` answers 307 to the same origin, then serves this list: followed.
     RedirectSameOriginTo(String),
 }
 
@@ -363,13 +342,12 @@ impl Hosts {
             Self::NamingItselfFailing(_) if hosts => ok_body(format!(r#"["{me}"]"#).as_bytes()),
             Self::NamingItselfFailing(code) => cluster_error(*code),
             Self::RedirectCrossOrigin if hosts => {
-                // A different origin: port 1 on loopback, which no client of
-                // ours is bound to, so it is unambiguously cross-origin.
+                // Port 1 on loopback, which no stub binds, is unambiguously
+                // a different origin.
                 redirect(307, "http://127.0.0.1:1/hosts")
             }
             Self::RedirectSameOriginTo(list) if head.starts_with("GET /hosts ") => {
-                // Same-origin canonicalisation: an absolute-path Location on the
-                // host that answered.
+                // Same-origin canonicalisation: `/hosts` to `/hosts/`.
                 redirect(307, &format!("http://{me}/hosts/"))
             }
             Self::RedirectSameOriginTo(list) if head.starts_with("GET /hosts/") => {
