@@ -1,12 +1,9 @@
 //! What a cached upload does against a cache the caller may not write to.
 //!
-//! No cluster here answers `Access denied`: a local one in Docker is a cluster
-//! where the caller is `root` and every path is writable, which is exactly why
-//! the failure this pins was found on a real installation and not before. So
-//! the cluster is a socket in-process that answers each command as told —
-//! `request_shape.rs` does the same for one request, and this does it for the
-//! seven a cached upload sends, because what is under test is the *sequence*:
-//! which command was refused, and what the client did next.
+//! A local Docker cluster runs as `root`, where every path is writable and
+//! nothing answers `Access denied`, so the cluster here is an in-process socket
+//! that answers each command as told. What is under test is the sequence of up
+//! to seven commands: which one was refused, and what the client did next.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,14 +27,12 @@ const MISS: &str = r#""""#;
 
 #[test]
 fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
-    // The reported failure: `//tmp/yt_wrapper/file_storage` is operator-managed
-    // and an ordinary user may read it and nothing else, so the `create` on the
-    // miss branch is refused and the launch dies at its first upload. It is an
-    // optimisation that failed, and the worker still has somewhere to go.
+    // `//tmp/yt_wrapper/file_storage` may be operator-managed and read-only to
+    // an ordinary user, so the `create` on a miss is refused. The cache is an
+    // optimisation: the worker is uploaded outside it instead.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
-        // Everything else aimed at the cache, whichever of the writes into it
-        // this installation checks first.
+        // Every write into the cache, whichever one is checked first.
         _ if sent.mentions(CACHE) => Answer::Denied,
         _ => Answer::Body("{}".to_owned()),
     });
@@ -52,10 +47,8 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
         uploaded.uploaded,
         "the fallback is an upload, and says so: {uploaded:?}"
     );
-    // And says *where*. `uploaded` is true on both paths, so it cannot be the
-    // signal a caller branches on: a launcher that tidies up after itself on
-    // that alone deletes the installation's shared cache entry on an ordinary
-    // cluster. This is the field that tells the two apart.
+    // `uploaded` is true on both paths; `cached` is what tells a caller not to
+    // delete the path afterwards, since a cached one is the shared entry.
     assert!(
         !uploaded.cached,
         "the fallback claims the cache took it: {uploaded:?}"
@@ -65,8 +58,7 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
         "the worker went somewhere the caller cannot write: {}",
         uploaded.path
     );
-    // The sandbox name still comes from the file, not from the path it landed
-    // at — the whole point of `CachedFile::name`.
+    // `CachedFile::name` comes from the file, not from where it landed.
     assert_eq!(uploaded.name, "managed");
 
     let sent = cluster.sent();
@@ -81,9 +73,8 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
         ],
         "the lookup, the refused cache directory, then a plain upload: {sent:?}"
     );
-    // Nothing was staged in the cache and nothing was handed to it: the client
-    // stopped asking at the first refusal rather than working through the rest
-    // of the sequence collecting the same answer.
+    // The client stopped at the first refusal: nothing staged in or handed to
+    // the cache.
     assert!(
         !sent.iter().any(|s| s.command == "put_file_to_cache"),
         "the cache was still asked to take the file: {sent:?}"
@@ -98,13 +89,9 @@ fn a_cache_the_installation_keeps_to_itself_still_launches_the_worker() {
 
 #[test]
 fn a_refusal_the_cluster_wrapped_is_still_the_cache_refusing() {
-    // Every transcript of this failure seen so far is flat, so the fallback
-    // works today reading the outer code alone. It is the *next* transcript
-    // that is the problem: an outer code is routinely a category — `Error
-    // creating node`, `Request retries failed` — with the reason underneath,
-    // and a classifier that only reads the top would quietly stop firing on
-    // the day a proxy wrapped the answer. Both sibling classifiers in this
-    // crate walk the document; this one does too.
+    // An outer error is often a category (`Error creating node`) with the
+    // reason in `inner_errors`. The refusal is recognised one level down, as
+    // the crate's other error classifiers do.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
         _ if sent.mentions(CACHE) => Answer::DeniedInside,
@@ -134,10 +121,8 @@ fn a_refusal_the_cluster_wrapped_is_still_the_cache_refusing() {
 
 #[test]
 fn a_cache_that_takes_the_bytes_and_refuses_the_handover_falls_back_too() {
-    // The other half, and the more expensive one: `put_file_to_cache` is the
-    // last call of the sequence, so by the time it is refused the whole binary
-    // is already on the cluster. Sending it again is worth it — the alternative
-    // is a launch that fails having done all the work.
+    // `put_file_to_cache` is refused after the whole binary is staged. The
+    // client uploads it again outside the cache rather than fail the launch.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
         "put_file_to_cache" => Answer::Denied,
@@ -170,9 +155,8 @@ fn a_cache_that_takes_the_bytes_and_refuses_the_handover_falls_back_too() {
             "write_file",
             "set",
             "put_file_to_cache",
-            // The staging node goes whichever way the handover went. It is
-            // inside the cache, and cache expiry collects what the cache itself
-            // created, not what was left beside it.
+            // The staging node is removed either way: cache expiry does not
+            // collect what was left beside the cache's own entries.
             "remove",
             "create",
             "write_file",
@@ -193,9 +177,8 @@ fn a_cache_that_takes_the_bytes_and_refuses_the_handover_falls_back_too() {
 
 #[test]
 fn a_cluster_that_allows_the_cache_still_uses_it() {
-    // The path nothing above exercises, and the one every cluster in CI takes.
-    // A fallback that fired whatever the cluster answered would pass both tests
-    // above and quietly stop caching for everybody.
+    // The path CI clusters take: a fallback that fired on any answer would pass
+    // the tests above and stop caching for everybody.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
         "put_file_to_cache" => Answer::Body(format!("{IN_THE_CACHE:?}")),
@@ -209,8 +192,7 @@ fn a_cluster_that_allows_the_cache_still_uses_it() {
         .expect("uploads");
 
     assert_eq!(uploaded.path, IN_THE_CACHE);
-    // Uploaded *and* cached: the two are one answer only on this path, which is
-    // why the pair is asserted here as well as on the fallback.
+    // Uploaded and cached are both true only on this path.
     assert!(uploaded.uploaded && uploaded.cached, "{uploaded:?}");
 
     let sent = cluster.sent();
@@ -224,9 +206,8 @@ fn a_cluster_that_allows_the_cache_still_uses_it() {
             "set",
             "put_file_to_cache",
             "remove",
-            // The executable bit on the cached path, which is a different node
-            // from the one that was written: whether the attribute survives the
-            // cache's move decides whether the job can exec at all.
+            // The executable bit, set on the cached node rather than the
+            // written one, so that the job can exec it.
             "set",
         ],
         "{sent:?}"
@@ -257,20 +238,16 @@ fn a_cache_hit_uploads_nothing_and_falls_back_to_nothing() {
 
     assert_eq!(uploaded.path, IN_THE_CACHE);
     assert!(!uploaded.uploaded, "a hit uploaded something: {uploaded:?}");
-    // The one case where the two fields disagree in the other direction:
-    // nothing was sent, and the file is the cache's all the same. A `cached`
-    // that merely echoed `uploaded` would read as "not in the cache" here, on
-    // the path where the answer came *from* the cache.
+    // Nothing was sent, and the file is the cache's: `cached` must not merely
+    // echo `uploaded`.
     assert!(uploaded.cached, "a hit is not cached: {uploaded:?}");
     assert_eq!(commands(&cluster.sent()), ["get_file_from_cache"]);
 }
 
 #[test]
 fn a_create_that_failed_for_some_other_reason_is_not_a_cache_to_give_up_on() {
-    // A resolve error is not a permission error, and no amount of uploading
-    // elsewhere addresses it. Catching by command alone — "the create failed,
-    // so there is no cache" — would turn every such failure into a silent
-    // second upload and a launch that reports success.
+    // A resolve error is not a permission error, and uploading elsewhere does
+    // not address it. Falling back on any failed `create` would hide it.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
         "create" => Answer::Failed(500, "Error resolving path //tmp/yt_wrapper"),
@@ -287,12 +264,9 @@ fn a_create_that_failed_for_some_other_reason_is_not_a_cache_to_give_up_on() {
         matches!(&error, ClientError::Cluster { code: 500, command, .. } if command == "create"),
         "{error:?}"
     );
-    // The sequence, and not merely "nothing was uploaded". This stub refuses
-    // *every* `create`, including the fallback's own — so a client that had
-    // stopped checking the code and fell back on any failed `create` would
-    // fail here too, with the same variant, the same code and the same absent
-    // `write_file`, having quietly sent a second `create` on the way. The one
-    // observable difference is the command that is not there.
+    // The stub refuses every `create`, the fallback's too, so a client falling
+    // back on any failed `create` would fail with the same error. Only the
+    // absent second `create` tells the two apart.
     assert_eq!(
         commands(&cluster.sent()),
         ["get_file_from_cache", "create"],
@@ -303,11 +277,8 @@ fn a_create_that_failed_for_some_other_reason_is_not_a_cache_to_give_up_on() {
 
 #[test]
 fn an_access_denied_that_is_not_the_caches_is_not_swallowed() {
-    // 901 on the bytes themselves, at a node this caller has just created. That
-    // is not the installation withholding its cache — it is this write being
-    // refused, and the same bytes sent to another path would be refused the
-    // same way. A fallback here uploads twice and then fails anyway, having
-    // hidden the first answer.
+    // 901 on `write_file` to a node this caller just created is not the cache
+    // being withheld; a fallback would upload twice and hide the first error.
     let cluster = cluster(|sent| match sent.command.as_str() {
         "get_file_from_cache" => Answer::Body(MISS.to_owned()),
         "write_file" => Answer::Denied,
@@ -351,10 +322,9 @@ struct Sent {
 }
 
 impl Sent {
-    /// Whether the parameters name `text` — a path, in every use here.
-    ///
-    /// A substring rather than an equality: `set` addresses `<path>/@executable`
-    /// and `get_file_from_cache` carries a `cache_path` beside its `md5`.
+    /// Whether the parameters contain `text`, a path in every use here: `set`
+    /// addresses `<path>/@executable`, and `get_file_from_cache` carries a
+    /// `cache_path` beside its `md5`.
     fn mentions(&self, text: &str) -> bool {
         self.parameters.contains(text)
     }
@@ -369,12 +339,10 @@ const ACCESS_DENIED: &str = "Access denied for user \"tester\": \"write | modify
 enum Answer {
     /// 200, and this text-YSON body.
     Body(String),
-    /// The refusal this whole file is about: cluster error 901, in the
-    /// `X-YT-Error` header the client reads it from.
+    /// Cluster error 901, `Access denied`, in the `X-YT-Error` header.
     Denied,
-    /// The same refusal, one level down — the outer error a category and the
-    /// reason nested under it, which is what a master that wrapped its own
-    /// answer sends.
+    /// The same refusal nested under a category error, as a master that wraps
+    /// its answer sends it.
     DeniedInside,
     /// Any other cluster error.
     Failed(i64, &'static str),
@@ -434,8 +402,7 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// A client pointed at it, sending each command once — the stub answers
-    /// every request itself, so a retry could only confuse the record.
+    /// A client pointed at it, with no retries to confuse the record.
     fn client(&self) -> Client {
         Client::new(&self.proxy).with_retries(RetryPolicy::none())
     }
@@ -456,11 +423,9 @@ fn cluster(answer: impl Fn(&Sent) -> Answer + Send + Sync + 'static) -> Cluster 
 
     let answering: Answering = Arc::new(answer);
     let log = Arc::clone(&sent);
-    // A thread per connection, because the client opens a second one whenever
-    // the first is not returned to its pool — which is what a response whose
-    // body goes unread does, and every error answered here is one of those.
-    // Serving connections in turn would leave the second waiting on the first,
-    // which never ends.
+    // A thread per connection: an error response's body goes unread, so its
+    // connection leaves the pool and the client opens another, which would
+    // wait forever if connections were served in turn.
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { return };
@@ -475,8 +440,7 @@ fn cluster(answer: impl Fn(&Sent) -> Answer + Send + Sync + 'static) -> Cluster 
 
 /// Answers every request on one connection, until the client goes away.
 fn serve(stream: &TcpStream, answer: &Answering, log: &Mutex<Vec<Sent>>) {
-    // So a connection the client keeps open but never uses again does not hold
-    // a thread for the lifetime of the test binary.
+    // A pooled connection never used again must not hold a thread forever.
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("sets a timeout");
@@ -489,8 +453,7 @@ fn serve(stream: &TcpStream, answer: &Answering, log: &Mutex<Vec<Sent>>) {
         let (status, error, body) = answer(&request).parts();
         let mut reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
         if let Some(error) = error {
-            // The cluster's own error, which is where the client looks first —
-            // and reads whatever the status says.
+            // The client reads this header first, whatever the status.
             reply.push_str(&format!("X-YT-Error: {error}\r\n"));
         }
         reply.push_str("Content-Type: application/x-yt-yson-text\r\n\r\n");
@@ -515,10 +478,8 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Sent> {
         }
     }
 
-    // The body has to be consumed before the reply, or a client still writing
-    // one finds the socket closed and reports a broken pipe instead of the
-    // answer this stub was asked for. Everything here declares its length:
-    // `write_file` and `set` carry bytes, the rest carry nothing.
+    // The body is read before the reply, or a client still writing it reports
+    // a broken pipe. Every request here declares its length.
     if let Some(length) = header(&head, "content-length").and_then(|v| v.parse().ok()) {
         let mut body = vec![0_u8; length];
         reader.read_exact(&mut body).ok()?;
@@ -548,11 +509,8 @@ fn header(head: &str, name: &str) -> Option<String> {
         .map(|line| line[line.find(':').unwrap_or(0) + 1..].trim().to_owned())
 }
 
-/// A "worker binary" on disk, named after the test that wants one.
-///
-/// Its contents are arbitrary: `upload_worker_cached` uploads what it is given
-/// and hashes it, and only `upload_current_exe` checks for an ELF a node could
-/// run.
+/// A "worker binary" on disk, named after the test that wants one. Its
+/// contents are arbitrary: only `upload_current_exe` checks for an ELF.
 fn worker_file(name: &str) -> std::path::PathBuf {
     let directory = std::env::temp_dir().join(format!("ytsaurus-rs-cache-{}", std::process::id()));
     std::fs::create_dir_all(&directory).expect("creates");
