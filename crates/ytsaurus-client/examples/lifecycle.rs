@@ -1,16 +1,16 @@
-//! `lifecycle` — the half of an operation's life that is not starting it.
+//! `lifecycle`: what a supervisor does to a running operation, checked against
+//! a cluster.
 //!
-//! An operation used to be a string and four commands here: start it, ask its
-//! state, wait, abort. Everything a supervised pipeline does *between* those —
-//! pause it while the cluster is busy, give it more of the pool because it
-//! turned out to matter, finish it early and keep what it made, find it again
-//! after the launcher restarted — had no method to call. This runs all of it
-//! against a cluster, and checks the answers rather than printing them.
+//! Starts a long vanilla operation under an alias, then reattaches to it by id,
+//! finds it by alias, suspends and resumes it, changes its pool weight, lists
+//! it and one of its jobs, reads its event log, and completes it early so it
+//! ends as `completed` with its output kept. Each answer is checked, not just
+//! printed.
 //!
-//! The second half runs two of the four operation types the enum could not name
-//! until now: a sorted `merge` and an `erase`. `remote_copy` needs a second
-//! cluster and is not exercised here; `join_reduce` has no spec builder, for the
-//! reason [`OperationType::JoinReduce`](ytsaurus_client::OperationType) gives.
+//! The second half runs a sorted `merge` and an `erase` under
+//! `//tmp/ytsaurus_rs_lifecycle`. `remote_copy` needs a second cluster and is
+//! not exercised; `join_reduce` has no spec builder, for the reason
+//! [`OperationType::JoinReduce`](ytsaurus_client::OperationType) gives.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -60,9 +60,8 @@ fn run() -> Result<(), ClientError> {
     done("it is running");
 
     step("Attaching to it, the way a restarted supervisor would");
-    // Nothing is sent: an id and a client is all a handle is. This is the
-    // reattach door — C++'s `AttachOperation`, Go's `Track(id)` — and the
-    // reason the id is the thing worth persisting.
+    // Nothing is sent: a handle is an id and a client, as C++'s
+    // `AttachOperation` and Go's `Track(id)`. The id is what to persist.
     let op = client.attach_operation(&id);
     check("the handle carries the id it was given", op.id() == id)?;
     check(
@@ -71,9 +70,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Finding it by the alias its spec gave it");
-    // Until now an alias could be *set* through `with_raw` and then never
-    // looked up: `get_operation` takes `operation_alias`, and refuses it
-    // without `include_runtime`, which nothing here sent.
+    // `get_operation` takes `operation_alias`, and refuses it without
+    // `include_runtime`.
     let found = client.get_operation_by_alias(&alias, &["id", "state"])?;
     check(
         "the alias resolves to this operation",
@@ -87,10 +85,8 @@ fn run() -> Result<(), ClientError> {
         "the scheduler took the request in {:.0} ms",
         paused.elapsed().as_secs_f64() * 1000.0
     ));
-    // The one that catches people out. Suspension is not a state: a paused
-    // operation still says `running`, so a loop watching the state alone waits
-    // out a pause without ever saying why. `status` is both in one request,
-    // which is what a poll loop wants and what `wait_for_operation` uses.
+    // Suspension is not a state: a paused operation still says `running`.
+    // `status` returns both in one request, as `wait_for_operation` uses.
     let paused_status = op.status()?;
     check("and reports it suspended", paused_status.suspended)?;
     check(
@@ -99,8 +95,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Pausing it again");
-    // Unlike abort and complete, this one forgives a repeat, which is why it
-    // is the only mutating command here that the client retries.
+    // Unlike abort and complete, suspend accepts a repeat, so it is the only
+    // mutating command here that the client retries.
     op.suspend(false)?;
     check("is accepted: suspend is idempotent", op.suspended()?)?;
 
@@ -109,8 +105,7 @@ fn run() -> Result<(), ClientError> {
     check("it is no longer suspended", !op.suspended()?)?;
 
     step("Resuming one that is not suspended");
-    // The asymmetry worth knowing about before writing a retry: resume is not
-    // idempotent, which is why the client sends it once and never repeats it.
+    // Resume is not idempotent, so the client sends it once and never retries.
     match op.resume() {
         Ok(()) => return fail("an operation that was not suspended accepted a resume"),
         Err(e) => {
@@ -123,17 +118,15 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Giving it more of the pool while it runs");
-    // The one thing about a started operation that is not fixed. The weight
-    // lands under the pool tree the operation is scheduled in, which is why it
-    // is read back from there rather than from where it was sent.
+    // The weight lands under the pool tree the operation is scheduled in, so it
+    // is read back from there.
     op.update_parameters(&OperationParameters::new().with_weight(2.5))?;
     check(
         "the cluster recorded the new weight",
         weight_in_first_tree(&op.get(&["runtime_parameters"])?) == Some(2.5),
     )?;
 
-    // Assignment, not increment: the same update twice leaves the operation
-    // where the first one put it. That is what makes this one safe to retry.
+    // Assignment, not increment, so the update is safe to retry.
     op.update_parameters(&OperationParameters::new().with_weight(2.5))?;
     check(
         "and says the same thing when told twice",
@@ -141,8 +134,7 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Asking it to change nothing");
-    // The cluster answers 200 and does nothing, so this is refused here — a
-    // no-op that reports success is a mistake nobody finds.
+    // The cluster would answer 200 and do nothing, so the client refuses it.
     match op.update_parameters(&OperationParameters::new()) {
         Ok(()) => return fail("an empty update was sent to the cluster"),
         Err(e) => {
@@ -184,11 +176,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Reading one of its jobs by id");
-    // Polled, not asked once: an operation reports `running` as soon as the
-    // scheduler accepts it, which is before it has allocated a job — and the
-    // suspend and resume above gave it every reason to be slow about it. A
-    // single empty listing here means "not yet", never "this cluster is
-    // broken", and every other wait in this file is written the same way.
+    // Polled: an operation reports `running` before it has allocated a job,
+    // so an empty listing means "not yet".
     let first = wait_for_running_job(&op, PATIENCE)?;
     let job = op.job(&first.id)?;
     check(
@@ -201,9 +190,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("Reading its event log");
-    // Registered on every cluster and empty on one with no operations archive,
-    // which is what a local cluster is. Reported rather than checked, because
-    // an empty list here is the correct answer.
+    // Empty on a cluster with no operations archive, such as a local one, so
+    // the count is reported rather than checked.
     let events = op.events()?;
     done(&format!(
         "list_operation_events answered with {} event(s){}",
@@ -216,13 +204,11 @@ fn run() -> Result<(), ClientError> {
     ));
 
     step("Finishing it early, and keeping what it made");
-    // The difference from an abort: an aborted operation's output is discarded
-    // and it ends as `aborted`; this ends as `completed`, so a launcher waiting
-    // on it is told the work succeeded.
+    // Unlike an abort, which discards output and ends as `aborted`, this ends
+    // as `completed`, and a launcher waiting on it is told the work succeeded.
     op.complete()?;
     sleeper.finished();
-    // `wait_for_state` is the check: it gives up on any other terminal state,
-    // so reaching the next line is the fact being reported.
+    // `wait_for_state` is the check: it fails on any other terminal state.
     let stopped = wait_for_state(&client, &id, "completed", PATIENCE)?;
     done(&format!(
         "it ends as `completed`, not `aborted` — {:.1}s",
@@ -251,7 +237,7 @@ fn run() -> Result<(), ClientError> {
     Ok(())
 }
 
-/// The second half: two operation types this crate could not name until now.
+/// The second half: a sorted merge and an erase.
 fn merge_and_erase(client: &Client) -> Result<(), ClientError> {
     step("Two sorted tables, and a merge of them");
     client.remove_tree(BASE)?;
@@ -264,8 +250,7 @@ fn merge_and_erase(client: &Client) -> Result<(), ClientError> {
     // In key order: the table is sorted by `host`, and the cluster enforces it.
     client.write_table_rows(&monday, visits(&["alpha", "delta"]))?;
     client.write_table_rows(&tuesday, visits(&["beta", "gamma"]))?;
-    // Unschematised on purpose: a merge infers the output's schema from its
-    // inputs, and this is the shape a caller reaches for first.
+    // Unschematised: a merge infers the output's schema from its inputs.
     client.create("table", &week)?;
     done("4 rows across two tables sorted by host");
 
@@ -288,10 +273,8 @@ fn merge_and_erase(client: &Client) -> Result<(), ClientError> {
     )?;
 
     step("A sorted merge that does not say what to merge by");
-    // `merge_by` is optional, and this is where that was found out. The client
-    // used to refuse this spec on the grounds that the cluster would; it does
-    // not — it takes the key from the sort columns the inputs already carry.
-    // Checking it here is what keeps the claim from drifting back.
+    // `merge_by` is optional: the cluster takes the key from the sort columns
+    // the inputs already carry.
     let inferred = format!("{BASE}/inferred");
     client.create("table", &inferred)?;
     let id = client.start_merge(
@@ -307,8 +290,8 @@ fn merge_and_erase(client: &Client) -> Result<(), ClientError> {
     )?;
 
     step("Erasing the first two rows");
-    // The range is part of the path — there is no parameter for it — and a
-    // path with no range would erase every row and leave the table.
+    // The range is part of the path; a path with no range erases every row and
+    // leaves the table.
     let id =
         client.start_erase(&EraseSpec::new(format!("{week}[#0:#2]")).with_combine_chunks(true))?;
     client.wait_for_operation(&id)?;
@@ -346,8 +329,8 @@ fn visits(hosts: &[&str]) -> Vec<Visit> {
 
 /// A sleeping operation that stops itself if this example gives up.
 ///
-/// An example about not leaving operations running should not leave one running
-/// when a check fails.
+/// `Drop` aborts it unless [`Sleeper::finished`] was called, so a failed check
+/// does not leave it running.
 struct Sleeper<'a> {
     client: &'a Client,
     id: String,
@@ -361,8 +344,6 @@ impl<'a> Sleeper<'a> {
                 .with_memory_limit(256 * 1024 * 1024),
         )
         // The alias is a spec field, and the leading `*` is the cluster's rule.
-        // Setting one used to be a one-way trip: nothing here could look it up
-        // again.
         .with_raw("alias", yson_build::string(alias))
         .with_raw("max_failed_job_count", yson_build::int(1));
 
@@ -382,8 +363,7 @@ impl<'a> Sleeper<'a> {
 impl Drop for Sleeper<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            // Best effort, and quiet: this runs while an error is on its way
-            // out, and a failure to tidy up must not replace it.
+            // Best effort and quiet: an error is already on its way out.
             let _ = self
                 .client
                 .abort_operation(&self.id, Some("the lifecycle example gave up"));
@@ -421,9 +401,8 @@ fn wait_for_state(
 
 /// Waits for the operation to have a job running, and returns the first one.
 ///
-/// A separate wait from [`wait_for_state`]: an operation is `running` before
-/// any of its jobs are, so the state says nothing about whether there is a job
-/// to ask about yet.
+/// An operation is `running` before any of its jobs are, so its state does not
+/// say whether there is a job yet.
 fn wait_for_running_job(
     op: &ytsaurus_client::Operation,
     patience: Duration,
