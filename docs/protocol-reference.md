@@ -147,7 +147,7 @@ Observed:
 - The chain shares the command's one deadline. A fresh `timeout_global` per hop would allow `(MAX_REDIRECTS + 1)×` the requested time: 22 minutes at the default two, on an `exists`.
 - `Location` is resolved against the request's address (RFC 3986 §4.2); a reference with no path (`?path=…`, `#frag`) keeps the request's path (§5.3).
 - Tested offline in `crates/ytsaurus-client/tests/redirect_credentials.rs` (a local cluster redirects nothing). A stub must read the whole request (head and body, `Content-Length` or chunked) before answering, as `request_shape.rs` does; otherwise `ureq` reports a broken pipe (a small body survives on macOS, not on a Linux runner).
-- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and must be reconciled with `Repeatable::Heavy` when #38 merges (marked in the source).
+- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and is kept by hand beside the `Repeatable::Heavy` call sites, with nothing checking that the two agree: `lookup_rows_dynamic` and `select_rows_dynamic` send `Repeatable::Heavy` and are not on it.
 
 ### TLS
 
@@ -188,6 +188,7 @@ Observed:
 - A sorted merge needs no `merge_by`: two tables sorted by `host`, merged with `mode=sorted`, complete with output `sorted_by=[host]`.
 - `get_job` answers unwrapped with `job_id`; `list_jobs` wraps in `{jobs=[…]}` with `id`. One parser reads both.
 - `get_job_input` never answers for a vanilla job: 30 s, zero bytes.
+- A Cypress lookup under `//sys/operations` answered `has no child with key` on a local cluster for an operation id that exists; `get_operation` finds it.
 
 ## Appending to a table
 
@@ -351,6 +352,7 @@ Observed:
   - `requests` missing: `Missing required parameter /requests` (no parts, so n/a).
 
 - Parts run in parallel: `create` and `exists` on one node got `%false`. Put a dependent part in a second batch.
+- Results come back in part order: a create·set·get·remove batch answered `[error 501, ok, ok, error 500]`.
 - A replay under one mutation id is deduplicated per part. Part *k* gets the batch's id plus *k* (`NRpc::GenerateNextBatchMutationId`, `++id.Parts32[0]`), and every volatile part gets the batch's `retry` flag. Measured with `BatchRequest::create_table` (no `ignore_existing`):
 
   ```text
@@ -360,6 +362,7 @@ Observed:
   ```
 
   **Do not test this with `BatchRequest::create`**: its `ignore_existing` returns the old node ids under a fresh id too. Per-part ids are derived by incrementing, so the client refuses to split a batch carrying a caller's id.
+- Executing the same batch again, without the caller's id, is new work: each execution mints its own mutation ids. The second run answered `501 already exists` for `create_table` parts, `500` for `remove` parts, and the first run's node ids for `create` parts, because of `ignore_existing`.
 - Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`, and the other parts still run. That is 21 of the 190 commands in `GET /api/v4`, against 7 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
 - Also refused whole: a part whose command needs input and has none (`Command %Qv requires input`; `insert_rows`, `write_table` and seven others).
 - No modelled command answers a bare `{}` under API v4: `create` → `{"output":{"node_id":…}}`, `set` and `remove` → `{"output":{}}`, `exists` → `{"output":{"value":false}}`. The reference's bare `{}` for `set` is v3 (`GET /api/v4` lists `remove` and `set` as `output_type: structured`, `/api/v3` as `null`). The parser checks the key: `node_id` for `create`, `value` for `exists`/`get`/`list`.

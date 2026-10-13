@@ -1,25 +1,11 @@
 //! Table paths that carry attributes.
 //!
-//! A YTsaurus path is not only a string: it is a YSON value, and attributes on
-//! it change what a command does with it. `<append=%true>//tmp/log` and
-//! `//tmp/log` name the same table and mean opposite things — one adds rows,
-//! the other replaces them. `<columns=[host];ranges=[{lower_limit={row_index=0};
-//! upper_limit={row_index=100}}]>//tmp/log` names a hundred rows of one column
-//! of it, which is the difference between a read worth doing over a laptop
-//! link and one that is not.
-//!
-//! This crate sent bare strings until now, so every write replaced the table
-//! and append was unreachable. [`TablePath`] is the type that makes the
-//! attributes expressible, and `From<&str>` is what keeps `client.write_table
-//! ("//tmp/out", …)` reading exactly as it did.
-//!
-//! The attribute spellings are the
-//! [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath):
-//! `columns` is a list of names, `ranges` a list of maps with `lower_limit`,
-//! `upper_limit` and `exact`, and inside a limit sit `row_index`, `key` and
-//! `key_bound`. The Go SDK's `ypath.Rich` renders the same shapes
-//! (`yt/go/ypath/rich.go`: `Ranges []Range \`yson:"ranges,attr"\``,
-//! `ReadLimit{Key []any; RowIndex *int64}`).
+//! A YTsaurus path is a YSON value, and attributes on it change what a command
+//! does: `<append=%true>//tmp/log` adds rows where `//tmp/log` replaces them,
+//! and `columns` and `ranges` select part of a table on a read. [`TablePath`]
+//! builds them, and `From<&str>` keeps a plain path plain. The spellings are
+//! the [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath)'s,
+//! as the Go SDK's `ypath.Rich` renders them.
 
 use std::ops::{Bound, RangeBounds};
 
@@ -29,8 +15,6 @@ use crate::yson_build;
 
 /// A table to read from or write to, and which part of it.
 ///
-/// Built from a `&str` wherever a plain path will do:
-///
 /// ```
 /// # use ytsaurus_client::TablePath;
 /// let replace = TablePath::from("//tmp/log");
@@ -38,21 +22,20 @@ use crate::yson_build;
 /// let head = TablePath::new("//tmp/log").columns(["host", "status"]).range(0..100);
 /// ```
 ///
-/// Append is a write-side attribute; columns and ranges are read-side ones,
-/// the same split the C++ `TRichYPath` and the Go `ypath.Rich` carry. The
-/// write methods **refuse** a path with a read selection rather than sending
-/// it — the cluster ignores a selection on a write and replaces the whole
-/// table with a 200, which is silent data loss. Measured on a local cluster,
-/// in both spellings: `write_table_rows("//tmp/t[#0:#2]", rows)` replaced
-/// everything and reported success, and a `write_table` whose path carried
-/// `<ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>` as an
-/// attribute did exactly the same — 200, three rows replaced by one.
+/// Append is a write attribute; columns and ranges are read attributes, as in
+/// the C++ `TRichYPath` and the Go `ypath.Rich`. The path string is never
+/// parsed. Each refusal below replaces a silent 200 from the cluster
+/// ([Selecting columns and rows on a path](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#selecting-columns-and-rows-on-a-path)):
 ///
-/// The path *string* is never parsed. Rich YPath syntax spelled into it —
-/// `<append=%true>//tmp/t`, `//tmp/t[#0:#2]`, `//tmp/t{a,b}` — goes to the
-/// cluster verbatim on a read, where the cluster honours it, and is refused on
-/// a write, where the cluster would not: the attribute form of a selection is
-/// ignored there, and this type exists so that cannot happen by accident.
+/// - a write refuses a typed selection: the cluster ignores it and replaces
+///   the whole table;
+/// - a write refuses a string with a leading `<…>` or an unescaped `[` or `{`;
+///   a read sends such a string verbatim;
+/// - a read refuses a typed selection of a kind the string already spells
+///   (`{…}` columns, `[…]` rows), and any typed selection on a string that
+///   opens with `<…>`;
+/// - a read refuses a [`RowRange`] with a negative row index, or one that ends
+///   before it starts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TablePath {
     path: String,
@@ -75,67 +58,33 @@ impl TablePath {
         }
     }
 
-    /// Adds rows to the table instead of replacing it.
-    ///
-    /// The table has to exist: appending to a path that does not is refused
-    /// with `Error getting basic attributes of user objects`, which is the
-    /// cluster's way of saying there was nothing to append to.
-    ///
-    /// **A sorted table stays sorted, and the cluster checks.** Rows appended
-    /// after a larger key are refused — `Sort order violation: [0#9] > [0#1]`
-    /// — so an append to a sorted table is a continuation of it rather than an
-    /// addition to it.
+    /// Adds rows to the table instead of replacing it. The table must exist,
+    /// or the cluster answers `Error getting basic attributes of user objects`,
+    /// and a sorted table stays sorted: a row below the last key is refused
+    /// with `Sort order violation`. See
+    /// [Appending to a table](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#appending-to-a-table).
     #[must_use]
     pub fn append(mut self) -> Self {
         self.append = true;
         self
     }
 
-    /// Reads only the named columns.
+    /// Reads only the named columns, as the path's `columns` attribute, which
+    /// only read commands recognise. Calling this again replaces the selection.
     ///
-    /// Three columns out of a forty-column table cost three columns' worth of
-    /// wire and decode, which is what makes a laptop-side read of a wide table
-    /// reasonable. The names travel as the `columns` attribute on the path,
-    /// which the
-    /// [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath)
-    /// says is *"recognized by the table data read command (`read_table`)"* —
-    /// and by read commands **only**, which is why the write methods refuse a
-    /// path carrying one rather than letting the cluster ignore it.
-    ///
-    /// **A column the table does not have is not an error** — measured on a
-    /// local cluster: `columns(["a", "nosuch"])` against a table with no
-    /// `nosuch` answered 200, every row carrying only `a`. Rows simply come
-    /// back without the key, exactly as they do for a row with no value in a
-    /// named column, so a typo here reads clean and decodes short. A struct
-    /// decoded from such a read fails loudly on the missing field, which is
-    /// where the typo surfaces; a map decodes to fewer keys and does not.
-    ///
-    /// **The empty selection is that same shape taken to its end, and it is
-    /// sent.** Measured: `<columns=[]>` answers 200 with one empty map per
-    /// row, and it composes with a range —
-    /// `<columns=[];ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>`
-    /// came back as two empty maps, and the same range spelled with `key`
-    /// bounds came back as three. That is how many rows a range holds, or
-    /// whether a key range holds any, with no column bytes on the wire —
-    /// a question [`Client::row_count`](crate::Client::row_count) cannot
-    /// answer, since it reads the `@row_count` attribute and so speaks only
-    /// for a whole static table. It decodes to a map with no keys and to a
-    /// struct missing every field, so name the columns when the *rows* are
-    /// what is wanted.
-    ///
-    /// Calling this again replaces the selection rather than adding to it.
+    /// A column the table lacks is not an error: rows come back without it, so
+    /// a typo decodes short into a map and fails only into a struct. An empty
+    /// selection is sent and answers one empty map per row: a range's row count
+    /// with no column bytes, which [`Client::row_count`](crate::Client::row_count)
+    /// cannot give.
     #[must_use]
     pub fn columns(mut self, columns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.columns = Some(columns.into_iter().map(Into::into).collect());
         self
     }
 
-    /// Reads only the rows a [`RowRange`] selects. May be called several
-    /// times: the ranges are read one after another, in the order given —
-    /// the documented meaning of the `ranges` attribute.
-    ///
-    /// Plain Rust ranges convert, so row windows read as they would on a
-    /// slice:
+    /// Reads only the rows a [`RowRange`] selects. Called several times, the
+    /// ranges are read one after another, in order. Plain Rust ranges convert:
     ///
     /// ```
     /// # use ytsaurus_client::{Key, RowRange, TablePath};
@@ -149,13 +98,8 @@ impl TablePath {
         self
     }
 
-    /// Whether [`TablePath::append`] was called on this path.
-    ///
-    /// Not "whether the cluster will append": the cluster parses attributes out
-    /// of the path *string* too, so a path built from the text
-    /// `<append=%true>//tmp/t` appends while this answers `false`. Spelling the
-    /// attribute into the string is not a supported way to ask for it, and a
-    /// *write* to such a string is refused outright — see [`TablePath`].
+    /// Whether [`TablePath::append`] was called; `false` for a string that
+    /// spells `<append=%true>` itself, which a write refuses.
     #[must_use]
     pub fn is_append(&self) -> bool {
         self.append
@@ -179,11 +123,8 @@ impl TablePath {
         &self.path
     }
 
-    /// The path as the command parameter wants it.
-    ///
-    /// A bare string when there is nothing to say, because that is what every
-    /// version of this crate has sent and there is no reason for the common
-    /// case to start looking different on the wire.
+    /// The path as the command parameter wants it: a bare string when there are
+    /// no attributes.
     pub(crate) fn to_yson(&self) -> YsonValue {
         let path = yson_build::string(&self.path);
         let mut attributes: Vec<(&str, YsonValue)> = Vec::new();
@@ -209,17 +150,9 @@ impl TablePath {
         }
     }
 
-    /// Why a write must not send this path, if it must not.
-    ///
-    /// Two families of refusal, both protecting against the same measured
-    /// failure — a selection on a write is **ignored with a 200** and the
-    /// whole table is replaced:
-    ///
-    /// - a typed selection ([`TablePath::columns`] / [`TablePath::range`]),
-    ///   which only read commands recognise;
-    /// - rich YPath syntax spelled into the path string — a leading `<…>`
-    ///   attribute block, or an unescaped `[` / `{` — which this client never
-    ///   parses and a write-side cluster silently strips.
+    /// Why a write must not send this path: a typed selection, a leading `<…>`
+    /// block, or an unescaped `[` or `{` in the string. The cluster ignores a
+    /// selection on a write and replaces the whole table with a 200.
     pub(crate) fn write_refusal(&self) -> Option<String> {
         if self.columns.is_some() {
             return Some(format!(
@@ -261,16 +194,9 @@ impl TablePath {
         None
     }
 
-    /// Why a read must not send this path, if it must not.
-    ///
-    /// A read passes the string through verbatim, selection syntax and all —
-    /// the cluster honours it there, and code that read `//tmp/t[#0:#2]`
-    /// before this type existed keeps working. Two shapes are refused: a range
-    /// asking for rows no table has, and a typed selection landing on a string
-    /// that already spells **the same kind** of selection, where the typed one
-    /// silently wins and the caller's string half is discarded — see
-    /// [`TablePath::selection_conflict`] for the measurements and for why the
-    /// other pairings go through.
+    /// Why a read must not send this path: a range asking for rows no table has,
+    /// or a typed selection that conflicts with the string
+    /// ([`TablePath::selection_conflict`]).
     pub(crate) fn read_refusal(&self) -> Option<String> {
         for range in &self.ranges {
             if let Some(reason) = range.refusal() {
@@ -285,45 +211,16 @@ impl TablePath {
         )
     }
 
-    /// Why the attributes this client is about to add cannot ride on this
-    /// path string, if they cannot.
+    /// Why the attributes about to be added cannot ride on this path string.
     ///
-    /// The client never parses a path string. It sends the string as a YSON
-    /// string node and hangs its own attributes *outside* it —
-    /// `<columns=[n]>"//tmp/t{k}"`, not the flat text
-    /// `<columns=[n]>//tmp/t{k}` — and the cluster reads both halves. Measured
-    /// on a local cluster, in that wire shape, every combination answers 200
-    /// and one rule covers all of them: **the outer attribute wins, and the
-    /// selector spelled in the string is silently discarded.**
+    /// The string goes as a YSON string node with the attributes outside it
+    /// (`<columns=[n]>"//tmp/t{k}"`), and the outer attribute wins at 200. So a
+    /// kind the string already spells is refused, since the string's half would
+    /// be discarded silently; different kinds compose and pass. A leading `<…>`
+    /// is refused because this client does not parse it to see which it names.
     ///
-    /// - **The same kind spelled twice: the caller's string half is dropped
-    ///   without a word.** `<columns=[n]>"//tmp/t{k}"` answered with column
-    ///   `n` — the `{k}` the caller wrote had no effect;
-    ///   `<ranges=[…0:2]>"//tmp/t[#3:#5]"` answered with rows 0–1, not 3–4.
-    ///   Inside a leading block it is the same:
-    ///   `<columns=[k]>"<columns=[n]>//tmp/t"` answered with column `k`.
-    ///   Nothing is corrupted — the read is exactly what the *attribute*
-    ///   asked for — but the caller is told nothing about the half that was
-    ///   thrown away, which is the whole trap this type exists to close.
-    /// - **Different kinds compose, so they are allowed.** Rows and columns
-    ///   answer different questions: `<columns=[n]>"//tmp/t[#3:#5]"` gave rows
-    ///   3–4 carrying only `n`, and `<ranges=[…0:2]>"//tmp/t{k}"` gave rows
-    ///   0–1 carrying only `k`. Both are the read that was asked for.
-    /// - **A leading `<…>` is honoured, and is refused only because this
-    ///   client cannot read it.** With nothing added, `"<columns=[n]>//tmp/t"`
-    ///   answered with column `n`, so the string's own block works; adding a
-    ///   *different* kind composes, as `<ranges=[…0:2]>"<columns=[n]>//tmp/t"`
-    ///   (rows 0–1, column `n`) showed. But telling those apart means parsing
-    ///   the block to see which attribute it names, which this client does
-    ///   not do — and if it names the one being added, the caller's is
-    ///   discarded silently. Refusing the whole shape is the conservative
-    ///   answer to a block that cannot be read; there is no cluster error
-    ///   here to point at.
-    ///
-    /// `adding_columns` / `adding_rows` say which attributes are going on;
-    /// `columns_source` / `rows_source` name what is putting them there, since
-    /// a Skiff read **synthesises** `columns` from its format's fields whether
-    /// the caller named columns or not.
+    /// `columns_source` and `rows_source` name what adds each attribute, since
+    /// a Skiff read synthesises `columns` from its format's fields.
     pub(crate) fn selection_conflict(
         &self,
         adding_columns: bool,
@@ -346,9 +243,7 @@ impl TablePath {
                 self.path
             ));
         }
-        // Both selectors can appear on one string — `//tmp/t{a}[#0:#2]` is the
-        // documented spelling — so each is asked about separately rather than
-        // through whichever came first.
+        // One string can spell both (`//tmp/t{a}[#0:#2]`), so each is checked.
         let spelled = unescaped_selectors(&self.path);
         if adding_columns && spelled.columns {
             return Some(format!(
@@ -376,11 +271,8 @@ impl TablePath {
     }
 }
 
-/// The first unescaped `[` or `{` in a path string, if any.
-///
-/// Rich YPath escapes a literal bracket in a node name as `\[` / `\{`
-/// (and a literal backslash as `\\`), so an unescaped one is selection
-/// syntax, not a name.
+/// The first unescaped `[` or `{` in a path string: selection syntax, since
+/// rich YPath escapes a literal one (and `\\`) with a backslash.
 fn first_unescaped_selector(path: &str) -> Option<char> {
     let mut bytes = path.bytes();
     while let Some(byte) = bytes.next() {
@@ -396,12 +288,8 @@ fn first_unescaped_selector(path: &str) -> Option<char> {
     None
 }
 
-/// Which selections a path string spells, by the same escaping rule.
-///
-/// Separate from [`first_unescaped_selector`] because one string can carry
-/// both — `//tmp/t{host}[#0:#2]` selects columns *and* rows — and the two are
-/// answered differently: only the kind the client is about to add a second
-/// time is a conflict.
+/// Which selections a path string spells. One string can carry both, and only
+/// a kind added a second time conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Selectors {
     /// An unescaped `[`: a row range.
@@ -429,19 +317,18 @@ fn unescaped_selectors(path: &str) -> Selectors {
     found
 }
 
-/// One entry of a path's `ranges` attribute: which rows to read.
+/// One entry of a path's `ranges` attribute: which rows to read, by one of the
+/// [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath)'s
+/// selectors:
 ///
-/// Built three ways, one per selector the
-/// [rich YPath reference](https://ytsaurus.tech/docs/en/user-guide/storage/ypath)
-/// defines:
+/// - [`RowRange::rows`]: by row index; plain Rust ranges convert via `Into`;
+/// - [`RowRange::keys`]: by key, on a sorted table;
+/// - [`RowRange::exact_key`]: the rows whose key starts with a tuple.
 ///
-/// - [`RowRange::rows`] — by row index; plain Rust ranges convert via `Into`,
-///   so `path.range(0..100)` reads as it would on a slice;
-/// - [`RowRange::keys`] — by key, on a sorted table;
-/// - [`RowRange::exact_key`] — exactly the rows whose key starts with a tuple.
-///
-/// A range never mixes `exact` with a lower or upper limit, because no
-/// constructor can express that — the reference defines them as alternatives.
+/// No constructor mixes `exact` with a limit. A read refuses a negative row
+/// index, which the cluster clamps to 0, and a range that ends before it
+/// starts, which it answers with no rows; an empty range such as `5..5` is
+/// sent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowRange {
     lower: Option<Limit>,
@@ -450,20 +337,13 @@ pub struct RowRange {
 }
 
 impl RowRange {
-    /// Rows by index: `rows(0..100)`, `rows(100..)`, `rows(..)`.
-    ///
-    /// Rust range semantics and the cluster's are the same — `lower_limit` is
-    /// inclusive and `upper_limit` exclusive for a `row_index` (the reference:
-    /// *"All limit types except for `key_bound` are inclusive in the
-    /// `lower_limit` attribute and exclusive in the `upper_limit`
-    /// attribute"*) — so `0..2` means rows 0 and 1 on both sides of the wire,
-    /// and `..=2` rows 0 through 2.
+    /// Rows by index: `rows(0..100)`, `rows(100..)`, `rows(..)`. The cluster's
+    /// `row_index` limits are inclusive below and exclusive above, as Rust's
+    /// ranges are, so `0..2` is rows 0 and 1 and `..=2` rows 0 through 2.
     #[must_use]
     pub fn rows(rows: impl RangeBounds<i64>) -> Self {
-        // The two saturations at i64's edge are exact, not approximate: a
-        // table's row count fits in an i64, so no row has index i64::MAX —
-        // an exclusive lower bound *at* i64::MAX excludes every possible row
-        // either way, and an inclusive upper bound there includes them all.
+        // Saturating at i64::MAX is exact: no row has that index, so the bound
+        // selects the same rows either way.
         let lower = match rows.start_bound() {
             Bound::Included(&index) => Some(Limit::RowIndex(index)),
             Bound::Excluded(&index) => Some(Limit::RowIndex(index.saturating_add(1))),
@@ -481,55 +361,28 @@ impl RowRange {
         }
     }
 
-    /// Rows by key, on a sorted table.
+    /// Rows by key, on a sorted table; the inclusivity travels with the range.
     ///
-    /// Takes a Rust range of [`Key`]s, and the inclusivity travels with it:
+    /// `keys(a..b)` sends `{key=[…]}` on both sides, as the Go SDK's `ypath.Key`
+    /// does. An inclusive upper bound is sent as `{key_bound=["<="; […]]}` and
+    /// an exclusive lower one as `{key_bound=[">"; […]]}`; the cluster accepts a
+    /// range mixing the two selectors.
     ///
-    /// - `keys(a..b)` — from `a` inclusive to `b` exclusive. These are the
-    ///   spellings the `key` selector has natively (inclusive in
-    ///   `lower_limit`, exclusive in `upper_limit`), so they are sent as
-    ///   `{key=[…]}`, exactly what the Go SDK's `ypath.Key` sends.
-    /// - `keys(a..=b)` — inclusive upper bound. The `key` selector cannot say
-    ///   that, so it is sent as the cluster's `key_bound` form,
-    ///   `{key_bound=["<="; […]]}`; an exclusive *lower* bound
-    ///   (`(Bound::Excluded(a), …)`) likewise becomes `{key_bound=[">"; […]]}`.
-    ///   The reference defines `key_bound` as `[relation; prefix]` with `>`
-    ///   `>=` allowed only in `lower_limit` and `<` `<=` only in
-    ///   `upper_limit`, and this constructor is what makes the wrong pairing
-    ///   unwritable.
-    ///
-    /// **A key shorter than the table's key columns is a prefix bound — and
-    /// the two selectors compare a prefix by opposite rules.**
-    ///
-    /// `key` compares the row's whole key against the bound component-wise,
-    /// the shorter tuple being smaller when equal so far. `key_bound` does
-    /// not: the reference says the row's key is first **truncated** to the
-    /// bound's length — *"we need to extract a prefix of length K from that
-    /// key and perform a lexicographic comparison"* — after which every row
-    /// sharing the prefix compares *equal* to the bound. So `<=` takes that
-    /// whole group and `>` drops that whole group, and the practical
-    /// consequence is that `a..b` and `a..=b` differ by a group of rows
-    /// rather than by one row.
-    ///
-    /// Measured on a local cluster, on a table keyed `(host, path)` holding
+    /// A key shorter than the table's key columns is a prefix, compared by
+    /// opposite rules: `key` compares whole keys, the shorter tuple smaller,
+    /// while `key_bound` truncates the row's key to the prefix, so every row
+    /// sharing it compares equal. `a..b` and `a..=b` differ by a whole prefix
+    /// group, and an exclusive lower bound skips every row of its prefix; give
+    /// a full key to skip one row. On a table keyed `(host, path)` holding
     /// `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
     ///
-    /// | asked for | sent | rows back |
-    /// | --- | --- | --- |
-    /// | `keys(a..b)` | `{key=[a]}` … `{key=[b]}` | `(a,/x) (a,/y)` |
-    /// | `keys(a..=b)` | `{key=[a]}` … `{key_bound=["<=";[b]]}` | `(a,/x) (a,/y) (b,/x) (b,/y)` |
-    /// | `keys((Excluded(a), Unbounded))` | `{key_bound=[">";[a]]}` | `(b,/x) (b,/y) (c,/x)` |
-    /// | `keys(a..=a)` | `{key=[a]}` … `{key_bound=["<=";[a]]}` | `(a,/x) (a,/y)` |
+    /// | asked for | rows back |
+    /// | --- | --- |
+    /// | `keys(a..b)` | `(a,/x) (a,/y)` |
+    /// | `keys(a..=b)` | `(a,/x) (a,/y) (b,/x) (b,/y)` |
+    /// | `keys((Excluded(a), Unbounded))` | `(b,/x) (b,/y) (c,/x)` |
     ///
-    /// The third row is the one to remember: an exclusive lower bound on a
-    /// *prefix* excludes every row of that prefix, not the one row equal to
-    /// it — there is no "the row just after `a`" for the cluster to start
-    /// from. Give a full key if you want a single row skipped.
-    ///
-    /// The second row settles the other question a mixed range raises: an
-    /// entry carrying `key` on one side and `key_bound` on the other is
-    /// **accepted** — the same local cluster answered it 200 with the rows
-    /// above — so the most natural inclusive spelling needs no workaround.
+    /// See [Selecting columns and rows on a path](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#selecting-columns-and-rows-on-a-path).
     #[must_use]
     pub fn keys(keys: impl RangeBounds<Key>) -> Self {
         let lower = match keys.start_bound() {
@@ -555,14 +408,10 @@ impl RowRange {
         }
     }
 
-    /// Exactly the rows whose full key starts with `key`.
-    ///
-    /// The `exact` selector of the reference: *"only returns those rows where
-    /// the full key contains the `key` tuple as its prefix"*. On a table keyed
-    /// by `(host, path)`, `exact_key(Key::from("example.com"))` is every row
-    /// of that host — the same rows `keys(k..=k)` selects, measured on a
-    /// local cluster against the table in [`RowRange::keys`], said in the
-    /// cluster's own word for it.
+    /// Exactly the rows whose full key starts with `key`: the reference's
+    /// `exact` selector. On a table keyed `(host, path)`,
+    /// `exact_key(Key::from("example.com"))` is every row of that host, the
+    /// same rows as `keys(k..=k)`.
     #[must_use]
     pub fn exact_key(key: impl Into<Key>) -> Self {
         Self {
@@ -587,34 +436,12 @@ impl RowRange {
         yson_build::map(entries)
     }
 
-    /// Why this range asks for rows no table has, if it does.
-    ///
-    /// The cluster validates neither shape, and the two go wrong differently —
-    /// measured on a local cluster against a five-row table:
-    ///
-    /// - **A negative `row_index` is clamped to 0 and the read succeeds**, so
-    ///   the bound is not so much rejected as quietly replaced.
-    ///   `{lower_limit={row_index=-5}}` returned **all five rows**, and
-    ///   `{lower_limit={row_index=-5};upper_limit={row_index=2}}` returned rows
-    ///   0 and 1 — a lower limit of `-5` reads exactly as `0` would. A negative
-    ///   *upper* limit clamps the same way and therefore selects nothing:
-    ///   `{upper_limit={row_index=-2}}` came back 200 and empty. So a
-    ///   miscomputed offset either reads from the start of the table or reads
-    ///   nothing at all, and both are reported as success.
-    /// - **A backwards range is answered 200 with no rows.**
-    ///   `{lower_limit={row_index=5};upper_limit={row_index=3}}` returned
-    ///   nothing, and so did the key spelling,
-    ///   `{lower_limit={key=[3]};upper_limit={key=[1]}}`.
-    ///
-    /// Rust refuses the same mistake on a slice (`&rows[5..3]` panics with
-    /// *"slice index starts at 5 but ends at 3"*) and clippy will not even
-    /// compile the literal, so a range built from Rust's own syntax refuses it
-    /// here rather than spending a round trip. Neither shape can be written
-    /// deliberately: both arrive *computed*, from a page number or an offset
-    /// that came out wrong, and reading the whole table under a bound that
-    /// asked for something else is worse than an error, not better. An
-    /// *empty* range is fine: `5..5` is legal on a slice and asks honestly for
-    /// no rows, and `keys(a..a)` likewise.
+    /// Why this range asks for rows no table has: a negative row index, which
+    /// the cluster clamps to 0, so a lower bound reads from the start and an
+    /// upper one reads nothing; or a range that ends before it starts, which
+    /// the cluster answers with no rows. Both arrive computed from an offset
+    /// gone wrong and both are a 200, so they are refused as `&rows[5..3]`
+    /// would panic. An empty range (`5..5`, `keys(a..a)`) is fine.
     fn refusal(&self) -> Option<String> {
         for limit in [&self.lower, &self.upper] {
             if let Some(Limit::RowIndex(index)) = limit
@@ -654,15 +481,10 @@ impl RowRange {
     }
 }
 
-/// How two key tuples order, when this client can tell.
-///
-/// Component-wise, which is how the cluster compares them, with a shorter
-/// tuple sorting first when the components it has all match — the `key` rule
-/// [`RowRange::keys`] documents. Two components of different YSON types are
-/// **not** compared: the cluster's own answer there is not the obvious one
-/// (measured, it reads an int64 `42` and a uint64 `42u` as the same key), so
-/// a mixed pair returns `None` and no refusal follows. This only ever has to
-/// be right about ranges it refuses.
+/// How two key tuples order, when this client can tell: component-wise, a
+/// shorter tuple first when the rest match. Components of different types give
+/// `None` and no refusal, since the cluster reads int64 `42` and uint64 `42u`
+/// as one key.
 fn key_ordering(lower: &Key, upper: &Key) -> Option<std::cmp::Ordering> {
     for (lower, upper) in lower.0.iter().zip(upper.0.iter()) {
         if lower.attributes.is_some() || upper.attributes.is_some() {
@@ -731,10 +553,7 @@ enum Limit {
 }
 
 impl Limit {
-    /// The key this limit compares against, whichever selector spells it.
-    ///
-    /// `keys(a..=b)` puts a `key` on one side and a `key_bound` on the other,
-    /// so a backwards range has to be recognised across both spellings.
+    /// The key this limit compares against; `keys(a..=b)` mixes both spellings.
     fn key(&self) -> Option<&Key> {
         match self {
             Limit::RowIndex(_) => None,
@@ -754,12 +573,9 @@ impl Limit {
     }
 }
 
-/// A key tuple: the value of one row's key columns, or a prefix of them.
-///
-/// A key is a **list** of YSON values, compared component-wise — the same
-/// `[]any` the Go SDK's `ypath.Key(values …any)` takes. Single-component keys
-/// convert from the value itself; a composite or mixed-type key is spelled
-/// with [`yson_build`]:
+/// A key tuple: the value of one row's key columns, or a prefix of them,
+/// compared component-wise, as the Go SDK's `ypath.Key` takes it. One component
+/// converts from the value; a composite key is spelled with [`yson_build`]:
 ///
 /// ```
 /// # use ytsaurus_client::{Key, yson_build};
@@ -768,15 +584,9 @@ impl Limit {
 /// let visit = Key::new([yson_build::uint(1_700_000_000)]);
 /// ```
 ///
-/// The `From` shortcuts cover the types a key column usually has. `From<i64>`
-/// sends an **int64**, and on a `uint64` key column that is not a mismatch —
-/// measured on a `uint64`-keyed table, `{exact={key=[42]}}` and
-/// `{exact={key=[42u]}}` both returned the same row, so the cluster reads the
-/// two as one key. What `i64` cannot do is *reach* the top of that column:
-/// every key above `i64::MAX` is unnameable by it, and only
-/// [`yson_build::uint`] gets there —
-/// `{exact={key=[18446744073709551615u]}}` returned its row. That ceiling is
-/// why the helper exists.
+/// `From<i64>` sends an int64, which a `uint64` key column matches too
+/// (`{exact={key=[42]}}` and `{exact={key=[42u]}}` return the same row); a key
+/// above `i64::MAX` needs [`yson_build::uint`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Key(Vec<YsonValue>);
 
@@ -840,10 +650,7 @@ impl From<&TablePath> for TablePath {
     }
 }
 
-// The shapes `&str` used to absorb by deref coercion and `Into` does not. A
-// `&&str` is what `for path in &paths` hands you, and a `Cow<str>` is what a
-// function that sometimes rewrites a path returns; neither is exotic, and
-// leaving them out would break code that compiled before this type existed.
+// `&&str` comes from iterating `&[&str]`; `Cow<str>` from code that may rewrite a path.
 impl From<&&str> for TablePath {
     fn from(path: &&str) -> Self {
         Self::new(*path)
@@ -857,9 +664,8 @@ impl From<std::borrow::Cow<'_, str>> for TablePath {
 }
 
 impl std::fmt::Display for TablePath {
-    /// Prints the path the way the cluster spells it —
-    /// `<append=%true;columns=[a]>//tmp/out` — so an error naming the path
-    /// says which rows and columns were in play, not only which table.
+    /// Prints the path as the cluster spells it, `<append=%true;columns=[a]>//tmp/out`,
+    /// so an error names the selection as well as the table.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = self.to_yson();
         if let Some(attributes) = &value.attributes {
@@ -868,9 +674,7 @@ impl std::fmt::Display for TablePath {
                 if i > 0 {
                     f.write_str(";")?;
                 }
-                // Encoding a value this type built cannot fail — every leaf is
-                // a string, an int or a boolean — so the fallback is belt and
-                // braces rather than a reachable path.
+                // Cannot fail: every leaf this type builds is a string, int or boolean.
                 let rendered = ytsaurus_yson::to_string(attribute, YsonFormat::Text)
                     .unwrap_or_else(|_| "?".to_owned());
                 write!(f, "{}={rendered}", String::from_utf8_lossy(name))?;
@@ -1077,11 +881,8 @@ mod tests {
 
     #[test]
     fn it_is_built_from_every_shape_of_string_a_call_site_has() {
-        // Deref coercion used to absorb all of these when the parameter was a
-        // `&str`, and `Into` does not: each one that is missing is a call site
-        // that stops compiling when this type arrives. `&&str` is what
-        // `for path in &paths` gives you, and `Cow` is what a function that
-        // sometimes rewrites a path returns.
+        // Each shape a call site may pass; `&&str` is what `for path in &paths`
+        // gives, and `Cow` what a function that may rewrite a path returns.
         let owned = String::from("//tmp/out");
         let borrowed: &str = "//tmp/out";
         let paths = vec!["//tmp/out"];

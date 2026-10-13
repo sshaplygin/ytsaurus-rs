@@ -1,75 +1,40 @@
-//! Table and file I/O that does not go through memory.
-//!
-//! [`Client::read_table`](crate::Client::read_table),
+//! Table and file I/O that does not go through memory: the streaming forms move
+//! the same bytes as [`Client::read_table`](crate::Client::read_table),
 //! [`Client::write_table`](crate::Client::write_table) and
-//! [`Client::read_file`](crate::Client::read_file) hold the whole thing at
-//! once, which is right for a launcher inspecting a result and wrong for
-//! anything the size of the data. The streaming forms move the same bytes
-//! without ever holding more than a buffer of them.
-//!
-//! Both are the raw byte stream — a YSON list fragment — because that is what
-//! the other end of this project already speaks: `ytsaurus_job::JobReader`
-//! reads exactly this, so a table read on a laptop and a table read inside a
-//! job go through the same decoder.
+//! [`Client::read_file`](crate::Client::read_file) while holding one buffer. A
+//! table stream is a YSON list fragment, which `ytsaurus_job::JobReader`
+//! decodes as it does inside a job.
 
 use std::io::Read;
 
-/// A table's rows, arriving as they are read.
+/// A table's rows as they are read: a YSON list fragment in the format the read
+/// asked for, binary by default, as `ytsaurus_job::JobReader::binary` expects.
 ///
-/// A YSON list fragment, in whatever format the read asked for — binary by
-/// default, which is what `ytsaurus_job::JobReader::binary` expects.
-///
-/// This is [`ResponseReader`] under the name the table paths use; the type is
-/// the same, because nothing about reading a response body as it arrives is
-/// specific to tables.
-///
-/// # The check this gives up
-///
-/// [`Client::read_table`](crate::Client::read_table) verifies that what came
-/// back is a *complete* fragment, which is the client's only defence against a
-/// mid-stream failure it cannot see (the proxy reports one in a trailer, and
-/// `ureq` 3.3 exposes no trailers — rechecked against its source, not assumed).
-/// Streaming cannot do that up front: the point is not to have the whole thing.
-///
-/// The defence moves to the decoder. A fragment cut short leaves a record that
-/// does not parse, and `JobReader` fails on it rather than stopping quietly —
-/// which is the same protection, applied at the point where it can still be
-/// applied.
+/// Unlike [`Client::read_table`](crate::Client::read_table), nothing checks that
+/// the fragment is complete: a proxy reports a mid-stream failure in a trailer,
+/// which `ureq` does not expose. A fragment cut short leaves a record that does
+/// not parse, and `JobReader` fails on it. See
+/// [Streaming table I/O](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#streaming-table-io).
 pub type TableReader = ResponseReader;
 
-/// A file's bytes, arriving as they are read.
+/// A file's bytes as they are read, from
+/// [`Client::read_file_streaming`](crate::Client::read_file_streaming).
 ///
-/// This is [`ResponseReader`] under the name the file path uses, exactly as
-/// [`TableReader`] is for tables: what
-/// [`Client::read_file_streaming`](crate::Client::read_file_streaming) hands
-/// back is the response body, and nothing about reading one as it arrives is
-/// specific to files.
-///
-/// The check described on [`TableReader`] is given up here too, and with less
-/// underneath it: a table cut short leaves a record that does not parse, but a
-/// file's bytes carry no framing at all, so a body ended early by a mid-stream
-/// failure is indistinguishable from a complete one. [`bytes_read`] against
-/// the size the caller expects — which is what the buffered
-/// [`Client::read_file`](crate::Client::read_file) checks against the node's
-/// own `@uncompressed_data_size` — is the compensation available.
+/// A proxy reports a mid-stream failure in a trailer, which `ureq` does not
+/// expose, and a file has no framing, so a body ended early looks complete.
+/// Compare [`bytes_read`] with the expected size, as the buffered
+/// [`Client::read_file`](crate::Client::read_file) does with the node's
+/// `@uncompressed_data_size`.
 ///
 /// [`bytes_read`]: ResponseReader::bytes_read
 pub type FileReader = ResponseReader;
 
-/// A response body, arriving as it is read.
-///
-/// What [`Client::read_table_streaming`](crate::Client::read_table_streaming)
-/// and [`Client::read_file_streaming`](crate::Client::read_file_streaming)
-/// hand back under the names [`TableReader`] and [`FileReader`], and what
+/// A response body as it is read: [`TableReader`], [`FileReader`], and what
 /// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming)
-/// hands back for a command this crate does not model — `read_blob_table`, or
-/// anything else whose answer is the data rather than a report about it.
-///
-/// Uncapped, unlike the buffered path: a stream has no size a client should
-/// presume. The trailer gap described on [`TableReader`] applies to every use
-/// of this, not only to tables — a body cut short by a mid-stream failure ends
-/// early and says nothing, so whatever consumes it has to be the thing that
-/// notices.
+/// returns for a command whose answer is data, such as `read_blob_table`.
+/// Uncapped, unlike the buffered path. A proxy reports a mid-stream failure in
+/// a trailer, which `ureq` does not expose, so a body cut short ends early and
+/// says nothing; its consumer has to notice.
 pub struct ResponseReader {
     inner: ureq::BodyReader<'static>,
     read: u64,
@@ -78,11 +43,8 @@ pub struct ResponseReader {
 impl ResponseReader {
     pub(crate) fn new(body: ureq::Body) -> Self {
         Self {
-            // A reader has no size cap, where the buffered path enforces one
-            // of its own (`http::CapReader`) and `ureq`'s `read_to_vec` stops
-            // at 10 MB unless told otherwise. That asymmetry is the right way
-            // round: a stream has no size a client should presume, and a table
-            // read into memory very much does.
+            // Uncapped: the buffered path has its own cap (`http::CapReader`),
+            // and a stream has no size to presume.
             inner: body.into_reader(),
             read: 0,
         }
@@ -111,35 +73,20 @@ impl std::fmt::Debug for ResponseReader {
     }
 }
 
-/// Turns rows into the byte stream a table write sends.
-///
-/// The encoder sits inside the request body rather than in front of it: rows
-/// are serialised a bufferful at a time, as the transport asks for bytes, so
-/// writing a million rows costs one buffer and not a million rows' worth of
-/// memory. That is the difference between
-/// [`Client::write_table_rows`](crate::Client::write_table_rows) and encoding a
-/// `Vec<u8>` first, and it is why the encoder lives here.
+/// Turns rows into a table write's body, encoding a bufferful at a time as the
+/// transport asks, so a million rows cost one buffer: the body of
+/// [`Client::write_table_rows`](crate::Client::write_table_rows).
 pub(crate) struct RowStream<I> {
     rows: I,
     buffer: Vec<u8>,
     position: usize,
     /// How many rows have been encoded, so a failure can name which one.
     written: u64,
-    /// The first row that would not serialise.
-    ///
-    /// `Read` can only report an `io::Error`, which the transport wraps in
-    /// whatever it makes of a failed body. Keeping the real reason here lets
-    /// the caller be told what actually happened: which is that row 40 000 has
-    /// a map key that is not a string, not that the connection broke.
+    /// The first row that would not serialise: `Read` can only report an
+    /// `io::Error`, so the real reason is carried out here.
     pub(crate) failed: Option<String>,
-    /// Latched once the rows have run out.
-    ///
-    /// `Read::read` may be called again after it has answered `Ok(0)`, and
-    /// without this the next call would poll the iterator past its first
-    /// `None`. `write_table_rows` accepts any `IntoIterator`, and what an
-    /// iterator that is not `Fuse` does after `None` is unspecified — a
-    /// generator that resumed yielding would append rows to a body the
-    /// transport had already finished sending.
+    /// Latched once the rows run out: `read` may be called again after `Ok(0)`,
+    /// and an iterator that is not fused could yield again into a finished body.
     exhausted: bool,
 }
 
@@ -177,9 +124,7 @@ where
                 break;
             };
 
-            // Serialised straight into the buffer that is about to be sent:
-            // `to_vec` would allocate a `Vec` per row, which for a table write
-            // is one allocation per row of the table.
+            // Straight into the send buffer: `to_vec` would allocate per row.
             let mut serializer =
                 ytsaurus_yson::ser::Serializer::with_buffer(std::mem::take(&mut self.buffer), true);
             let outcome = serde::Serialize::serialize(&row, &mut serializer);
@@ -203,9 +148,7 @@ where
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if self.position == self.buffer.len() {
             if self.failed.is_some() {
-                // Ending the body early would upload a truncated table and
-                // call it success. Failing the request is the only honest
-                // answer, and `failed` carries the reason out.
+                // Ending early would upload a truncated table as a success.
                 return Err(std::io::Error::other("a row could not be encoded"));
             }
             self.fill();

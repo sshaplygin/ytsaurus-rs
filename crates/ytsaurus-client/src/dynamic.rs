@@ -1,27 +1,13 @@
-//! Dynamic tables over HTTP API v4.
+//! Dynamic tables over HTTP API v4: `insert_rows`, `delete_rows`,
+//! `select_rows` and `lookup_rows`, which let [`Client`] implement
+//! [`ytsaurus_api::TableClient`], so the transport is chosen at construction,
+//! as with the C++ client's `CreateClient` and `CreateRpcClient`.
 //!
-//! The four commands the RPC proxy exists to make fast, implemented on the
-//! transport that was already here. They are what lets [`Client`] satisfy
-//! [`ytsaurus_api::TableClient`], so a caller can pick the transport at
-//! construction and change nothing else — the arrangement the C++ client has,
-//! where `CreateClient` and `CreateRpcClient` return the same interface.
-//!
-//! The command shapes are the driver's own registration table
-//! (`yt/yt/client/driver/driver.cpp`), not a guess:
-//!
-//! | command | input | output | mutating |
-//! | --- | --- | --- | --- |
-//! | `insert_rows` | tabular | structured | yes |
-//! | `delete_rows` | tabular | structured | yes |
-//! | `select_rows` | none | tabular | no |
-//! | `lookup_rows` | tabular | tabular | no |
-//!
-//! All four are heavy, so they go to a heavy proxy.
-//!
-//! Rows travel as a **YSON list fragment**: one map per row, each followed by
-//! `;`. That is the same encoding [`Client::write_table_rows`] uses, and the
-//! format is named explicitly on every request rather than left to the
-//! cluster's default.
+//! All four are heavy in the driver's registration table
+//! (`yt/yt/client/driver/driver.cpp`); only `select_rows` takes no input, and
+//! only `insert_rows` and `delete_rows` mutate. Rows travel as a binary YSON
+//! list fragment, one map per row, as in [`Client::write_table_rows`], and the
+//! format is named on every request.
 
 use ytsaurus_api::{LookupOptions, MaybeRow, Row, SelectOptions, Value};
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue};
@@ -35,8 +21,7 @@ fn rows_to_fragment(rows: &[Row]) -> Result<Vec<u8>> {
     for row in rows {
         let value = row_to_yson(row)?;
         let mut serializer = ytsaurus_yson::ser::Serializer::with_buffer(buffer, true);
-        // A `YsonValue` always serializes; the writer is a `Vec`, which cannot
-        // fail either.
+        // Cannot fail: a `YsonValue` serialised into a `Vec`.
         serde::Serialize::serialize(&value, &mut serializer)
             .expect("a YsonValue always serializes into a Vec");
         buffer = serializer.into_output();
@@ -65,10 +50,7 @@ fn value_to_yson(value: &Value) -> Result<YsonValue> {
         Value::Double(number) => yson_build::double(*number),
         Value::Boolean(flag) => yson_build::boolean(*flag),
         Value::String(bytes) => yson_build::string(bytes),
-        // `Any` names a YSON value, not a string holding its bytes. The API's
-        // response format is binary YSON, but accepting text here too means a
-        // caller can construct a row with either documented encoding. The
-        // fragment itself is always serialized as binary YSON below.
+        // A YSON value, accepted in binary or text; the fragment is binary.
         Value::Any(bytes) => ytsaurus_yson::from_slice(bytes, YsonFormat::Binary)
             .or_else(|binary_error| {
                 ytsaurus_yson::from_slice(bytes, YsonFormat::Text).map_err(|text_error| {
@@ -83,10 +65,8 @@ fn value_to_yson(value: &Value) -> Result<YsonValue> {
     })
 }
 
-/// Decodes a YSON list fragment of maps into rows.
-///
-/// A `#` entity at row level is a null row, which is how `lookup_rows` reports
-/// a key it did not find.
+/// Decodes a YSON list fragment of maps into rows. A `#` entity is a null row,
+/// which is how `lookup_rows` reports a key it did not find.
 fn fragment_to_rows(body: &[u8]) -> Result<Vec<MaybeRow>> {
     let mut rows = Vec::new();
     let mut rest = body;
@@ -160,17 +140,14 @@ fn yson_to_value(value: &YsonValue) -> Value {
         YsonNode::Double(number) => Value::Double(*number),
         YsonNode::Boolean(flag) => Value::Boolean(*flag),
         YsonNode::String(bytes) => Value::String(bytes.clone()),
-        // A list or a map in a column is a composite or `any` value, and it
-        // reaches the caller as the YSON that describes it rather than being
-        // flattened into something it is not.
+        // A list or a map is a composite or `any` value: passed on as its YSON.
         _ => {
             let mut serializer = ytsaurus_yson::ser::Serializer::with_buffer(Vec::new(), true);
             let encoded = serde::Serialize::serialize(value, &mut serializer)
                 .map(|()| serializer.into_output());
             match encoded {
                 Ok(bytes) => Value::Any(bytes),
-                // Unreachable for a value that was just parsed, and not worth
-                // a panic if it ever is.
+                // Unreachable for a value just parsed.
                 Err(_) => Value::Null,
             }
         }
@@ -178,10 +155,8 @@ fn yson_to_value(value: &YsonValue) -> Value {
 }
 
 impl Client {
-    /// Looks rows up by key over HTTP.
-    ///
-    /// One answer per key asked for, in order; a key with no row comes back as
-    /// `None`, which is what `keep_missing_rows` buys.
+    /// Looks rows up by key over HTTP: one answer per key, in order, and
+    /// `None` for a key with no row.
     pub fn lookup_rows_dynamic(
         &self,
         path: &str,
@@ -240,10 +215,8 @@ impl Client {
         Ok(fragment_to_rows(&body)?.into_iter().flatten().collect())
     }
 
-    /// Writes rows over HTTP.
-    ///
-    /// Not repeatable: a tablet write is not covered by the master's mutation
-    /// cache, so a retry after an uncertain failure could write twice.
+    /// Writes rows over HTTP, sent once: the master's mutation cache does not
+    /// cover a tablet write, so a retry could write twice.
     pub fn insert_rows_dynamic(&self, path: &str, rows: &[Row]) -> Result<()> {
         self.modify_rows_dynamic("insert_rows", path, rows)
     }
@@ -271,18 +244,13 @@ impl Client {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The shared interface
-// ---------------------------------------------------------------------------
+// The shared interface.
 
 /// Maps this crate's error onto the interface's.
 fn map_error(operation: &str, error: ClientError) -> ytsaurus_api::Error {
     match &error {
-        // A cluster refusal carries a YTsaurus code; the interface's callers
-        // match on those without caring which transport reported them. The
-        // code is an i64 here and an i32 there, because HTTP reports it as a
-        // YSON integer and the RPC proto declares it `int32`; the values are
-        // the same table, so it narrows.
+        // Callers of the interface match YTsaurus codes whatever the transport;
+        // HTTP's i64 narrows to RPC's int32, which holds the same codes.
         ClientError::Cluster { code, .. } => {
             let code = i32::try_from(*code).ok();
             ytsaurus_api::Error::cluster_from(operation, code, error)
@@ -321,25 +289,14 @@ impl ytsaurus_api::TableClient for Client {
             .map_err(|error| map_error("delete_rows", error))
     }
 
-    /// **Not available over HTTP**, and the cluster says so itself.
-    ///
-    /// A tablet transaction is *sticky*: it belongs to the proxy that created
-    /// it, and every later call in it has to reach that same proxy over the
-    /// same connection. An HTTP client routes each request independently — it
-    /// balances across proxies on purpose — so the transaction is lost the
-    /// moment the second request lands somewhere else. Asked to write in one
-    /// anyway, a real cluster answers:
-    ///
-    /// > Sticky transaction … is not found, this usually means that you use
-    /// > tablet transactions within HTTP API; consider using RPC API instead
-    ///
-    /// So this refuses up front rather than failing on the second call, and the
-    /// C++ client has the same split: this is one of the reasons
-    /// `CreateRpcClient` exists at all.
-    ///
-    /// [`Client::insert_rows`](ytsaurus_api::TableClient::insert_rows) and
-    /// [`delete_rows`](ytsaurus_api::TableClient::delete_rows) work over HTTP —
-    /// each is its own atomic write — and so does everything that only reads.
+    /// **Not available over HTTP.** A tablet transaction is sticky to the proxy
+    /// that created it, and HTTP requests are balanced across proxies, so a
+    /// cluster answers `Sticky transaction … is not found, this usually means
+    /// that you use tablet transactions within HTTP API`. This refuses up
+    /// front; use the RPC transport.
+    /// [`insert_rows`](ytsaurus_api::TableClient::insert_rows) and
+    /// [`delete_rows`](ytsaurus_api::TableClient::delete_rows) work, each its
+    /// own atomic write.
     fn start_transaction(
         &self,
     ) -> ytsaurus_api::Result<Box<dyn ytsaurus_api::TableTransaction + '_>> {
