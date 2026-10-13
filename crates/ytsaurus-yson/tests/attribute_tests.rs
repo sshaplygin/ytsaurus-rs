@@ -123,8 +123,8 @@ mod unit_tests {
 
     /// An attributed *map* reaches `YsonValue`'s visitor flattened: `@`-keys
     /// carry the attributes and the body's entries arrive as plain keys at the
-    /// same level. Those plain keys used to be discarded, so `<a=b>{x=10}`
-    /// decoded to an attributed entity — the whole body silently lost.
+    /// same level. Discarding those plain keys would decode `<a=b>{x=10}` to
+    /// an attributed entity, silently losing the whole body.
     #[test]
     fn an_attributed_map_keeps_its_body() {
         use ytsaurus_yson::{YsonNode, YsonValue};
@@ -163,12 +163,11 @@ mod unit_tests {
         assert!(matches!(back.node, YsonNode::Map(_)), "{back:?}");
     }
 
-    /// The serializer used to emit structural garbage for three struct shapes
-    /// instead of either valid YSON or an error: an `@`-field declared after a
-    /// plain field produced `{a=1<x=2>}`, an empty struct produced zero bytes,
-    /// and an all-attribute struct produced `<x=1>` with no value node. The
-    /// first is now an error (YSON attributes stand strictly before their
-    /// value); the other two produce `{}` and `<…>#`.
+    /// Three struct shapes serialize to valid YSON or an error, not structural
+    /// garbage. An `@`-field declared after a plain field (which would give
+    /// `{a=1<x=2>}`) is an error, because YSON attributes stand strictly before
+    /// their value. An empty struct produces `{}`, not zero bytes. An
+    /// all-attribute struct produces `<…>#`, not `<x=1>` with no value node.
     #[test]
     fn struct_shapes_serialize_to_valid_yson_or_error() {
         use ytsaurus_yson::{YsonFormat, YsonValue, to_vec};

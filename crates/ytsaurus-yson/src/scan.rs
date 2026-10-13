@@ -36,10 +36,9 @@ pub enum Scan {
 
 /// Returns the length of the first complete YSON value in `input`.
 ///
-/// Leading whitespace and comments (text format only) are counted as part of the
-/// value's extent, so `&input[..len]` can be handed straight to
-/// [`crate::from_slice`]. A leading item separator is *not* consumed — strip it
-/// before calling.
+/// Leading whitespace and comments (text format only) count as part of the
+/// value, so `&input[..len]` can go straight to [`crate::from_slice`]. A
+/// leading item separator is *not* consumed: strip it before calling.
 ///
 /// # Errors
 ///

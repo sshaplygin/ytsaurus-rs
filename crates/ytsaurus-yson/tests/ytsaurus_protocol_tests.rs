@@ -462,9 +462,9 @@ fn malformed_binary_input_errors_without_panicking() {
     }
 }
 
-/// Regression: a `/` that opens neither a `//` nor a `/*` comment used to spin
-/// forever in `skip_ignored`, because no branch advanced the cursor. Any text
-/// input containing such a byte would hang the parser rather than fail it.
+/// A `/` that opens neither a `//` nor a `/*` comment is an error. If no
+/// branch of `skip_ignored` advanced the cursor past it, any text input
+/// containing such a byte would hang the parser rather than fail it.
 ///
 /// Guarded by a worker thread so a regression fails the test instead of hanging CI.
 #[test]
