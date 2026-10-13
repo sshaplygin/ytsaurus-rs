@@ -1,15 +1,11 @@
 //! What the client actually puts on the wire.
 //!
-//! Everything else in this crate is checked against a cluster, which answers
-//! the same whether or not the request was well made. These serve the request
-//! from a socket in-process and read the bytes the client sent, which is the
-//! only way to pin the things a cluster is too forgiving to notice:
-//! compression the client asks for, the token it carries, and the header the
-//! parameters travel in.
+//! A cluster answers the same whether or not a request was well made, so these
+//! tests serve the request in-process and read the bytes the client sent: the
+//! compression it asks for, the token, the header the parameters travel in.
 //!
-//! The last section is a second question — not what a request looked like but
-//! *which address* it went to, which no single listener can answer. It uses
-//! two, and [`Proxy`] rather than [`capture`].
+//! The last section asks *which address* a request went to, which needs two
+//! listeners: [`Proxy`] rather than [`capture`].
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -43,16 +39,13 @@ fn capture(request_from: impl FnOnce(&str)) -> String {
             }
         }
 
-        // A command with a body — a table write — is only finished sending
-        // when its body is read. Replying before then leaves the client writing
-        // into a socket nobody is reading, which surfaces as a broken pipe
-        // rather than as the request under test.
+        // The body is read before the reply, or the client, still writing it,
+        // reports a broken pipe instead of the request under test.
         if let Some(length) = content_length(&head) {
             let mut body = vec![0_u8; length];
             reader.read_exact(&mut body).ok();
         } else if head.to_lowercase().contains("transfer-encoding: chunked") {
-            // The row-by-row writers stream, so their length is only known
-            // when the terminating chunk arrives.
+            // The row-by-row writers stream a chunked body.
             drain_chunked(&mut reader);
         }
 
@@ -103,10 +96,8 @@ fn content_length(head: &str) -> Option<usize> {
 
 /// One header of a captured request, exactly as it was sent.
 ///
-/// The name is matched case-insensitively, because HTTP says a header name is;
-/// the value comes back untouched, because some of them are case-sensitive and
-/// lowercasing the whole request head — which the tests here otherwise do —
-/// would hide that.
+/// The name is matched case-insensitively; the value comes back untouched,
+/// since some values are case-sensitive.
 fn header_value(head: &str, name: &str) -> Option<String> {
     head.lines()
         .find(|line| {
@@ -126,9 +117,7 @@ fn parameters(head: &str) -> String {
 
 #[test]
 fn a_plain_write_replaces_and_says_nothing_about_it() {
-    // The shape every version of this crate has sent. A path that grew
-    // `<append=%false>` would be a new request for an unchanged meaning, and
-    // the day it changed nobody would know which release did it.
+    // A replacing write sends a bare path, with no `<append=%false>`.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         client.write_table("//tmp/out", b"").expect("writes");
@@ -146,9 +135,8 @@ fn a_plain_write_replaces_and_says_nothing_about_it() {
 
 #[test]
 fn an_appending_write_carries_the_attribute_on_the_path() {
-    // The attribute goes on the *path*, not beside it as a parameter of its
-    // own. A cluster given `{path="//tmp/out";append=%true}` replaces the
-    // table and reports success, which is the failure this pins.
+    // The attribute goes on the path: a cluster given
+    // `{path="//tmp/out";append=%true}` replaces the table and reports success.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         client
@@ -164,11 +152,8 @@ fn an_appending_write_carries_the_attribute_on_the_path() {
 
 #[test]
 fn all_three_writers_can_append() {
-    // `write_table`, `write_table_rows` and `write_table_streaming` build the
-    // same parameter block three times over, and only one of them is exercised
-    // by an example. A path that lost its attribute on the streaming route
-    // would replace a table the caller meant to add to, and the caller would
-    // find out by losing rows.
+    // The three writers build their parameter blocks separately; a path that
+    // lost its attribute on one route would replace the table.
     let row = std::collections::BTreeMap::from([("n", 1_i64)]);
 
     let heads = [
@@ -212,15 +197,13 @@ fn all_three_writers_can_append() {
     }
 }
 
-// The reads below ignore their result on purpose: the stub's reply is not a
-// binary YSON fragment, so the read errors *after* the request — the thing
-// under test — is already on the wire.
+// The reads below ignore their result: the stub's reply is not binary YSON, so
+// the read fails after the request under test is on the wire.
 
 #[test]
 fn a_column_selection_travels_as_an_attribute_on_the_path() {
-    // Same trap as append, read side: `columns` is an attribute ON the path —
-    // the rich YPath reference lists it as recognized by `read_table` — and a
-    // sibling parameter would be silently dropped.
+    // `columns` is an attribute on the path, as the rich YPath reference lists
+    // it for `read_table`; a sibling parameter would be silently dropped.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_table(TablePath::new("//tmp/wide").columns(["host", "status"]));
@@ -238,9 +221,8 @@ fn a_column_selection_travels_as_an_attribute_on_the_path() {
 
 #[test]
 fn a_row_range_travels_in_the_documented_limits() {
-    // `0..2` is rows 0 and 1 on both sides of the wire: the reference says
-    // every limit but key_bound is inclusive below and exclusive above, which
-    // is exactly Rust's `..`.
+    // `0..2` is rows 0 and 1 on both sides: every limit but key_bound is
+    // inclusive below and exclusive above, as Rust's `..` is.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_table(TablePath::new("//tmp/t").range(0..2));
@@ -256,10 +238,9 @@ fn a_row_range_travels_in_the_documented_limits() {
 
 #[test]
 fn key_bounds_travel_in_the_clusters_representation() {
-    // The two bounds `key` says natively go as `key`; the two it cannot go as
-    // `key_bound=[relation;prefix]`, with the only relation the reference
-    // allows on that side. Every literal is fixed, so asserting the rendered
-    // text is safe.
+    // Inclusive-below, exclusive-above bounds go as `key`; the other two go as
+    // `key_bound=[relation;prefix]`. Every literal is fixed, so the rendered
+    // text may be asserted.
     let plain = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_table(
@@ -306,9 +287,8 @@ fn an_exact_key_read_asks_in_the_clusters_word_for_it() {
 
 #[test]
 fn all_three_readers_carry_the_selection() {
-    // `read_table`, `read_table_rows` and `read_table_streaming` build their
-    // parameter block separately; a selection lost on one route would quietly
-    // read the whole table — the cost the selection exists to avoid.
+    // The three readers build their parameter blocks separately; a selection
+    // lost on one route would read the whole table.
     let selected = || TablePath::new("//tmp/wide").columns(["host"]).range(0..100);
     let expected = r#"path=<columns=[host];ranges=[{lower_limit={row_index=0};upper_limit={row_index=100}}]>"//tmp/wide""#;
 
@@ -347,20 +327,15 @@ fn all_three_readers_carry_the_selection() {
 
 #[test]
 fn a_skiff_read_merges_a_row_range_with_its_schema_columns() {
-    // The Skiff format's fields are the column selection; a typed range says
-    // which rows. Different questions, one path — both attributes must
-    // arrive, or the read silently covers the wrong slice of the table.
+    // The Skiff fields select columns and a typed range selects rows; both
+    // attributes must arrive on the path.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_skiff_table(TablePath::new("//tmp/t").range(0..2), &one_column());
     });
 
-    // The whole rendering rather than two independent substrings: the claim
-    // is that both attributes sit on the *path*, and a pair of `contains`
-    // would still pass if `columns` moved off it to a sibling parameter —
-    // which is precisely the trap `<append=%true>` taught. Attribute order is
-    // the encoder's BTreeMap, so `columns` before `ranges` is byte order, not
-    // insertion luck.
+    // The whole rendering, so `columns` moving to a sibling parameter fails.
+    // Attributes are in the encoder's BTreeMap order.
     assert!(
         parameters(&head).contains(
             r#"path=<columns=[n];ranges=[{lower_limit={row_index=0};upper_limit={row_index=2}}]>"//tmp/t""#
@@ -371,16 +346,11 @@ fn a_skiff_read_merges_a_row_range_with_its_schema_columns() {
 
 #[test]
 fn a_skiff_read_refuses_a_column_selection_spelled_into_the_string() {
-    // The "one spelling of a selection" rule, in the one place it can be
-    // broken with nothing typed at all: a Skiff read synthesises a `columns`
-    // attribute out of the format's fields, so `//tmp/t{n}` arrives as two
-    // column selections on one path. Measured in the wire shape this client
-    // sends — attributes hung outside a YSON string node — the synthesised
-    // attribute wins: `<columns=[n]>"//tmp/t{k}"` came back as column `n`, so
-    // the tuple stays aligned with its schema and nothing decodes wrong. What
-    // is lost is the caller's own `{n}`, discarded at 200 without a word. A
-    // leading `<…>` is refused one step removed: the cluster takes it, but
-    // this client cannot parse the block to know whether it names `columns`.
+    // A Skiff read synthesises `columns` from the format's fields, so
+    // `//tmp/t{n}` would be two column selections; the cluster keeps the
+    // attribute and discards the string's at 200 (docs/protocol-reference.md).
+    // A leading `<…>` is refused because the client cannot parse it to know
+    // whether it names `columns`.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
 
     for path in [
@@ -400,12 +370,8 @@ fn a_skiff_read_refuses_a_column_selection_spelled_into_the_string() {
 
 #[test]
 fn a_skiff_read_sends_a_string_spelled_row_range() {
-    // The refusal above exists to stop a columns-versus-columns conflict, and
-    // a row range is not one. Measured, `<columns=["n"]>"//tmp/t[#3:#5]"`
-    // answered 200 with rows 3-4 carrying only `n`: ranges select rows, the
-    // synthesised attribute selects columns, and they compose — neither is
-    // discarded. `read_table` has always taken the string spelling, and a
-    // Skiff read takes it too.
+    // A string-spelled row range composes with the synthesised `columns`:
+    // `<columns=["n"]>"//tmp/t[#3:#5]"` answered rows 3-4 with only `n`.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_skiff_table("//tmp/t[#0:#2]", &one_column());
@@ -419,9 +385,8 @@ fn a_skiff_read_sends_a_string_spelled_row_range() {
 
 #[test]
 fn a_skiff_read_refuses_a_second_column_selection() {
-    // Two projections — the schema's fields and TablePath::columns — with one
-    // positional wire format between them. Whichever the cluster picked, the
-    // decoder would disagree with it; refused before anything is sent.
+    // The schema's fields and `TablePath::columns` are two projections over
+    // one positional format, so the read is refused before anything is sent.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
     let error = client
         .read_skiff_table(TablePath::new("//tmp/t").columns(["n"]), &one_column())
@@ -435,12 +400,10 @@ fn a_skiff_read_refuses_a_second_column_selection() {
 
 #[test]
 fn a_write_with_a_read_selection_is_refused_before_anything_is_sent() {
-    // The decision this crate makes about columns and ranges on a write:
-    // refuse locally. The cluster's answer is to ignore them and replace the
-    // whole table with a 200 — measured, and recorded in docs/protocol-reference.md — so
-    // sending them is silent data loss with nicer syntax. The client points
-    // at an address that answers nothing: had a request been attempted, the
-    // error would be Transport, not Config.
+    // A cluster ignores columns and ranges on a write and replaces the whole
+    // table with a 200 (docs/protocol-reference.md), so they are refused
+    // locally. Nothing answers at this address, so an attempted request would
+    // be a Transport error, not Config.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
     let row = std::collections::BTreeMap::from([("n", 1_i64)]);
 
@@ -490,10 +453,8 @@ fn a_write_with_a_read_selection_is_refused_before_anything_is_sent() {
 
 #[test]
 fn a_write_path_string_spelling_a_selection_is_refused() {
-    // The measured trap, verbatim: write_table_rows("//tmp/t[#0:#2]", rows)
-    // replaced the whole table and returned success. The string is never
-    // parsed, so the only write this client will send is one whose string is
-    // a bare path.
+    // `write_table_rows("//tmp/t[#0:#2]", rows)` replaced the whole table and
+    // succeeded, so a write path string must be a bare path.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
 
     for path in ["//tmp/t[#0:#2]", "//tmp/t{a,b}", "<append=%true>//tmp/t"] {
@@ -507,8 +468,8 @@ fn a_write_path_string_spelling_a_selection_is_refused() {
 
 #[test]
 fn an_escaped_bracket_is_a_node_name_and_still_writable() {
-    // Rich YPath escapes a literal bracket as `\[`, so this is a table named
-    // `t[x]`, not a range — refusing it would make that table unwritable.
+    // Rich YPath escapes a literal bracket as `\[`: this is a table named
+    // `t[x]`, not a range.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         client.write_table(r"//tmp/t\[x\]", b"").expect("writes");
@@ -522,10 +483,8 @@ fn an_escaped_bracket_is_a_node_name_and_still_writable() {
 
 #[test]
 fn a_read_keeps_passing_a_string_spelled_path_through() {
-    // Reads honoured string-spelled ranges before TablePath modelled them,
-    // and the cluster reads them correctly; refusing now would break working
-    // code to protect it from nothing. The path travels as a bare string,
-    // syntax and all — not parsed, not rewritten.
+    // The cluster reads a string-spelled range correctly, so a read path
+    // travels as a bare string, not parsed or rewritten.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_table("//tmp/t[#0:#2]");
@@ -539,19 +498,12 @@ fn a_read_keeps_passing_a_string_spelled_path_through() {
 
 #[test]
 fn a_read_refuses_a_selection_spelled_twice() {
-    // A string that already carries `[…]` plus a typed range is the *same
-    // kind* of selection spelled twice on one path. Measured, the attribute
-    // this client hangs on the path wins and the string's half is discarded at
-    // 200 with nothing said — the rows that come back are the ones the typed
-    // range names, and the range the caller wrote into the string simply never
-    // happens.
+    // A string carrying `[…]` plus a typed range: the cluster keeps the
+    // attribute and discards the string's range at 200 without a word.
     //
-    // Every reader has to refuse it, not just the buffered one: each builds
-    // its parameter block separately, and the streaming reader is where a
-    // doubled selection costs the most — it exists because the table is too
-    // big to hold, so reading the wrong slice of it is the expensive mistake.
-    // The address answers nothing, so a request that *was* attempted would
-    // come back Transport rather than Config.
+    // Every reader builds its parameters separately, so each must refuse.
+    // Nothing answers at this address, so an attempted request would be a
+    // Transport error, not Config.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
     let doubled = || TablePath::new("//tmp/t[#0:#2]").range(0..2);
 
@@ -593,15 +545,11 @@ fn a_read_refuses_a_selection_spelled_twice() {
 
 #[test]
 fn a_read_refuses_a_range_asking_for_rows_no_table_has() {
-    // Measured on a local cluster: a backwards range is answered 200 with no
-    // rows, in either selector; a negative `row_index` is *clamped to 0* and
-    // answered 200 with real rows — `{lower_limit={row_index=-5}}` returned
-    // all five rows of a five-row table, and `-5..2` returned rows 0 and 1.
-    // Neither bound is honoured as written, and neither is reported.
+    // A backwards range is answered 200 with no rows, and a negative
+    // `row_index` is clamped to 0 (docs/protocol-reference.md); neither is
+    // reported, so both are refused.
     let client = Client::new(&nowhere()).with_retries(RetryPolicy::none());
-    // From variables because clippy will not compile the literal `5..3` —
-    // which is also how a caller reaches it: computed, from an offset that
-    // came out wrong, where a silently wrong read is hardest to notice.
+    // From variables, since clippy rejects the literal `5..3`.
     let (from, to) = (5_i64, 3_i64);
 
     let refusals: Vec<(&str, ClientError)> = vec![
@@ -637,13 +585,9 @@ fn a_read_refuses_a_range_asking_for_rows_no_table_has() {
 
 #[test]
 fn a_read_sends_an_empty_column_selection() {
-    // `columns([])` is a read that succeeds, not one that cannot: measured,
-    // `<columns=[]>` answers 200 with one empty map per row, and it composes
-    // with a range — `<columns=[];ranges=[…#0:#2]>` came back as two empty
-    // maps. That counts the rows of a *range*, or probes whether a key range
-    // holds any, with no column bytes on the wire — which `Client::row_count`
-    // cannot do, reading as it does the whole-table `@row_count` attribute.
-    // So it travels, on the path, as the empty list it is.
+    // `<columns=[]>` answers one empty map per row and composes with a range,
+    // counting a range's rows with no column bytes, which `Client::row_count`
+    // (the whole-table `@row_count`) cannot. So it is sent as an empty list.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.read_table(
@@ -663,10 +607,8 @@ fn a_read_sends_an_empty_column_selection() {
 
 #[test]
 fn an_abort_reason_cannot_break_out_of_its_header() {
-    // The reason is caller's text and it travels in an HTTP header, so the
-    // YSON encoder is the only thing between a chatty message and a forged
-    // request. A raw newline here would end the header — and start whatever
-    // came after it as a header of its own.
+    // The reason is caller's text in an HTTP header: a raw newline would end
+    // the header and start a forged one. The YSON encoder escapes it.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         client
@@ -686,8 +628,7 @@ fn an_abort_reason_cannot_break_out_of_its_header() {
         !head.lines().any(|line| line.starts_with("X-Forged")),
         "the reason smuggled a header into the request:\n{head}"
     );
-    // One `X-YT-Parameters` line, holding the whole parameter block: the
-    // cluster reads the header, not the lines under it.
+    // One `X-YT-Parameters` line holds the whole parameter block.
     assert_eq!(
         head.lines()
             .filter(|line| line.to_lowercase().starts_with("x-yt-parameters:"))
@@ -709,26 +650,22 @@ fn an_abort_carries_its_reason_and_no_mutation_id() {
     let params = parameters(&head);
     assert!(head.starts_with("POST /api/v4/abort_operation"), "{head}");
     assert!(params.contains(r#"operation_id="1-2-3-4""#), "{params}");
-    // The reason is what tells whoever finds the aborted operation later who
-    // stopped it; dropping it silently would be the easy mistake here.
+    // The reason tells whoever finds the aborted operation who stopped it.
     assert!(
         params.contains(r#"abort_message="stopped by the test""#),
         "{params}"
     );
-    // Deliberately absent, though this is a mutating command. The master's
-    // mutation cache does not cover a scheduler command: a resend of the same
-    // ID is answered `No such operation` rather than with the first response,
-    // so a retry would report a successful abort as a failed one. Verified
-    // against the cluster before this was changed.
+    // No mutation ID, though the command mutates: the master's mutation cache
+    // does not cover scheduler commands, and a resend under the same ID is
+    // answered `No such operation` (verified on a cluster).
     assert!(!params.contains("mutation_id"), "{params}");
     assert!(!params.contains("retry="), "{params}");
 }
 
 #[test]
 fn an_abort_without_a_reason_sends_no_empty_message() {
-    // An empty `abort_message` is a different statement from none, and it is
-    // the one that would show up in the operation's error document as a blank
-    // line under "aborted by user request".
+    // An empty `abort_message` would show as a blank line under "aborted by
+    // user request" in the operation's error document.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         client.abort_operation("1-2-3-4", None).expect("aborts");
@@ -743,10 +680,8 @@ fn an_abort_without_a_reason_sends_no_empty_message() {
 
 #[test]
 fn every_request_asks_for_a_compressed_answer() {
-    // The proxy compresses when asked — a 67.7 MiB table came back as 400 KiB
-    // — and `ureq` asks on its own because this crate turns its `gzip` feature
-    // on. Nothing else here would notice if that feature were dropped: the
-    // cluster answers the same either way, just larger.
+    // `ureq` asks for compression because its `gzip` feature is on
+    // (docs/protocol-reference.md); a cluster answers either way, only larger.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         assert_eq!(client.exists("//tmp").ok(), Some(true));
@@ -770,8 +705,8 @@ fn the_parameters_travel_as_a_header_and_not_a_query_string() {
         head.starts_with("GET /api/v4/exists HTTP/1.1"),
         "the command is the path, with nothing appended:\n{head}"
     );
-    // The body is where a data stream goes, so parameters cannot live there;
-    // the query string is not where API v4 looks for them either.
+    // The body carries a data stream, and API v4 does not read parameters
+    // from the query string.
     assert!(
         head.contains(r#"x-yt-parameters: {path="//tmp/some/path"}"#)
             || head.contains(r#"X-YT-Parameters: {path="//tmp/some/path"}"#),
@@ -800,8 +735,7 @@ fn a_token_is_carried_as_an_oauth_authorization() {
 
 #[test]
 fn an_unauthenticated_client_sends_no_authorization_at_all() {
-    // Not an empty one: a header that is present and empty is a different
-    // statement to a proxy than a header that is absent.
+    // Absent, not empty: a proxy treats the two differently.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.exists("//tmp");
@@ -815,11 +749,9 @@ fn an_unauthenticated_client_sends_no_authorization_at_all() {
 
 #[test]
 fn a_trace_context_travels_as_a_traceparent_header() {
-    // The cluster traces itself, and a request that names a trace has its
-    // proxy-side span put inside that one. The header is the W3C spelling,
-    // which is what `TryParseTraceParent` in the proxy reads and what all three
-    // official clients send; a header we spelled our own way would be dropped
-    // in silence and the launch would simply not appear in the trace.
+    // The proxy puts its span inside a trace named by the W3C `traceparent`
+    // header, which `TryParseTraceParent` reads and all three official
+    // clients send.
     let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         .expect("a W3C traceparent");
 
@@ -828,8 +760,7 @@ fn a_trace_context_travels_as_a_traceparent_header() {
             .with_retries(RetryPolicy::none())
             .with_trace_context(&context);
 
-        // What will be sent, before it is sent — the read-back a caller logs
-        // so the trace can be found again.
+        // The read-back a caller logs so the trace can be found again.
         assert_eq!(
             client.traceparent(),
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
@@ -838,10 +769,8 @@ fn a_trace_context_travels_as_a_traceparent_header() {
         let _ = client.exists("//tmp");
     });
 
-    // The header *name* is matched case-insensitively because HTTP says it is,
-    // and the *value* case-sensitively because the standard says the hex is
-    // lowercase. Lowercasing the whole line, as the tests around this one do,
-    // would accept an uppercased id the standard does not allow.
+    // The value is matched case-sensitively: the standard requires lowercase
+    // hex.
     let value = header_value(&head, "traceparent");
     assert_eq!(
         value.as_deref(),
@@ -852,11 +781,8 @@ fn a_trace_context_travels_as_a_traceparent_header() {
 
 #[test]
 fn a_tracestate_travels_beside_the_traceparent() {
-    // The standard pairs the two, and a participant that forwards one is
-    // required to forward the other unmodified. The proxy ignores `tracestate`;
-    // the caller's own backend is what keys off it, so dropping it here would
-    // cost the sampling decision or the correlation key of everything
-    // downstream of this hop and nothing would say so.
+    // The standard requires forwarding `tracestate` unmodified with its
+    // `traceparent`. The proxy ignores it; the caller's backend keys off it.
     let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         .expect("a W3C traceparent")
         .with_tracestate("vendora=t61rcWkgMzE,vendorb=x9");
@@ -885,8 +811,7 @@ fn a_tracestate_travels_beside_the_traceparent() {
 
 #[test]
 fn a_traced_client_sends_no_tracestate_it_was_not_given() {
-    // A `tracestate` naming no vendor is not a smaller version of one; it is a
-    // header the caller's backend has to decide what to do with.
+    // No `tracestate` is sent unless one was given.
     let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         .expect("a W3C traceparent");
 
@@ -905,12 +830,8 @@ fn a_traced_client_sends_no_tracestate_it_was_not_given() {
 
 #[test]
 fn a_transaction_inherits_the_clients_trace() {
-    // The doc on `with_trace_context` promises this, and it holds only because
-    // `Transaction::start` clones the client rather than rebuilding one from
-    // its parts — which is a plausible refactor, since it immediately overrides
-    // the retries and the timeout on the ping client. A commit or a ping that
-    // hung is named in that doc as the thing the trace is for, so the claim is
-    // load-bearing and nothing else here would notice it breaking.
+    // `with_trace_context` promises this. It holds because `Transaction::start`
+    // clones the client rather than rebuilding it from parts.
     let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         .expect("a W3C traceparent");
 
@@ -918,9 +839,8 @@ fn a_transaction_inherits_the_clients_trace() {
         let client = Client::new(proxy)
             .with_retries(RetryPolicy::none())
             .with_trace_context(&context);
-        // The reply is an `exists` answer rather than a transaction id, so the
-        // start fails to decode and no ping thread outlives this. The request
-        // is what is under test.
+        // The reply is not a transaction id, so the start fails to decode and
+        // no ping thread outlives this.
         let _ = client.start_transaction();
     });
 
@@ -937,8 +857,7 @@ fn a_transaction_inherits_the_clients_trace() {
 
 #[test]
 fn a_client_without_a_trace_context_sends_no_traceparent() {
-    // Sampling costs the cluster something, so a client that was not asked to
-    // join a trace must not start one on its own.
+    // Sampling costs the cluster, so an untraced client starts no trace.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.exists("//tmp");
@@ -952,10 +871,8 @@ fn a_client_without_a_trace_context_sends_no_traceparent() {
 
 #[test]
 fn the_hosts_lookup_carries_the_trace_like_a_command_does() {
-    // `/hosts` is not a command and builds its own request, which is how it
-    // once came to carry neither the token nor the timeout. The trace context
-    // is one more thing it would miss, and a heavy-proxy lookup slow enough to
-    // matter is exactly the one worth seeing in the trace.
+    // `/hosts` is not a command and builds its own request; it carries the
+    // trace context and the token as a command does.
     let context = TraceContext::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         .expect("a W3C traceparent");
 
@@ -963,8 +880,7 @@ fn the_hosts_lookup_carries_the_trace_like_a_command_does() {
         let client = Client::with_token(proxy, "secret-token")
             .with_retries(RetryPolicy::none())
             .with_trace_context(&context);
-        // The reply is an `exists` answer rather than a host list, so this
-        // fails to decode; the request is what is under test.
+        // The reply is not a host list, so this fails to decode.
         let _ = client.heavy_proxy();
     });
 
@@ -986,12 +902,8 @@ fn the_hosts_lookup_carries_the_trace_like_a_command_does() {
 
 #[test]
 fn a_raw_command_is_dressed_like_every_other_command() {
-    // The reason the escape hatch is a `Client` method and not a bare `ureq`
-    // agent handed to the caller. A raw command has to arrive looking like a
-    // command — the token, the header format, the parameters header, the
-    // compression — or every user of it reimplements this crate's transport
-    // badly. A cluster answers the same either way, so nothing but this would
-    // notice a regression.
+    // A raw command carries the token, the header format, the parameters
+    // header and the compression request, like every other command.
     let head = capture(|proxy| {
         let client = Client::with_token(proxy, "secret-token").with_retries(RetryPolicy::none());
         let _ = client.raw_command(
@@ -1025,11 +937,8 @@ fn a_raw_command_is_dressed_like_every_other_command() {
 /// A refusal that has to happen before the socket does.
 #[test]
 fn a_multi_table_skiff_write_is_refused_before_anything_is_sent() {
-    // Nothing listens on this port, so reaching the transport at all would be
-    // a connection error. A Config error is therefore proof that the format
-    // was checked first, and that the caller is told what is actually wrong
-    // with the request rather than what the stream looked like to a decoder
-    // holding the wrong schema.
+    // Nothing listens on this port, so a Config error proves the format was
+    // checked before the transport was reached.
     let client = Client::new("http://127.0.0.1:1").with_retries(RetryPolicy::none());
     let two_tables = SkiffFormat::new(vec![
         SkiffSchemaRef::Inline(SkiffSchema::tuple([SkiffSchema::named(
@@ -1045,8 +954,8 @@ fn a_multi_table_skiff_write_is_refused_before_anything_is_sent() {
 
     let error = client
         .write_table_with_format(
-            // Truncated on purpose: with the checks the other way round this
-            // is the byte that produces the misleading answer.
+            // Truncated: with the checks reversed, this byte would produce a
+            // misleading decode error.
             TablePath::from("//tmp/out"),
             b"\x00",
             &DataFormat::skiff(two_tables),
@@ -1064,10 +973,8 @@ fn a_multi_table_skiff_write_is_refused_before_anything_is_sent() {
 
 #[test]
 fn a_suspend_says_what_to_do_with_the_running_jobs() {
-    // Sent either way round, never left out. The two are different requests:
-    // one lets the jobs that have started finish, the other throws their work
-    // away — and a caller who asked for the second and got the first would
-    // find out much later, from a cluster bill.
+    // `abort_running_jobs` is always sent, either way: one value lets started
+    // jobs finish, the other throws their work away.
     for abort_running_jobs in [false, true] {
         let head = capture(|proxy| {
             let client = Client::new(proxy).with_retries(RetryPolicy::none());
@@ -1088,12 +995,9 @@ fn a_suspend_says_what_to_do_with_the_running_jobs() {
 
 #[test]
 fn the_scheduler_commands_carry_no_mutation_id() {
-    // The master's mutation cache does not cover a scheduler command, which is
-    // the fact `abort_operation` was built on and these three inherit: a
-    // resend under the same ID is answered `No such operation` rather than
-    // with the first response. Suspend is retried, but on its own idempotency
-    // — a second suspend of a suspended operation is simply accepted — and not
-    // by asking the cluster to deduplicate it.
+    // The master's mutation cache does not cover scheduler commands: a resend
+    // under the same ID is answered `No such operation`. Suspend is retried on
+    // its own idempotency, since a second suspend is accepted.
     let heads = [
         (
             "suspend_operation",
@@ -1133,10 +1037,9 @@ fn the_scheduler_commands_carry_no_mutation_id() {
 
 #[test]
 fn updated_parameters_travel_in_the_header_and_not_in_the_body() {
-    // The command reference calls this command's input "structured", which
-    // reads like a request body. The cluster's own registry says `null`, and
-    // the registry is what the proxy implements: the parameters go in
-    // `X-YT-Parameters` like every other command's.
+    // The command reference calls the input "structured", but the registry
+    // the proxy implements says `null`: the parameters go in
+    // `X-YT-Parameters`.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         client
@@ -1168,10 +1071,8 @@ fn updated_parameters_travel_in_the_header_and_not_in_the_body() {
 
 #[test]
 fn an_update_that_changes_nothing_is_refused_before_it_is_sent() {
-    // Nothing listens on this port, so a Config error proves the check ran
-    // first. The cluster answers an empty update with 200 and does nothing,
-    // which is the shape of mistake that survives every test but the one that
-    // reads the pool afterwards.
+    // A cluster answers an empty update 200 and does nothing. Nothing listens
+    // on this port, so a Config error proves the check ran first.
     let client = Client::new("http://127.0.0.1:1").with_retries(RetryPolicy::none());
     let error = client
         .update_operation_parameters("1-2-3-4", &OperationParameters::new())
@@ -1182,9 +1083,8 @@ fn an_update_that_changes_nothing_is_refused_before_it_is_sent() {
 
 #[test]
 fn an_alias_lookup_asks_for_runtime_information() {
-    // Without it the cluster refuses outright: "Operation alias cannot be
-    // resolved without using runtime information". A lookup that forgot this
-    // would fail every time, and only against a real cluster.
+    // Without `include_runtime` the cluster refuses: "Operation alias cannot
+    // be resolved without using runtime information".
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.get_operation_by_alias("*nightly", &["state"]);
@@ -1203,9 +1103,8 @@ fn an_alias_lookup_asks_for_runtime_information() {
 
 #[test]
 fn the_whole_operation_document_is_asked_for_by_naming_no_attributes() {
-    // `attributes=[]` is a request for *no* attributes, which the cluster
-    // answers with `{}`. Leaving the parameter out is what asks for
-    // everything, so an empty slice must not be sent as an empty list.
+    // `attributes=[]` asks for no attributes and gets `{}`; leaving it out
+    // asks for everything, so an empty slice is not sent.
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
         let _ = client.get_operation("1-2-3-4", &[]);
@@ -1238,8 +1137,7 @@ fn a_filtered_listing_sends_its_filter_and_nothing_else() {
 fn a_job_is_asked_for_by_operation_and_job() {
     let head = capture(|proxy| {
         let client = Client::new(proxy).with_retries(RetryPolicy::none());
-        // The stub answers `{value=%true}`, which names no job; the request is
-        // what this is about.
+        // The stub's answer names no job; only the request is checked.
         let _ = client.get_job("1-2-3-4", "5-6-7-8");
     });
 
@@ -1252,16 +1150,13 @@ fn a_job_is_asked_for_by_operation_and_job() {
 
 // ------------------------------------------- where a command is sent, and why
 //
-// A cluster answers a heavy command the same way whichever of its proxies was
-// asked — that is the point of the roles — so nothing about the *answers* here
-// could tell a routed client from an unrouted one. Two listeners and a record
-// of which one was spoken to can.
+// A cluster answers a heavy command the same whichever proxy was asked, so
+// only a record of which listener was spoken to tells routing apart.
 
 /// A stand-in proxy that keeps serving, and remembers what it was asked.
 ///
-/// [`capture`] serves exactly one request, which is all a wire *shape* needs.
-/// Routing is about which address a request went to and how many there were,
-/// so this keeps a list and stays up.
+/// Unlike [`capture`], it stays up and records every request, since routing
+/// is about which address each request went to.
 struct Proxy {
     address: std::net::SocketAddr,
     seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -1272,13 +1167,13 @@ struct Proxy {
 enum Hosts {
     /// Answers 200 with this JSON body.
     List(String),
-    /// Answers 404 — a cluster with no such endpoint.
+    /// Answers 404: a cluster with no such endpoint.
     Absent,
-    /// Answers a status that says "not now": the shape of a proxy restarting.
+    /// Answers a "not now" status, as a restarting proxy does.
     Status(u16),
     /// Accepts the question and never answers it.
     Hang,
-    /// Answers this body, eventually — a cluster slower than the budget.
+    /// Answers this body after the delay: a cluster slower than the budget.
     Slow(std::time::Duration, String),
     /// Answers each ask with the next `(status, body)`; the last one repeats.
     /// A `/hosts` whose answer changes over time, for the refresh tests.
@@ -1287,11 +1182,9 @@ enum Hosts {
 
 /// What a stand-in proxy does with a **heavy** command.
 ///
-/// The default stub serves everything, which is a single-node installation and
-/// most of this file. It is also, for the tests that are about routing, a stub
-/// that cannot fail the way the real thing does: a control proxy refuses a
-/// heavy request outright, so a client that stopped routing looks exactly like
-/// one that never did unless the stub refuses too.
+/// `Any` serves everything, like a single-node installation. A real control
+/// proxy refuses a heavy request, and `Control` does too, so a client that
+/// stopped routing fails.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     /// Serves every command, whatever its weight.
@@ -1300,8 +1193,8 @@ enum Role {
     Control,
 }
 
-/// The commands a control proxy will not serve, from the cluster's own registry
-/// — the `isHeavy` column of `REGISTER_ALL` in `driver.cpp`.
+/// The commands a control proxy will not serve: the `isHeavy` column of
+/// `REGISTER_ALL` in `driver.cpp`.
 const HEAVY_COMMANDS: &[&str] = &[
     "write_table",
     "write_file",
@@ -1312,8 +1205,7 @@ const HEAVY_COMMANDS: &[&str] = &[
 ];
 
 impl Proxy {
-    /// A proxy that answers `/hosts` with `hosts`, or with 404 when given
-    /// `None` — the shape of a cluster that has no such endpoint.
+    /// A proxy that answers `/hosts` with `hosts`, or 404 for `None`.
     fn new(hosts: Option<String>) -> Self {
         Self::answering(hosts.map_or(Hosts::Absent, Hosts::List), 200)
     }
@@ -1340,9 +1232,9 @@ impl Proxy {
                 let Ok(stream) = stream else { return };
                 let hosts = hosts.clone();
                 let seen = std::sync::Arc::clone(&served);
-                // One thread per connection: `ureq` pools them, and a client
-                // that opened a second while the first sat idle would deadlock
-                // against a server that answered them in turn.
+                // One thread per connection: a client that opened a second
+                // while the first sat pooled would deadlock against a server
+                // answering them in turn.
                 std::thread::spawn(move || serve(stream, hosts, commands, role, seen));
             }
         });
@@ -1389,7 +1281,7 @@ fn serve(
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clones"));
     // Held open and never answered, for `Hosts::Hang`: dropping the socket
-    // would be a connection reset, which is a different thing to measure.
+    // would be a connection reset instead.
     let mut hung = Vec::new();
 
     loop {
@@ -1407,8 +1299,7 @@ fn serve(
             return;
         }
 
-        // The body first, for the reason `capture` gives: a request is only
-        // finished being sent when its body has been read.
+        // The body first, as in `capture`.
         if let Some(length) = content_length(&head) {
             let mut body = vec![0_u8; length];
             if reader.read_exact(&mut body).is_err() {
@@ -1474,9 +1365,8 @@ fn reply(status: u16, body: &[u8]) -> Vec<u8> {
 
 /// What a control proxy answers a heavy request with input data.
 ///
-/// The cluster's own shape, from `TContext::TryRedirectHeavyRequests`: **503**
-/// with `Retry-After`, carrying the reason in an `X-YT-Error` document — which
-/// is where this client reads it, so the status is not what the caller sees.
+/// The cluster's shape, from `TContext::TryRedirectHeavyRequests`: 503 with
+/// `Retry-After` and the reason in `X-YT-Error`, which the client reports.
 fn refusal() -> Vec<u8> {
     let error =
         r#"{"code":1,"message":"Control proxy may not serve heavy requests with input data"}"#;
@@ -1486,35 +1376,22 @@ fn refusal() -> Vec<u8> {
 
 /// An address nothing is listening on, for a proxy that has gone away.
 ///
-/// It has one job — a connection to it must be *refused*, at once — and one
-/// hazard behind that job: the port must be one no other stub in the suite can
-/// end up bound to, or "nowhere" becomes somewhere.
+/// A connection to it must be refused at once, and no other stub in the suite
+/// may ever be bound to it. Binding `127.0.0.1:0` and dropping the listener
+/// fails the second rule: across a suite that binds thousands of sockets the
+/// OS hands the freed port to another test's `TcpListener::bind`.
 ///
-/// The obvious way is to bind `127.0.0.1:0`, read the port the OS chose, and
-/// drop the listener so nothing is left answering. That refuses connections —
-/// until the OS hands the freed port to another test's `TcpListener::bind`. The
-/// range is cycled through before a port is reused, so within one binary it
-/// almost never comes round; across a suite that binds thousands of sockets it
-/// does, and then a request meant to go nowhere reaches a live listener (or the
-/// stub that took the port receives a stray request). It is the kind of flake
-/// that passes on a re-run and cannot be reproduced on demand.
-///
-/// A **privileged** port sidesteps the hazard entirely: `bind("127.0.0.1:0")`
-/// draws from the ephemeral range only — 32768+ on Linux, 49152+ on macOS — so
-/// nothing in this suite can ever be assigned a port below 1024, and no test
-/// process binds one deliberately. Nothing is listening there, so a connection
-/// is refused immediately on both platforms. The refusal is *verified* rather
-/// than assumed: the first candidate that actually refuses is the one returned,
-/// so a machine that happens to run something on one of these ports is skipped
-/// rather than silently turning "nowhere" into a live host.
+/// A **privileged** port cannot be assigned that way: `bind("127.0.0.1:0")`
+/// draws from the ephemeral range only (32768+ on Linux, 49152+ on macOS). The
+/// refusal is verified, so a port something on the machine listens on is
+/// skipped.
 fn nowhere() -> String {
     for port in 1u16..=16 {
         let address = format!("127.0.0.1:{port}");
         let socket = address.parse().expect("a valid loopback address");
         match TcpStream::connect_timeout(&socket, std::time::Duration::from_millis(200)) {
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return address,
-            // A listener answered, or the connect timed out: not nowhere. Try
-            // the next reserved port rather than hand back a live one.
+            // A listener answered, or the connect timed out: try the next.
             _ => continue,
         }
     }
@@ -1523,10 +1400,8 @@ fn nowhere() -> String {
 
 /// A client that discovers, though it is talking to a listener on loopback.
 ///
-/// Discovery is off for a loopback address by default — a local cluster cannot
-/// be improved on and a tunnelled one cannot be followed — and every listener
-/// in this file is on loopback. So the tests that are *about* discovery say so
-/// explicitly, and the one that is about the default does not.
+/// Discovery is off by default for a loopback address, where every listener
+/// here is, so the tests about discovery turn it on explicitly.
 fn discovering(proxy: &Proxy) -> Client {
     Client::new(&proxy.url())
         .with_retries(RetryPolicy::none())
@@ -1535,9 +1410,9 @@ fn discovering(proxy: &Proxy) -> Client {
 
 #[test]
 fn a_heavy_command_goes_to_the_proxy_the_cluster_names() {
-    // The bug this file is the regression test for: every heavy command went
-    // to whatever `YT_PROXY` held, which on an installation that separates
-    // proxy roles is a control proxy, and a control proxy refuses one.
+    // A heavy command goes to the proxy `/hosts` names, not to the configured
+    // address (`YT_PROXY`), which with separate roles is a control proxy that
+    // refuses it.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
 
@@ -1554,9 +1429,7 @@ fn a_heavy_command_goes_to_the_proxy_the_cluster_names() {
     );
     assert_eq!(heavy.requests(), ["PUT /api/v4/write_table HTTP/1.1"]);
 
-    // The other half of sending it elsewhere: it has to arrive dressed as a
-    // command. A heavy proxy that is handed a request with no token answers by
-    // blaming the caller's credentials.
+    // It arrives with its token and parameters.
     let head = &heavy.heads()[0];
     assert_eq!(
         header_value(head, "authorization").as_deref(),
@@ -1579,28 +1452,17 @@ fn one_column() -> SkiffFormat {
 
 #[test]
 fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
-    // Buffered, streamed in, streamed out, files in both directions, Skiff in
-    // both directions and a job's stderr: every route through the transport —
-    // `call`, `upload`, `open` — that each had their own way of choosing an
-    // address. And one lookup between all of them, because the answer is kept
-    // until the refresh interval elapses — a minute by default, which nothing
-    // here outlives — not one lookup per command. The interval itself is
-    // pinned in
-    // `a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not`.
+    // Every route through the transport (`call`, `upload`, `open`): tables,
+    // files and Skiff in both directions, and a job's stderr. One lookup
+    // serves them all, since the answer is kept for the refresh interval, a
+    // minute by default (pinned in
+    // `a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not`).
     //
-    // The exact request lists below survive the random pick (#40) because the
-    // pool has one host in it: `/hosts` names `heavy` and nobody else, so
-    // there is nothing to choose between and the order is the order these
-    // calls are made in. Nor does anything here empty that pool — the reads
-    // fail on the *answer*, after a 200 the host served perfectly well, which
-    // is not a failure attributable to the host and so drops nobody.
+    // The pool has one host, so the random pick leaves the order as called;
+    // the reads fail on the answer after a 200, which drops nobody.
     //
-    // The list is exact in both directions on purpose. Each of these call
-    // sites is one word — `Repeatable::Heavy` — away from going to the control
-    // proxy in silence, and `write_file` is the one that matters most:
-    // `upload_worker`, `upload_current_exe` and `upload_worker_cached` all
-    // funnel through it, so a single wrong word there sends every worker
-    // upload back to a proxy that will not take it.
+    // Each call site is one `Repeatable::Heavy` away from the control proxy;
+    // `write_file` carries every worker upload.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&control);
@@ -1617,8 +1479,7 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
     client
         .write_skiff_table("//tmp/t", b"", &skiff)
         .expect("skiff write");
-    // The stub answers `{value=%true}`, which is not a table: these fail on
-    // the answer, having asked the question this is about.
+    // The stub's answer is not a table: these fail after the request.
     let _ = client.read_table("//tmp/t");
     let _ = client.read_table_streaming("//tmp/t");
     let _ = client.read_skiff_table("//tmp/t", &skiff);
@@ -1626,10 +1487,8 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
     let _ = client.read_file_streaming("//tmp/f");
     let _ = client.get_job_stderr("1-2-3-4", "5-6-7-8");
 
-    // The `get` is the buffered `read_file`'s completeness check — one light
-    // command beside the heavy read, and light commands stay on the address
-    // the caller configured. Routing it away would be the same mistake as not
-    // routing the read, pointing the other way.
+    // The `get` is the buffered `read_file`'s size check, a light command, so
+    // it stays on the configured address.
     assert_eq!(
         control.requests(),
         ["GET /hosts HTTP/1.1", "GET /api/v4/get HTTP/1.1"],
@@ -1654,10 +1513,8 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
 
 #[test]
 fn a_light_command_stays_where_the_client_was_pointed() {
-    // Cypress, the scheduler and the master are the control proxy's own work.
-    // Sending them to a heavy proxy would be the same mistake pointing the
-    // other way, and asking `/hosts` before a `get` would put a round trip in
-    // front of every one of them.
+    // Cypress, scheduler and master commands are the control proxy's work, and
+    // no `/hosts` lookup goes in front of them.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&control);
@@ -1683,9 +1540,8 @@ fn a_light_command_stays_where_the_client_was_pointed() {
 
 #[test]
 fn a_cluster_that_names_no_heavy_proxy_keeps_serving_the_uploads_itself() {
-    // The fallback that keeps a single-node installation working, and every
-    // deployment that does not separate the roles. Asked once and then not
-    // again: an empty answer is an answer.
+    // A single-node installation, or one without separate roles: the empty
+    // answer is kept, and the configured address serves the uploads.
     let control = Proxy::new(Some("[]".to_owned()));
     let client = discovering(&control);
 
@@ -1704,10 +1560,8 @@ fn a_cluster_that_names_no_heavy_proxy_keeps_serving_the_uploads_itself() {
 
 #[test]
 fn a_cluster_with_no_hosts_endpoint_is_not_asked_before_every_upload() {
-    // `absent`, not merely empty: 404 is deterministic, so asking again would
-    // cost a round trip per upload and buy nothing. A failure that might pass —
-    // a timeout, a restarting proxy — is judged the other way, by the same
-    // rule the retry policy uses.
+    // A 404 is deterministic, so it is not asked again before each upload. A
+    // failure that might pass is judged by the retry policy's rule.
     let control = Proxy::new(None);
     let client = discovering(&control);
 
@@ -1726,16 +1580,11 @@ fn a_cluster_with_no_hosts_endpoint_is_not_asked_before_every_upload() {
 
 #[test]
 fn a_heavy_proxy_that_cannot_be_reached_gives_the_configured_address_back() {
-    // The measured trigger, from a single-node container reached from the
-    // host: `172.17.0.2` is not local, so discovery runs, and `/hosts` answers
-    // with a container-internal name nothing outside can dial.
-    //
-    // The first upload finds that out — it is not re-sent, because heavy
-    // commands are not retried and a streamed body is gone by then. What must
-    // not happen is what happened before: the answer thrown away, the same
-    // question asked, the same dead host resolved, and every upload for the
-    // rest of the client's life failing the same way. The client falls back to
-    // the address the caller gave, which is serving perfectly well.
+    // A single-node container reached at `172.17.0.2` is not local, so
+    // discovery runs, and `/hosts` names a container-internal host nothing
+    // outside can dial. The first upload fails and is not re-sent (heavy
+    // commands are not retried); the dead host is dropped, and later uploads
+    // go to the configured address without asking again.
     let dead = nowhere();
     let control = Proxy::new(Some(format!(r#"["{dead}"]"#)));
     let client = discovering(&control);
@@ -1757,10 +1606,8 @@ fn a_heavy_proxy_that_cannot_be_reached_gives_the_configured_address_back() {
 
 #[test]
 fn a_failure_at_a_discovered_proxy_says_which_one() {
-    // `write_table: transport error: io: Connection refused` is a true report
-    // about an address that appears nowhere in the caller's own code — the
-    // client picked it out of a list the cluster gave it, and then said
-    // nothing about the choice.
+    // A discovered address appears nowhere in the caller's code, so the error
+    // names it: `write_table at <host>:`.
     let dead = nowhere();
     let control = Proxy::new(Some(format!(r#"["{dead}"]"#)));
 
@@ -1778,15 +1625,9 @@ fn a_failure_at_a_discovered_proxy_says_which_one() {
 
 #[test]
 fn a_failure_at_the_configured_address_is_not_dressed_up_as_a_routed_one() {
-    // The other half of naming the host, and the guard that keeps the two
-    // decisions apart. The caller typed the configured address, so naming it
-    // back at them says nothing — and a failure there is not evidence about a
-    // lookup that was never in charge of it.
-    //
-    // Both uploads fail with the same 503 from the same kind of stub; the only
-    // difference is that the client chose where the first one went. That is
-    // what the message has to reflect, and what "state is `At(x)` and `x` is
-    // where this command went" is for.
+    // A failure at the configured address is not named as a routed one. Both
+    // uploads fail with the same 503; only the first went where the client
+    // chose.
     let heavy = Proxy::answering(Hosts::Absent, 503);
     let control = Proxy::answering(Hosts::List(format!(r#"["{}"]"#, heavy.host())), 503);
     let client = discovering(&control);
@@ -1808,17 +1649,11 @@ fn a_failure_at_the_configured_address_is_not_dressed_up_as_a_routed_one() {
 
 #[test]
 fn a_settled_lookup_survives_a_failed_upload() {
-    // A 404 `/hosts` is remembered as "this cluster serves its own heavy
-    // commands", and an upload that then fails at *that* address says nothing
-    // about the lookup — the caller chose the address, and there is no other
-    // answer to go back for. Forgetting here would restart a settled question
-    // on every 503, which is the opposite of what the fallback is for.
+    // A 404 `/hosts` settles that the cluster serves its own heavy commands,
+    // and a 503 at that address says nothing about the lookup.
     //
-    // **With the retry window set to nothing**, which is what makes this test
-    // its name. At ten seconds a forgotten answer and a settled one look
-    // identical for the whole life of the test: the state could be written as
-    // `FellBack` here, or the guard that keeps this code out of a settled
-    // lookup could be deleted outright, and this assertion would still pass.
+    // **The retry window is zero**: at the default ten seconds a forgotten
+    // answer and a settled one look identical for the whole test.
     let control = Proxy::answering(Hosts::Absent, 503);
     let client = discovering(&control).with_hosts_retry_after(std::time::Duration::ZERO);
 
@@ -1838,15 +1673,9 @@ fn a_settled_lookup_survives_a_failed_upload() {
 
 #[test]
 fn a_lookup_that_did_not_settle_is_asked_again_and_a_settled_one_is_not() {
-    // The distinction the whole `HeavyProxy` enum turns on, and the one nothing
-    // could see: with the window fixed at ten seconds, no test in this suite
-    // outlived one, so `Configured` and `FellBack` were observationally
-    // identical — either could be written where the other was, and every test
-    // stayed green. Set the window to nothing and the two say different things
-    // about the very next upload.
-    //
-    // 404 is deterministic, so asking again would cost a round trip per upload
-    // and buy nothing. 503 says only "not now".
+    // `Configured` and `FellBack` differ only once the retry window has
+    // passed, so the window is zero here. 404 is deterministic and settles the
+    // question; 503 says only "not now".
     let settled = Proxy::answering(Hosts::Absent, 200);
     let client = discovering(&settled).with_hosts_retry_after(std::time::Duration::ZERO);
 
@@ -1863,8 +1692,8 @@ fn a_lookup_that_did_not_settle_is_asked_again_and_a_settled_one_is_not() {
         "a settled answer was asked about again"
     );
 
-    // An answer this client declines in full is settled too: the names will be
-    // the same names next time, and the domain rule the same rule.
+    // An answer declined in full is settled too: the names and the domain rule
+    // will be the same next time.
     let refused = Proxy::new(Some(r#"["n0132-sas.somewhere-else.net"]"#.to_owned()));
     let client = discovering(&refused).with_hosts_retry_after(std::time::Duration::ZERO);
 
@@ -1901,10 +1730,8 @@ fn a_lookup_that_did_not_settle_is_asked_again_and_a_settled_one_is_not() {
 
 #[test]
 fn the_control_proxy_in_these_tests_refuses_a_heavy_command_as_a_real_one_does() {
-    // Everything below depends on this. A stub that cheerfully serves every
-    // upload cannot tell a client that routed from one that did not, so a
-    // regression that sends heavy commands back to the control proxy — the
-    // whole of #30 — is invisible against it.
+    // The routing tests below depend on this: a stub serving every upload
+    // cannot tell a client that routed from one that did not.
     let control = Proxy::control("[]".to_owned());
 
     let error = Client::new(&control.url())
@@ -1918,8 +1745,7 @@ fn the_control_proxy_in_these_tests_refuses_a_heavy_command_as_a_real_one_does()
             .contains("Control proxy may not serve heavy requests with input data"),
         "{error}"
     );
-    // And the refusal says what the cluster cannot: that this client sent it
-    // here on purpose, and which switch changes that.
+    // And the refusal names the switch that would have routed it.
     assert!(
         error.to_string().contains("with_proxy_discovery"),
         "the refusal says nothing about the routing that would have avoided it: {error}"
@@ -1928,20 +1754,14 @@ fn the_control_proxy_in_these_tests_refuses_a_heavy_command_as_a_real_one_does()
 
 #[test]
 fn a_proxy_that_stumbles_is_dropped_from_the_pool_not_for_the_control_proxy() {
-    // The failure that arrived through the fix for the previous one. A data
-    // proxy answering a single transient 503 — a drain, a restart — used to
-    // send the client back to the *configured* address for ten seconds, and on
-    // the deployment this feature was written for that address is a balancer in
-    // front of the control proxies. So every heavy command in that window was
-    // answered `Control proxy may not serve heavy requests with input data`:
-    // #30 itself, reproducible on demand, once per hiccup.
+    // A data proxy answering one transient 503 is dropped from the pool; the
+    // client does not fall back to the configured address, which with
+    // separate roles is a balancer in front of control proxies that refuse
+    // heavy commands.
     //
-    // `/hosts` had already named the alternatives. Now they are used — and the
-    // pick is random (#40), so the shape here is not "first fails, second
-    // takes over" but "the bad host costs exactly one command, ever": writes
-    // land on the good proxy until chance routes one onto the bad, that one
-    // fails and drops it, and every write after that succeeds. The bound is
-    // 64 tries; the chance a coin lands one side 64 times is not a flake.
+    // The pick is random, so the bad host costs exactly one command: writes
+    // land on the good proxy until one lands on the bad and drops it. The
+    // bound is 64 tries, which a fair pick does not miss by chance.
     let bad = Proxy::answering(Hosts::Absent, 503);
     let good = Proxy::new(None);
     let control = Proxy::control(format!(r#"["{}", "{}"]"#, bad.host(), good.host()));
@@ -1976,16 +1796,11 @@ fn a_proxy_that_stumbles_is_dropped_from_the_pool_not_for_the_control_proxy() {
 
 #[test]
 fn heavy_commands_spread_across_the_pool_rather_than_piling_onto_the_first() {
-    // `/hosts` is ordered by load, so "take `[0]`" reads like the obviously
-    // right pick and is the pin: a client that keeps its one pick for life
-    // never rebalances, and a draining host keeps every client that ever
-    // picked it. Both official clients pick at random per command for exactly
-    // this reason, and now so does this one.
+    // Always taking `[0]` of the load-ordered `/hosts` never rebalances, so
+    // each command picks at random, as both official clients do.
     //
-    // Sixty-four commands across a pool of three: the chance a fair pick
-    // leaves any host unvisited is 3·(2/3)^64 ≈ 5e-12, so "every proxy served
-    // something" is an assertion about the picker, not about luck — a
-    // round-robin would pass it too, but a pick pinned to any subset fails.
+    // Over 64 commands and three hosts, a fair pick leaves a host unvisited
+    // with probability 3·(2/3)^64 ≈ 5e-12; a pick pinned to a subset fails.
     let (a, b, c) = (Proxy::new(None), Proxy::new(None), Proxy::new(None));
     let control = Proxy::control(format!(
         r#"["{}", "{}", "{}"]"#,
@@ -2016,18 +1831,12 @@ fn heavy_commands_spread_across_the_pool_rather_than_piling_onto_the_first() {
 
 #[test]
 fn a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not() {
-    // The documentation's own strategy — "re-query the /hosts list every
-    // minute or every few queries" — which this client declined for a release
-    // and now follows (#40). Lazily, like the C++ SDK: the heavy command that
-    // finds the answer stale asks first, and no background thread exists to
-    // ask on its own.
+    // The documentation says "re-query the /hosts list every minute or every
+    // few queries". The refresh is lazy, as in the C++ SDK: the heavy command
+    // that finds the answer stale asks first; no background thread asks.
     //
-    // An interval of zero makes every answer already stale, so the second
-    // write must re-ask; the mutation "never refresh" fails here. The default
-    // interval is the other half — a fresh answer asked about once — and
-    // `every_heavy_shape_goes_there_and_the_cluster_is_asked_once` already
-    // pins it, but the pair belongs together: an hour-long interval here is
-    // what tells "refreshed on the interval" from "refreshed every time".
+    // An interval of zero makes every answer stale, so the second write
+    // re-asks; an hour-long interval does not.
     let heavy = Proxy::new(None);
     let stale = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&stale).with_host_list_refresh_interval(std::time::Duration::ZERO);
@@ -2058,11 +1867,9 @@ fn a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not(
     assert_eq!(heavy.requests().len(), 2);
 }
 
-/// An interval long enough for a test to do things "inside" it, short enough
-/// to sleep past. The sleeps that wait it out add ~0.4 s to the suite each;
-/// the alternative — an interval of zero — cannot tell "put off for another
-/// interval" from "retried in front of the very next upload", which is the
-/// distinction the refresh-failure tests exist to pin.
+/// An interval long enough to act inside and short enough to sleep past (each
+/// sleep adds ~0.4 s). Zero could not tell "put off for another interval" from
+/// "retried before the next upload".
 const TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Sleeps `TEST_INTERVAL` out, with margin.
@@ -2072,18 +1879,11 @@ fn outlive_the_interval() {
 
 #[test]
 fn a_refresh_that_fails_keeps_the_pool_and_waits_out_another_interval() {
-    // A `/hosts` that answered once and then stopped — a coordinator
-    // restarting — must not take routing down with it: the hosts in hand are
-    // from an answer the cluster did give, and dropping them for the
-    // configured address would route uploads to a control proxy because a
-    // *lookup* hiccupped. And the failed question is put off for a whole
-    // interval rather than hurried back on the short retry window: unlike the
-    // initial lookup nothing is waiting on the answer, so retrying it sooner
-    // would put a lookup's stall in front of heavy traffic several times a
-    // minute for an answer the pool makes unnecessary. The third write here
-    // rides the deferral — with the short window this small (zero) and the
-    // interval outlived only once, a refresh retried on the wrong clock asks
-    // a third time and fails the count.
+    // A refresh that fails (a coordinator restarting) keeps the pool, and the
+    // next try waits a whole interval, not the short retry window: nothing
+    // waits on the answer, and an earlier retry would stall heavy traffic.
+    // With the retry window at zero, a refresh retried on the wrong clock
+    // asks before the third write.
     let heavy = Proxy::new(None);
     let flaky = Proxy::answering(
         Hosts::Sequence(vec![
@@ -2119,11 +1919,8 @@ fn a_refresh_that_fails_keeps_the_pool_and_waits_out_another_interval() {
 
 #[test]
 fn a_refresh_adopts_the_answer_it_fetched() {
-    // The half of "refreshed" that a second `GET /hosts` alone cannot prove:
-    // the fresh answer has to *replace* the pool, or the lookup is theatre.
-    // The cluster here names one host and then a different one, and the
-    // traffic has to move — which is also the property that restores a
-    // dropped host, since a replacement pool is built from the answer alone.
+    // A fresh answer replaces the pool: the cluster names one host, then
+    // another, and the traffic moves. This also restores dropped hosts.
     let (first, second) = (Proxy::new(None), Proxy::new(None));
     let moving = Proxy::answering(
         Hosts::Sequence(vec![
@@ -2151,13 +1948,10 @@ fn a_refresh_adopts_the_answer_it_fetched() {
 
 #[test]
 fn a_dropped_host_is_restored_by_the_next_refresh() {
-    // The deliberate price of dropping without a ban list: a host that is
-    // *persistently* bad — the misissued certificate that motivated #40 — is
-    // re-learned at one failed command per interval, in exchange for a host
-    // that was merely draining coming back as soon as the cluster vouches for
-    // it again. The proof it came back is that it can fail again: a second
-    // failure after the interval is a command reaching a host that a
-    // permanent drop would never have let another command reach.
+    // Without a ban list, a persistently bad host (a misissued certificate)
+    // costs one failed command per interval, and a host that was draining
+    // returns as soon as the cluster lists it again. A second failure after
+    // the interval shows the host was restored.
     let bad = Proxy::answering(Hosts::Absent, 503);
     let good = Proxy::new(None);
     let control = Proxy::control(format!(r#"["{}", "{}"]"#, bad.host(), good.host()));
@@ -2193,11 +1987,8 @@ fn a_dropped_host_is_restored_by_the_next_refresh() {
 
 #[test]
 fn a_refresh_that_answers_nobody_keeps_the_pool_in_hand() {
-    // A fleet mid-rotation can briefly answer `[]`. Adopting that would end
-    // routing — and an adopted empty pool would have nothing to pick from at
-    // all — where waiting out another interval costs nothing: the hosts in
-    // hand are from an answer the cluster did give. The uploads must keep
-    // reaching the discovered host, not the configured address.
+    // A fleet mid-rotation can briefly answer `[]`. The pool in hand is kept
+    // for another interval, and uploads keep reaching the discovered host.
     let heavy = Proxy::new(None);
     let briefly_empty = Proxy::answering(
         Hosts::Sequence(vec![
@@ -2222,10 +2013,8 @@ fn a_refresh_that_answers_nobody_keeps_the_pool_in_hand() {
 
 #[test]
 fn an_emptied_pool_asks_the_cluster_again_after_the_window() {
-    // The other half of the fallback's name: it ends. A pool whose every host
-    // has been dropped uses the configured address for the retry window, and
-    // the first heavy command past the window puts the question again rather
-    // than living at the fallback for ever.
+    // A pool with every host dropped uses the configured address for the
+    // retry window; the first heavy command after it asks again.
     let dead = nowhere();
     let control = Proxy::new(Some(format!(r#"["{dead}"]"#)));
     let client = discovering(&control).with_hosts_retry_after(std::time::Duration::ZERO);
@@ -2244,10 +2033,8 @@ fn an_emptied_pool_asks_the_cluster_again_after_the_window() {
 
 #[test]
 fn an_interval_of_forever_disables_the_refresh() {
-    // `Duration::MAX` never elapses, which has to hold by arithmetic that
-    // cannot panic — the pool judges its age with `elapsed()` against the
-    // interval rather than by adding the interval to an `Instant`, which
-    // `Duration::MAX` would overflow.
+    // `Duration::MAX` never elapses and does not panic: the pool compares
+    // `elapsed()` with the interval rather than adding it to an `Instant`.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&control).with_host_list_refresh_interval(std::time::Duration::MAX);
@@ -2265,13 +2052,9 @@ fn an_interval_of_forever_disables_the_refresh() {
 
 #[test]
 fn a_cluster_that_named_nobody_is_asked_again_an_interval_later() {
-    // "The cluster names no heavy proxy" used to settle for ever, and a
-    // permanent answer from one lookup is a pin of its own: a launcher whose
-    // first upload landed in the few seconds of a rolling restart when
-    // `/hosts` answers `[]` sent every heavy command to the control proxy for
-    // the rest of its life. The verdict now expires with the same refresh
-    // interval as a pool, so the discovery that ends the window is watched
-    // here: an empty answer, then a real one, and the third upload routes.
+    // An empty answer, as during a rolling restart, expires with the refresh
+    // interval like a pool: an empty answer, then a real one, and the third
+    // upload routes.
     let heavy = Proxy::new(None);
     let recovering = Proxy::answering(
         Hosts::Sequence(vec![
@@ -2301,13 +2084,10 @@ fn a_cluster_that_named_nobody_is_asked_again_an_interval_later() {
 
 #[test]
 fn a_proxy_that_refuses_heavy_work_is_given_up_like_one_that_cannot_be_reached() {
-    // `/hosts` lists what `default_role_filter` says, and that is a coordinator
-    // config parameter an operator can change — not a protocol guarantee that
-    // the names are data proxies. A control proxy among them refuses with an
-    // ordinary cluster error, code 1, which is hopeless to *retry* and plainly
-    // the host's own fault: the same command is served happily next door. So
-    // it is dropped from the pool exactly as an unreachable host is — at most
-    // one command ever reaches it, and everything after the drop succeeds.
+    // `/hosts` lists what `default_role_filter`, an operator-set coordinator
+    // parameter, says, so it may name a control proxy. That refuses with
+    // cluster code 1, not retriable but the host's fault, so it is dropped
+    // like an unreachable host: at most one command reaches it.
     let good = Proxy::new(None);
     let wrong_role = Proxy::control("[]".to_owned());
     let control = Proxy::control(format!(r#"["{}", "{}"]"#, wrong_role.host(), good.host()));
@@ -2338,15 +2118,11 @@ fn a_proxy_that_refuses_heavy_work_is_given_up_like_one_that_cannot_be_reached()
 
 #[test]
 fn a_refusal_at_the_configured_address_says_what_would_have_routed_it() {
-    // The silent half of #30: the client asked, was given a perfectly good
-    // name, declined it under the domain rule, and said nothing. What the
-    // operator sees is the cluster error the feature was built to prevent, with
-    // nothing in it about `/hosts`, about a name, or about the one builder call
+    // A name declined under the domain rule leaves the control proxy's
+    // refusal; the error names `with_heavy_proxies_anywhere`, the builder call
     // that would have used it.
     //
-    // The client here is configured with `127.0.0.1`, a literal address, which
-    // admits only itself — so `localhost` names the same machine and is still
-    // refused.
+    // A literal `127.0.0.1` admits only itself, so `localhost` is refused.
     let elsewhere = Proxy::new(None);
     let named = format!("localhost:{}", elsewhere.address.port());
     let control = Proxy::control(format!(r#"["{named}"]"#));
@@ -2368,10 +2144,9 @@ fn a_refusal_at_the_configured_address_says_what_would_have_routed_it() {
 
 #[test]
 fn a_list_of_proxies_written_out_by_hand_is_what_is_used() {
-    // The third mode, and the only one that is a boundary rather than a
-    // heuristic: `anywhere` is all-or-nothing, and the domain rule is a guard
-    // against a typo — on a shared platform, a parent domain is shared with
-    // every other tenant of it.
+    // An explicit list is a boundary: `anywhere` is all-or-nothing, and the
+    // domain rule is a typo guard that admits every tenant of a shared parent
+    // domain.
     let allowed = Proxy::new(None);
     let refused = Proxy::new(None);
     let control = Proxy::control(format!(
@@ -2398,11 +2173,9 @@ fn a_list_of_proxies_written_out_by_hand_is_what_is_used() {
 
 #[test]
 fn the_lookup_budget_can_be_raised_and_not_only_lowered() {
-    // It used to be the smaller of 800 ms and the client's own timeout, so
-    // `with_timeout` could only ever lower it: a cluster answering `/hosts` in
-    // 900 ms was unroutable by any configuration at all. And 800 ms is not
-    // always generous — the first heavy command is often a client's first
-    // request, with DNS, TCP and a TLS handshake inside the same budget.
+    // The default lookup budget gives up on a 1.2 s `/hosts`;
+    // `with_hosts_timeout` raises it. The first heavy command is often the
+    // client's first request, with DNS, TCP and TLS inside the budget.
     let heavy = Proxy::new(None);
     let slow = Hosts::Slow(
         std::time::Duration::from_millis(1200),
@@ -2437,10 +2210,9 @@ fn the_lookup_budget_can_be_raised_and_not_only_lowered() {
 
 #[test]
 fn a_mistake_at_the_heavy_proxy_does_not_send_the_client_back_to_ask() {
-    // A table that does not exist will not exist over there either. Only a
-    // failure another proxy could plausibly not have — a refused connection, a
-    // 503, a banned proxy — is worth giving up a resolved address for; asking
-    // again on every mistake would cost a lookup per typo.
+    // A missing table is missing at every proxy. Only a failure another proxy
+    // might not have (a refused connection, a 503, a banned proxy) gives up a
+    // resolved address.
     let heavy = Proxy::answering(Hosts::Absent, 404);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&control);
@@ -2461,9 +2233,8 @@ fn a_mistake_at_the_heavy_proxy_does_not_send_the_client_back_to_ask() {
 
 #[test]
 fn a_discovery_off_client_never_touches_the_routing_state() {
-    // Nothing to forget and nothing to ask, so a heavy failure costs no lock
-    // and no lookup. The point is that `with_proxy_discovery(false)` is a
-    // whole-feature off switch and not merely a "do not ask first".
+    // `with_proxy_discovery(false)` turns the whole feature off: a heavy
+    // failure costs no lock and no lookup.
     let control = Proxy::answering(Hosts::List(r#"["heavy.example.net"]"#.to_owned()), 503);
 
     let client = Client::new(&control.url())
@@ -2484,10 +2255,8 @@ fn a_discovery_off_client_never_touches_the_routing_state() {
 
 #[test]
 fn a_blank_name_in_the_answer_is_passed_over_rather_than_believed() {
-    // `/hosts` is ordered best-first, so the first entry is the one to use —
-    // unless it is not a host name at all. A blank one used to be filtered out
-    // by hand; it is now one of the several shapes `heavy_base` refuses, and
-    // the list is walked until something usable turns up.
+    // A blank name is one of the shapes `heavy_base` refuses; the rest of the
+    // list is still used.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["", "   ", "{}"]"#, heavy.host())));
     let client = discovering(&control);
@@ -2500,10 +2269,8 @@ fn a_blank_name_in_the_answer_is_passed_over_rather_than_believed() {
 
 #[test]
 fn an_answer_that_is_not_a_list_of_host_names_settles_the_question() {
-    // A body this client cannot read will not become readable by being asked
-    // for again, so it is remembered exactly as an empty list is: the
-    // configured address serves the uploads, and no lookup goes in front of
-    // them.
+    // An unreadable body is settled like an empty list: the configured
+    // address serves the uploads, and no lookup goes in front of them.
     for nonsense in [
         "not json at all",
         r#"{"hosts": ["n0132-sas.example.net"]}"#,
@@ -2530,15 +2297,11 @@ fn an_answer_that_is_not_a_list_of_host_names_settles_the_question() {
 
 #[test]
 fn a_host_outside_the_configured_domain_is_refused() {
-    // The `/hosts` body decides where every heavy command goes, and a heavy
-    // command carries the caller's OAuth token. On a plain-http base, forging
-    // this body is exactly as easy as forging a `Location` header — which this
-    // client refuses to follow. So a name from another domain is passed over,
-    // and the upload goes to the address the caller actually chose.
+    // A heavy command carries the token, and on plain http the `/hosts` body
+    // is as easy to forge as a `Location` header, so a name from another
+    // domain is passed over and the upload goes to the configured address.
     //
-    // The client here is configured with `127.0.0.1`, which is a literal
-    // address and therefore admits only itself: `localhost` names the same
-    // machine and is still not the same host.
+    // A literal `127.0.0.1` admits only itself, so `localhost` is refused.
     let elsewhere = Proxy::new(None);
     let named = format!("localhost:{}", elsewhere.address.port());
     let control = Proxy::new(Some(format!(r#"["{named}"]"#)));
@@ -2560,10 +2323,8 @@ fn a_host_outside_the_configured_domain_is_refused() {
 
 #[test]
 fn an_installation_that_really_does_answer_elsewhere_can_opt_in() {
-    // The escape hatch, so that an installation whose `/hosts` genuinely names
-    // another domain — a vanity address, data proxies in a separate zone — is
-    // not stranded by the default. Same two listeners as above, one builder
-    // call apart.
+    // An installation whose `/hosts` names another domain (a vanity address,
+    // data proxies in another zone) opts in with one builder call.
     let heavy = Proxy::new(None);
     let named = format!("localhost:{}", heavy.address.port());
     let control = Proxy::new(Some(format!(r#"["{named}"]"#)));
@@ -2581,21 +2342,16 @@ fn an_installation_that_really_does_answer_elsewhere_can_opt_in() {
 
 #[test]
 fn the_lookup_has_its_own_budget_and_a_heavy_command_does_not_wait_out_the_clients() {
-    // The lookup used to run under the client's full policy — five attempts,
-    // one to eight seconds of backoff between them, two minutes each — while
-    // holding the lock every other heavy command wants. A `/hosts` answering
-    // 503 therefore cost a heavy command **15 s**, and one that hung cost it
-    // **615 s**. Both measured; the second is why this test exists at all.
-    //
-    // The bound is loose because this is a clock, and the thing being ruled
-    // out is two orders of magnitude away from it.
+    // The lookup has its own budget, not the client's retry policy (five
+    // attempts, backoff, two minutes each), under which a 503 `/hosts` was
+    // measured to cost a heavy command 15 s and a hung one 615 s. The 5 s
+    // bound is loose; what it rules out is two orders of magnitude away.
     for (what, hosts) in [
         ("503", Hosts::Status(503)),
         ("no answer at all", Hosts::Hang),
     ] {
         let control = Proxy::answering(hosts, 200);
-        // The client's own policy, not `none()`: the point is that the lookup
-        // does not inherit it.
+        // The default policy, not `none()`: the lookup must not inherit it.
         let client = Client::new(&control.url()).with_proxy_discovery(true);
 
         let started = std::time::Instant::now();
@@ -2611,13 +2367,10 @@ fn the_lookup_has_its_own_budget_and_a_heavy_command_does_not_wait_out_the_clien
 
 #[test]
 fn waiting_threads_do_not_queue_up_behind_a_failing_lookup() {
-    // Eight threads, one broken `/hosts`. Each used to wait out the lookup in
-    // front of it and then perform its own, because a failure that might pass
-    // left the state unasked: 8 x 5 attempts = 40 lookups and 240 s, measured.
-    //
-    // A lookup that fails now leaves an answer too — "the configured address,
-    // for the next few seconds" — so the seven behind the first find a
-    // decision rather than an invitation to repeat it.
+    // Eight threads, one hung `/hosts`. A failed lookup leaves a verdict (the
+    // configured address, for the retry window), so the seven behind the
+    // first do not repeat it. Leaving the state unasked instead costs 8 x 5
+    // attempts: measured, 40 lookups and 240 s.
     let control = Proxy::answering(Hosts::Hang, 200);
     let client = Client::new(&control.url()).with_proxy_discovery(true);
 
@@ -2643,9 +2396,8 @@ fn waiting_threads_do_not_queue_up_behind_a_failing_lookup() {
 
 #[test]
 fn eight_threads_against_a_healthy_cluster_still_ask_exactly_once() {
-    // The success path, which was already perfect and must stay that way: the
-    // lock is held across the lookup precisely so that the seven threads
-    // behind the first read its answer instead of asking again.
+    // The lock is held across the lookup so that the seven threads behind the
+    // first read its answer instead of asking again.
     let heavy = Proxy::new(None);
     let control = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&control);
@@ -2662,12 +2414,8 @@ fn eight_threads_against_a_healthy_cluster_still_ask_exactly_once() {
 
 #[test]
 fn a_local_cluster_is_never_asked_where_to_send_a_heavy_command() {
-    // The no-regression test, and the reason the others have to ask for
-    // discovery explicitly. A cluster on loopback is this machine's own or a
-    // tunnel to one: the address such a cluster publishes for itself is not
-    // reachable from here, and following it would break every upload that
-    // works today. So the default sends the request straight there, with no
-    // lookup in front of it.
+    // A cluster on loopback is local or tunnelled, and the address it
+    // publishes is not reachable from here, so by default no lookup is made.
     let control = Proxy::new(Some(r#"["heavy.example.net"]"#.to_owned()));
 
     Client::new(&control.url())
