@@ -1836,7 +1836,8 @@ fn a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not(
     // that finds the answer stale asks first; no background thread asks.
     //
     // An interval of zero makes every answer stale, so the second write
-    // re-asks; an hour-long interval does not.
+    // re-asks; an hour-long interval does not. The default interval is
+    // pinned in `every_heavy_shape_goes_there_and_the_cluster_is_asked_once`.
     let heavy = Proxy::new(None);
     let stale = Proxy::new(Some(format!(r#"["{}"]"#, heavy.host())));
     let client = discovering(&stale).with_host_list_refresh_interval(std::time::Duration::ZERO);
