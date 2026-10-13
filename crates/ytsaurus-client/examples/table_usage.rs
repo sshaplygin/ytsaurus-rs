@@ -4,7 +4,7 @@
 //! with it, writes a hundred structs, reads the row count back out of the
 //! table's attributes and scans every row into the struct again. This does the
 //! same, command for command, through `write_table_rows` and `read_table_rows`,
-//! with no YSON in the example. It checks that the schema derived from
+//! so rows never appear as YSON. It checks that the schema derived from
 //! `Contact` is the one the cluster stored and enforces, that the rows come back
 //! in order, and that `Name`, a struct naming one of the four columns, reads as
 //! a projection. Tables are left under `//tmp/ytsaurus_rs_table_usage`.
