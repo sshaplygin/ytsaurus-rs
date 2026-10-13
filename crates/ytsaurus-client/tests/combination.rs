@@ -143,7 +143,8 @@ fn a_discovered_proxy_that_fails_non_retriably_is_not_re_resolved() {
     // `worth_asking_again`, or a rejected certificate (`NotValidForName` names
     // one host). A failure about the request (cluster code 500, a resolve
     // error) is not the host's fault and would fail at every host, so the
-    // discovered proxy is kept and not re-resolved. The certificate side is pinned in
+    // discovered proxy is kept and not re-resolved. The certificate side is
+    // pinned in
     // `http::tests::a_rejected_certificate_drops_the_host_and_a_wrong_command_does_not`,
     // since a stub cannot stage the TLS handshake.
     let heavy = Proxy::new(Hosts::naming_itself().failing_commands_with(500));
@@ -284,7 +285,8 @@ fn a_plain_http_discovered_host_is_refused_from_an_https_client() {
     // `heavy_base` refuses any name carrying its own scheme. The client here
     // is configured over http, because a stub cannot serve TLS; the
     // `http://` entry is refused all the same, and the test checks only that
-    // the http host was never dialled.
+    // the http host was never dialled. The https case is pinned in
+    // `http::tests::a_hosts_answer_cannot_send_the_token_somewhere_else`.
     let evil = Proxy::new(Hosts::naming_itself());
     let control = Proxy::new(Hosts::listing(&format!("http://{}", evil.host())));
 
@@ -314,7 +316,8 @@ enum Hosts {
     /// `/hosts` answers 307 to a different origin: refused, as the client
     /// holds a token.
     RedirectCrossOrigin,
-    /// `/hosts` answers 307 to the same origin, then serves this list: followed.
+    /// `/hosts` answers 307 to the same origin, then serves this list:
+    /// followed.
     RedirectSameOriginTo(String),
 }
 
