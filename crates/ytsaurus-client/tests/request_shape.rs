@@ -1800,7 +1800,7 @@ fn heavy_commands_spread_across_the_pool_rather_than_piling_onto_the_first() {
     // each command picks at random, as both official clients do.
     //
     // Over 64 commands and three hosts, a fair pick leaves a host unvisited
-    // with probability 3·(2/3)^64 ≈ 5e-12; a pick pinned to a subset fails.
+    // with probability 3·(2/3)^64 ≈ 1.6e-11; a pick pinned to a subset fails.
     let (a, b, c) = (Proxy::new(None), Proxy::new(None), Proxy::new(None));
     let control = Proxy::control(format!(
         r#"["{}", "{}", "{}"]"#,
@@ -2346,7 +2346,7 @@ fn the_lookup_has_its_own_budget_and_a_heavy_command_does_not_wait_out_the_clien
     // The lookup has its own budget, not the client's retry policy (five
     // attempts, backoff, two minutes each), under which a 503 `/hosts` was
     // measured to cost a heavy command 15 s and a hung one 615 s. The 5 s
-    // bound is loose; what it rules out is two orders of magnitude away.
+    // bound is loose; the 615 s it rules out is two orders of magnitude away.
     for (what, hosts) in [
         ("503", Hosts::Status(503)),
         ("no answer at all", Hosts::Hang),
@@ -2370,8 +2370,9 @@ fn the_lookup_has_its_own_budget_and_a_heavy_command_does_not_wait_out_the_clien
 fn waiting_threads_do_not_queue_up_behind_a_failing_lookup() {
     // Eight threads, one hung `/hosts`. A failed lookup leaves a verdict (the
     // configured address, for the retry window), so the seven behind the
-    // first do not repeat it. Leaving the state unasked instead costs 8 x 5
-    // attempts: measured, 40 lookups and 240 s.
+    // first do not repeat it. With the lookup under the client's five-attempt
+    // policy and a failure leaving the state unasked, this was measured at
+    // 8 x 5 = 40 lookups and 240 s.
     let control = Proxy::answering(Hosts::Hang, 200);
     let client = Client::new(&control.url()).with_proxy_discovery(true);
 
