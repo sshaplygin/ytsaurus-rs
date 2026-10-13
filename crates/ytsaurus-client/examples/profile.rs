@@ -196,7 +196,7 @@ fn run() -> Result<(), ClientError> {
 /// read leaves it out rather than failing a finished measurement.
 ///
 /// The per-mode best times are quoted. They are the modes, not the phases in
-/// the table: `parse` includes everything up to decoding, and the table's
+/// the table: `parse` is everything up to and including decoding, and the table's
 /// `decoding them` is `parse` minus `frames`. `separable` picks the last
 /// sentence, so a run that could not separate the phases offers no verdict.
 fn caption(
