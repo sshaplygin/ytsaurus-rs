@@ -179,10 +179,10 @@ impl io::Write for SharedBuffer {
 /// - `cargo test --all-targets` compiles every example as a libtest harness at
 ///   `examples/<name>-<hash>`, which answers `running 0 tests`; a hashed
 ///   sibling is never used.
-/// - a plain `cargo test` builds runnable examples except those declared
-///   `test = true` in `Cargo.toml`, which also get the harness: `counted`,
-///   `sessionize`, `shards` and `wordcount`, four of the five workers exec'd
-///   here.
+/// - a plain `cargo test` builds runnable examples except the four declared
+///   `test = true` in `Cargo.toml` (`counted`, `sessionize`, `shards`,
+///   `wordcount`), which also get the harness. Three of them (`counted`,
+///   `sessionize`, `wordcount`) are among the five workers exec'd here.
 /// - `cargo test --test cat_e2e` builds no examples at all.
 ///
 /// So this runs `cargo build --example <name>` once per name per test binary.
