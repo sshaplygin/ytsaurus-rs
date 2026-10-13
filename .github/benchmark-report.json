@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "comparison": {
+    "regression_percent": 20,
+    "improvement_percent": 20,
+    "percent_decimals": 1,
+    "fail_on_regression": false,
+    "statistics": "none"
+  },
+  "report": {
+    "title": "Criterion: main vs PR",
+    "metrics": [
+      "time"
+    ],
+    "group_by": [
+      "suite"
+    ],
+    "sort": "name",
+    "columns": [
+      "benchmark",
+      "base",
+      "head",
+      "change",
+      "signal"
+    ]
+  },
+  "outputs": {
+    "markdown": "report.md",
+    "json": "report.json"
+  }
+}
