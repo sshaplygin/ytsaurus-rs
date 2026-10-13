@@ -18,7 +18,7 @@
 //! client.create_table("//tmp/visits", &Visit::table_schema())?;
 //! ```
 //!
-//! The attributes [`macro@TableRow`] reads, on the struct and on its fields:
+//! An example using most of the attributes [`macro@TableRow`] reads:
 //!
 //! ```ignore
 //! #[derive(TableRow)]
@@ -48,8 +48,8 @@ use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse
 ///
 /// One column per field, in declaration order, named after the field. The
 /// Rust type decides the column type, and `Option<T>` is the *only* thing that
-/// makes a column optional. Any other type is a compile error naming the
-/// field; give it `#[yt(column_type = "…")]`.
+/// makes a column optional. A type not in the table is a compile error naming
+/// the field; give it `#[yt(column_type = "…")]`.
 ///
 /// | Rust | column type |
 /// | --- | --- |
@@ -60,13 +60,13 @@ use syn::{Data, DeriveInput, Fields, GenericArgument, PathArguments, Type, parse
 /// | `YsonValue` | `any` |
 /// | `Option<T>` | `T`, not required |
 ///
-/// On the struct (examples in the [crate docs](crate)): `#[yt(non_strict)]`
-/// lets rows carry columns the schema does not mention; `#[yt(unique_keys)]`
-/// promises no two rows share a key, and requires a key;
-/// `#[yt(crate_path = "::path::to::ytsaurus_client")]` is for a renamed
-/// dependency. On a field: `#[yt(key)]` makes a key column, sorted ascending.
-/// Key fields must come first: the cluster refuses a schema whose keys are not
-/// a prefix, so the macro refuses it earlier and names the field.
+/// Attributes, most shown in the [`ytsaurus-helpers` docs](https://docs.rs/ytsaurus-helpers):
+/// on the struct, `#[yt(non_strict)]` lets rows carry columns the schema does
+/// not mention; `#[yt(unique_keys)]` promises no two rows share a key, and
+/// requires a key; `#[yt(crate_path = "::path::to::ytsaurus_client")]` is for a
+/// renamed dependency. On a field, `#[yt(key)]` makes a key column, sorted
+/// ascending. Key fields must come first: the cluster refuses a schema whose
+/// keys are not a prefix, so the macro refuses it earlier and names the field.
 /// `#[yt(name = "…")]` sets the column name, `#[yt(column_type = "…")]` the
 /// column type by its wire name, and `#[yt(skip)]` makes the field no column.
 #[proc_macro_derive(TableRow, attributes(yt))]
