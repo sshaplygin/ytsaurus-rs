@@ -1,65 +1,35 @@
-//! `yql_smoke` — phase 0 of `docs/format-comparison.md`.
+//! `yql_smoke`: phase 0 of `docs/format-comparison.md`, YQL through Query
+//! Tracker driven by `Client::raw_command`.
 //!
-//! Answers four questions about a cluster, driving Query Tracker through
-//! `Client::raw_command`. It is an **observation** program: it prints the
-//! bodies it got rather than only what it made of them, because the next
-//! decision — whether these commands deserve modelled methods on `Client` —
-//! needs an observed answer rather than a guessed one.
+//! Answers four questions about a cluster and prints the bodies it got as well
+//! as what it made of them:
 //!
 //! 1. Does this installation run YQL at all?
-//! 2. Which UDF modules does the agent load? `Re2` and `String` decide how
-//!    phase 1 tokenises `wordcount`. Asked first of the questions that could
-//!    fail, because it needs no table and so cannot be lost to one.
-//! 3. How is a table referred to — is there a `USE <cluster>` to get right?
-//! 4. Does a table-to-table `INSERT` run, and **where are the IDs of the
-//!    operations it spawns**?
+//! 2. Which UDF modules does the agent load (`Re2`, `String`, `Unicode`)?
+//!    Asked before anything that needs a table, so a table failure cannot lose
+//!    the answer.
+//! 3. How is a table referred to: a bare path, `USE <cluster>`, or a
+//!    cluster-qualified path?
+//! 4. Does a table-to-table `INSERT` run, and where are the IDs of the
+//!    operations it spawns?
+//!
+//! It exits non-zero when a step of the gate fails. The answers observed on
+//! `ghcr.io/ytsaurus/local:stable`, and the two pragmas in [`PRAGMAS`], are in
+//! `docs/format-comparison.md`, *Driving YQL* and *Phase 0*.
 //!
 //! ```sh
 //! tests/cluster-e2e/run_local_cluster.sh
 //! export YT_PROXY=http://localhost:8000
 //! cargo run -p ytsaurus-client --example yql_smoke
 //!
-//! # one query, whole answer printed — how every finding below was settled
+//! # one query, whole answer printed
 //! YT_YQL_QUERY='SELECT 1;' cargo run -p ytsaurus-client --example yql_smoke
 //! ```
 //!
-//! ## What it found on `ghcr.io/ytsaurus/local:stable`, 13 August 2026
-//!
-//! Each finding says what established it, because three earlier ones were
-//! written down from runs that could not have shown them and were false. The
-//! way they were false is worth keeping: every one came from a query that
-//! **spawned no operations** — `SELECT 1`, which runs inside the agent, and a
-//! repeat served from cache — so "there is no operation id here" was a
-//! statement about a query that had none.
-//!
-//! - The cluster is called **`locasaurus`** and needs no `USE`: a
-//!   backtick-quoted absolute path resolves on its own. `USE locasaurus;` also
-//!   works; `` `locasaurus.//tmp/…` `` does not. *(The three spellings in
-//!   question 3, each run.)*
-//! - **`Re2`, `String` and `Unicode` are loaded.** *(Question 2, one query
-//!   each.)*
-//! - **The query cache makes a repeat free.** The same `INSERT` run twice
-//!   without `PRAGMA yt.QueryCacheMode = "disable"` spawns two operations and
-//!   then **none**; with the pragma, two and two. A benchmark without it would
-//!   have measured a cache hit and called it a fast runtime. *(Two pairs of
-//!   runs through `YT_YQL_QUERY`, operations counted per query.)*
-//! - **YQL's default job memory is not quite enough here.** Without a pragma
-//!   the `map_reduce` stage dies with `User job failed: Memory limit exceeded`.
-//!   The default is `reducer.memory_limit = 545523360` — 512 MB plus overhead,
-//!   the same order as the 512 MB the other examples give a worker — and the
-//!   boundary is between **576M (fails) and 640M (passes)**. Hence
-//!   [`PRAGMAS`]. *(A query per candidate limit, plus `get_operation` on the
-//!   spec.)*
-//! - **The operation IDs are in the answer**, under
-//!   `progress/yql_progress/<node>/remoteId`, spelled `<proxy>/<operation
-//!   id>`, and again under `progress/yql_statistics/…/_id`. They are empty for
-//!   nodes that are not YT operations, which is every node of `SELECT 1`.
-//! - **`list_operations` finds them server-side**: its `filter` parameter
-//!   matches the title YQL gives each operation, `YQL operation (<query id> by
-//!   <user>)`. So the modelled `Client::list_operations` with
-//!   `OperationFilter::with_substring(query_id)` is the lookup, and no
-//!   `raw_command` detour is needed for it. *(Both checked against a query
-//!   whose operations existed — the mistake that made the earlier claim false.)*
+//! `YT_YQL_QUERY` runs that one query instead of the gate. Tables are left
+//! under `//tmp/ytsaurus_rs_yql`. A conclusion such as "the answer holds no
+//! operation id" needs a query that spawned operations: `SELECT 1` runs inside
+//! the agent, and a repeat is served from the query cache.
 
 use std::process::ExitCode;
 use std::thread::sleep;
@@ -76,13 +46,10 @@ const BASE: &str = "//tmp/ytsaurus_rs_yql";
 
 /// Prepended to every query that touches a table.
 ///
-/// Both are load-bearing, and the module docs say how each was measured.
 /// Without the first, a repeated query is served from cache and spawns
-/// nothing at all; without the second, the `map_reduce` stage dies on its own
-/// memory limit. 640M is the measured boundary rather than a round number: it
-/// is close to YQL's own default, so the Rust side of a comparison stays at
-/// the 512 MB the other examples use rather than being handed several times
-/// what it needs.
+/// nothing; without the second, the `map_reduce` stage dies on its memory
+/// limit. 640M is the measured boundary (576M fails), close to YQL's own
+/// default, so a worker compared against it keeps the 512 MB other examples use.
 const PRAGMAS: &str = "PRAGMA yt.QueryCacheMode = \"disable\";\n\
                        PRAGMA yt.DefaultMemoryLimit = \"640M\";\n";
 
@@ -92,16 +59,13 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(300);
 /// States a query does not leave.
 ///
 /// Observed on the way there: `pending`, `running`, `completing`, `failing`.
-/// Anything unknown is treated as non-terminal and waits, which is the safe
-/// direction: a query wrongly called finished is a wrong measurement, a query
-/// wrongly waited on is a slow one.
+/// An unknown state is treated as non-terminal and waited on.
 const TERMINAL: [&str; 3] = ["completed", "failed", "aborted"];
 
 fn main() -> ExitCode {
     match run() {
         Ok(true) => ExitCode::SUCCESS,
-        // The gate not passing is a legitimate outcome and still a successful
-        // run of this program — but the exit code has to say so.
+        // The gate not passing is an answer, reported through the exit code.
         Ok(false) => {
             eprintln!("\nthe YQL gate did not pass; see above for which step failed");
             ExitCode::FAILURE
@@ -116,16 +80,11 @@ fn main() -> ExitCode {
 fn run() -> Result<bool, ClientError> {
     let client = Client::from_env()?;
 
-    // One query, printed whole. The knob exists because settling a question
-    // like "is an operation id anywhere in this answer" is a loop, and running
-    // the whole gate for each turn of it costs a minute a time. Every finding
-    // in the module docs was settled through here.
+    // One query, printed whole, without running the gate.
     if let Ok(query) = std::env::var("YT_YQL_QUERY") {
         step("One query, verbatim");
-        // Through the same wait as the gate: a cluster that has just come up
-        // fails this query with "YQL agent stage ... is not found", and the
-        // knob is what a person uses most, so it is the last place that should
-        // report a starting cluster as a broken one.
+        // Through the same wait as the gate, so a cluster that is still
+        // starting is not reported as broken.
         wait_for_agent(&client)?;
         let outcome = run_query(&client, &query, true)?;
         return Ok(outcome.completed());
@@ -162,9 +121,7 @@ fn run() -> Result<bool, ClientError> {
 
     // --------------------------------------------------------- UDF modules
 
-    // Before anything that needs a table: this question has no table in it,
-    // and phase 1's tokenisation depends on the answer, so it must not be lost
-    // to a failure that belongs to a different question.
+    // Before anything that needs a table, so a table failure cannot lose it.
     step("2. Which UDF modules the agent loads");
     let mut loaded = Vec::new();
     for (module, query) in [
@@ -205,9 +162,7 @@ fn run() -> Result<bool, ClientError> {
     let input = format!("{BASE}/lines");
     let output = format!("{BASE}/counts");
     if let Err(e) = prepare_input(&client, &input) {
-        // Not fatal, and not `?`: the answers already collected are the
-        // point of this program, and one of them is worth more than a tidy
-        // exit.
+        // Not `?`: the answers already collected are still reported.
         println!("   could not prepare {input}: {e}");
         report(&answers);
         return Ok(false);
@@ -224,10 +179,8 @@ fn run() -> Result<bool, ClientError> {
         ("cluster-qualified path", String::new(), qualified.as_str()),
     ];
 
-    // Both halves are carried forward, because they differ in different
-    // places: `USE` is a prefix, a qualified name is the table expression
-    // itself. Keeping only one of them would answer question 4 with a spelling
-    // that had just failed.
+    // Both halves are carried forward: `USE` is a prefix, a qualified name is
+    // the table expression itself.
     let mut working: Option<(String, String)> = None;
     for (name, prefix, table) in &spellings {
         let reference = if table.starts_with('`') {
@@ -282,13 +235,9 @@ fn run() -> Result<bool, ClientError> {
         }
     };
 
-    // Read whether or not the query worked: a failed query that still spawned
-    // operations answers the question either way.
-    // `Result` rather than a `Vec` flattened on failure. "The call failed" and
-    // "the query spawned none" are opposite answers to the one question this
-    // step exists to ask, and printing both as `operations per query: 0` would
-    // report a broken lookup as a finding about YQL — which is exactly how the
-    // three false claims this file records came to be written.
+    // Read whether or not the query worked: a failed query may still have
+    // spawned operations. Kept as a `Result`, so a failed lookup is not
+    // reported as "the query spawned none".
     let spawned = operations_of(&client, &outcome.id);
     match &spawned {
         Ok(found) if found.is_empty() => {
@@ -307,9 +256,7 @@ fn run() -> Result<bool, ClientError> {
     let spawned = spawned.unwrap_or_default();
     for operation in &spawned {
         println!("   spawned {} {} {}", operation.0, operation.1, operation.2);
-        // The question is not "is there a key called operation" — an earlier
-        // version asked that and got the wrong answer — but "is this id in the
-        // body", which is answerable by looking for the id itself.
+        // Searched by the id's value, not by a key name.
         let mentions = paths_mentioning(&outcome.answer, &operation.0);
         if mentions.is_empty() {
             println!("     not mentioned anywhere in the get_query answer");
@@ -359,10 +306,7 @@ struct Outcome {
     state: String,
     /// Whether the wait ran out before the query reached a terminal state.
     ///
-    /// Separate from `state` rather than spliced into it: a query that
-    /// completes on the very poll that notices the deadline is completed, and
-    /// a state string reading `completed (timed out)` would fail every
-    /// comparison against `completed`.
+    /// Separate from `state`, so comparisons against `completed` stay exact.
     timed_out: bool,
     answer: YsonValue,
     error: Option<Vec<String>>,
@@ -377,12 +321,8 @@ impl Outcome {
 
     /// One line: the state, and what went wrong.
     ///
-    /// The category and the innermost cause, which is what
-    /// [`ytsaurus_client::error_summary`] produces — the crate has known how to
-    /// flatten one of these since jobs had errors, and this example carried its
-    /// own worse version until that function was made public. The chain is
-    /// still collected and printed in full elsewhere here, because this is an
-    /// observation program and the whole tree is sometimes the point.
+    /// The category and the innermost cause, from
+    /// [`ytsaurus_client::error_summary`]. `run_query` prints the whole chain.
     fn summary(&self) -> String {
         let mut line = if self.timed_out {
             format!(
@@ -403,16 +343,12 @@ impl Outcome {
 
 /// Starts a query and polls it to a terminal state.
 ///
-/// The verb is not a guess. The HTTP proxy reference gives the rule outright —
-/// *"If the command has an input data stream, then PUT. If the command is
-/// mutating, then POST. Otherwise GET."* — and the cluster's driver registry
-/// declares those two properties per command. So `start_query` is a POST and
-/// `get_query` a GET; `Repeatable::Never` for the first because the crate has
-/// never heard of it and a retry could start a second query rather than find
-/// the first, `Repeatable::Freely` for the second because it is a read.
+/// The HTTP proxy reference's rule: *"If the command has an input data
+/// stream, then PUT. If the command is mutating, then POST. Otherwise GET."*
+/// So `start_query` is a POST with `Repeatable::Never`, since a retry could
+/// start a second query, and `get_query` a GET with `Repeatable::Freely`.
 ///
-/// `verbose` prints the whole final answer, which is what settles a question
-/// about the shape of an API nobody here had seen.
+/// `verbose` prints the whole final answer.
 fn run_query(client: &Client, query: &str, verbose: bool) -> Result<Outcome, ClientError> {
     let params = yson_build::map([
         ("engine", yson_build::string("yql")),
@@ -423,8 +359,7 @@ fn run_query(client: &Client, query: &str, verbose: bool) -> Result<Outcome, Cli
     if verbose {
         println!("   start_query answered {}", clip(&started, 400));
     }
-    // The envelope is `{query_id=…}`, observed. No fallback for a bare-string
-    // body: an untested branch that fired would poll on whatever it was given.
+    // The envelope is `{query_id=…}`, observed; a bare-string body is an error.
     let id = field(&started, "query_id")
         .as_ref()
         .and_then(text_of)
@@ -456,8 +391,7 @@ fn run_query(client: &Client, query: &str, verbose: bool) -> Result<Outcome, Cli
             last_state = state.clone();
         }
 
-        // Terminal wins over the deadline: a query that finished on this very
-        // poll finished, however long it took to get here.
+        // Terminal wins over the deadline.
         let terminal = TERMINAL.contains(&state.as_str());
         let timed_out = !terminal && Instant::now() >= deadline;
         if terminal || timed_out {
@@ -501,14 +435,11 @@ fn run_query(client: &Client, query: &str, verbose: bool) -> Result<Outcome, Cli
 /// `SELECT 1`, retried while the YQL agent is still coming up.
 ///
 /// A freshly started or resumed cluster answers `ping` in seconds, publishes
-/// `//sys/@cluster_name` a little later, and registers its YQL agent later
-/// still. In between, Query Tracker **accepts** a query and then fails it with
-/// `YQL agent stage "production" is not found in cluster directory` — so a gate
-/// run too early reports "this installation does not run YQL" about an
-/// installation that does. That is a wrong answer to the one question this
-/// program exists to answer, which is worth a minute of patience.
-///
-/// Only that one error is waited on. Anything else is the answer.
+/// `//sys/@cluster_name` later, and registers its YQL agent later still. In
+/// between, Query Tracker accepts a query and fails it with
+/// `YQL agent stage "production" is not found in cluster directory`. Only that
+/// error is waited on, twelve attempts ten seconds apart; anything else is the
+/// answer.
 fn wait_for_agent(client: &Client) -> Result<Outcome, ClientError> {
     const ATTEMPTS: usize = 12;
     const GAP: Duration = Duration::from_secs(10);
@@ -533,9 +464,8 @@ fn wait_for_agent(client: &Client) -> Result<Outcome, ClientError> {
 
 /// Stops a query this program has given up on.
 ///
-/// Best effort, and reported rather than propagated: the caller is already
-/// handling a failure, and a query left running on the cluster is the thing
-/// worth avoiding. POST and `Repeatable::Never`, for `start_query`'s reasons.
+/// Best effort: a failure is printed, not propagated, since the caller is
+/// already handling one. POST and `Repeatable::Never`, as for `start_query`.
 fn abort_query(client: &Client, id: &str) {
     let params = yson_build::map([("query_id", yson_build::string(id))]);
     match client.raw_command(Method::Post, "abort_query", &params, None) {
@@ -547,13 +477,8 @@ fn abort_query(client: &Client, id: &str) {
 /// The operations a query spawned: `(id, type, state)` apiece.
 ///
 /// YQL titles every operation it starts `YQL operation (<query id> by <user>)`,
-/// and the cluster's own `filter` matches on it — so this is the modelled
-/// `Client::list_operations`, not a raw command and not a scan of titles this
-/// program does itself. An earlier version did both, on the strength of a test
-/// against a query that had spawned nothing.
-///
-/// Read soon rather than later: a local cluster has no operations archive, so
-/// the scheduler's memory is the only copy.
+/// and the cluster's `filter` matches on it, so `Client::list_operations` finds
+/// them. Read promptly: a local cluster has no operations archive.
 fn operations_of(
     client: &Client,
     query_id: &str,
@@ -606,9 +531,8 @@ fn prepare_input(client: &Client, path: &str) -> Result<(), ClientError> {
 
 /// The messages inside a cluster error tree, outermost first.
 ///
-/// The tree is mostly attributes — pids, thread names, trace ids — and the one
-/// thing a reader needs is the sentence at the bottom of it. Printing the tree
-/// instead of this is how a failed query costs an hour.
+/// The tree is mostly attributes (pids, thread names, trace ids); `attributes`
+/// is skipped.
 fn error_messages(error: &YsonValue) -> Vec<String> {
     let mut found = Vec::new();
     collect_messages(error, &mut found);
@@ -641,10 +565,8 @@ fn collect_messages(value: &YsonValue, found: &mut Vec<String>) {
 
 /// Every place in `value` whose string contains `needle`, with its path.
 ///
-/// By value rather than by key name. The question is "is this operation id in
-/// this answer", and the ids turned out to live under `remoteId` and `_id` —
-/// keys a search for the word "operation" cannot find, which is exactly how an
-/// earlier version of this file concluded they were absent.
+/// By value rather than by key name: the ids live under `remoteId` and `_id`,
+/// which a search for the word "operation" cannot find.
 fn paths_mentioning(value: &YsonValue, needle: &str) -> Vec<(String, YsonValue)> {
     let mut found = Vec::new();
     walk(value, String::new(), needle, &mut found);
@@ -766,8 +688,8 @@ mod tests {
         assert!(error_messages(&parse("{code=0;message=\"\";attributes={}}")).is_empty());
     }
 
-    /// The finding this file got wrong once: the ids are under `remoteId`, a
-    /// key no search for the word "operation" would reach.
+    /// The ids are under `remoteId` and `_id`, keys no search for the word
+    /// "operation" would reach.
     #[test]
     fn paths_mentioning_finds_an_id_under_any_key() {
         let answer = parse(
