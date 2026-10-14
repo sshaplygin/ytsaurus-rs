@@ -474,4 +474,72 @@ mod tests {
         let error = rows_to_fragment(&[row]).unwrap_err();
         assert!(error.to_string().contains("Value::Any"), "{error}");
     }
+
+    #[test]
+    fn a_bad_any_value_fails_lookup_insert_and_delete_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Short, so a request that does go out fails here rather than after
+        // the default timeout: nothing answers on this listener.
+        let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()))
+            .with_timeout(std::time::Duration::from_secs(1));
+        let rows = [Row::new().with("key", Value::Any(b"not a yson value".to_vec()))];
+
+        let results = [
+            (
+                "lookup",
+                client
+                    .lookup_rows_dynamic("//t", &rows, &LookupOptions::default())
+                    .err(),
+            ),
+            ("insert", client.insert_rows_dynamic("//t", &rows).err()),
+            ("delete", client.delete_rows_dynamic("//t", &rows).err()),
+        ];
+        for (method, error) in results {
+            assert!(
+                matches!(error, Some(ClientError::Decode { .. })),
+                "{method}: {error:?}"
+            );
+        }
+
+        let accepted = listener.accept().map(|_| ());
+        assert!(
+            matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a request reached the listener: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn the_interface_keeps_cluster_codes_and_reports_the_rest_as_transport() {
+        let cluster = |code| ClientError::Cluster {
+            command: "lookup_rows".to_owned(),
+            code,
+            message: "refused".to_owned(),
+            raw: String::new(),
+        };
+
+        let mapped = map_error("lookup_rows", cluster(1702));
+        assert!(
+            matches!(mapped, ytsaurus_api::Error::Cluster { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.code(), Some(1702));
+
+        let mapped = map_error("lookup_rows", cluster(i64::from(i32::MAX) + 1));
+        assert!(
+            matches!(mapped, ytsaurus_api::Error::Cluster { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.code(), None);
+
+        let decode = ClientError::Decode {
+            command: "lookup_rows".to_owned(),
+            reason: "malformed row".to_owned(),
+        };
+        let mapped = map_error("lookup_rows", decode);
+        assert!(
+            matches!(mapped, ytsaurus_api::Error::Transport { .. }),
+            "{mapped:?}"
+        );
+    }
 }
