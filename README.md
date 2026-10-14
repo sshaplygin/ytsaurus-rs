@@ -271,11 +271,10 @@ surface and open gates. `DataFormat` selects binary or text YSON or dynamic
 Skiff. Whether Skiff becomes the default is undecided:
 [docs/benchmarking.md](docs/benchmarking.md).
 
-The pinned parity issue tracks what is still needed to match the official
-clients. Open work that needs a human: a public write-up, upstreaming, and
-convergence with yson-rs, all listed under
-[Status in AGENTS.md](AGENTS.md#status), the project context for contributors
-and coding agents.
+Open work is in the
+[issue tracker](https://github.com/sshaplygin/ytsaurus-rs/issues); what needs
+a human decision is under [Status in AGENTS.md](AGENTS.md#status), the project
+context for contributors and coding agents.
 
 Verified on a local YTsaurus in Docker: the identity map (output byte-identical
 to the input, 309 688 bytes), a two-input, two-output run with table switching,

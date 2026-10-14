@@ -229,9 +229,7 @@ library would pick. Better than both:
   does it only when the error message happens to match a string;
 - typed whole-table I/O in one call, which neither has.
 
-The six gaps the
-[parity issue](https://github.com/sshaplygin/ytsaurus-rs/issues) listed are
-built: logging and tracing (a `traceparent`, and the optional
+The six gaps a production deployment needed are built: logging and tracing (a `traceparent`, and the optional
 `tracing` feature); the operation object and lifecycle; read-side
 `TablePath::columns` / `::range`; `read_file` and its streaming half; batch
 requests (`BatchRequest`, `Client::execute_batch`, per-part `Result`s, the C++
