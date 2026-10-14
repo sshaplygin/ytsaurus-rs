@@ -77,8 +77,9 @@ const ERROR_BODY_LIMIT: u64 = 64 * 1024;
 /// How much of a `/hosts` answer [`Transport::fetch`] holds, after
 /// decompression: 1 MiB.
 ///
-/// The answer is a JSON list of bare host names; the cap holds 4 096 of the
-/// longest a DNS name can be ([response size
+/// The answer is a JSON list of bare host names. Written compactly and without
+/// ports, the cap holds 4 096 entries of the longest a DNS name can be;
+/// spacing or a port in each entry means fewer ([response size
 /// limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits)).
 /// A larger answer fails with [`ClientError::ResponseTooLarge`].
 const HOSTS_LIMIT: u64 = 1024 * 1024;
@@ -1267,7 +1268,10 @@ impl Transport {
             // As in `send`: a body cut off by the network stays a retriable
             // `Transport`, and one past the cap is `ResponseTooLarge`.
             let body = read_capped(what, response.body_mut(), HOSTS_LIMIT)?;
-            Ok(String::from_utf8_lossy(&body).into_owned())
+            String::from_utf8(body).map_err(|e| ClientError::Decode {
+                command: what.to_owned(),
+                reason: format!("{path} answered with a body that is not UTF-8: {e}"),
+            })
         })
     }
 
@@ -1832,7 +1836,9 @@ impl<R: std::io::Read> std::io::Read for CapReader<R> {
 /// The backstop beneath [`CapReader`], which counts decoded bytes: a chunked
 /// stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing,
 /// and `flate2` loops inside one `read` that never returns without a wire
-/// limit. `an_endless_body_that_decodes_to_nothing_is_still_bounded` checks it.
+/// limit. `an_endless_body_that_decodes_to_nothing_is_still_bounded` checks it
+/// for [`read_capped`], `an_endless_error_body_that_decodes_to_nothing_is_still_bounded`
+/// for [`error_body`].
 ///
 /// It cannot be `limit`: deflate expands incompressible input, so the largest
 /// permitted body crosses the wire larger than the cap. The budget is zlib's
@@ -1880,25 +1886,37 @@ fn error_body(body: &mut ureq::Body) -> String {
     render_error_body(wire, ERROR_BODY_LIMIT)
 }
 
-/// Reads at most `limit` bytes of `reader` through [`CapReader`] and renders
-/// the first 400 of them.
+/// Reads at most `limit` decoded bytes of `reader` through [`CapReader`] and
+/// renders the first 400 of them.
 ///
-/// A body past `limit` ends with `… (cut at {limit} bytes, the rest unread)`.
-/// Any other body is rendered by [`truncate`], which quotes its whole length.
+/// A body read to its end goes to [`truncate`], which quotes its length when
+/// it is over 400 bytes. A read that stopped early ends with a note saying
+/// why and how much was read:
+///
+/// - `cut at {limit} bytes, the rest unread`: past `limit` decoded bytes;
+/// - `cut after {n} bytes on the wire, {m} decoded, the rest unread`: past the
+///   wire limit beneath the decoder, which reports a limit other than `limit`;
+/// - `{m} bytes read, then: {error}`: any other failure, such as a connection
+///   cut mid-body.
 fn render_error_body(reader: impl std::io::Read, limit: u64) -> String {
     use std::io::Read;
 
     let mut bytes = Vec::new();
     let read = CapReader::new(reader, limit).read_to_end(&mut bytes);
+    let decoded = bytes.len();
     let text = String::from_utf8_lossy(&bytes);
 
-    match read.map_err(ureq::Error::from) {
-        Err(ureq::Error::BodyExceedsLimit(_)) => format!(
-            "{}… (cut at {limit} bytes, the rest unread)",
-            prefix(&text, 400)
-        ),
-        _ => truncate(&text, 400),
-    }
+    let note = match read.map_err(ureq::Error::from) {
+        Ok(_) => return truncate(&text, 400),
+        Err(ureq::Error::BodyExceedsLimit(cap)) if cap == limit => {
+            format!("cut at {limit} bytes, the rest unread")
+        }
+        Err(ureq::Error::BodyExceedsLimit(wire)) => {
+            format!("cut after {wire} bytes on the wire, {decoded} decoded, the rest unread")
+        }
+        Err(error) => format!("{decoded} bytes read, then: {error}"),
+    };
+    format!("{}… ({note})", prefix(&text, 400))
 }
 
 /// Which error a buffered response body failed with, and whose fault it is.
@@ -4402,6 +4420,33 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         format!("http://{address}")
     }
 
+    /// Serves `sent` under a `Content-Length` of `declared` and closes the
+    /// connection: a body cut by the network after `sent.len()` bytes.
+    fn serving_cut_short(status: &'static str, sent: &'static [u8], declared: usize) -> String {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("has an address");
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
+            drain_request(&mut reader);
+
+            let mut reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {declared}\r\n\r\n"
+            )
+            .into_bytes();
+            reply.extend_from_slice(sent);
+            stream.write_all(&reply).ok();
+            stream.flush().ok();
+            stream.shutdown(std::net::Shutdown::Both).ok();
+        });
+
+        format!("http://{address}")
+    }
+
     /// Serves a gzip body that never ends and decodes to nothing.
     ///
     /// The case the wire backstop is the only guard against, and the reason
@@ -4415,6 +4460,11 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
     /// Chunked, so there is no length to disagree with, and the thread writes
     /// until the client stops listening.
     fn serving_endless_empty_deflate() -> String {
+        serving_endless_empty_deflate_as("200 OK")
+    }
+
+    /// [`serving_endless_empty_deflate`] with the status line chosen.
+    fn serving_endless_empty_deflate_as(status: &'static str) -> String {
         use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -4425,13 +4475,11 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
             let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
             drain_request(&mut reader);
 
-            if stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
-                      Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
-                )
-                .is_err()
-            {
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
                 return;
             }
 
@@ -4819,6 +4867,96 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
     fn the_small_caps_are_the_documented_ones() {
         assert_eq!(ERROR_BODY_LIMIT, 64 * 1024);
         assert_eq!(HOSTS_LIMIT, 1024 * 1024);
+    }
+
+    #[test]
+    fn an_endless_error_body_that_decodes_to_nothing_is_still_bounded() {
+        // `an_endless_body_that_decodes_to_nothing_is_still_bounded` for the
+        // non-2xx branch: only the wire limit in `error_body` ends this read,
+        // so without it the call never returns. On threads with a deadline
+        // for the same reason.
+        let status = "503 Service Unavailable";
+        let (done, answer) = std::sync::mpsc::channel();
+
+        let opened = done.clone();
+        let base = serving_endless_empty_deflate_as(status);
+        std::thread::spawn(move || {
+            let outcome = Transport::new(&base, None, Duration::from_secs(10))
+                .open(
+                    Method::Get,
+                    "read_table",
+                    &map([("path", string("//tmp/t"))]),
+                )
+                .map(|_| ());
+            let _ = opened.send(("open", outcome));
+        });
+
+        let base = serving_endless_empty_deflate_as(status);
+        std::thread::spawn(move || {
+            let outcome = Transport::new(&base, None, Duration::from_secs(10))
+                .fetch("/hosts", "hosts")
+                .map(|_| ());
+            let _ = done.send(("fetch", outcome));
+        });
+
+        for _ in 0..2 {
+            let (what, outcome) = answer
+                .recv_timeout(Duration::from_secs(20))
+                .expect("an error body that never ends must still be cut, and was not");
+            let error = outcome.expect_err(what);
+            let ClientError::Http { status, body, .. } = &error else {
+                panic!("{what}: {error:?}");
+            };
+            assert_eq!(*status, 503, "{what}");
+            // Stopped beneath the decoder, with nothing decoded: the note says
+            // so rather than claim a cut at the decoded cap.
+            let wire = wire_budget(ERROR_BODY_LIMIT);
+            assert!(
+                body.contains(&format!("cut after {wire} bytes on the wire, 0 decoded")),
+                "{what}: {body}"
+            );
+            assert!(!body.contains("cut at"), "{what}: {body}");
+        }
+    }
+
+    #[test]
+    fn a_hosts_answer_cut_by_the_network_is_told_by_its_status() {
+        // 2xx: the answer itself is incomplete, a retriable `Transport`, so
+        // the router asks again after `HOSTS_RETRY_AFTER`.
+        let base = serving_cut_short("200 OK", b"[\"n1.exa", 64);
+        let error = Transport::new(&base, None, Duration::from_secs(10))
+            .fetch("/hosts", "hosts")
+            .expect_err("the answer is incomplete");
+        assert!(matches!(error, ClientError::Transport { .. }), "{error:?}");
+        assert!(crate::retry::worth_asking_again(&error), "{error}");
+
+        // Non-2xx: the status has decided, so it is `Http`, and the message
+        // keeps what arrived and says it is not the whole body.
+        let base = serving_cut_short("400 Bad Request", b"{\"message\":\"no", 64);
+        let error = Transport::new(&base, None, Duration::from_secs(10))
+            .fetch("/hosts", "hosts")
+            .expect_err("the status is 400");
+        let ClientError::Http { status, body, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*status, 400);
+        assert!(
+            body.starts_with("{\"message\":\"no… (14 bytes read, then: "),
+            "{body}"
+        );
+        assert!(!crate::retry::worth_asking_again(&error), "{error}");
+    }
+
+    #[test]
+    fn a_hosts_answer_that_is_not_utf8_is_refused() {
+        let base = serving(b"[\"n1.\xffexample.net\"]", false);
+        let error = Transport::new(&base, None, Duration::from_secs(10))
+            .heavy_hosts()
+            .expect_err("the answer is not UTF-8");
+        assert!(
+            matches!(&error, ClientError::Decode { command, .. } if command == "hosts"),
+            "{error:?}"
+        );
     }
 
     #[test]
