@@ -36,7 +36,7 @@ allocator. This comparison did not decide whether Skiff should be the default.
   ([§ Skiff in a job](#skiff-in-a-job-today)).
 - The decode share in the threshold's unit, job CPU, is not measured: the local
   cluster reports nothing under `user_job/cpu`. Repeated production runs are
-  still owed (#70), and so is required test 5 (cluster fixtures) of
+  still owed, and so is required test 5 (cluster fixtures) of
   [`skiff-compatibility.md`](skiff-compatibility.md).
 - Of the four parts of the prediction recorded before the runs, two were
   refuted, one was refuted in part and one held.
@@ -192,8 +192,8 @@ to prove semantic agreement cheaply.
 v1.0 collected "total job CPU time". From
 [`docs/protocol-reference.md`](protocol-reference.md#custom-job-statistics):
 
-> A local cluster reports nothing under `user_job/cpu`, so job-CPU
-> comparisons cannot be run here; `time/exec` is what it does report.
+> A local cluster reports `time/exec` but nothing under `user_job/cpu`, so
+> job-CPU comparisons cannot be run here.
 > — [`docs/protocol-reference.md`](protocol-reference.md), *Custom job statistics*
 
 Locally the results are wall clock under emulation, never CPU.
@@ -339,16 +339,17 @@ harness killed mid-run does not leave a query running on the cluster.
 Query Tracker is a non-goal of this client (AGENTS.md); the harness reaches it
 through `raw_command`, as
 [`docs/sdk-comparison.md`](sdk-comparison.md#query-tracker-through-raw_command)
-shows. For scale: `read_file` was 1824 lines across 15
-files (#47), transaction detach 1864 (#45), batch requests 3371 (#44). A minimal
-query surface (`start_query`, `get_query`, `wait_for_query`, `abort_query`, a
-`QueryState` enum, a parsed `QueryInfo`) would be roughly 1.5–2 k lines with
-wire-shape tests, a cluster example and the CHANGELOG; `list_queries` with a
-filter builder and the `get_query_result` / `read_query_result` path roughly
-doubles it. The harness's raw helpers are under 150 lines. Phase 0 proved the
-`get_query` wire shape, as `examples/raw.rs` did for `Client::read_file` and
-`read_file_streaming`; a modelled surface still lacks a second caller.
-`OperationInfo` has no `brief_spec`, which nothing here needs.
+shows. For scale, GitHub reports the pull requests for `read_file`, transaction
+detach and batch requests as adding 1824 lines (across 15 files), 1864 and 3371.
+A minimal query surface (`start_query`, `get_query`, `wait_for_query`,
+`abort_query`, a `QueryState` enum, a parsed `QueryInfo`) would be roughly 1.5–2
+k lines with wire-shape tests, a cluster example and the CHANGELOG;
+`list_queries` with a filter builder and the `get_query_result` /
+`read_query_result` path roughly doubles it. The harness's raw helpers are under
+150 lines. Phase 0 proved the `get_query` wire shape, as `examples/raw.rs` did
+for `Client::read_file` and `read_file_streaming`; a modelled surface still
+lacks a second caller. `OperationInfo` has no `brief_spec`, which nothing here
+needs.
 
 ## Phases
 

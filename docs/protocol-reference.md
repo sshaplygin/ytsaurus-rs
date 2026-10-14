@@ -24,7 +24,7 @@ Output table `k` is fd `3k + 1`: tables 0, 1 and 2 are fds 1, 4 and 7. A job's e
 Observed in a job: `YT_JOB_ID`, `YT_OPERATION_ID`, `YT_JOB_COOKIE`, `YT_JOB_INDEX`, `YT_TASK_JOB_INDEX`, `YT_START_ROW_INDEX`, `YT_FIRST_OUTPUT_TABLE_FD`, `YT_NODE_HOST`, `YT_POOL_TREE`, `YT_COLLECTIVE_ID`/`YT_COLLECTIVE_MEMBER_RANK`, `YT_JOB_PROXY_{GRPC,HTTP}_SOCKET_PATH`.
 
 - `is_inside_job()` tests `YT_JOB_ID`, as Go's `mapreduce.InsideJob` does.
-- argv is exactly the spec's command, `["./selfrun"]`. Role dispatch by argv (`wordcount map`) works if the call site passes the role.
+- argv is the spec's command, `["./selfrun"]`. Role dispatch by argv (`wordcount map`) works if the call site passes the role.
 
 ## Custom job statistics
 
@@ -38,7 +38,7 @@ Observed in a job: `YT_JOB_ID`, `YT_OPERATION_ID`, `YT_JOB_COOKIE`, `YT_JOB_INDE
   The name is one key, slash included; below it `$`, job state, job type, aggregate.
 - `Client::statistic_sum` totals the `completed` state across job types; an aborted job's work is redone by its replacement.
 - `JobStatistics` writes fd 5 only when `is_inside_job()`; in a launcher fd 5 may be a socket.
-- Built-in statistics are stored differently, hence `Client::job_statistic_sum`: the name nests by path component (`time` → `exec`) and the state separator is `$$`. A local cluster reports nothing under `user_job/cpu`, so job-CPU comparisons cannot be run here; `time/exec` is what it does report.
+- Built-in statistics are stored differently, hence `Client::job_statistic_sum`: the name nests by path component (`time` → `exec`) and the state separator is `$$`. A local cluster reports `time/exec` but nothing under `user_job/cpu`, so job-CPU comparisons cannot be run here.
 
 ## Table schemas
 
@@ -92,7 +92,7 @@ Observed:
 
 ### Handing a transaction to another process
 
-`detach` / `attach_transaction` (#13). Observed:
+`detach` / `attach_transaction`. Observed:
 
 - `@timeout` is in milliseconds and is `Int64`: `get #<id>/@timeout` on a 30 s transaction answers `{"value"=30000;}` in text YSON. `Transaction::attach` also accepts `Uint64`.
 - The attribute is the configured timeout, not the time remaining. `attach` pings before returning; otherwise a handoff longer than `timeout × 2/3` yields a handle whose first ping arrives after expiry.
@@ -116,12 +116,12 @@ Observed:
 
 - `read_file` streams and `write_file` takes a chunked body: a 4 MB round trip through `Client::raw_command_streaming` and `raw_command_upload` held the file in neither direction.
 - The buffered `read_file` compares the body with `@uncompressed_data_size`: a truncated body looks like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot read. On `compression_codec=zlib_6` nodes of 1 000 000 bytes, `@compressed_data_size` was 4 214 for cycling `i % 256` bytes, 999 for zeros and 1 000 324 for `os.urandom`; the read passes against all three. `@file_size` does not exist (`Attribute "file_size" is not found`).
-- A rich path does nothing to a file read. On a 1000-byte file, `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads all 1000 bytes; `//tmp/f[#0:#10]` also returns 1000, then fails the size check because `//tmp/f[#0:#10]/@uncompressed_data_size` does not parse (`Error reading parameter /path: Unexpected token "/" of type "slash"`). Files are sliced by the `offset` and `length` parameters; selection is #12.
+- A rich path does nothing to a file read. On a 1000-byte file, `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads all 1000 bytes; `//tmp/f[#0:#10]` also returns 1000, then fails the size check because `//tmp/f[#0:#10]/@uncompressed_data_size` does not parse (`Error reading parameter /path: Unexpected token "/" of type "slash"`). Files are sliced by the `offset` and `length` parameters.
 
 ### Response size limits
 
 - `ureq`'s `limit()` bounds transferred bytes, not memory: `BodyWithConfig::do_build` puts the gzip decoder on top of a `LimitReader`. Measured: a `read_file` of 600 MiB of zeros arrived in 611 522 wire bytes, and `.limit(536870912)` returned all 629 145 600. The memory cap, `http::CapReader`, sits above the decoder.
-- A wire limit is still needed underneath: a chunked stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing, and `flate2` loops inside one `read`.
+- A wire limit is needed underneath: a chunked stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing, and `flate2` loops inside one `read`.
 - The wire limit cannot be the memory cap: 4 096 incompressible bytes gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip wrapper.
 - The memory cap is not a process budget: `read_to_end` doubles a `Vec` and copies, so both buffers are resident during a copy (about 1.5× where the allocator cannot extend in place). Measured (release build, local listener): a read of 536 870 911 bytes peaked at 544 178 176 bytes resident, a 600 MiB read refused by the 512 MiB cap at 611 385 344. Quote the cap as what is held, never as what to size a container for.
 
@@ -139,7 +139,7 @@ Observed:
   - same origin: followed, token included;
   - other origin (scheme, host or port), with a token: refused with `ClientError::Redirected`, naming the target;
   - other origin, no token, with data: refused, `RedirectRefusal::Payload`;
-  - other origin, no token, no data (`Content-Length: 0` included): followed, since a bodiless `POST` carries no data;
+  - other origin, no token, no data (`Content-Length: 0` included): followed;
   - a body that cannot be resent (`Transport::upload`'s reader: `write_table_rows`, `raw_command_upload`): refused anywhere, since following would write no rows and return `Ok(())`;
   - longer than `MAX_REDIRECTS`: refused as a loop.
 
@@ -147,12 +147,12 @@ Observed:
 - The chain shares the command's one deadline. A fresh `timeout_global` per hop would allow `(MAX_REDIRECTS + 1)×` the requested time: 22 minutes at the default two, on an `exists`.
 - `Location` is resolved against the request's address (RFC 3986 §4.2); a reference with no path (`?path=…`, `#frag`) keeps the request's path (§5.3).
 - Tested offline in `crates/ytsaurus-client/tests/redirect_credentials.rs` (a local cluster redirects nothing). A stub must read the whole request (head and body, `Content-Length` or chunked) before answering, as `request_shape.rs` does; otherwise `ureq` reports a broken pipe (a small body survives on macOS, not on a Linux runner).
-- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and is kept by hand beside the `Repeatable::Heavy` call sites, with nothing checking that the two agree: `lookup_rows_dynamic` and `select_rows_dynamic` send `Repeatable::Heavy` and are not on it.
+- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and is kept by hand, unchecked against the `Repeatable::Heavy` call sites: `lookup_rows_dynamic` and `select_rows_dynamic` send `Repeatable::Heavy` and are not on it.
 
 ### TLS
 
 - Default trust is the Mozilla bundle, `webpki-roots`, via `ureq`'s `rustls` feature. A bare host name in `YT_PROXY` means `https://`. Behind a corporate CA this failed with `invalid peer certificate: UnknownIssuer` where `curl` (OS trust store) worked.
-- `YT_CA_BUNDLE` names a PEM file; the `platform-verifier` feature trusts the OS store; the bundle wins when both are set. A bundle with no certificates is refused, naming the file. Verified on a real installation with a three-deep, self-signed chain (#29); a local cluster is plain HTTP.
+- `YT_CA_BUNDLE` names a PEM file; the `platform-verifier` feature trusts the OS store; the bundle wins when both are set. A bundle with no certificates is refused, naming the file. Verified on a real installation with a three-deep, self-signed chain ([#29](https://github.com/sshaplygin/ytsaurus-rs/issues/29)); a local cluster is plain HTTP.
 - `ureq::tls::parse_pem` only splits and base64-decodes (its `Certificate` is unvalidated), and `rustls`' `add_parsable_certificates` silently drops what it cannot parse: a PKCS#7 `.p7b` under a `BEGIN CERTIFICATE` label gave an empty root store and `UnknownIssuer`. `http::is_x509` checks the DER skeleton (`SEQUENCE { SEQUENCE, SEQUENCE, BIT STRING }` and the head of the `TBSCertificate`), and one bad block refuses the file. A `ContentInfo` fails at its first member, an OBJECT IDENTIFIER where the `tbsCertificate` sequence belongs.
 - The bundle is `stat`ed before opening: a FIFO blocks forever, and `Client::new` is infallible.
 - A rejected certificate is `ureq::Error::Io` of kind `InvalidData` wrapping a `rustls::Error`, rendered `invalid peer certificate: <CertificateError>`; retried as a transport failure it cost five attempts and ~15 s. `UnknownIssuer` and the name mismatch depend only on this client's roots and URL, and are not retried.
@@ -188,7 +188,7 @@ Observed:
 - A sorted merge needs no `merge_by`: two tables sorted by `host`, merged with `mode=sorted`, complete with output `sorted_by=[host]`.
 - `get_job` answers unwrapped with `job_id`; `list_jobs` wraps in `{jobs=[…]}` with `id`. One parser reads both.
 - `get_job_input` never answers for a vanilla job: 30 s, zero bytes.
-- A Cypress lookup under `//sys/operations` answered `has no child with key` on a local cluster for an operation id that exists; `get_operation` finds it.
+- A Cypress lookup under `//sys/operations` answered `has no child with key` for an operation id that exists; `get_operation` finds it.
 
 ## Appending to a table
 
@@ -212,7 +212,7 @@ Observed:
 - `columns=[]` gets 200 and one empty map per row, and composes with a range: `<columns=[];ranges=[{lower_limit={row_index=0}; upper_limit={row_index=2}}]>` gave two empty maps, the same range with `key` bounds three. It counts a range's rows with no column bytes, which `@row_count` cannot, so the client sends it.
 - A negative `row_index` is clamped to 0: `{lower_limit={row_index=-5}}` returned all five rows of a five-row table, `-5..2` rows 0 and 1, `-5..0` (empty because `upper_limit=0`) and `{upper_limit={row_index=-2}}` none. The client refuses negative bounds anyway.
 - A backwards range gets 200 and no rows in either selector (`{lower_limit={row_index=5};upper_limit={row_index=3}}`, `{lower_limit={key=[3]};upper_limit={key=[1]}}`). The client refuses both.
-- The client sends `path` as a YSON string node with attributes outside, `<columns=[n]>"//tmp/t{k}"`. A JSON-parameter `curl` sends the flat text `<columns=[n]>//tmp/t{k}`, where the string's `{k}` wins instead of the attribute. Reproduce the client's shape with `-H 'X-YT-Header-Format: <format=text>yson'` and `{path=<columns=["n"]>"//tmp/t{k}";output_format=json}`.
+- The client sends `path` as a YSON string node with attributes outside, `<columns=[n]>"//tmp/t{k}"`. A JSON-parameter `curl` sends the flat text `<columns=[n]>//tmp/t{k}`, where the string's `{k}` wins over the attribute. Reproduce the client's shape with `-H 'X-YT-Header-Format: <format=text>yson'` and `{path=<columns=["n"]>"//tmp/t{k}";output_format=json}`.
 - When the attribute and the string spell the same kind of selection, the attribute wins silently, at 200; different kinds compose. On a table `k,n`, YSON shape:
 
   | Sent | Read |
@@ -227,7 +227,7 @@ Observed:
 
   No combination in the YSON shape gets a 400. The client refuses a doubled kind, sends the pairing, and refuses a string opening with `<…>`, whose attribute it cannot parse. Flat text with two `<…>` blocks gets 400, *does not start with a valid root-designator*.
 - A `uint64` key column takes `{exact={key=[42]}}` and `{exact={key=[42u]}}` alike. For ranges, `Key::from(i64)` stops at `i64::MAX`: the row keyed `18446744073709551615u` came back only via `yson_build::uint`.
-- `key` and `key_bound` compare a short key differently. `key` compares the row's whole key component-wise, shorter tuple smaller when equal so far. `key_bound` truncates the row's key to the bound's length, so every row sharing the prefix compares equal. On a table keyed `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
+- `key` compares the row's whole key component-wise, shorter tuple smaller when equal so far. `key_bound` truncates the row's key to the bound's length, so every row sharing the prefix compares equal. On a table keyed `(host, path)` holding `(a,/x) (a,/y) (b,/x) (b,/y) (c,/x)`:
 
   | Sent | Rows back |
   | --- | --- |
@@ -259,7 +259,7 @@ Read from the cluster's source (the HTTP reference omits it) and observed throug
 
 ## Where a heavy command goes
 
-Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)); docs and source cited per fact.
+Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)).
 
 - A control proxy does not serve heavy requests; the rule is `TContext::TryRedirectHeavyRequests` in [`yt/yt/server/http_proxy/context.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/server/http_proxy/context.cpp):
 
@@ -279,9 +279,9 @@ Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs
 ### `/hosts`
 
 - `/hosts` answers a JSON list of bare host names, `["n0008-sas.cluster-name", …]` ([HTTP proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)), "ordered by load … the very first proxy in the resulting list is the least loaded" ([reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)); `TCoordinator::ListProxies` shuffles the better half. No scheme and usually no port: both come from the configured address.
-- The `data` role default is undocumented: `default_role_filter`, a coordinator config parameter defaulted in `TCoordinatorConfig::Register` to `NApi::DefaultHttpProxyRole`, `"data"` in [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h). An operator can change it; the client validates what it gets. `?role=`, `/hosts/all` (the only form listing banned and dead proxies) and the plain-text form (exact `Accept: text/plain`) are also source-only.
-- The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first, lazily, when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too.
-- A failed heavy command drops its host from the pool; with separate roles, falling back to the configured address would reach a control proxy (#30). Only an empty pool falls back, for `HOSTS_RETRY_AFTER`; a refresh restores dropped hosts. The drop uses `retry::attributable_to_the_host`, not `worth_asking_again`: they differ on a rejected certificate, and `NotValidForName` is about one host (#40). A proxy refusing heavy work for its role is also the host's fault, which `is_retriable` cannot express; hence three predicates.
+- The `data` role default is undocumented: `default_role_filter`, a coordinator config parameter defaulted in `TCoordinatorConfig::Register` to `NApi::DefaultHttpProxyRole`, `"data"` in [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h). An operator can change it; the client validates what it gets. `?role=`, `/hosts/all` (the only form listing banned and dead proxies) and the plain-text form (exact `Accept: text/plain`) are source-only.
+- The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too.
+- A failed heavy command drops its host from the pool; with separate roles, falling back to the configured address would reach a control proxy ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)). Only an empty pool falls back, for `HOSTS_RETRY_AFTER`; a refresh restores dropped hosts. The drop uses `retry::attributable_to_the_host`, not `worth_asking_again`: they differ on a rejected certificate, and `NotValidForName` is about one host (reasoning). A proxy refusing heavy work for its role is also the host's fault, which `is_retriable` cannot express; hence three predicates.
 - An empty or absent list means the configured address serves everything. A loopback cluster is not asked: it would publish an address behind the port mapping or tunnel (reasoning; no local `/hosts` answer was captured).
 
 ### Which names from `/hosts` are used
@@ -325,7 +325,7 @@ Observed:
 - `lock` requires a transaction (`A valid master transaction is required`) and answers `{lock_id, node_id, revision}`.
 - A conflicting lock names the winner: error 402, `… since "exclusive" lock is taken by concurrent transaction 4-dac2-10001-eb1b`, with a `winner_transaction` attribute.
 - `waitable=%true` returns a `pending` lock with `revision=0`; `#<lock_id>/@state` becomes `acquired` when the queue clears.
-- A waitable lock can wait forever: a transaction holding a snapshot lock is refused an exclusive one on the same node (error 400, `already taken by same transaction`), but the waitable form queues forever. `lock_waiting` has a deadline.
+- A transaction holding a snapshot lock is refused an exclusive one on the same node (error 400, `already taken by same transaction`), but the waitable form queues forever; `lock_waiting` has a deadline.
 - `unlock` is not modelled; its rules after the node was modified were not verified.
 
 ## Batched commands
@@ -362,8 +362,8 @@ Observed:
   ```
 
   **Do not test this with `BatchRequest::create`**: its `ignore_existing` returns the old node ids under a fresh id too. Per-part ids are derived by incrementing, so the client refuses to split a batch carrying a caller's id.
-- Executing the same batch again, without the caller's id, is new work: each execution mints its own mutation ids. The second run answered `501 already exists` for `create_table` parts, `500` for `remove` parts, and the first run's node ids for `create` parts, because of `ignore_existing`.
-- Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`, and the other parts still run. That is 21 of the 190 commands in `GET /api/v4`, against 7 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
+- Executing the same batch again without the caller's id is new work (each execution mints its own mutation ids), answered as the fresh run above; `remove` parts got `500`.
+- Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`; the other parts still run. That is 21 of the 190 commands in `GET /api/v4`, against 7 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
 - Also refused whole: a part whose command needs input and has none (`Command %Qv requires input`; `insert_rows`, `write_table` and seven others).
 - No modelled command answers a bare `{}` under API v4: `create` → `{"output":{"node_id":…}}`, `set` and `remove` → `{"output":{}}`, `exists` → `{"output":{"value":false}}`. The reference's bare `{}` for `set` is v3 (`GET /api/v4` lists `remove` and `set` as `output_type: structured`, `/api/v3` as `null`). The parser checks the key: `node_id` for `create`, `value` for `exists`/`get`/`list`.
 
@@ -381,25 +381,25 @@ Enabled in the operation spec:
 
 - `job_io.control_attributes.{enable_table_index,enable_row_index,enable_range_index,enable_key_switch}`
 - `mapper.enable_input_table_index` overrides `enable_table_index`.
-- For map-reduce, the reducer's section is `reduce_job_io`, not `job_io`: each job type has its own I/O section.
+- For map-reduce, the reducer's section is `reduce_job_io`, not `job_io`: each job type has its own.
 
 ## Cluster gotchas
 
 - `--spec` is YSON: `{mapper={memory_limit=536870912}}`, with `=`, `;` and `%true`. JSON fails with `Unexpected token ":"`.
 - `map-reduce` uses `--map-local-file` / `--reduce-local-file`, not `--local-file`.
 - Binary YSON in Python needs the `ytsaurus-client` and `ytsaurus-yson` packages; without the second, `YSON bindings required`. `ytsaurus-yson` includes the compiled `library/cpp/skiff`, the C++ reference for `tests/skiff-cpp-interop/`.
-- A duplicate `mutation_id` without `retry=%true` is refused, `Duplicate request is not marked as "retry"`. The flag is not inferred from a known id.
+- A duplicate `mutation_id` without `retry=%true` is refused, `Duplicate request is not marked as "retry"`.
 - The file-cache commands answer with a bare string, not the `{path=…}` envelope, and a miss is an empty string.
-- A `cache_path` that does not exist is also a miss: with no `//tmp/yt_wrapper` at all, `get_file_from_cache` answers 200 and `""` (verified by removing the tree and re-running `cached_upload`). The lookup needs no `create`, which a read-only managed cache would refuse; `upload_worker_cached` creates the directory on the miss branch.
-- On a managed cache that create is refused with code 901, `Access denied … "write | modify_children" … not allowed by any matching ACE` (real installation, #32). A 901 on the cache's own writes (the directory, the staging node, `put_file_to_cache`) makes `upload_worker_cached` upload under `//tmp` and warn, naming `Client::with_file_cache`; any other error fails the upload. Neither branch has run against a denying cluster; `crates/ytsaurus-client/tests/file_cache.rs` scripts the refusals in-process.
+- A `cache_path` that does not exist is also a miss: with no `//tmp/yt_wrapper` at all, `get_file_from_cache` answers 200 and `""` (verified by removing the tree and re-running `cached_upload`). The lookup needs no `create`; `upload_worker_cached` creates the directory on the miss branch.
+- On a managed cache that create is refused with code 901, `Access denied … "write | modify_children" … not allowed by any matching ACE` (real installation, [#32](https://github.com/sshaplygin/ytsaurus-rs/issues/32)). A 901 on the cache's own writes (the directory, the staging node, `put_file_to_cache`) makes `upload_worker_cached` upload under `//tmp` and warn, naming `Client::with_file_cache`; any other error fails the upload. Neither branch has run against a denying cluster; `crates/ytsaurus-client/tests/file_cache.rs` scripts the refusals in-process.
 - `CachedFile::cached` says which node the caller holds; `uploaded` is also true for the `//tmp` fallback, and deleting on it evicts a shared entry. The fallback has `//tmp`'s ACL, no expiry and a name that is unique but not unpredictable, so a co-tenant listing `//tmp` can rewrite the worker before exec. Prefer `with_file_cache` on your own directory.
 - A managed cache allows an ordinary user only `read` (`check_permission` on `//tmp/yt_wrapper/file_storage/new_cache`: `read allow`; `write`, `remove`, `create` deny), so `cached_upload`'s clearing step got 901. The example brings its own cache beside `BASE`, which each run removes; `YT_FILE_CACHE` overrides it.
 - A cached file is named by its hash. Reference it as `<file_name="my_job">//tmp/.../ab/cdef…` in `file_paths`, or the job's command finds nothing to run.
 - Two operations writing one output table serialise on an exclusive lock, and the loser fails to prepare. Give concurrent operations separate outputs.
 - A column value cannot carry attributes: `Table values cannot have top-level attributes`.
 - The cluster re-encodes rows on ingest: 309 676 bytes uploaded came back as 309 688. Compare read-back against read-back.
-- `stderr_size` from `list_jobs` is a hint: several hundred bytes of stderr reported as `1`. Never use it to decide whether there is stderr to fetch.
+- `stderr_size` from `list_jobs` is a hint (several hundred bytes reported as `1`); stderr is fetched regardless.
 - A Rust panic reaches the cluster as `Process terminated by signal 6` (`panic = "abort"`); the message is in the job's stderr, which `wait_for_operation` fetches.
 - A job error's outer message is a category (`User job failed`); the cause is at the bottom of `inner_errors`. Both `ClientError` paths flatten outer plus innermost.
-- A v4 answer is keyed by what it returns; for `exists` the key is `value`, not `exists`. Every command whose result is read needs a call site.
+- A v4 answer is keyed by what it returns; every command whose result is read needs a call site.
 - Never assert on the rendered text of a generated value. The text YSON writer leaves a string unquoted when its first byte is a letter or `_` and the rest alphanumeric or `_-.` (`ser::is_safe_unquoted`), so a mutation ID goes bare (`ebd6e011-…`) or quoted (`3f2a1b-…`) by its first hex digit: 39.8 % unquoted over 100 000 IDs, and a test matching `mutation_id="…"` failed two runs in five. Decode `X-YT-Parameters` and compare values (`tests::sent_parameters`); a fixed literal like `transaction_id="3-5d231-…"` is safe. The cluster accepts both forms.
