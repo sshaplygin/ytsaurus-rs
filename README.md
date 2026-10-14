@@ -272,8 +272,8 @@ Skiff. Whether Skiff becomes the default is undecided:
 [docs/benchmarking.md](docs/benchmarking.md).
 
 The pinned parity issue tracks what is still needed to match the official
-clients. Open work that needs a human: a public write-up (#71),
-upstreaming (#72), and convergence with yson-rs (#73), all listed under
+clients. Open work that needs a human: a public write-up, upstreaming, and
+convergence with yson-rs, all listed under
 [Status in AGENTS.md](AGENTS.md#status), the project context for contributors
 and coding agents.
 

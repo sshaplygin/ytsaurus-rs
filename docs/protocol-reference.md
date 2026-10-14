@@ -92,7 +92,7 @@ Observed:
 
 ### Handing a transaction to another process
 
-`detach` / `attach_transaction` (#13). Observed:
+`detach` / `attach_transaction`. Observed:
 
 - `@timeout` is in milliseconds and is `Int64`: `get #<id>/@timeout` on a 30 s transaction answers `{"value"=30000;}` in text YSON. `Transaction::attach` also accepts `Uint64`.
 - The attribute is the configured timeout, not the time remaining. `attach` pings before returning; otherwise a handoff longer than `timeout × 2/3` yields a handle whose first ping arrives after expiry.
@@ -116,7 +116,7 @@ Observed:
 
 - `read_file` streams and `write_file` takes a chunked body: a 4 MB round trip through `Client::raw_command_streaming` and `raw_command_upload` held the file in neither direction.
 - The buffered `read_file` compares the body with `@uncompressed_data_size`: a truncated body looks like a shorter file, and the proxy's verdict is in a trailer `ureq` cannot read. On `compression_codec=zlib_6` nodes of 1 000 000 bytes, `@compressed_data_size` was 4 214 for cycling `i % 256` bytes, 999 for zeros and 1 000 324 for `os.urandom`; the read passes against all three. `@file_size` does not exist (`Attribute "file_size" is not found`).
-- A rich path does nothing to a file read. On a 1000-byte file, `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads all 1000 bytes; `//tmp/f[#0:#10]` also returns 1000, then fails the size check because `//tmp/f[#0:#10]/@uncompressed_data_size` does not parse (`Error reading parameter /path: Unexpected token "/" of type "slash"`). Files are sliced by the `offset` and `length` parameters; selection is #12.
+- A rich path does nothing to a file read. On a 1000-byte file, `<lower_limit={offset=0};upper_limit={offset=10}>//tmp/f` reads all 1000 bytes; `//tmp/f[#0:#10]` also returns 1000, then fails the size check because `//tmp/f[#0:#10]/@uncompressed_data_size` does not parse (`Error reading parameter /path: Unexpected token "/" of type "slash"`). Files are sliced by the `offset` and `length` parameters; path selection applies to tables only.
 
 ### Response size limits
 

@@ -95,9 +95,10 @@ the countable part in CI; the rest is on review.
    [docs/protocol-reference.md](docs/protocol-reference.md). Measurements and
    method: `docs/benchmarking.md` and `docs/format-comparison.md`. What changed
    for a caller: the crate's CHANGELOG. An item's contract: its rustdoc.
-   History: git. Open work: the issue tracker; this file names no issue
-   numbers, because they go stale. Anywhere else, link to the home instead of
-   restating it.
+   History: git. Open work: the issue tracker. Docs name no issue for open
+   work or history, because those go stale; a closed issue may be cited as the
+   source of an observation ("verified on a real installation, #NN"). This file
+   names none. Anywhere else, link to the home instead of restating it.
 2. State results as they are. A null or negative result is written as one:
    "X did not decide Y; Z is still needed." Do not present it as a
    finding, a success, or a question that is still "not lost".

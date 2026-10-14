@@ -148,8 +148,8 @@ been relaxed.
   cleanly on a dropped connection (tested); there is no reconnection or
   per-proxy banning.
 - G, the numbers that justify the project: not started. Latency and
-  throughput under concurrency, the case for RPC over HTTP, are unmeasured
-  (#67); until then this is a protocol implementation, not a recommendation.
+  throughput under concurrency, the case for RPC over HTTP, are unmeasured;
+  until then this is a protocol implementation, not a recommendation.
 - H, publishable: green. `cargo package` omits submodules, so
   `ytsaurus-proto` commits its generated bindings, with no build script; CI
   regenerates them and fails on a diff.

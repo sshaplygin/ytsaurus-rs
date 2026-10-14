@@ -36,7 +36,7 @@ allocator. This comparison did not decide whether Skiff should be the default.
   ([§ Skiff in a job](#skiff-in-a-job-today)).
 - The decode share in the threshold's unit, job CPU, is not measured: the local
   cluster reports nothing under `user_job/cpu`. Repeated production runs are
-  still owed (#70), and so is required test 5 (cluster fixtures) of
+  still owed, and so is required test 5 (cluster fixtures) of
   [`skiff-compatibility.md`](skiff-compatibility.md).
 - Of the four parts of the prediction recorded before the runs, two were
   refuted, one was refuted in part and one held.
@@ -340,7 +340,7 @@ Query Tracker is a non-goal of this client (AGENTS.md); the harness reaches it
 through `raw_command`, as
 [`docs/sdk-comparison.md`](sdk-comparison.md#query-tracker-through-raw_command)
 shows. For scale: `read_file` was 1824 lines across 15
-files (#47), transaction detach 1864 (#45), batch requests 3371 (#44). A minimal
+files, transaction detach 1864, batch requests 3371. A minimal
 query surface (`start_query`, `get_query`, `wait_for_query`, `abort_query`, a
 `QueryState` enum, a parsed `QueryInfo`) would be roughly 1.5–2 k lines with
 wire-shape tests, a cluster example and the CHANGELOG; `list_queries` with a
