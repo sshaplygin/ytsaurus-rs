@@ -160,6 +160,28 @@ fn yson_to_value(value: &YsonValue) -> Value {
 impl Client {
     /// Looks rows up by key over HTTP: one answer per key, in order, and
     /// `None` for a key with no row.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Decode`] before anything is sent if a key holds a
+    ///   [`Value::Any`] that is not one YSON value, and after the answer if it
+    ///   is not a binary YSON list fragment.
+    /// - [`ClientError::Cluster`] if the cluster refuses: the table is missing,
+    ///   static or not mounted (code 1702), a key does not fit the key
+    ///   columns, or the client is bound to a transaction
+    ///   ([`Client::with_transaction`]), answered with 11000 `Sticky
+    ///   transaction … is not found`.
+    /// - [`ClientError::Transport`] if the connection fails or
+    ///   [`Client::with_timeout`] runs out; [`ClientError::Http`] for a non-2xx
+    ///   answer without a readable `X-YT-Error`; [`ClientError::Redirected`]
+    ///   for a redirect off the origin carrying a token or keys, or a loop;
+    ///   [`ClientError::ResponseTooLarge`] past 512 MiB; [`ClientError::Config`]
+    ///   for an `https://` address in a build without `tls`, or after
+    ///   `YT_CA_BUNDLE` was refused.
+    ///
+    /// Through [`TableClient`](ytsaurus_api::TableClient), `Cluster` is
+    /// `Error::Cluster` with its code; every other variant, a timeout included,
+    /// is `Error::Transport`.
     pub fn lookup_rows_dynamic(
         &self,
         path: &str,
@@ -195,6 +217,13 @@ impl Client {
     }
 
     /// Runs a query over HTTP.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::lookup_rows_dynamic`], except that nothing is checked
+    /// before sending and a redirect off the origin is refused only when a
+    /// token is set. [`ClientError::Cluster`] also covers a query that does not
+    /// parse.
     pub fn select_rows_dynamic(&self, query: &str, options: &SelectOptions) -> Result<Vec<Row>> {
         let mut params = vec![
             ("query", yson_build::string(query)),
@@ -221,11 +250,27 @@ impl Client {
     /// Writes rows over HTTP, to a heavy proxy and sent once: the master's
     /// mutation cache does not cover a tablet write, so a retry could write
     /// twice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::lookup_rows_dynamic`] for `rows` in place of keys, except
+    /// that the answer is not decoded and a table that is not mounted is
+    /// refused with code 1, `has no mounted tablets`. [`ClientError::Cluster`]
+    /// also covers a row the schema refuses. After a
+    /// [`ClientError::Transport`] the write may have landed. Each call is its
+    /// own tablet transaction: over HTTP,
+    /// [`TableClient::start_transaction`](ytsaurus_api::TableClient::start_transaction)
+    /// returns [`Error::Unsupported`](ytsaurus_api::Error::Unsupported).
     pub fn insert_rows_dynamic(&self, path: &str, rows: &[Row]) -> Result<()> {
         self.modify_rows_dynamic("insert_rows", path, rows)
     }
 
     /// Deletes rows by key over HTTP.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::insert_rows_dynamic`], for keys; [`ClientError::Cluster`]
+    /// also for an ordered table, which has no key to delete by.
     pub fn delete_rows_dynamic(&self, path: &str, keys: &[Row]) -> Result<()> {
         self.modify_rows_dynamic("delete_rows", path, keys)
     }
