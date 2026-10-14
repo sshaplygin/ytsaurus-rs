@@ -3,7 +3,8 @@
 //! An aborted transaction and a detached one that expired both end, so the
 //! tests read which requests the client sent: a detach and an attached
 //! handle's drop send nothing, a started handle's drop sends the abort, and
-//! the by-id commands carry the id they were given.
+//! the by-id commands carry the id they were given. A start whose answer was
+//! lost is retried under the same mutation id and pings before it returns.
 //!
 //! The stub **reads every request in full before answering**: replying into a
 //! body still being written closes the connection under `ureq`, which passes
@@ -12,6 +13,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -467,6 +469,183 @@ fn finishing_someone_elses_transaction_takes_only_the_id() {
     }
 }
 
+// --------------------------------------------------------- a retried start
+
+/// One lost start answer, retried once after 1.1 s: longer than the 1 s ping
+/// interval of a 3 s transaction, so the first ping is due when `start`
+/// returns.
+fn retried_once() -> RetryPolicy {
+    RetryPolicy::new(2, Duration::from_millis(1100), Duration::from_millis(1100)).quiet()
+}
+
+#[test]
+fn a_retried_start_pings_before_it_returns() {
+    // The retry carries the first attempt's mutation id, so the cluster hands
+    // back the first attempt's transaction, whose clock started 1.1 s before
+    // the answer: past the interval, so `start` pings before returning.
+    let cluster = StubCluster::answering(Answers {
+        lost_starts: AtomicUsize::new(1),
+        ..Answers::default()
+    });
+    let client = Client::new(&cluster.url()).with_retries(retried_once());
+
+    let tx = client
+        .start_transaction_with(Duration::from_secs(3))
+        .expect("starts on the second attempt");
+    // Read at once: the keep-alive's own first ping is a full second away.
+    let lines = cluster.request_lines();
+    assert_eq!(tx.id(), TX);
+
+    let starts = cluster.heads_for("start_transaction");
+    assert_eq!(starts.len(), 2, "one lost answer, one retry: {lines:?}");
+    let first = str_param(&starts[0], "mutation_id").expect("the start carries a mutation id");
+    assert_eq!(
+        str_param(&starts[1], "mutation_id").as_deref(),
+        Some(first.as_str()),
+        "the retry must carry the first attempt's mutation id"
+    );
+    assert_eq!(
+        param_of(&starts[0], "retry").map(|v| v.node),
+        Some(YsonNode::Boolean(false))
+    );
+    assert_eq!(
+        param_of(&starts[1], "retry").map(|v| v.node),
+        Some(YsonNode::Boolean(true)),
+        "the second start must say it is a retry"
+    );
+
+    let pings: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("ping_transaction"))
+        .collect();
+    assert_eq!(
+        pings.len(),
+        1,
+        "a start that took longer than the ping interval must ping before it returns: {lines:?}"
+    );
+    let ping_head = &cluster.heads_for("ping_transaction")[0];
+    assert_eq!(str_param(ping_head, "transaction_id").as_deref(), Some(TX));
+    let second_start = lines
+        .iter()
+        .rposition(|line| line.contains("start_transaction"))
+        .expect("a start is on record");
+    let ping = lines
+        .iter()
+        .position(|line| line.contains("ping_transaction"))
+        .expect("a ping is on record");
+    assert!(
+        ping > second_start,
+        "the ping preceded the start: {lines:?}"
+    );
+    drop(tx);
+}
+
+#[test]
+fn a_start_whose_transaction_expired_during_the_retries_fails() {
+    // The retried start returns an id, but the ping says the transaction is
+    // gone, as for one that expired while the start was being retried.
+    // `start` fails instead of returning a handle on nothing, and leaves no
+    // ping thread behind.
+    let cluster = StubCluster::answering(Answers {
+        lost_starts: AtomicUsize::new(1),
+        ping_gone: true,
+        ..Answers::default()
+    });
+    let client = Client::new(&cluster.url()).with_retries(retried_once());
+
+    let error = client
+        .start_transaction_with(Duration::from_secs(3))
+        .expect_err("the transaction is gone");
+    let message = error.to_string();
+    for expected in ["start", TX, "No such transaction"] {
+        assert!(
+            message.contains(expected),
+            "the error does not say {expected:?}: {message}"
+        );
+    }
+
+    let aborts = cluster.heads_for("abort_transaction");
+    assert!(
+        aborts.len() <= 1,
+        "one bounded abort at most: {:?}",
+        cluster.request_lines()
+    );
+    for abort in &aborts {
+        assert_eq!(str_param(abort, "transaction_id").as_deref(), Some(TX));
+    }
+
+    let settled = cluster.request_count();
+    std::thread::sleep(Duration::from_millis(1600));
+    assert_eq!(
+        cluster.request_count(),
+        settled,
+        "a failed start left a ping thread behind: {:?}",
+        cluster.request_lines()
+    );
+}
+
+#[test]
+fn a_quick_start_sends_no_extra_ping() {
+    // The common path costs one request: a start answered within the ping
+    // interval leaves the first ping to the keep-alive, ten seconds away.
+    let cluster = StubCluster::answering(Answers::default());
+    let client = Client::new(&cluster.url()).with_retries(RetryPolicy::none());
+
+    let tx = client.start_transaction().expect("starts");
+
+    assert!(
+        cluster.heads_for("ping_transaction").is_empty(),
+        "a quick start pinged before returning: {:?}",
+        cluster.request_lines()
+    );
+    drop(tx);
+}
+
+#[test]
+fn a_slow_starts_first_ping_counts_from_when_it_was_sent() {
+    // The stub holds the start's answer for 700 ms, under the 1 s interval
+    // of a 3 s transaction, so `start` sends no ping of its own, and the
+    // keep-alive's first ping is due 1 s after the start was sent rather than
+    // 1 s after it returned.
+    //
+    // The bound is an upper one, so load pushes toward it. Measured from the
+    // call: 1.005-1.022 s over ten runs at load average 22-35 on ten cores,
+    // 1.010-1.058 s over eight at 124-130; counted from the return instead,
+    // 1.714-1.788 s.
+    const HELD: Duration = Duration::from_millis(700);
+    const BOUND: Duration = Duration::from_millis(1350);
+
+    let cluster = StubCluster::answering(Answers {
+        start_delay: HELD,
+        ..Answers::default()
+    });
+    let client = Client::new(&cluster.url()).with_retries(RetryPolicy::none());
+
+    let began = Instant::now();
+    let tx = client
+        .start_transaction_with(Duration::from_secs(3))
+        .expect("starts");
+    assert!(
+        cluster.heads_for("ping_transaction").is_empty(),
+        "a start within the interval pinged before returning: {:?}",
+        cluster.request_lines()
+    );
+
+    let deadline = began + Duration::from_secs(5);
+    while cluster.heads_for("ping_transaction").is_empty() {
+        assert!(Instant::now() < deadline, "no ping within 5 s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let first_ping = began.elapsed();
+    drop(tx);
+
+    assert!(
+        first_ping < BOUND,
+        "the first ping came {first_ping:?} after the start was sent: it was counted \
+         from when the start returned"
+    );
+}
+
 // ------------------------------------------------------------------ the stub
 
 /// What the stub cluster answers with.
@@ -482,6 +661,12 @@ struct Answers {
     /// transaction that expired or that somebody else finished. Separate from
     /// `missing`: the object may still resolve.
     ping_gone: bool,
+    /// How many `start_transaction` requests are read, recorded and then
+    /// left unanswered, the connection closed: an answer lost after the
+    /// cluster received the request.
+    lost_starts: AtomicUsize,
+    /// How long a `start_transaction` is held before it is answered.
+    start_delay: Duration,
 }
 
 impl Default for Answers {
@@ -491,30 +676,47 @@ impl Default for Answers {
             ping_delay: Duration::ZERO,
             missing: false,
             ping_gone: false,
+            lost_starts: AtomicUsize::new(0),
+            start_delay: Duration::ZERO,
         }
     }
 }
 
 impl Answers {
-    fn answer(&self, head: &str) -> Vec<u8> {
+    /// The reply to one request; `None` closes the connection unanswered.
+    fn answer(&self, head: &str) -> Option<Vec<u8>> {
         let path = head
             .split_whitespace()
             .nth(1)
             .unwrap_or_default()
             .to_owned();
-        match path.as_str() {
-            "/api/v4/start_transaction" => ok(format!(r#"{{"transaction_id"="{TX}"}}"#).as_bytes()),
+        let reply = match path.as_str() {
+            "/api/v4/start_transaction" => {
+                let lost = self
+                    .lost_starts
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok();
+                if lost {
+                    return None;
+                }
+                std::thread::sleep(self.start_delay);
+                ok(format!(r#"{{"transaction_id"="{TX}"}}"#).as_bytes())
+            }
             "/api/v4/get" if self.missing => resolve_error(),
             "/api/v4/get" => ok(format!(r#"{{"value"={}}}"#, self.timeout_ms).as_bytes()),
             "/api/v4/ping_transaction" => {
                 std::thread::sleep(self.ping_delay);
                 if self.ping_gone {
-                    return no_such_transaction();
+                    no_such_transaction()
+                } else {
+                    ok(b"{}")
                 }
-                ok(b"{}")
             }
             _ => ok(b"{}"),
-        }
+        };
+        Some(reply)
     }
 }
 
@@ -609,7 +811,9 @@ fn serve(mut stream: std::net::TcpStream, answers: &Answers, seen: &Arc<Mutex<Ve
             .expect("nothing panicked holding it")
             .push(head.clone());
 
-        let answer = answers.answer(&head);
+        let Some(answer) = answers.answer(&head) else {
+            return;
+        };
         if stream.write_all(&answer).is_err() {
             return;
         }

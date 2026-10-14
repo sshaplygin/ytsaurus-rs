@@ -694,13 +694,14 @@ impl Client {
     /// ```
     ///
     /// The transaction expires 30 seconds after its last ping, the cluster's
-    /// default, and the handle pings it every ten.
-    /// [`Client::start_transaction_with`] changes the timeout. Dropping the
-    /// handle aborts the transaction.
+    /// default. The handle pings it every ten, counted from when the start was
+    /// sent, so a start slower than that (a retried one can be) pings once
+    /// before it returns. [`Client::start_transaction_with`] changes the
+    /// timeout. Dropping the handle aborts the transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the transaction cannot be started.
+    /// Returns [`ClientError`] if the start fails or its transaction expired.
     pub fn start_transaction(&self) -> Result<Transaction> {
         Transaction::start(self, transaction::DEFAULT_TRANSACTION_TIMEOUT)
     }
@@ -708,11 +709,15 @@ impl Client {
     /// Starts a transaction that expires `timeout` after its last ping.
     ///
     /// The handle pings three times per timeout, so `timeout` decides how long
-    /// the locks outlive a process that dies without aborting.
+    /// the locks outlive a process that dies without aborting. Pings are
+    /// counted from when the start was sent, so a start that took a ping
+    /// interval or more, as a retried one can, pings once before it returns:
+    /// the transaction's clock started with the first attempt.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] if the transaction cannot be started.
+    /// Returns [`ClientError`] if the start fails, or if the transaction it was
+    /// given back had expired during the start's retries.
     pub fn start_transaction_with(&self, timeout: Duration) -> Result<Transaction> {
         Transaction::start(self, timeout)
     }

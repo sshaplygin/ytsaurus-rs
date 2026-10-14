@@ -23,7 +23,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ytsaurus_yson::{YsonNode, YsonValue};
 
@@ -96,6 +96,7 @@ impl Transaction {
         let millis = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
         let params = yson_build::map([("timeout", yson_build::int(millis))]);
 
+        let began = Instant::now();
         let body = client.transport.call(
             Method::Post,
             "start_transaction",
@@ -103,11 +104,11 @@ impl Transaction {
             Payload::None,
             // Under a mutation ID, so a retried start cannot leave an orphan
             // transaction holding locks until it expires. A retried start
-            // returns the first attempt's transaction, whose clock started
-            // then; unlike `attach`, it is not pinged here, which would cost a
-            // round trip on every start.
+            // returns the first attempt's transaction, whose clock may have
+            // started as early as `began`.
             Repeatable::WithMutationId,
         )?;
+        let spent = began.elapsed();
 
         let value = client.value_field(&body, "transaction_id")?;
         let YsonNode::String(bytes) = &value.node else {
@@ -118,7 +119,20 @@ impl Transaction {
         };
         let id = String::from_utf8_lossy(bytes).into_owned();
 
-        Ok(Self::held(client, id, timeout, Origin::Started))
+        // Within one interval, the pings keep the schedule an instant start
+        // would have: counted from `began`, at no extra request.
+        if spent < ping_interval(timeout) {
+            return Ok(Self::held(client, id, timeout, Origin::Started, spent));
+        }
+
+        // Otherwise the first ping is already due, so it is sent before the
+        // handle is returned, under the caller's retry policy as in `attach`.
+        // If it fails, `?` drops the handle, which aborts the transaction; an
+        // abort of one that expired during the retries answers `{}`.
+        let tx = Self::held(client, id, timeout, Origin::Started, Duration::ZERO);
+        tx.ping()
+            .map_err(|error| start_failed(&tx.id, spent, error))?;
+        Ok(tx)
     }
 
     pub(crate) fn attach(client: &Client, id: String) -> Result<Self> {
@@ -136,11 +150,25 @@ impl Transaction {
         // caller's retry policy, since the caller waits on this verdict.
         ping(client, &id).map_err(|error| attach_failed(&id, error))?;
 
-        Ok(Self::held(client, id, timeout, Origin::Attached))
+        Ok(Self::held(
+            client,
+            id,
+            timeout,
+            Origin::Attached,
+            Duration::ZERO,
+        ))
     }
 
-    /// A handle around `id`, pinging every third of `timeout`.
-    fn held(client: &Client, id: String, timeout: Duration, origin: Origin) -> Self {
+    /// A handle around `id`, pinging every third of `timeout`. The first ping
+    /// is due one interval after the transaction's clock was last restarted,
+    /// which was up to `spent` ago.
+    fn held(
+        client: &Client,
+        id: String,
+        timeout: Duration,
+        origin: Origin,
+        spent: Duration,
+    ) -> Self {
         let client = client.clone().with_transaction(&id);
         let interval = ping_interval(timeout);
 
@@ -152,7 +180,12 @@ impl Transaction {
         ping_client
             .transport
             .set_timeout(ping_request_timeout(interval));
-        let keep_alive = KeepAlive::spawn(ping_client, id.clone(), interval);
+        let keep_alive = KeepAlive::spawn(
+            ping_client,
+            id.clone(),
+            first_ping_in(interval, spent),
+            interval,
+        );
 
         Self {
             client,
@@ -384,13 +417,33 @@ fn attached_timeout(id: &str, value: &YsonValue) -> Result<Duration> {
 /// code and raw document. A garbage id such as `1-2-3-4` is refused as
 /// `cluster error 1: Unknown cell tag 0`, which names neither.
 fn attach_failed(id: &str, error: ClientError) -> ClientError {
+    renamed(
+        "attach_transaction",
+        &format!("cannot attach to transaction {id}"),
+        error,
+    )
+}
+
+/// Rewrites a failed ping after a slow start as a failed start naming the id
+/// and how long the start took, keeping the code and raw document.
+fn start_failed(id: &str, spent: Duration, error: ClientError) -> ClientError {
+    renamed(
+        "start_transaction",
+        &format!("transaction {id} did not answer a ping {spent:?} after its start was sent"),
+        error,
+    )
+}
+
+/// A cluster error as `command`'s, its message prefixed with `context`; other
+/// errors unchanged, since they say nothing about the transaction.
+fn renamed(command: &str, context: &str, error: ClientError) -> ClientError {
     match error {
         ClientError::Cluster {
             code, message, raw, ..
         } => ClientError::Cluster {
-            command: "attach_transaction".to_owned(),
+            command: command.to_owned(),
             code,
-            message: format!("cannot attach to transaction {id}: {message}"),
+            message: format!("{context}: {message}"),
             raw,
         },
         other => other,
@@ -417,6 +470,13 @@ pub(crate) fn abort_by_id(client: &Client, id: &str) -> Result<()> {
 /// the pings fall behind, which suits a transaction that is meant to expire.
 fn ping_interval(timeout: Duration) -> Duration {
     (timeout / 3).max(Duration::from_secs(1))
+}
+
+/// How long the keep-alive waits before its first ping: what is left of the
+/// interval after `spent`, the time since the transaction's clock may have
+/// started. Zero once the interval has passed.
+fn first_ping_in(interval: Duration, spent: Duration) -> Duration {
+    interval.saturating_sub(spent)
 }
 
 /// One ping request's budget: half the interval, so a stalled ping leaves the
@@ -456,9 +516,10 @@ struct KeepAlive {
 }
 
 impl KeepAlive {
-    /// Starts pinging `id` every `interval`. `None` if the thread could not be
-    /// spawned; the transaction then has to finish within its timeout.
-    fn spawn(client: Client, id: String, interval: Duration) -> Option<Self> {
+    /// Starts pinging `id`: first after `first`, then every `interval`. `None`
+    /// if the thread could not be spawned; the transaction then has to finish
+    /// within its timeout.
+    fn spawn(client: Client, id: String, first: Duration, interval: Duration) -> Option<Self> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = Arc::clone(&stop);
         let lost = Arc::new(AtomicBool::new(false));
@@ -472,6 +533,7 @@ impl KeepAlive {
                 // `stop_and_join`.
                 let _alive = alive;
                 let (lock, wake) = &*signal;
+                let mut wait = first;
                 loop {
                     {
                         let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -479,7 +541,7 @@ impl KeepAlive {
                             return;
                         }
                         let (guard, _) = wake
-                            .wait_timeout(guard, interval)
+                            .wait_timeout(guard, wait)
                             .unwrap_or_else(PoisonError::into_inner);
                         // Checked after the wait too: a stop raised during a
                         // ping finds nobody on the condvar, so its wake is lost.
@@ -487,6 +549,7 @@ impl KeepAlive {
                             return;
                         }
                     }
+                    wait = interval;
 
                     // A failed ping is retried by the next one, but "no such
                     // transaction" is final: stop and raise `lost` rather than
@@ -559,6 +622,20 @@ mod tests {
                 "{seconds}s timeout pinged every {interval:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_first_ping_counts_from_when_the_start_was_sent() {
+        let second = Duration::from_secs(1);
+        assert_eq!(first_ping_in(second, Duration::ZERO), second);
+        assert_eq!(
+            first_ping_in(second, Duration::from_millis(400)),
+            Duration::from_millis(600)
+        );
+        // An interval or more has passed: the ping is due now.
+        let ten = Duration::from_secs(10);
+        assert_eq!(first_ping_in(ten, ten), Duration::ZERO);
+        assert_eq!(first_ping_in(ten, Duration::from_secs(600)), Duration::ZERO);
     }
 
     #[test]
@@ -706,8 +783,13 @@ mod tests {
         // died on the first failed ping would leave real transactions to
         // expire.
         let client = Client::new("http://127.0.0.1:1").with_retries(crate::RetryPolicy::none());
-        let keep_alive = KeepAlive::spawn(client, "1-2-3-4".to_owned(), Duration::from_millis(1))
-            .expect("the thread starts");
+        let keep_alive = KeepAlive::spawn(
+            client,
+            "1-2-3-4".to_owned(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .expect("the thread starts");
 
         let stop = Arc::clone(&keep_alive.stop);
         keep_alive.stop();
@@ -752,7 +834,7 @@ mod tests {
         ping_client
             .transport
             .set_timeout(ping_request_timeout(interval));
-        let keep_alive = KeepAlive::spawn(ping_client, "1-2-3-4".to_owned(), interval)
+        let keep_alive = KeepAlive::spawn(ping_client, "1-2-3-4".to_owned(), interval, interval)
             .expect("the thread starts");
 
         an_accept
@@ -811,9 +893,13 @@ mod tests {
 
         let mut ping_client = Client::new(&proxy).with_retries(crate::RetryPolicy::none());
         ping_client.transport.set_timeout(PING_BUDGET);
-        let keep_alive =
-            KeepAlive::spawn(ping_client, "1-2-3-4".to_owned(), Duration::from_millis(1))
-                .expect("the thread starts");
+        let keep_alive = KeepAlive::spawn(
+            ping_client,
+            "1-2-3-4".to_owned(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .expect("the thread starts");
 
         an_accept
             .recv_timeout(Duration::from_secs(5))
