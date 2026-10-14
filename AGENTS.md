@@ -75,7 +75,8 @@ MapReduce workers in Rust, is secondary to the clients.
    recorded in [docs/sdk-comparison.md](docs/sdk-comparison.md). Read
    [docs/go-parity.md](docs/go-parity.md) before adding client API.
 4. Every change ends with green CI: `cargo fmt --check`, `cargo clippy
-   --all-targets -D warnings`, `cargo test`, `cargo test --doc`.
+   --all-targets -D warnings`, `cargo test`, `cargo test --doc`, `cargo doc`
+   with `-D warnings`.
 5. No scope creep. Non-Linux targets are out of scope until a human decides
    otherwise. A human added custom job statistics (`JobStatistics`). A human
    also brought the RPC proxy, the protobuf row format and dynamic tables into
@@ -139,6 +140,10 @@ python3 scripts/check_readme_example.py     # README.md's quick start matches
 cargo test --workspace            # 938 tests: 863 unit and integration, 75 doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
+    --lib --bins --examples --document-private-items --all-features
+                                  # CI also runs it without --all-features, and
+                                  # for the client without the tls feature
 
 ./scripts/build-worker.sh         # static musl workers -> target/x86_64-unknown-linux-musl/release-worker/
 ./scripts/build-worker.sh cat     # just one
