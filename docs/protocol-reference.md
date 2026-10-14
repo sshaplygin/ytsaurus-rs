@@ -398,7 +398,7 @@ Enabled in the operation spec:
 - Two operations writing one output table serialise on an exclusive lock, and the loser fails to prepare. Give concurrent operations separate outputs.
 - A column value cannot carry attributes: `Table values cannot have top-level attributes`.
 - The cluster re-encodes rows on ingest: 309 676 bytes uploaded came back as 309 688. Compare read-back against read-back.
-- `stderr_size` from `list_jobs` is a hint: several hundred bytes of stderr reported as `1`.
+- `stderr_size` from `list_jobs` is a hint (several hundred bytes reported as `1`); stderr is fetched regardless.
 - A Rust panic reaches the cluster as `Process terminated by signal 6` (`panic = "abort"`); the message is in the job's stderr, which `wait_for_operation` fetches.
 - A job error's outer message is a category (`User job failed`); the cause is at the bottom of `inner_errors`. Both `ClientError` paths flatten outer plus innermost.
 - A v4 answer is keyed by what it returns; every command whose result is read needs a call site.
