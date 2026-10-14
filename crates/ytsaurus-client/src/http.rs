@@ -31,7 +31,7 @@ use ureq::SendBody;
 use ureq::http::HeaderMap;
 use ytsaurus_yson::{YsonFormat, YsonValue, to_string};
 
-use crate::error::{ClientError, RedirectRefusal, Result, truncate};
+use crate::error::{ClientError, RedirectRefusal, Result, prefix, truncate};
 use crate::retry::{MutationId, Repeatable, RetryPolicy};
 use crate::yson_build::{boolean, insert, string};
 
@@ -60,12 +60,31 @@ const MAX_REDIRECTS: usize = 10;
 /// limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits).
 ///
 /// It covers [`Transport::send`] and [`Transport::upload`], which read through
-/// [`read_capped`]. Two reads take `ureq`'s wire-only limit and are not bounded
-/// in memory: the non-2xx branch of [`Transport::open`], which reads an answer
-/// the client is about to fail on, and the `/hosts` read in
-/// [`Transport::fetch`], which is the lookup's normal answer, taken from the
-/// configured address.
+/// [`read_capped`]. The two smaller reads have their own caps, counted the same
+/// way: a non-2xx body in [`Transport::open`] and [`Transport::fetch`]
+/// ([`ERROR_BODY_LIMIT`]) and the `/hosts` answer ([`HOSTS_LIMIT`]).
 const RESPONSE_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// How much of a non-2xx body [`error_body`] reads, after decompression:
+/// 64 KiB.
+///
+/// The message shows 400 bytes of it. A body up to the cap is read whole, so
+/// the message quotes its whole length and `ureq` can pool the connection
+/// ([connections](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#connections)).
+/// A longer one is cut, said to be cut, and its connection dropped.
+const ERROR_BODY_LIMIT: u64 = 64 * 1024;
+
+/// How much of a `/hosts` answer [`Transport::fetch`] holds, after
+/// decompression: 1 MiB.
+///
+/// The answer is a JSON list of bare host names
+/// ([`/hosts`](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#hosts)).
+/// A domain name is at most 255 octets on the wire (RFC 1035, section 2.3.4),
+/// 253 characters written with dots, so an entry with its quotes and comma
+/// is 256 bytes and the cap holds 4 096 of the longest; the largest answer
+/// recorded named 79 hosts. A larger answer fails with
+/// [`ClientError::ResponseTooLarge`].
+const HOSTS_LIMIT: u64 = 1024 * 1024;
 
 /// The heavy commands this crate routes to a heavy proxy, plus
 /// `read_blob_table`, which has no method here and is reachable through
@@ -1087,6 +1106,7 @@ impl Transport {
     /// first would put a whole table in memory, which is the thing this avoids.
     ///
     /// Sent once, never retried, and to a heavy proxy: [`Repeatable::Heavy`].
+    /// A non-2xx body is read up to [`ERROR_BODY_LIMIT`] for the message.
     pub(crate) fn open(
         &self,
         method: Method,
@@ -1113,11 +1133,10 @@ impl Transport {
 
             if !(200..300).contains(&status) {
                 let mut response = response;
-                let body = response.body_mut().read_to_string().unwrap_or_default();
                 return Err(ClientError::Http {
                     command: command.to_owned(),
                     status,
-                    body: truncate(&body, 400),
+                    body: error_body(response.body_mut()),
                 });
             }
 
@@ -1198,6 +1217,9 @@ impl Transport {
     /// It goes to the configured address. A same-origin redirect is followed; a
     /// cross-origin one is refused with [`ClientError::Redirected`], which the
     /// router treats as worth asking again.
+    ///
+    /// The answer is held up to [`HOSTS_LIMIT`]; a non-2xx body is read up to
+    /// [`ERROR_BODY_LIMIT`] for the message.
     pub(crate) fn fetch(&self, path: &str, what: &str) -> Result<String> {
         if let Some(error) = self.unusable(&self.base) {
             return Err(error);
@@ -1237,25 +1259,18 @@ impl Transport {
             };
 
             let status = response.status().as_u16();
-            let body = response
-                .body_mut()
-                .read_to_string()
-                // As in `send`: a body cut off by the network must stay
-                // retriable, and `Decode` is not.
-                .map_err(|e| ClientError::Transport {
-                    command: what.to_owned(),
-                    source: Box::new(e),
-                })?;
-
             if !(200..300).contains(&status) {
                 return Err(ClientError::Http {
                     command: what.to_owned(),
                     status,
-                    body: truncate(&body, 400),
+                    body: error_body(response.body_mut()),
                 });
             }
 
-            Ok(body)
+            // As in `send`: a body cut off by the network stays a retriable
+            // `Transport`, and one past the cap is `ResponseTooLarge`.
+            let body = read_capped(what, response.body_mut(), HOSTS_LIMIT)?;
+            Ok(String::from_utf8_lossy(&body).into_owned())
         })
     }
 
@@ -1852,6 +1867,41 @@ fn read_capped(command: &str, body: &mut ureq::Body, limit: u64) -> Result<Vec<u
         .map_err(|e| body_failure(command, limit, e.into()))?;
 
     Ok(bytes)
+}
+
+/// The message a non-2xx body contributes to [`ClientError::Http`], read up to
+/// [`ERROR_BODY_LIMIT`] decoded bytes.
+///
+/// The status has already decided the outcome, so nothing here fails: a body
+/// cut by the network yields what arrived. [`wire_budget`] bounds the transfer
+/// beneath the decoder, as in [`read_capped`].
+fn error_body(body: &mut ureq::Body) -> String {
+    let wire = body
+        .with_config()
+        .limit(wire_budget(ERROR_BODY_LIMIT))
+        .reader();
+    render_error_body(wire, ERROR_BODY_LIMIT)
+}
+
+/// Reads at most `limit` bytes of `reader` through [`CapReader`] and renders
+/// the first 400 of them.
+///
+/// A body past `limit` ends with `… (cut at {limit} bytes, the rest unread)`.
+/// Any other body is rendered by [`truncate`], which quotes its whole length.
+fn render_error_body(reader: impl std::io::Read, limit: u64) -> String {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    let read = CapReader::new(reader, limit).read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+
+    match read.map_err(ureq::Error::from) {
+        Err(ureq::Error::BodyExceedsLimit(_)) => format!(
+            "{}… (cut at {limit} bytes, the rest unread)",
+            prefix(&text, 400)
+        ),
+        _ => truncate(&text, 400),
+    }
 }
 
 /// Which error a buffered response body failed with, and whose fault it is.
@@ -4313,6 +4363,12 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
     /// The listener is on its own thread and is dropped with it; nothing here
     /// retries, so one accepted connection is the whole of its life.
     fn serving(payload: &[u8], gzip: bool) -> String {
+        serving_as("200 OK", payload, gzip)
+    }
+
+    /// [`serving`] with the status line chosen, such as `"503 Service
+    /// Unavailable"`.
+    fn serving_as(status: &'static str, payload: &[u8], gzip: bool) -> String {
         use std::io::Write;
 
         let (encoding, body) = if gzip {
@@ -4336,7 +4392,7 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
             drain_request(&mut reader);
 
             let mut reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\n\
                  {encoding}Content-Length: {}\r\n\r\n",
                 body.len()
             )
@@ -4645,6 +4701,127 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
         let transport = Transport::new("https://cluster.example.net", None, Duration::from_secs(1));
         assert_eq!(transport.response_limit, RESPONSE_LIMIT);
         assert_eq!(RESPONSE_LIMIT, 512 * 1024 * 1024);
+    }
+
+    /// `head`, `spaces` spaces, then `tail`: megabytes decoded, a few
+    /// kilobytes gzipped.
+    fn expanding(head: &[u8], spaces: usize, tail: &[u8]) -> Vec<u8> {
+        let mut payload = head.to_vec();
+        payload.resize(head.len() + spaces, b' ');
+        payload.extend_from_slice(tail);
+        payload
+    }
+
+    #[test]
+    fn an_error_body_past_its_cap_is_cut_and_says_so() {
+        // About 4 KB of gzip on the wire, 4 MiB decoded: 64 times the cap.
+        let payload = expanding(b"<html>proxy overloaded</html>", 4 * 1024 * 1024, b"");
+        let status = "503 Service Unavailable";
+
+        let base = serving_as(status, &payload, true);
+        let opened = Transport::new(&base, None, Duration::from_secs(10))
+            .open(
+                Method::Get,
+                "read_table",
+                &map([("path", string("//tmp/t"))]),
+            )
+            .map(|_| ());
+
+        let base = serving_as(status, &payload, true);
+        let fetched = Transport::new(&base, None, Duration::from_secs(10))
+            .fetch("/hosts", "hosts")
+            .map(|_| ());
+
+        for (what, outcome) in [("open", opened), ("fetch", fetched)] {
+            let error = outcome.expect_err(what);
+            let ClientError::Http { status, body, .. } = &error else {
+                panic!("{what}: {error:?}");
+            };
+            assert_eq!(*status, 503, "{what}");
+            assert!(
+                body.starts_with("<html>proxy overloaded</html>"),
+                "{what}: {body}"
+            );
+            assert!(body.contains("cut at 65536 bytes"), "{what}: {body}");
+            assert!(!body.contains("bytes total"), "{what}: {body}");
+            assert!(body.len() < 512, "{what}: {} bytes", body.len());
+        }
+    }
+
+    #[test]
+    fn a_hosts_answer_past_its_cap_is_refused() {
+        // Valid JSON naming one host, 2 MiB decoded, about 2 KB on the wire.
+        let payload = expanding(b"[", 2 * 1024 * 1024, b"\"n1.example.net\"]");
+        let base = serving(&payload, true);
+        let error = Transport::new(&base, None, Duration::from_secs(10))
+            .heavy_hosts()
+            .expect_err("the answer is past the cap");
+
+        assert!(
+            matches!(
+                &error,
+                ClientError::ResponseTooLarge { command, limit }
+                    if command == "hosts" && *limit == HOSTS_LIMIT
+            ),
+            "{error:?}"
+        );
+        // The router asks again after a refresh interval, not after
+        // `HOSTS_RETRY_AFTER`.
+        assert!(!crate::retry::worth_asking_again(&error), "{error}");
+
+        let base = serving(b"[\"n1.example.net\"]", true);
+        let hosts = Transport::new(&base, None, Duration::from_secs(10))
+            .heavy_hosts()
+            .expect("a small answer");
+        assert_eq!(hosts, ["n1.example.net"]);
+    }
+
+    #[test]
+    fn an_error_body_is_read_no_further_than_its_cap() {
+        /// `left` bytes of `x`, counting what is pulled.
+        struct Source {
+            left: u64,
+            pulled: u64,
+        }
+        impl std::io::Read for Source {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.min(buf.len() as u64) as usize;
+                buf[..n].fill(b'x');
+                self.left -= n as u64;
+                self.pulled += n as u64;
+                Ok(n)
+            }
+        }
+
+        // 16 MiB on offer: one byte past the cap is pulled, and the rest is
+        // never asked for.
+        let mut source = Source {
+            left: 16 * 1024 * 1024,
+            pulled: 0,
+        };
+        let body = render_error_body(&mut source, ERROR_BODY_LIMIT);
+        assert_eq!(source.pulled, ERROR_BODY_LIMIT + 1);
+        assert!(
+            body.ends_with("(cut at 65536 bytes, the rest unread)"),
+            "{body}"
+        );
+        assert!(body.len() < 512, "{} bytes", body.len());
+
+        // A body of exactly the cap is whole, and its length is quoted.
+        let mut source = Source {
+            left: ERROR_BODY_LIMIT,
+            pulled: 0,
+        };
+        let body = render_error_body(&mut source, ERROR_BODY_LIMIT);
+        assert_eq!(source.pulled, ERROR_BODY_LIMIT);
+        assert!(body.ends_with("(65536 bytes total)"), "{body}");
+        assert!(!body.contains("cut at"), "{body}");
+    }
+
+    #[test]
+    fn the_small_caps_are_the_documented_ones() {
+        assert_eq!(ERROR_BODY_LIMIT, 64 * 1024);
+        assert_eq!(HOSTS_LIMIT, 1024 * 1024);
     }
 
     #[test]
