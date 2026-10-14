@@ -24,7 +24,7 @@ Output table `k` is fd `3k + 1`: tables 0, 1 and 2 are fds 1, 4 and 7. A job's e
 Observed in a job: `YT_JOB_ID`, `YT_OPERATION_ID`, `YT_JOB_COOKIE`, `YT_JOB_INDEX`, `YT_TASK_JOB_INDEX`, `YT_START_ROW_INDEX`, `YT_FIRST_OUTPUT_TABLE_FD`, `YT_NODE_HOST`, `YT_POOL_TREE`, `YT_COLLECTIVE_ID`/`YT_COLLECTIVE_MEMBER_RANK`, `YT_JOB_PROXY_{GRPC,HTTP}_SOCKET_PATH`.
 
 - `is_inside_job()` tests `YT_JOB_ID`, as Go's `mapreduce.InsideJob` does.
-- argv is exactly the spec's command, `["./selfrun"]`. Role dispatch by argv (`wordcount map`) works if the call site passes the role.
+- argv is the spec's command, `["./selfrun"]`. Role dispatch by argv (`wordcount map`) works if the call site passes the role.
 
 ## Custom job statistics
 
@@ -62,7 +62,7 @@ All observed:
 
 ### Changing a schema
 
-`alter_table` takes `schema` as a top-level parameter. On a table with rows, a change that asks more of existing rows fails with error 316, `Table schemas are incompatible`; the inner error names the column, so the client has no local rules. Observed:
+`alter_table` takes `schema` as a top-level parameter. On a table with rows, a change that asks more of existing rows fails with error 316, `Table schemas are incompatible`; the inner error names the column, so the client has no local rules. Observed on a table with rows:
 
 - allowed: adding an optional column at any position, required → optional, strict → non-strict;
 - add a required column: `Cannot insert a new required column "must" into a non-empty table`;
@@ -121,7 +121,7 @@ Observed:
 ### Response size limits
 
 - `ureq`'s `limit()` bounds transferred bytes, not memory: `BodyWithConfig::do_build` puts the gzip decoder on top of a `LimitReader`. Measured: a `read_file` of 600 MiB of zeros arrived in 611 522 wire bytes, and `.limit(536870912)` returned all 629 145 600. The memory cap, `http::CapReader`, sits above the decoder.
-- A wire limit is still needed underneath: a chunked stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing, and `flate2` loops inside one `read`.
+- A wire limit is needed underneath: a chunked stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing, and `flate2` loops inside one `read`.
 - The wire limit cannot be the memory cap: 4 096 incompressible bytes gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip wrapper.
 - The memory cap is not a process budget: `read_to_end` doubles a `Vec` and copies, so both buffers are resident during a copy (about 1.5× where the allocator cannot extend in place). Measured (release build, local listener): a read of 536 870 911 bytes peaked at 544 178 176 bytes resident, a 600 MiB read refused by the 512 MiB cap at 611 385 344. Quote the cap as what is held, never as what to size a container for.
 
@@ -147,7 +147,7 @@ Observed:
 - The chain shares the command's one deadline. A fresh `timeout_global` per hop would allow `(MAX_REDIRECTS + 1)×` the requested time: 22 minutes at the default two, on an `exists`.
 - `Location` is resolved against the request's address (RFC 3986 §4.2); a reference with no path (`?path=…`, `#frag`) keeps the request's path (§5.3).
 - Tested offline in `crates/ytsaurus-client/tests/redirect_credentials.rs` (a local cluster redirects nothing). A stub must read the whole request (head and body, `Content-Length` or chunked) before answering, as `request_shape.rs` does; otherwise `ureq` reports a broken pipe (a small body survives on macOS, not on a Linux runner).
-- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and is kept by hand beside the `Repeatable::Heavy` call sites, unchecked: `lookup_rows_dynamic` and `select_rows_dynamic` send `Repeatable::Heavy` and are not on it.
+- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and is kept by hand, unchecked against the `Repeatable::Heavy` call sites: `lookup_rows_dynamic` and `select_rows_dynamic` send `Repeatable::Heavy` and are not on it.
 
 ### TLS
 
@@ -279,9 +279,9 @@ Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs
 ### `/hosts`
 
 - `/hosts` answers a JSON list of bare host names, `["n0008-sas.cluster-name", …]` ([HTTP proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)), "ordered by load … the very first proxy in the resulting list is the least loaded" ([reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)); `TCoordinator::ListProxies` shuffles the better half. No scheme and usually no port: both come from the configured address.
-- The `data` role default is undocumented: `default_role_filter`, a coordinator config parameter defaulted in `TCoordinatorConfig::Register` to `NApi::DefaultHttpProxyRole`, `"data"` in [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h). An operator can change it; the client validates what it gets. `?role=`, `/hosts/all` (the only form listing banned and dead proxies) and the plain-text form (exact `Accept: text/plain`) are also source-only.
+- The `data` role default is undocumented: `default_role_filter`, a coordinator config parameter defaulted in `TCoordinatorConfig::Register` to `NApi::DefaultHttpProxyRole`, `"data"` in [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h). An operator can change it; the client validates what it gets. `?role=`, `/hosts/all` (the only form listing banned and dead proxies) and the plain-text form (exact `Accept: text/plain`) are source-only.
 - The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too.
-- A failed heavy command drops its host from the pool; with separate roles, falling back to the configured address would reach a control proxy ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)). Only an empty pool falls back, for `HOSTS_RETRY_AFTER`; a refresh restores dropped hosts. The drop uses `retry::attributable_to_the_host`, not `worth_asking_again`: they differ on a rejected certificate, and `NotValidForName` is about one host ([#40](https://github.com/sshaplygin/ytsaurus-rs/issues/40)). A proxy refusing heavy work for its role is also the host's fault, which `is_retriable` cannot express; hence three predicates.
+- A failed heavy command drops its host from the pool; with separate roles, falling back to the configured address would reach a control proxy ([#30](https://github.com/sshaplygin/ytsaurus-rs/issues/30)). Only an empty pool falls back, for `HOSTS_RETRY_AFTER`; a refresh restores dropped hosts. The drop uses `retry::attributable_to_the_host`, not `worth_asking_again`: they differ on a rejected certificate, and `NotValidForName` is about one host (reasoning). A proxy refusing heavy work for its role is also the host's fault, which `is_retriable` cannot express; hence three predicates.
 - An empty or absent list means the configured address serves everything. A loopback cluster is not asked: it would publish an address behind the port mapping or tunnel (reasoning; no local `/hosts` answer was captured).
 
 ### Which names from `/hosts` are used
