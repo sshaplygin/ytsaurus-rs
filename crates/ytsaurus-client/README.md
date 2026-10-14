@@ -460,9 +460,10 @@ the documentation says they cannot be. Use
 
 ## Where a heavy command goes
 
-Table and file data (`write_table`, `read_table`, `write_file`, `read_file`,
-`upload_worker`, their streaming forms) are heavy commands, which a large
-installation serves on separate proxies. The first heavy command asks `/hosts`;
+Table, file and row data (`write_table`, `read_table`, `write_file`,
+`read_file`, `upload_worker`, their streaming forms, and the four `*_rows_dynamic`
+methods) are heavy commands, which a large installation serves on separate
+proxies. The first heavy command asks `/hosts`;
 the answer becomes a pool, and each heavy command picks a member at random, as
 both official SDKs do. The pool is refreshed lazily when older than
 `Client::with_host_list_refresh_interval` (one minute by default); a failed

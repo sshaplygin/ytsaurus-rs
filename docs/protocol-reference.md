@@ -147,7 +147,7 @@ Observed:
 - The chain shares the command's one deadline. A fresh `timeout_global` per hop would allow `(MAX_REDIRECTS + 1)×` the requested time: 22 minutes at the default two, on an `exists`.
 - `Location` is resolved against the request's address (RFC 3986 §4.2); a reference with no path (`?path=…`, `#frag`) keeps the request's path (§5.3).
 - Tested offline in `crates/ytsaurus-client/tests/redirect_credentials.rs` (a local cluster redirects nothing). A stub must read the whole request (head and body, `Content-Length` or chunked) before answering, as `request_shape.rs` does; otherwise `ureq` reports a broken pipe (a small body survives on macOS, not on a Linux runner).
-- The `HEAVY` list in `http.rs` only decides whether a refusal says "go to a heavy proxy". It is the cluster's `isHeavy` bit, covering commands only `raw_command` can send, and is kept by hand, unchecked against the `Repeatable::Heavy` call sites: `lookup_rows_dynamic` and `select_rows_dynamic` send `Repeatable::Heavy` and are not on it.
+- The `HEAVY` list in `http.rs` decides whether a refusal says "go to a heavy proxy", and which commands `BatchRequest::raw` refuses by policy. It holds the commands the crate routes to a heavy proxy (`Repeatable::Heavy`), plus `read_blob_table`, which only `raw_command_streaming` sends; each is `isHeavy` in [`driver.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp): `REGISTER_ALL(TLookupRowsCommand, "lookup_rows", Tabular, Tabular, false, true)`, `select_rows` `(Null, Tabular, false, true)`, and v4 `insert_rows` and `delete_rows` `(Tabular, Structured, true, true)`. It is not the whole registry: `get_job_spec` is `isHeavy` too. A unit test (`a_command_goes_to_a_heavy_proxy_exactly_when_it_is_on_the_heavy_list`) sends every modelled command through a stub control proxy and fails if routing and `HEAVY` disagree in either direction.
 
 ### TLS
 
@@ -265,12 +265,12 @@ Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs
 
   | Request | Answer |
   | --- | --- |
-  | heavy with input data: `write_table`, `write_file` | 503 + `Retry-After: 60`, `Control proxy may not serve heavy requests with input data` |
-  | heavy without: `read_table`, `read_file`, `get_job_input`, `get_job_stderr` | 307 to a data proxy |
+  | heavy with input data: `write_table`, `write_file`, `lookup_rows`, `insert_rows`, `delete_rows` | 503 + `Retry-After: 60`, `Control proxy may not serve heavy requests with input data` |
+  | heavy without: `read_table`, `read_file`, `get_job_input`, `get_job_stderr`, `select_rows` | 307 to a data proxy |
   | heavy read, no data proxy available | 503, `There are no data proxies available` |
   | any of them with `X-YT-Suppress-Redirect` | served by the control proxy |
 
-  The split is the registry's `inDataType` column.
+  The split is the registry's `inDataType` column. For the four dynamic-table commands it is read from the source, not observed.
 - Only the error string was observed: `ClientError::Cluster` renders `{command}: cluster error {code}: {message}` without the status; the statuses come from the source.
 - The documentation gives each half: the [`/hosts` section](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts) says "When you try to execute a heavy command, light proxies return code 503"; the [return-code table](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#return_codes) says "307 — Redirecting heavy queries from light to heavy proxies".
 - Only the role `control` refuses: `TCoordinator::CanHandleHeavyRequests` is `Role != "control"`, so `default` serves heavy commands.
@@ -363,7 +363,7 @@ Observed:
 
   **Do not test this with `BatchRequest::create`**: its `ignore_existing` returns the old node ids under a fresh id too. Per-part ids are derived by incrementing, so the client refuses to split a batch carrying a caller's id.
 - Executing the same batch again without the caller's id is new work (each execution mints its own mutation ids), answered as the fresh run above; `remove` parts got `500`.
-- Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`; the other parts still run. That is 21 of the 190 commands in `GET /api/v4`, against 7 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
+- Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`; the other parts still run. That is 21 of the 190 commands in `GET /api/v4`, against 11 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
 - Also refused whole: a part whose command needs input and has none (`Command %Qv requires input`; `insert_rows`, `write_table` and seven others).
 - No modelled command answers a bare `{}` under API v4: `create` → `{"output":{"node_id":…}}`, `set` and `remove` → `{"output":{}}`, `exists` → `{"output":{"value":false}}`. The reference's bare `{}` for `set` is v3 (`GET /api/v4` lists `remove` and `set` as `output_type: structured`, `/api/v3` as `null`). The parser checks the key: `node_id` for `create`, `value` for `exists`/`get`/`list`.
 

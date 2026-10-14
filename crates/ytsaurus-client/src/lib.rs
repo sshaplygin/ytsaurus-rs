@@ -394,9 +394,10 @@ impl Client {
     /// Overrides how a failed request is repeated. The default is five attempts
     /// with a doubling delay; [`RetryPolicy::none`] turns it off.
     ///
-    /// Applies to light commands only. Heavy ones (table and file I/O) are sent
-    /// once whatever the policy, because the documentation says they cannot be
-    /// retried; use a transaction to make one atomic.
+    /// Applies to light commands only. Heavy ones (table, file and
+    /// dynamic-table I/O) are sent once whatever the policy, because the
+    /// documentation says they cannot be retried; use a transaction to make one
+    /// atomic.
     #[must_use]
     pub fn with_retries(mut self, policy: RetryPolicy) -> Self {
         self.transport.set_retries(policy);
@@ -418,12 +419,13 @@ impl Client {
 
     /// Overrides whether heavy commands ask the cluster where to go.
     ///
-    /// Heavy commands are table and file data: [`Client::write_table`],
+    /// Heavy commands are table, file and row data: [`Client::write_table`],
     /// [`Client::read_table`], [`Client::write_file`], [`Client::read_file`],
-    /// [`Client::upload_worker`] and their streaming forms. A control proxy
-    /// refuses them, so by default the first one asks `/hosts`, keeps the
-    /// answer as a pool and sends each heavy command to a random member; light
-    /// commands stay on the configured address.
+    /// [`Client::upload_worker`] and their streaming forms, and the four
+    /// dynamic-table methods, such as [`Client::lookup_rows_dynamic`]. A
+    /// control proxy refuses them, so by default the first one asks `/hosts`,
+    /// keeps the answer as a pool and sends each heavy command to a random
+    /// member; light commands stay on the configured address.
     ///
     /// - The pool is refreshed lazily ([`Client::with_host_list_refresh_interval`]).
     /// - A host that fails a command for a reason of its own is dropped. Only

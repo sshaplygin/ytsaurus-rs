@@ -58,7 +58,7 @@ pub enum Repeatable {
     /// Mutating outside the master's mutation cache. Sent once, whatever the
     /// policy says: nothing would deduplicate a second send.
     Never,
-    /// **Heavy**: table and file data, in either direction.
+    /// **Heavy**: table, file and dynamic-table row data, in either direction.
     ///
     /// Sent once, like [`Repeatable::Never`]: the documented way to make a
     /// heavy command atomic is a transaction.
@@ -72,7 +72,8 @@ pub enum Repeatable {
     /// and [where a heavy command goes](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#where-a-heavy-command-goes).
     ///
     /// The modelled heavy commands are `write_table`, `read_table`,
-    /// `write_file`, `read_file`, `get_job_input` and `get_job_stderr`, each
+    /// `write_file`, `read_file`, `get_job_input`, `get_job_stderr`,
+    /// `lookup_rows`, `select_rows`, `insert_rows` and `delete_rows`, each
     /// `isHeavy` in the cluster's
     /// [driver registry](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp).
     /// A raw command that streams in either direction is sent this way whatever
