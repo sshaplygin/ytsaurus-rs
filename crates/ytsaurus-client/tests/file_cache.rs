@@ -311,6 +311,66 @@ fn an_access_denied_that_is_not_the_caches_is_not_swallowed() {
     );
 }
 
+/// Set in the copy of this test binary that
+/// [`a_refused_cache_is_announced_on_stderr`] starts.
+const ANNOUNCING: &str = "YTSAURUS_CLIENT_TEST_ANNOUNCING";
+
+#[test]
+fn a_refused_cache_is_announced_on_stderr() {
+    if std::env::var_os(ANNOUNCING).is_some() {
+        let cluster = cluster(|sent| match sent.command.as_str() {
+            "get_file_from_cache" => Answer::Body(MISS.to_owned()),
+            _ if sent.mentions(CACHE) => Answer::Denied,
+            _ => Answer::Body("{}".to_owned()),
+        });
+        let uploaded = cluster
+            .client()
+            .upload_worker_cached(worker_file("announced"))
+            .expect("a cache that refuses this caller is not a failed upload");
+        assert!(!uploaded.cached, "{uploaded:?}");
+        return;
+    }
+
+    // The harness captures what a test prints, so the warning is read from a
+    // second run of this binary, filtered to this test, whose stderr is a pipe.
+    // No subscriber is installed here, so a `tracing` build prints it too.
+    let child = std::process::Command::new(std::env::current_exe().expect("has a path"))
+        .args([
+            "a_refused_cache_is_announced_on_stderr",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(ANNOUNCING, "1")
+        .output()
+        .expect("runs");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let stderr = String::from_utf8_lossy(&child.stderr);
+
+    assert!(
+        child.status.success(),
+        "the refused upload failed: {}\n{stdout}\n{stderr}",
+        child.status
+    );
+    // A filter that matches nothing also exits 0, and prints no warning.
+    assert!(
+        stdout.contains("ok. 1 passed;"),
+        "the filter did not run exactly this test: {stdout}"
+    );
+
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("ytsaurus-client: the file cache at"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the fallback is announced once on stderr: {stderr}"
+    );
+    for named in [CACHE, "Access denied", "Client::with_file_cache"] {
+        assert!(warnings[0].contains(named), "{named} is missing: {stderr}");
+    }
+}
+
 // -------------------------------------------------------------- the stub
 
 /// One request, as the stub saw it.
