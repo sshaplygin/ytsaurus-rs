@@ -192,8 +192,8 @@ to prove semantic agreement cheaply.
 v1.0 collected "total job CPU time". From
 [`docs/protocol-reference.md`](protocol-reference.md#custom-job-statistics):
 
-> A local cluster reports nothing under `user_job/cpu`, so job-CPU
-> comparisons cannot be run here; `time/exec` is what it does report.
+> A local cluster reports `time/exec` but nothing under `user_job/cpu`, so
+> job-CPU comparisons cannot be run here.
 > — [`docs/protocol-reference.md`](protocol-reference.md), *Custom job statistics*
 
 Locally the results are wall clock under emulation, never CPU.
