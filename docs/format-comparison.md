@@ -339,8 +339,9 @@ harness killed mid-run does not leave a query running on the cluster.
 Query Tracker is a non-goal of this client (AGENTS.md); the harness reaches it
 through `raw_command`, as
 [`docs/sdk-comparison.md`](sdk-comparison.md#query-tracker-through-raw_command)
-shows. For scale, the merged pull requests added 1824 lines across 15 files for
-`read_file`, 1864 for transaction detach and 3371 for batch requests. A minimal
+shows. For scale, the pull requests that added `read_file`, transaction detach
+and batch requests added 1824 lines (across 15 files), 1864 and 3371, as GitHub
+reports their additions. A minimal
 query surface (`start_query`, `get_query`, `wait_for_query`, `abort_query`, a
 `QueryState` enum, a parsed `QueryInfo`) would be roughly 1.5–2 k lines with
 wire-shape tests, a cluster example and the CHANGELOG; `list_queries` with a
