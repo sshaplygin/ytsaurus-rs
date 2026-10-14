@@ -77,13 +77,10 @@ const ERROR_BODY_LIMIT: u64 = 64 * 1024;
 /// How much of a `/hosts` answer [`Transport::fetch`] holds, after
 /// decompression: 1 MiB.
 ///
-/// The answer is a JSON list of bare host names
-/// ([`/hosts`](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#hosts)).
-/// A domain name is at most 255 octets on the wire (RFC 1035, section 2.3.4),
-/// 253 characters written with dots, so an entry with its quotes and comma
-/// is 256 bytes and the cap holds 4 096 of the longest; the largest answer
-/// recorded named 79 hosts. A larger answer fails with
-/// [`ClientError::ResponseTooLarge`].
+/// The answer is a JSON list of bare host names; the cap holds 4 096 of the
+/// longest a DNS name can be ([response size
+/// limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits)).
+/// A larger answer fails with [`ClientError::ResponseTooLarge`].
 const HOSTS_LIMIT: u64 = 1024 * 1024;
 
 /// The heavy commands this crate routes to a heavy proxy, plus
