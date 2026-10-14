@@ -99,6 +99,61 @@ optimistic one. None is CPU.
 - The 3.19× Criterion figure in `benchmarking.md` §2 was not re-run under that
   change, which bounds it rather than replacing it.
 
+### The `wordcount` task
+
+`format_compare`'s default task, separate from the eight-leg comparison above.
+It runs the [`wordcount`](../crates/ytsaurus-job/examples/wordcount.rs) worker
+on binary YSON twice, `map` (sums within a row) and `map-combine` (sums within
+the job), against the [phase 1 query](#phase-1-the-queries-and-the-modes). The
+format is the same in all three legs and the task shuffles, so these figures
+are about plan shape and job startup and are no evidence about wire formats.
+
+Conditions. Measured on 13 August 2026 on the local cluster of phase 0
+(`ghcr.io/ytsaurus/local:stable`, single node, x86-64 images under arm64
+emulation; the harness does not print the image tag). Input: 16 MiB of
+generated text whose vocabulary is capped at 3 750 distinct words and does
+not grow with the input. Harness: the version before pairing by round was
+added, squashed into `6fca203`. Its estimator was each leg's fastest timed
+round after one discarded warm-up, not the pairing in
+[The estimator](#the-estimator-and-three-rules); how many rounds were run is
+not recorded. The three legs' outputs were compared word by word before any
+timing. Every ms figure is `time/exec` summed over a leg's jobs, process start
+included, and for the query over every operation it spawned. The query held
+640 MB against the worker's 512 MB. The worker took the controller's default
+job count; the query's spec asks for 1 GiB per job. The query tokenises with
+`Re2` where `String::SplitToList` would do on this space-separated corpus.
+
+| | `map` | `map-combine` | query |
+| --- | ---: | ---: | ---: |
+| map jobs | 3 | 3 | 1 |
+| rows into the shuffle | 3 114 964 | 11 250 | 3 750 |
+| summed `time/exec`, ms | 8432 | 2787 | 4650 |
+
+- At 16 MiB the query took about 1.8× less summed `time/exec` than `map`; on
+  wall clock the two were indistinguishable. At 1 MiB `map` was 2.5× faster
+  than the query, so the direction depends on input size, not on the two
+  implementations.
+- The largest single cause is plan shape: YQL's planner combines in its map
+  stage, so 3 750 rows crossed its shuffle against 3 114 964 for `map`.
+- Per-row pre-aggregation in `map` removes 0.4 %: 3 126 408 words became
+  3 114 964 shuffle rows, because a word rarely repeats inside one line.
+- `map-combine` cut the shuffle 277×, to 11 250 rows: 3 map jobs × 3 750
+  distinct words, each job flushing the whole vocabulary. The query reached
+  3 750 because its map ran as one job, so the remaining factor of 3 is job
+  count, not combining.
+- `map-combine` takes the worker from 8432 to 2787 ms. Of the 5645 ms saved,
+  1294 ms is the mapper no longer encoding 3.1 M output rows and 4351 ms is the
+  reducer no longer reading 39.7 MiB of them back.
+- Most of each figure is job startup, about 640 ms a job against 150–500 ms
+  of actual wordcount, and the two sides ran different numbers of jobs.
+- The query's 4650 ms against `map-combine`'s 2787 reads as 1.67×; charged
+  only what the worker's own reduce cost, the query's 4650 ms becomes 3396, so
+  1.22×. On the stage that touches every row the two are within a few per cent
+  per byte.
+- A job-level combiner is worth about 3× on this workload; the rest is plan
+  shape and job startup. The corpus flatters a combiner: every job sees every
+  word, and the vocabulary does not grow with the input.
+
 ## Method
 
 ### The four legs
@@ -185,7 +240,8 @@ are counted, not kept.
 
 `wordcount` and the full `sessionize` stay as YSON-against-YQL only (map-reduce
 and a key-switch reduce are outside the Skiff envelope above), used in phase 1
-to prove semantic agreement cheaply.
+to prove semantic agreement cheaply. The `wordcount` timings are in
+[The `wordcount` task](#the-wordcount-task).
 
 ### The metric
 
