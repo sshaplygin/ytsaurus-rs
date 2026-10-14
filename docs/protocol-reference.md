@@ -188,7 +188,7 @@ Observed:
 - A sorted merge needs no `merge_by`: two tables sorted by `host`, merged with `mode=sorted`, complete with output `sorted_by=[host]`.
 - `get_job` answers unwrapped with `job_id`; `list_jobs` wraps in `{jobs=[…]}` with `id`. One parser reads both.
 - `get_job_input` never answers for a vanilla job: 30 s, zero bytes.
-- A Cypress lookup under `//sys/operations` answered `has no child with key` on a local cluster for an operation id that exists; `get_operation` finds it.
+- A Cypress lookup under `//sys/operations` answered `has no child with key` for an operation id that exists; `get_operation` finds it.
 
 ## Appending to a table
 
@@ -280,7 +280,7 @@ Observed on a real installation ([#30](https://github.com/sshaplygin/ytsaurus-rs
 
 - `/hosts` answers a JSON list of bare host names, `["n0008-sas.cluster-name", …]` ([HTTP proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload)), "ordered by load … the very first proxy in the resulting list is the least loaded" ([reference](https://ytsaurus.tech/docs/en/user-guide/proxy/http-reference#hosts)); `TCoordinator::ListProxies` shuffles the better half. No scheme and usually no port: both come from the configured address.
 - The `data` role default is undocumented: `default_role_filter`, a coordinator config parameter defaulted in `TCoordinatorConfig::Register` to `NApi::DefaultHttpProxyRole`, `"data"` in [`yt/yt/client/api/public.h`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/api/public.h). An operator can change it; the client validates what it gets. `?role=`, `/hosts/all` (the only form listing banned and dead proxies) and the plain-text form (exact `Accept: text/plain`) are also source-only.
-- The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first, lazily, when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too.
+- The [proxy guide](https://ytsaurus.tech/docs/en/user-guide/proxy/http#upload): "A good strategy is to re-query the `/hosts` list every minute or every few queries and change the current proxy to which queries are made." The client keeps the answer as a pool (`Transport::base_for`); each heavy command picks a member at random, and re-asks first when the answer is older than `with_host_list_refresh_interval` (one minute by default), as the C++ `THostManager` does. A failed refresh keeps the previous answer for another interval; an empty answer expires after one interval too.
 - A failed heavy command drops its host from the pool; with separate roles, falling back to the configured address would reach a control proxy (#30). Only an empty pool falls back, for `HOSTS_RETRY_AFTER`; a refresh restores dropped hosts. The drop uses `retry::attributable_to_the_host`, not `worth_asking_again`: they differ on a rejected certificate, and `NotValidForName` is about one host (#40). A proxy refusing heavy work for its role is also the host's fault, which `is_retriable` cannot express; hence three predicates.
 - An empty or absent list means the configured address serves everything. A loopback cluster is not asked: it would publish an address behind the port mapping or tunnel (reasoning; no local `/hosts` answer was captured).
 
@@ -363,7 +363,7 @@ Observed:
 
   **Do not test this with `BatchRequest::create`**: its `ignore_existing` returns the old node ids under a fresh id too. Per-part ids are derived by incrementing, so the client refuses to split a batch carrying a caller's id.
 - Executing the same batch again without the caller's id is new work (each execution mints its own mutation ids), answered as the fresh run above; `remove` parts got `500`.
-- Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`. That is 21 of the 190 commands in `GET /api/v4`, against 7 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
+- Data types, not `isHeavy`, decide what can be a part: a part with output `tabular` or `binary`, or input `binary`, fails the whole request with `Command %Qv cannot be part of a batch since it has inappropriate output type %Qlv`; the other parts still run. That is 21 of the 190 commands in `GET /api/v4`, against 7 on the crate's `HEAVY` list. Accepted: `get_job_spec` (`is_heavy: true`), and `write_table` (`is_heavy: true`, input `tabular`, output `structured`) with rows in the part's `input`, which the crate refuses by policy. Refused: `alter_query` and `push_queue_producer` (`is_heavy: false`), `lookup_rows`, and `select_rows`: `[create x1, select_rows]` got 400 `inappropriate output type "tabular"` with `x1` created.
 - Also refused whole: a part whose command needs input and has none (`Command %Qv requires input`; `insert_rows`, `write_table` and seven others).
 - No modelled command answers a bare `{}` under API v4: `create` → `{"output":{"node_id":…}}`, `set` and `remove` → `{"output":{}}`, `exists` → `{"output":{"value":false}}`. The reference's bare `{}` for `set` is v3 (`GET /api/v4` lists `remove` and `set` as `output_type: structured`, `/api/v3` as `null`). The parser checks the key: `node_id` for `create`, `value` for `exists`/`get`/`list`.
 
@@ -381,7 +381,7 @@ Enabled in the operation spec:
 
 - `job_io.control_attributes.{enable_table_index,enable_row_index,enable_range_index,enable_key_switch}`
 - `mapper.enable_input_table_index` overrides `enable_table_index`.
-- For map-reduce, the reducer's section is `reduce_job_io`, not `job_io`: each job type has its own I/O section.
+- For map-reduce, the reducer's section is `reduce_job_io`, not `job_io`: each job type has its own.
 
 ## Cluster gotchas
 
