@@ -46,7 +46,7 @@ Go. Neither is a superset.
 | Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic, random per command, refreshed every minute, constrained by domain; see below |
 | Compression | configurable, off by default | zstd both ways | gzip inbound only |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | one, 120 s by default, `Client::with_timeout` |
-| Response size cap | none; a non-2xx body is not read, `/hosts` is read whole | none; `/hosts` and a non-2xx body are read whole | 512 MiB decoded per buffered response, 1 MiB for `/hosts`, the first 64 KiB of a non-2xx body; see [response size limits](protocol-reference.md#response-size-limits) |
+| Response size cap | none; a non-2xx body is not read, `/hosts` is read whole | none; `/hosts` and a non-2xx body are read whole | 512 MiB decoded per buffered response, 2xx or not; 1 MiB for `/hosts`; the first 64 KiB of a non-2xx body of a streaming command or `/hosts`; see [response size limits](protocol-reference.md#response-size-limits) |
 | Batching several commands | `CreateBatchRequest` → futures | `NewBatchRequest` → `BatchResponse[T]` | `BatchRequest` → `Vec<Result<…>>`; no per-part retry (C++ re-queues a retriable part); a split batch that stops reports the prefix it was answered for (C++ throws and loses it) |
 | Retries | three policies by request class | interceptor chain | one policy × `Repeatable` |
 | Client logging | global `ILogger` | `Config.Logger`, structured | optional `tracing` feature, off by default |
