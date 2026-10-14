@@ -67,18 +67,19 @@ const MAX_REDIRECTS: usize = 10;
 /// configured address.
 const RESPONSE_LIMIT: u64 = 512 * 1024 * 1024;
 
-/// The commands the cluster declares heavy: they carry a data stream.
-///
-/// The [command reference](https://ytsaurus.tech/docs/en/api/commands) marks
-/// `read_table`, `write_table`, `read_file`, `write_file` and `read_blob_table`
-/// heavy; the answers of `get_job_input` and `get_job_stderr` are data streams
-/// too. `read_blob_table` has no method here and is reachable through
+/// The heavy commands this crate routes to a heavy proxy, plus
+/// `read_blob_table`, which has no method here and is reachable through
 /// [`Client::raw_command_streaming`](crate::Client::raw_command_streaming).
 ///
-/// Used only to decide whether a refused redirect is told to go to a heavy
-/// proxy: a heavy raw command missing here loses the advice, not the refusal.
-/// [`Repeatable::Heavy`] encodes the same `isHeavy` bit for routing, so a new
-/// `Repeatable::Heavy` call site belongs on this list too.
+/// Each is `isHeavy` in the driver's registry
+/// ([`driver.cpp`](https://github.com/ytsaurus/ytsaurus/blob/main/yt/yt/client/driver/driver.cpp))
+/// and "Heavy" in the [command reference](https://ytsaurus.tech/docs/en/api/commands).
+/// It is not the whole registry: `get_job_spec` and others are `isHeavy` but
+/// carry no table, file or row data, and a batch accepts them as parts.
+///
+/// Read through [`is_heavy`]. A unit test sends every modelled command through
+/// a stub control proxy and holds the commands that reach the heavy proxy
+/// equal to this list, less `read_blob_table`.
 const HEAVY: &[&str] = &[
     "read_table",
     "write_table",
@@ -87,9 +88,13 @@ const HEAVY: &[&str] = &[
     "read_blob_table",
     "get_job_input",
     "get_job_stderr",
+    "lookup_rows",
+    "select_rows",
+    "insert_rows",
+    "delete_rows",
 ];
 
-/// Whether `command` is one the cluster declares heavy.
+/// Whether `command` is on [`HEAVY`].
 ///
 /// Read by the redirect advice, and by
 /// [`BatchRequest::raw`](crate::BatchRequest::raw) for this crate's own policy
@@ -4144,14 +4149,9 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
     #[test]
     fn the_heavy_commands_are_the_ones_that_carry_a_stream() {
         // The advice a refused redirect ends with is "go to a heavy proxy",
-        // which only a heavy command can act on.
-        //
-        // Every command this crate itself sends heavily is here. `get_job_stderr`
-        // was the one that was not, and it is the one a launcher reaches for
-        // while it is already diagnosing a failure — the worst moment to be
-        // handed a refusal with no advice in it. See [`HEAVY`]:
-        // `Repeatable::Heavy` writes the same fact down a second time, and the
-        // two have to agree.
+        // which only a heavy command can act on. Every command this crate
+        // sends to a heavy proxy is here; which ones those are is held by
+        // `a_command_goes_to_a_heavy_proxy_exactly_when_it_is_on_the_heavy_list`.
         for command in [
             "read_table",
             "write_table",
@@ -4159,16 +4159,148 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
             "write_file",
             "get_job_input",
             "get_job_stderr",
+            "lookup_rows",
+            "select_rows",
+            "insert_rows",
+            "delete_rows",
         ] {
             assert!(HEAVY.contains(&command), "{command}");
         }
-        // And the one reachable only through the raw door, which is the point
-        // of listing what the cluster calls heavy rather than what this crate
-        // models.
+        // And the one reachable only through the raw door.
         assert!(HEAVY.contains(&"read_blob_table"));
         for command in ["create", "exists", "start_operation", "get_job", "hosts"] {
             assert!(!HEAVY.contains(&command), "{command}");
         }
+    }
+
+    /// A keep-alive stub proxy that records the request line of everything it
+    /// serves: `GET /hosts` gets `hosts` (404 for `None`), anything else a 200
+    /// `{"value"=%true}`, which no data method decodes, so each call ends after
+    /// its one request. Returns the address and the record.
+    fn recording_proxy(hosts: Option<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("has an address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        let record = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let hosts = hosts.clone();
+                let record = Arc::clone(&record);
+                // One thread per connection: the client may open a second
+                // while the first sits pooled.
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clones"));
+                    loop {
+                        let head = drain_request(&mut reader);
+                        let Some(line) = head.lines().next() else {
+                            return;
+                        };
+                        let (status, body) = match (line.starts_with("GET /hosts "), &hosts) {
+                            (true, Some(list)) => (200, list.clone()),
+                            (true, None) => (404, String::new()),
+                            (false, _) => (200, r#"{"value"=%true}"#.to_owned()),
+                        };
+                        record
+                            .lock()
+                            .expect("nothing panicked holding it")
+                            .push(line.to_owned());
+                        let reply = format!(
+                            "HTTP/1.1 {status} .\r\nContent-Type: application/x-yt-yson-text\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (format!("http://{address}"), seen)
+    }
+
+    /// The command names in a recorded list of request lines; `/hosts` is not
+    /// a command and is left out.
+    fn commands_in(seen: &Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock()
+            .expect("nothing panicked holding it")
+            .iter()
+            .filter_map(|line| line.split(' ').nth(1)?.strip_prefix("/api/v4/"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_command_goes_to_a_heavy_proxy_exactly_when_it_is_on_the_heavy_list() {
+        // `Repeatable::Heavy` at a call site routes a command; `HEAVY` gives a
+        // refused redirect of it the heavy-proxy advice and keeps it out of a
+        // batch. Every modelled data method, and three light ones, go through a
+        // control proxy that names one heavy proxy, and the two are held to the
+        // same set in both directions. The pool has one host, and a 200 answer
+        // that fails to decode does not drop it.
+        use crate::{Client, SkiffFormat, SkiffSchema, SkiffSchemaRef, SkiffWireType};
+        use ytsaurus_api::{LookupOptions, Row, SelectOptions};
+
+        let (heavy, heavy_seen) = recording_proxy(None);
+        let named = heavy.trim_start_matches("http://");
+        let (control, control_seen) = recording_proxy(Some(format!(r#"["{named}"]"#)));
+        let client = Client::new(&control)
+            .with_retries(RetryPolicy::none())
+            .with_proxy_discovery(true);
+        let skiff = SkiffFormat::new(vec![SkiffSchemaRef::Inline(SkiffSchema::tuple([
+            SkiffSchema::named("n", SkiffWireType::Int64),
+        ]))])
+        .expect("one named tuple is a valid format");
+        let key = [Row::new().with("k", 1_i64)];
+
+        let _ = client.write_table("//tmp/t", b"");
+        let _ = client.write_table_rows(
+            "//tmp/t",
+            [std::collections::BTreeMap::from([("n", 1_i64)])],
+        );
+        let _ = client.write_skiff_table("//tmp/t", b"", &skiff);
+        let _ = client.write_file("//tmp/f", b"x");
+        let _ = client.read_table("//tmp/t");
+        let _ = client.read_table_streaming("//tmp/t");
+        let _ = client.read_skiff_table("//tmp/t", &skiff);
+        let _ = client.read_file("//tmp/f");
+        let _ = client.read_file_streaming("//tmp/f");
+        let _ = client.get_job_input("1-2-3-4", "5-6-7-8");
+        let _ = client.get_job_stderr("1-2-3-4", "5-6-7-8");
+        let _ = client.lookup_rows_dynamic("//tmp/d", &key, &LookupOptions::default());
+        let _ = client.select_rows_dynamic("* from [//tmp/d]", &SelectOptions::default());
+        let _ = client.insert_rows_dynamic("//tmp/d", &key);
+        let _ = client.delete_rows_dynamic("//tmp/d", &key);
+        let _ = client.exists("//tmp");
+        let _ = client.create("table", "//tmp/t");
+        let _ = client.get("//tmp/@id");
+
+        let routed = commands_in(&heavy_seen);
+        let stayed = commands_in(&control_seen);
+        for command in &routed {
+            assert!(
+                is_heavy(command),
+                "{command} went to a heavy proxy and is not on HEAVY"
+            );
+        }
+        for command in &stayed {
+            assert!(
+                !is_heavy(command),
+                "{command} is on HEAVY and went to the configured address"
+            );
+        }
+        let routed: std::collections::BTreeSet<&str> = routed.iter().map(String::as_str).collect();
+        let listed: std::collections::BTreeSet<&str> = HEAVY
+            .iter()
+            .copied()
+            .filter(|command| *command != "read_blob_table")
+            .collect();
+        assert_eq!(routed, listed, "the configured address served {stayed:?}");
     }
 
     /// Serves one response carrying `payload`, and hands back the address to
@@ -4276,18 +4408,18 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
     }
 
     /// Reads one whole request off `reader` — the head, and the body if it has
-    /// one.
+    /// one — and returns the head, which is empty once the client hangs up.
     ///
     /// Not a parser, just enough of one to know when a request has ended.
     /// `upload` is why the body half exists: its request *is* a stream, `ureq`
     /// sends it chunked, and a listener that answered before reading it would
     /// leave the client writing into a socket nobody is draining.
-    fn drain_request(reader: &mut impl std::io::BufRead) {
+    fn drain_request(reader: &mut impl std::io::BufRead) -> String {
         let mut head = String::new();
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => return head,
                 Ok(_) if line == "\r\n" => break,
                 Ok(_) => head.push_str(&line),
             }
@@ -4306,14 +4438,14 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    return;
+                    return head;
                 }
                 let Ok(size) = usize::from_str_radix(line.trim(), 16) else {
-                    return;
+                    return head;
                 };
                 let mut chunk = vec![0; size + 2];
                 if reader.read_exact(&mut chunk).is_err() || size == 0 {
-                    return;
+                    return head;
                 }
             }
         }
@@ -4322,6 +4454,7 @@ yM+0UsZEWeI05Uq9c/Vs5TlJAcnvwJwxJqREhlHYMQA=
             let mut body = vec![0_u8; length];
             let _ = reader.read_exact(&mut body);
         }
+        head
     }
 
     /// `n` bytes gzip cannot shrink, the same `n` bytes every run.

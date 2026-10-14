@@ -1196,8 +1196,9 @@ enum Role {
     Control,
 }
 
-/// The commands a control proxy will not serve: the `isHeavy` column of
-/// `REGISTER_ALL` in `driver.cpp`.
+/// The commands a control proxy will not serve: those of the modelled
+/// commands that are `isHeavy` in `REGISTER_ALL` and `REGISTER` in
+/// `driver.cpp`.
 const HEAVY_COMMANDS: &[&str] = &[
     "write_table",
     "write_file",
@@ -1205,6 +1206,10 @@ const HEAVY_COMMANDS: &[&str] = &[
     "read_file",
     "get_job_input",
     "get_job_stderr",
+    "lookup_rows",
+    "select_rows",
+    "insert_rows",
+    "delete_rows",
 ];
 
 impl Proxy {
@@ -1456,9 +1461,9 @@ fn one_column() -> SkiffFormat {
 #[test]
 fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
     // Every route through the transport (`call`, `upload`, `open`): tables,
-    // files and Skiff in both directions, and a job's stderr. One lookup
-    // serves them all, since the answer is kept for the refresh interval, a
-    // minute by default (pinned in
+    // files and Skiff in both directions, a job's stderr, and the four
+    // dynamic-table commands. One lookup serves them all, since the answer is
+    // kept for the refresh interval, a minute by default (pinned in
     // `a_stale_answer_is_refreshed_by_the_next_heavy_command_and_a_fresh_one_is_not`).
     //
     // The pool has one host, so the random pick leaves the order as called;
@@ -1489,6 +1494,11 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
     let _ = client.read_file("//tmp/f");
     let _ = client.read_file_streaming("//tmp/f");
     let _ = client.get_job_stderr("1-2-3-4", "5-6-7-8");
+    let key = [ytsaurus_api::Row::new().with("k", 1_i64)];
+    let _ = client.lookup_rows_dynamic("//tmp/d", &key, &Default::default());
+    let _ = client.select_rows_dynamic("* from [//tmp/d]", &Default::default());
+    let _ = client.insert_rows_dynamic("//tmp/d", &key);
+    let _ = client.delete_rows_dynamic("//tmp/d", &key);
 
     // The `get` is the buffered `read_file`'s size check, a light command, so
     // it stays on the configured address.
@@ -1510,6 +1520,10 @@ fn every_heavy_shape_goes_there_and_the_cluster_is_asked_once() {
             "GET /api/v4/read_file HTTP/1.1",
             "GET /api/v4/read_file HTTP/1.1",
             "GET /api/v4/get_job_stderr HTTP/1.1",
+            "PUT /api/v4/lookup_rows HTTP/1.1",
+            "GET /api/v4/select_rows HTTP/1.1",
+            "PUT /api/v4/insert_rows HTTP/1.1",
+            "PUT /api/v4/delete_rows HTTP/1.1",
         ]
     );
 }
