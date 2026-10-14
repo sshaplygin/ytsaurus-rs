@@ -608,9 +608,8 @@ impl<'de> Deserialize<'de> for YsonValue {
                     // "@" keys are the attributes, and the body is either a
                     // "$value" entry (non-map bodies) or the remaining plain
                     // keys (a map body, whose entries arrive at this level).
-                    // The plain keys used to be discarded outright, so an
-                    // attributed *map* decoded to an attributed entity — the
-                    // whole body silently lost.
+                    // Discarding the plain keys would decode an attributed
+                    // *map* to an attributed entity, silently losing the body.
                     if !plain_map.is_empty() {
                         if body_node.is_some() {
                             let (key, _) = plain_map.iter().next().expect("checked non-empty");

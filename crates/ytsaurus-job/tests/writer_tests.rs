@@ -363,7 +363,7 @@ fn finish_flushes_buffered_output() {
     );
 }
 
-// ------------------------------------------------- named tables (#4)
+// ------------------------------------------------------ named tables
 
 /// Handles read at the call site, which is the whole point: `write(rejects, …)`
 /// cannot be mistaken for `write(events, …)` the way `write(1, …)` can.
@@ -430,8 +430,8 @@ fn table_names_reach_the_error_message() {
     assert!(message.contains("events, rejects"), "unhelpful: {message}");
 }
 
-/// A row written after `finish()` used to sit in the buffer and vanish when
-/// the job exited — a short table under exit code zero. It is refused now.
+/// A row written after `finish()` is refused. Accepted, it would sit in the
+/// buffer and vanish when the job exited: a short table under exit code zero.
 #[test]
 fn a_row_written_after_finish_is_refused() {
     let (mut writer, buffers) = writer_with_tables(1, YsonFormat::Text);

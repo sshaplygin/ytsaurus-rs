@@ -1,17 +1,12 @@
 //! `read_file` on the wire, and the check that makes its answer a file.
 //!
-//! A file's bytes carry no framing, so unlike a table — whose truncation
-//! leaves a record that does not parse — a `read_file` body cut short by a
-//! mid-stream failure looks exactly like a shorter file. The proxy says so in
-//! a trailer `ureq` cannot read (rechecked against its source, where the word
-//! does not appear), and the buffered path compensates by comparing the body
-//! against the size Cypress records for the node. These tests serve the file
-//! from a socket in-process, which is the only place a wrong-length body can
-//! be produced on demand: a cluster sends one only while something is
-//! genuinely failing mid-stream.
+//! A file's bytes carry no framing, so a body cut short by a mid-stream failure
+//! looks like a shorter file; the proxy's verdict is in a trailer `ureq` cannot
+//! read. The buffered path compares the body with the size Cypress records.
+//! The stub serves the file in-process, the only place a wrong-length body can
+//! be produced on demand.
 //!
-//! The stub follows the rule `request_shape.rs` learned the hard way: the
-//! whole request is read before the answer is written, or the client reports a
+//! The stub reads the whole request before it answers, or the client reports a
 //! broken pipe instead of the request under test.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -21,13 +16,11 @@ use std::time::Duration;
 
 use ytsaurus_client::{Client, ClientError, RetryPolicy};
 
-/// The path every test reads. Fixed, so the tests may assert its rendered
-/// spelling — a fixed literal cannot change, where a generated value's can.
+/// The path every test reads, fixed so the tests may assert its spelling.
 const PATH: &str = "//tmp/f";
 
-/// Bytes that are not text: every value a byte can take, cycled past the
-/// length of any one buffer, so an accidental `String` on the way through
-/// would corrupt them and a comparison would say so.
+/// Every byte value, cycled: an accidental `String` on the way through would
+/// corrupt them.
 fn file_of(len: usize) -> Vec<u8> {
     (0..len).map(|n| (n % 256) as u8).collect()
 }
@@ -40,9 +33,8 @@ fn a_file_comes_back_byte_for_byte_and_is_checked_against_the_recorded_size() {
     let read = stub.client().read_file(PATH).expect("reads");
     assert_eq!(read, contents, "the bytes are not what the proxy sent");
 
-    // The read, then the check: one heavy `read_file` and one light `get` for
-    // the node's recorded size — asked *after* the body, so the size compared
-    // is the size the file had when the proxy finished sending it.
+    // One `read_file`, then one `get` of the recorded size, asked after the
+    // body so the size is the one the file had when the proxy finished.
     assert_eq!(
         stub.request_lines(),
         ["GET /api/v4/read_file HTTP/1.1", "GET /api/v4/get HTTP/1.1",]
@@ -54,10 +46,8 @@ fn a_file_comes_back_byte_for_byte_and_is_checked_against_the_recorded_size() {
         heads[1]
     );
 
-    // Both requests on one connection. `ureq` pools a connection only when its
-    // response body was consumed, so a second connection here would mean the
-    // read left its body unread — the mistake that once put 11 623 sockets in
-    // TIME_WAIT (see docs/protocol-reference.md, *Connections*).
+    // One connection: `ureq` pools a connection only when its body was
+    // consumed (docs/protocol-reference.md, *Connections*).
     assert_eq!(
         stub.connections(),
         1,
@@ -67,12 +57,9 @@ fn a_file_comes_back_byte_for_byte_and_is_checked_against_the_recorded_size() {
 
 #[test]
 fn the_read_is_a_get_with_the_path_and_nothing_else() {
-    // `read_file` is registered with no input stream and as non-mutating, so
-    // the verb is GET by the proxy's own rule — and its answer is raw bytes,
-    // not rows, so there is no `output_format` to send. A format parameter
-    // appearing here would be this crate guessing at a shape it never
-    // verified; exact equality is what pins that, and the absence of a
-    // `mutation_id` besides.
+    // `read_file` has no input stream and does not mutate, so the verb is GET;
+    // its answer is raw bytes, so no `output_format` is sent. Exact equality
+    // of the parameters also pins that there is no `mutation_id`.
     let stub = FileStub::serving(b"x".to_vec(), Size::Bytes(1));
 
     stub.client().read_file(PATH).expect("reads");
@@ -88,12 +75,9 @@ fn the_read_is_a_get_with_the_path_and_nothing_else() {
 
 #[test]
 fn a_clean_short_body_is_an_error_rather_than_a_shorter_file() {
-    // The failure the size check exists for. A mid-stream failure ends the
-    // chunked body cleanly and puts the reason in a trailer this client cannot
-    // read, so at the HTTP layer nothing is wrong — the body is simply shorter
-    // than the file. Returning it as success would hand the caller a silently
-    // truncated file, which for a worker binary is an exec that fails on the
-    // node, at the worst possible distance from the cause.
+    // A mid-stream failure ends the chunked body cleanly with the reason in an
+    // unreadable trailer, so only the size says the body is short. The error
+    // names both sizes and the trailer.
     let stub = FileStub::serving(file_of(100), Size::Bytes(4096));
 
     let error = stub
@@ -115,9 +99,8 @@ fn a_clean_short_body_is_an_error_rather_than_a_shorter_file() {
 
 #[test]
 fn a_size_the_cluster_cannot_answer_fails_the_read_rather_than_skipping_the_check() {
-    // The check is promised, so it must refuse loudly rather than quietly not
-    // happen: a `read_file` that skipped it on a bad answer would be exactly
-    // as truncatable as one with no check at all, and nothing would say so.
+    // A size that is not an integer fails the read: skipping the check on a
+    // bad answer would leave truncation undetected.
     let stub = FileStub::serving(file_of(100), Size::NotAnInteger);
 
     let error = stub
@@ -134,13 +117,9 @@ fn a_size_the_cluster_cannot_answer_fails_the_read_rather_than_skipping_the_chec
 
 #[test]
 fn a_size_check_that_never_got_an_answer_is_reported_as_the_read_it_belongs_to() {
-    // The `get` is `read_file`'s own machinery, and it fails *after* the whole
-    // file has already arrived. Handed back as itself, it reads `get:
-    // unexpected HTTP 500` — a command the caller never sent, whose obvious
-    // remedy is to send it again, which is not what their retry will do: it
-    // will download the file a second time and then ask again. So the error
-    // says `read_file`, says which part of it failed, and quotes the `get`'s
-    // own words rather than swallowing them.
+    // The size `get` fails after the file arrived. The error starts with
+    // `read_file`, the command the caller sent, and quotes the `get`'s 500
+    // rather than swallowing it.
     let stub = FileStub::serving(file_of(100), Size::Unanswerable);
 
     let error = stub
@@ -161,8 +140,7 @@ fn a_size_check_that_never_got_an_answer_is_reported_as_the_read_it_belongs_to()
 
 #[test]
 fn an_empty_file_reads_back_empty() {
-    // Zero bytes recorded, zero bytes served: a legitimate file, not an edge
-    // the check may refuse.
+    // Zero bytes recorded and served is a legitimate file.
     let stub = FileStub::serving(Vec::new(), Size::Bytes(0));
 
     let read = stub.client().read_file(PATH).expect("reads");
@@ -175,10 +153,8 @@ fn an_empty_file_reads_back_empty() {
 
 #[test]
 fn the_streaming_read_hands_back_the_bytes_and_asks_nothing_else() {
-    // The streaming half never has the whole body, so it cannot run the size
-    // check — and must not pay for one it cannot run: no `get` beside the
-    // read. The caller who needs certainty compares `bytes_read` against the
-    // size themselves, which is what the doc on `FileReader` sends them to do.
+    // The streaming read never has the whole body, so it sends no size `get`;
+    // `FileReader`'s doc tells the caller to compare `bytes_read` instead.
     let contents = file_of(3000);
     let stub = FileStub::serving(contents.clone(), Size::Bytes(3000));
 
@@ -202,12 +178,12 @@ fn the_streaming_read_hands_back_the_bytes_and_asks_nothing_else() {
 
 /// What the stub answers a `get` for the file's size with.
 enum Size {
-    /// `{"value"=N}` — the envelope a cluster wraps an attribute in.
+    /// `{"value"=N}`, the envelope a cluster wraps an attribute in.
     Bytes(i64),
-    /// `{"value"=%true}` — well-formed, and not a size.
+    /// `{"value"=%true}`: well-formed, and not a size.
     NotAnInteger,
-    /// Not answered at all: a 500 with no error document, which is what a
-    /// master hiccup between the two requests looks like from here.
+    /// A 500 with no error document, as a master hiccup between the two
+    /// requests looks from here.
     Unanswerable,
 }
 
@@ -222,8 +198,7 @@ impl Size {
     }
 }
 
-/// A proxy that serves one file and the size beside it, and remembers what it
-/// was asked — including how many connections the asking took.
+/// A proxy serving one file and its size, recording requests and connections.
 struct FileStub {
     address: std::net::SocketAddr,
     heads: Arc<Mutex<Vec<String>>>,
@@ -248,9 +223,8 @@ impl FileStub {
                 let file = Arc::clone(&file);
                 let size = Arc::clone(&size);
                 let seen = Arc::clone(&seen);
-                // A thread per connection: a client whose pool declined a
-                // connection opens another, and serving them in turn would
-                // leave it waiting forever.
+                // A thread per connection: serving a second connection in
+                // turn would leave the client waiting forever.
                 std::thread::spawn(move || serve(&stream, &file, &size, &seen));
             }
         });
@@ -262,8 +236,7 @@ impl FileStub {
         }
     }
 
-    /// A client pointed at it, sending each command once: the stub answers
-    /// every request, so a retry could only confuse the record.
+    /// A client pointed at it, with no retries to confuse the record.
     fn client(&self) -> Client {
         Client::new(&format!("http://{}", self.address)).with_retries(RetryPolicy::none())
     }
@@ -294,8 +267,7 @@ fn serve(
     size: &(&'static str, String),
     seen: &Mutex<Vec<String>>,
 ) {
-    // So a connection the client keeps pooled but never uses again does not
-    // hold a thread for the lifetime of the test binary.
+    // A pooled connection never used again must not hold a thread forever.
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("sets a timeout");
@@ -321,7 +293,7 @@ fn serve(
     }
 }
 
-/// One request head off the wire — body drained first — or `None` at the end.
+/// One request head off the wire, body drained, or `None` at the end.
 fn read_request(reader: &mut BufReader<TcpStream>) -> Option<String> {
     let mut head = String::new();
     loop {
@@ -333,8 +305,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<String> {
         }
     }
 
-    // Both commands here are GETs and carry nothing, but the rule is the rule:
-    // a request is only finished being sent when its body has been read.
+    // A request is fully sent only once its body has been read.
     if let Some(length) = header(&head, "content-length").and_then(|v| v.parse().ok()) {
         let mut body = vec![0_u8; length];
         reader.read_exact(&mut body).ok()?;

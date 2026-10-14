@@ -1,31 +1,22 @@
-//! `cluster_info` — connect, and ask the cluster about itself.
+//! `cluster_info`: connect, and ask the cluster about itself.
 //!
-//! The Go SDK ships this as `yt/go/examples/cypress-example`, and despite the
-//! name it is not a tour of Cypress: it is the smallest program that proves a
-//! connection works. One config, one typed read of `//@`, one line of output
-//! saying when the cluster was created. This is that program in Rust, and the
-//! three places where the shapes differ are worth saying plainly.
+//! The Go SDK's `yt/go/examples/cypress-example`: one config, one typed read of
+//! `//@`, one line saying when the cluster was created. This example also
+//! checks that the struct's three attributes are a projection of the dozens
+//! the node carries, that `get` and `get_as` agree, that the same struct reads
+//! `//tmp/@`, that a scalar attribute reads into a `String`, and that a type
+//! the answer cannot fit is a `ClientError::Decode`. It writes nothing.
 //!
-//! **The transport is not a choice here.** Go takes a `-use-rpc` flag and
-//! builds either an `ythttp` or an `ytrpc` client from the same `yt.Config`.
-//! There is nothing to pick between: this crate speaks HTTP API v4, and the
-//! RPC proxy is a recorded non-goal — AGENTS.md, "Non-goals": *"RPC proxy
-//! (custom binary protocol), protobuf row format, dynamic tables, non-Linux
-//! targets, publishing to crates.io."* Go's `-use-tls` has no counterpart
-//! either. TLS is the `tls` feature, on by default, so an `https://` proxy
-//! needs no flag; the only thing that turns it off is a musl worker build,
-//! where `rustls` reaches `ring`, which wants a C cross-compiler.
-//!
-//! **The token is found the same way.** Go asks for `ReadTokenFromFile: true`;
-//! [`Client::from_env`] is that and the rest of the search — `YT_TOKEN`, then
-//! the file named by `YT_TOKEN_PATH`, then `~/.yt/token` — which is where the
-//! `yt` CLI looks, so a machine the CLI already works on needs nothing more.
-//!
-//! **Attributes the struct does not name are ignored.** That is the whole
-//! reason to ask for `//@` with a type rather than walk what comes back: a
-//! node carries dozens of attributes, this program has a use for three, and
-//! the decoder drops the rest. The run below counts them, so the claim is
-//! checked rather than asserted.
+//! - **Transport.** Go's `-use-rpc` flag builds an `ythttp` or `ytrpc` client
+//!   from one config. This example reads Cypress, which only the HTTP `Client`
+//!   does; the RPC proxy client (`create_rpc_client`, the `rpc` feature)
+//!   serves dynamic tables through `TableClient`.
+//! - **TLS.** Go's `-use-tls` has no counterpart: the `tls` feature is on by
+//!   default, so an `https://` proxy needs no flag. Musl worker builds turn it
+//!   off, because `ring` needs a C cross-compiler there.
+//! - **Token.** Go's `ReadTokenFromFile: true`; [`Client::from_env`] tries
+//!   `YT_TOKEN`, then the file named by `YT_TOKEN_PATH`, then `~/.yt/token`,
+//!   where the `yt` CLI looks.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -48,8 +39,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), ClientError> {
-    // The Go example's whole configuration, minus the flags it has no use for:
-    // yt.Config{Proxy: *flagProxy, ReadTokenFromFile: true, UseTLS: *flagUseTLS}.
+    // Go: yt.Config{Proxy: *flagProxy, ReadTokenFromFile: true, UseTLS: *flagUseTLS}.
     let client = Client::from_env()?;
 
     step("Asking the root node when the cluster was created");
@@ -57,9 +47,8 @@ fn run() -> Result<(), ClientError> {
     // The one line the Go program prints.
     println!("   cluster was created at {}", root.creation_time);
 
-    // Go decodes this into `yson.Time`. There is no date type in this stack and
-    // no dependency worth taking for one, so it stays the ISO 8601 instant the
-    // cluster sent — checked for being that, rather than for merely being text.
+    // Go decodes this into `yson.Time`. Here it stays the ISO 8601 instant the
+    // cluster sent, checked for that shape.
     check(
         "the creation time came back as a timestamp",
         !root.creation_time.is_empty()
@@ -69,8 +58,7 @@ fn run() -> Result<(), ClientError> {
     done(&format!("in account {}", root.account));
 
     step("What the struct did not ask for");
-    // The same attributes untyped, only to be counted. If this were not far
-    // larger than three, the sentence in the module doc would be decoration.
+    // The same attributes untyped, only to be counted.
     let all = client.get("//@")?;
     let offered = match &all.node {
         YsonNode::Map(attributes) => attributes.len(),
@@ -81,9 +69,8 @@ fn run() -> Result<(), ClientError> {
         offered > 3,
     )?;
 
-    // `get` hands back a document to walk; `get_as` hands back the shape you
-    // were going to walk it into. Both roads to one attribute, so a change that
-    // broke either would show up as disagreement rather than as silence.
+    // `get` returns a document to walk; `get_as` the shape it is walked into.
+    // Both must agree on one attribute.
     let asked_directly = client.get("//@type")?;
     check(
         &format!("//@ is a {} whichever way it is read", root.node_type),
@@ -91,8 +78,7 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("The same struct, a different path");
-    // Nothing in `NodeInfo` is particular to the root: type, creation time and
-    // account are on every Cypress node, so the same type reads any of them.
+    // Type, creation time and account are on every Cypress node.
     let tmp: NodeInfo = client.get_as("//tmp/@")?;
     check(
         &format!(
@@ -103,9 +89,8 @@ fn run() -> Result<(), ClientError> {
     )?;
 
     step("And one attribute on its own, which is no struct at all");
-    // A path ending in a scalar attribute answers with the scalar, so `get_as`
-    // reads it into a `String` with nothing wrapped around it. Asked about
-    // first because a cluster is under no obligation to have a name.
+    // A path ending in a scalar attribute answers with the scalar, which
+    // `get_as` reads into a `String`. A cluster need not have a name.
     if client.exists("//sys/@cluster_name")? {
         let name: String = client.get_as("//sys/@cluster_name")?;
         check(
@@ -117,10 +102,8 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Asking for a type the answer cannot fit");
-    // Deliberate: the failure mode of a typed read is the thing worth showing.
     // `creation_time` is a timestamp string and `Impossible` wants a number, so
-    // this must come back as an error naming the path — not as a panic, and not
-    // as a zero.
+    // this must be an error naming the path, not a panic and not a zero.
     match client.get_as::<Impossible>("//@") {
         Ok(_) => {
             return Err(ClientError::Config(
@@ -144,9 +127,8 @@ fn run() -> Result<(), ClientError> {
 
 /// The three attributes this program has a use for, from a node that has dozens.
 ///
-/// Go spells the same struct with `yson:"…"` tags and a `yt.NodeType` for the
-/// first field. There is no node-type enum here, and a `String` is what the
-/// cluster sends; the rename is because `type` is a keyword.
+/// Go uses `yson:"…"` tags and a `yt.NodeType`; here the type is the `String`
+/// the cluster sends, renamed because `type` is a keyword.
 #[derive(serde::Deserialize)]
 struct NodeInfo {
     #[serde(rename = "type")]
@@ -157,8 +139,7 @@ struct NodeInfo {
 
 /// The same attribute, asked for as something it can never be.
 ///
-/// Exists to be refused, so the error path is demonstrated rather than
-/// described.
+/// Exists to be refused.
 #[derive(serde::Deserialize)]
 #[expect(dead_code)]
 struct Impossible {

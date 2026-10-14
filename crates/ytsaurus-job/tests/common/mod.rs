@@ -167,38 +167,27 @@ impl io::Write for SharedBuffer {
     }
 }
 
-/// A runnable copy of one of the `examples/` workers, built if it is not there.
+/// A runnable copy of one of the `examples/` workers, built by this function.
 ///
-/// These end-to-end tests exec the worker the way a cluster does — rows in on
-/// fd 0, tables out on fds 1 and 4 — rather than calling into the library,
-/// because what the cluster runs is a process and not a function.
+/// End-to-end tests exec the worker as a cluster does (rows in on fd 0, tables
+/// out on fds 1 and 4), because what the cluster runs is a process. Cargo sets
+/// `CARGO_BIN_EXE_<name>` only for `[[bin]]` targets, so the path is derived:
+/// the test binary is `<profile>/deps/<name>-<hash>` and the runnable example
+/// `<profile>/examples/<name>`, under `--release` and `--target` alike.
 ///
-/// **Cargo names no variable for an example's path.** `CARGO_BIN_EXE_<name>`
-/// exists for `[[bin]]` targets and has no counterpart here, so the path is
-/// derived instead: the test binary sits at `<profile>/deps/<name>-<hash>` and a
-/// runnable example at `<profile>/examples/<name>`, and that relationship holds
-/// under `--release` and under a `--target` cross-build, since the whole tree
-/// moves together.
+/// No ordinary test command reliably builds the runnable example:
+/// - `cargo test --all-targets` compiles every example as a libtest harness at
+///   `examples/<name>-<hash>`, which answers `running 0 tests`; a hashed
+///   sibling is never used.
+/// - a plain `cargo test` builds runnable examples except the four declared
+///   `test = true` in `Cargo.toml` (`counted`, `sessionize`, `shards`,
+///   `wordcount`), which also get the harness. Three of them (`counted`,
+///   `sessionize`, `wordcount`) are among the five workers exec'd here.
+/// - `cargo test --test cat_e2e` builds no examples at all.
 ///
-/// **And no ordinary test command reliably builds one**, which is why this
-/// builds it rather than asserting:
-///
-/// - `cargo test --all-targets` compiles every example as a *libtest harness*
-///   to `examples/<name>-<hash>`, because there `--examples` means test them.
-///   No runnable binary is produced. Exec'ing the harness would answer
-///   `running 0 tests` and compare nothing, so a hashed sibling is never used
-///   here even when one is sitting right beside the name being looked for.
-/// - a plain `cargo test` does build runnable examples — except the four
-///   declared `test = true` in `Cargo.toml`, which get the harness treatment
-///   for the same reason, and those are `counted`, `sessionize`, `shards` and
-///   `wordcount`: four of the five workers these tests exec.
-/// - `cargo test --test cat_e2e` builds that test and no examples at all.
-///
-/// So the fallback is one `cargo build --example <name>`, run at most once per
-/// name per test binary. By the time a test runs, the cargo that started it has
-/// finished building and released the target-directory lock; a second cargo
-/// blocks on that lock only if something else is building, which is correct
-/// rather than merely tolerable.
+/// So this runs `cargo build --example <name>` once per name per test binary.
+/// The cargo that started the test has released the target-directory lock by
+/// then, so the build waits only if something else is building.
 ///
 /// # Panics
 ///
@@ -231,11 +220,10 @@ pub fn example(name: &str) -> std::path::PathBuf {
 
     // Once per name per process, and **not** only when the binary is missing.
     // An integration test does not depend on an example target, so cargo will
-    // not rebuild one for it; guarding this on `!path.is_file()` meant that
-    // after the first run every later run drove whatever binary happened to be
-    // on disk. Editing a worker and re-running its e2e test then reported on
-    // the previous edit — which is worse than no test, because it is a green
-    // one. Cargo is a no-op when nothing changed, so the guard bought nothing.
+    // not rebuild one for it; guarded on `!path.is_file()`, every run after
+    // the first would drive whatever binary is on disk, and an edited worker's
+    // e2e test would report on the previous edit while passing. Cargo is a
+    // no-op when nothing changed.
     if built.insert(name.to_owned()) {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
         let mut command = std::process::Command::new(cargo);

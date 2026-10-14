@@ -1,7 +1,7 @@
 # Python tooling for this workspace.
 #
 # There is no Python package here and there never will be — this repository is
-# a Rust workspace. The 14 `.py` files are its automation: the checks CI runs,
+# a Rust workspace. Its `.py` files are automation: the checks CI runs,
 # the benchmark comparison it posts, the helpers that drive the local-cluster
 # end-to-end run, and the one that regenerates the C++ Skiff vectors.
 # This file configures the tools that keep them honest — `ruff` for lint and

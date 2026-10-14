@@ -97,7 +97,7 @@ pub struct JobWriter {
     scratch: Vec<u8>,
     finished: bool,
     /// Declared table names, when built with [`JobWriter::named`]. Empty
-    /// otherwise; used to make an out-of-range write explain itself.
+    /// otherwise. An out-of-range write names them in its error.
     names: Vec<String>,
 }
 
@@ -154,8 +154,9 @@ impl JobWriter {
 
     /// Declares output tables by name, returning a handle for each.
     ///
-    /// The names are for the reader, not the cluster — YTsaurus knows tables by
-    /// position. What they buy is a call site that says which table it means:
+    /// The names are for the reader, not the cluster: YTsaurus knows tables by
+    /// position. Handles come out in the order declared, so table 0 is the
+    /// first name, and a call site says which table it means:
     ///
     /// ```no_run
     /// # use serde::Serialize;
@@ -170,10 +171,8 @@ impl JobWriter {
     /// # Ok::<(), ytsaurus_job::JobError>(())
     /// ```
     ///
-    /// Handles come out in the order declared, so table 0 is the first name.
-    /// Because they are the only way to get a [`TableId`] other than converting
-    /// a `usize`, an out-of-range write is impossible when using this
-    /// constructor.
+    /// A handle used with the writer that issued it cannot be out of range; a
+    /// [`TableId`] converted from a `usize`, or used with another writer, can.
     ///
     /// # Errors
     ///

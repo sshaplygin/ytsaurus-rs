@@ -1,9 +1,10 @@
-//! The same code, run twice: once over HTTP and once over the RPC proxy.
+//! `both_transports`: the same code over HTTP and over the RPC proxy.
 //!
-//! This is what the shared interface is for, and it is also the only place the
-//! two transports are checked to agree. They are wire-level unrelated — YSON
-//! over HTTP, the row wire protocol over bus — so "they behave the same" is a
-//! claim that needs running, not asserting.
+//! The same `TableClient` calls (insert, lookup, select, delete, and a tablet
+//! transaction where the transport has one) run over each transport, and the
+//! final tables are compared. This is the only place the two are checked to
+//! agree; on the wire they are unrelated, YSON over HTTP against the row wire
+//! format over bus.
 //!
 //! Needs a cluster with an RPC proxy, which the stock local one does not have:
 //!
@@ -41,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         answers.push(exercise(client.as_ref())?);
     }
 
-    // The point of the whole exercise: two transports, one answer.
+    // Two transports, one answer.
     println!("\n== comparing");
     let (first, second) = (&answers[0], &answers[1]);
     assert_eq!(
@@ -90,8 +91,7 @@ fn exercise(client: &dyn TableClient) -> Result<Vec<String>, Box<dyn std::error:
     println!("   selected {} rows", selected.len());
 
     // Tablet transactions are sticky to one proxy, which an HTTP client cannot
-    // hold — so this is the one place the two transports genuinely differ, and
-    // the interface says so rather than failing obscurely on the second call.
+    // hold, so here the transports differ and the interface says so.
     match client.start_transaction() {
         Ok(transaction) => {
             println!("   transaction {}", transaction.id());

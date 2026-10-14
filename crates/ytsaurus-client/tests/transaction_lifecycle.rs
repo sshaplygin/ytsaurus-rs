@@ -1,20 +1,14 @@
 //! The detach/attach lifecycle, on the wire.
 //!
-//! A cluster cannot distinguish a handle that aborted from one that detached
-//! and expired — both transactions end. What separates them is *which requests
-//! were sent*, so these tests serve the cluster's side from a socket
-//! in-process and read what the client put on the wire: a detach must send
-//! nothing, an attached handle's drop must send nothing, a started handle's
-//! drop must still send the abort, and the by-id commands must carry the id
-//! they were given.
+//! An aborted transaction and a detached one that expired both end, so the
+//! tests read which requests the client sent: a detach and an attached
+//! handle's drop send nothing, a started handle's drop sends the abort, and
+//! the by-id commands carry the id they were given.
 //!
-//! The stub is `combination.rs`'s, specialised: it stays up, **reads every
-//! request in full before answering** (replying into a body still being
-//! written closes the connection under `ureq`, which passes on macOS and fails
-//! on a Linux runner), and remembers the request heads in order. Parameters
-//! are asserted by decoding `X-YT-Parameters`, never by matching the rendered
-//! text of a generated value — a mutation ID's spelling depends on its first
-//! hex digit.
+//! The stub **reads every request in full before answering**: replying into a
+//! body still being written closes the connection under `ureq`, which passes
+//! on macOS and fails on a Linux runner. Parameters are asserted by decoding
+//! `X-YT-Parameters`, never by matching a generated value's spelling.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -24,17 +18,15 @@ use std::time::{Duration, Instant};
 use ytsaurus_client::{Client, RetryPolicy};
 use ytsaurus_yson::{YsonFormat, YsonNode, YsonValue, from_slice};
 
-/// The id every stub transaction answers with. A fixed literal, so asserting
-/// on it is safe where asserting on a generated value's spelling is not.
+/// The id every stub transaction answers with, fixed so tests may assert it.
 const TX: &str = "3-5bc70-10001-387a";
 
 // ------------------------------------------------------------- the lifecycle
 
 #[test]
 fn a_started_handles_drop_still_aborts() {
-    // The behaviour that must survive this feature: dropping a transaction
-    // this process started goes on aborting it. It is what makes `?` safe
-    // inside a transaction, and examples/transaction.rs is built on it.
+    // Dropping a transaction this process started aborts it, which makes `?`
+    // safe inside a transaction; examples/transaction.rs relies on it.
     let cluster = StubCluster::answering(Answers::default());
     {
         let client = Client::new(&cluster.url()).with_retries(RetryPolicy::none());
@@ -59,9 +51,8 @@ fn a_started_handles_drop_still_aborts() {
 
 #[test]
 fn a_detached_transaction_is_neither_aborted_nor_pinged_again() {
-    // A 3 s transaction is pinged every second, so 1.6 s of post-detach
-    // silence covers more than one interval: if the thread were still running,
-    // a ping would land in it.
+    // A 3 s transaction is pinged every second, so 1.6 s of silence after
+    // detach covers more than one interval.
     let cluster = StubCluster::answering(Answers::default());
     let client = Client::new(&cluster.url()).with_retries(RetryPolicy::none());
 
@@ -89,20 +80,14 @@ fn a_detached_transaction_is_neither_aborted_nor_pinged_again() {
 
 #[test]
 fn detach_with_a_ping_in_flight_waits_for_it() {
-    // The race the join in `detach` exists for: the keep-alive thread is
-    // mid-request when the handle detaches. The stub answers pings 500 ms
-    // late, and the test waits until one has *arrived* before detaching, so
-    // the ping is reliably in flight while detach runs.
+    // `detach` joins a keep-alive thread that is mid-request. The stub answers
+    // pings 500 ms late, and the test detaches once one has arrived, so the
+    // ping is in flight while detach runs.
     //
-    // **The assertion is the wall clock.** Counting requests cannot see the
-    // join at all: the stub records a request on arrival, so the in-flight
-    // ping is already counted before the detach, and the ping thread starts no
-    // *further* request either way. Dropping the join leaves everything else
-    // in this test passing and turns the measured wait into 0 ms — which is
-    // the bug it would be: a ping still on the wire lands after `detach`
-    // returns and restarts the cluster's expiry clock at that moment, so a
-    // transaction the caller believes dies at T+timeout survives to
-    // T+latency+timeout, still holding its locks.
+    // **The assertion is the wall clock.** Request counts cannot see the join:
+    // the in-flight ping is counted on arrival. Without the join, a ping
+    // landing after `detach` returns restarts the expiry clock, so the
+    // transaction outlives T+timeout, still holding its locks.
     const ANSWERED_AFTER: Duration = Duration::from_millis(500);
 
     let cluster = StubCluster::answering(Answers {
@@ -129,10 +114,9 @@ fn detach_with_a_ping_in_flight_waits_for_it() {
     let waited = waited.elapsed();
     assert_eq!(id, TX);
 
-    // Half the delay, not the whole of it: the polling loop above can notice
-    // the ping up to its own 10 ms — more on a loaded machine — after it
-    // arrived, so some of the stub's sleep is already spent. Without the join
-    // this is single-digit milliseconds.
+    // Half the delay: the polling loop sleeps 10 ms between checks, so it
+    // notices the ping up to 10 ms after it arrived, more on a loaded machine.
+    // Without the join this is single-digit milliseconds.
     assert!(
         waited >= ANSWERED_AFTER / 2,
         "detach returned in {waited:?} with a ping being answered {ANSWERED_AFTER:?} late: \
@@ -157,9 +141,9 @@ fn detach_with_a_ping_in_flight_waits_for_it() {
 
 #[test]
 fn attach_reads_the_timeout_pings_and_its_drop_does_not_abort() {
-    // 3000 ms of timeout means a ping every second; one must land within a
-    // few, carrying the id. Dropping the handle must stop them and must not
-    // abort — an attached handle detaches on drop, as the C++ destructor does.
+    // A 3000 ms timeout means a ping every second, carrying the id. Dropping
+    // the handle stops them without an abort: an attached handle detaches on
+    // drop, as the C++ destructor does.
     let cluster = StubCluster::answering(Answers {
         timeout_ms: 3000,
         ..Answers::default()
@@ -194,11 +178,9 @@ fn attach_reads_the_timeout_pings_and_its_drop_does_not_abort() {
 
     drop(tx);
 
-    // The drop does not join the thread, so one ping may already be in
-    // flight; let it land, then require silence for more than an interval. A
-    // second of grace, not the 300 ms this used to allow: the ping's own
-    // request budget is half the interval, 500 ms here, and a loaded machine
-    // has to fit inside whatever the window is.
+    // The drop does not join the thread, so one ping may be in flight. A
+    // second of grace covers its request budget (half the interval, 500 ms)
+    // on a loaded machine; then silence for more than an interval.
     std::thread::sleep(Duration::from_millis(1000));
     let settled = cluster.request_count();
     std::thread::sleep(Duration::from_millis(1600));
@@ -218,16 +200,12 @@ fn attach_reads_the_timeout_pings_and_its_drop_does_not_abort() {
 
 #[test]
 fn attaching_pings_before_it_returns() {
-    // What `@timeout` cannot say: how much of it is left. The attribute is the
-    // *configured* lifetime, and the id carries no hint of when somebody last
-    // pinged — so a handoff that took longer than two thirds of the timeout
-    // used to produce a handle whose first ping was already too late. It would
-    // be answered `No such transaction`, the keep-alive thread would give up
-    // silently, and the loss would surface later on an unrelated command.
+    // `@timeout` is the configured lifetime, not what is left of it, so a
+    // handoff slower than two thirds of the timeout would leave the first
+    // scheduled ping too late. The attach pings before it returns.
     //
-    // 30 s of timeout means the thread's own first ping is ten seconds away,
-    // so a ping already on record when `attach_transaction` returns can only
-    // be the one the attach sent itself.
+    // With a 30 s timeout the thread's first ping is ten seconds away, so a
+    // ping on record when `attach_transaction` returns is the attach's own.
     let cluster = StubCluster::answering(Answers {
         timeout_ms: 30_000,
         ..Answers::default()
@@ -249,10 +227,10 @@ fn attaching_pings_before_it_returns() {
 
 #[test]
 fn attaching_to_a_transaction_that_dies_between_the_two_reads_fails_here() {
-    // The other half of the ping above: it is also a probe, and one with a
-    // caller to report to. The stub answers the timeout read but refuses the
-    // ping, which is the shape of a transaction that expired in the handoff.
-    // Failing here beats handing back a handle that pings nothing.
+    // The attach's ping is also a probe. The stub answers the timeout read
+    // but refuses the ping, as for a transaction that expired in the
+    // handoff; the attach fails rather than return a handle that pings
+    // nothing.
     let cluster = StubCluster::answering(Answers {
         ping_gone: true,
         ..Answers::default()
@@ -282,17 +260,15 @@ fn attaching_to_a_transaction_that_dies_between_the_two_reads_fails_here() {
 
 #[test]
 fn a_handle_says_so_when_the_cluster_says_the_transaction_is_gone() {
-    // The keep-alive thread stops for exactly one reason, and used to stop
-    // silently: a handle that has quietly given up pinging looks identical to
-    // a healthy one. `is_lost` is that exit, made observable.
+    // The keep-alive thread stops only when the cluster says the transaction
+    // is gone; `is_lost` makes that observable.
     let cluster = StubCluster::answering(Answers {
         ping_gone: true,
         ..Answers::default()
     });
     let client = Client::new(&cluster.url()).with_retries(RetryPolicy::none());
 
-    // Started, not attached: the attach path refuses a transaction whose ping
-    // fails, so this is the shape where a live handle loses its transaction.
+    // Started, not attached: attach refuses a transaction whose ping fails.
     let tx = client
         .start_transaction_with(Duration::from_secs(3))
         .expect("starts");
@@ -308,8 +284,7 @@ fn a_handle_says_so_when_the_cluster_says_the_transaction_is_gone() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // And it stopped pinging rather than spending a request every interval on
-    // a transaction that cannot come back.
+    // And it stopped pinging.
     let settled = cluster.request_count();
     std::thread::sleep(Duration::from_millis(1600));
     assert_eq!(
@@ -322,10 +297,8 @@ fn a_handle_says_so_when_the_cluster_says_the_transaction_is_gone() {
 
 #[test]
 fn an_attached_handles_explicit_abort_still_aborts() {
-    // Only the *drop* is different for an attached handle. Asking for an abort
-    // is a decision, not a scope ending, and it must reach the cluster from
-    // either origin — otherwise a process handed a transaction could never
-    // refuse it.
+    // Only the drop differs for an attached handle; an explicit abort reaches
+    // the cluster from either origin.
     let cluster = StubCluster::answering(Answers {
         timeout_ms: 30_000,
         ..Answers::default()
@@ -347,9 +320,8 @@ fn an_attached_handles_explicit_abort_still_aborts() {
 
 #[test]
 fn detaching_an_attached_handle_sends_nothing() {
-    // Handing a transaction on again: attach in the middle of a chain, then
-    // detach for the next holder. 3 s of timeout is a ping every second, so
-    // 1.6 s of silence covers more than one interval.
+    // Attach in the middle of a chain, then detach for the next holder. A 3 s
+    // timeout is a ping every second, so 1.6 s of silence covers an interval.
     let cluster = StubCluster::answering(Answers {
         timeout_ms: 3000,
         ..Answers::default()
@@ -382,9 +354,8 @@ fn detaching_an_attached_handle_sends_nothing() {
 
 #[test]
 fn an_attached_handle_commits_like_an_owner() {
-    // Only the drop differs between attached and started; an explicit commit
-    // is the same commit, mutation ID included. 30 s of timeout keeps the
-    // ping thread quiet for the duration of the test.
+    // An attached handle's explicit commit is the same commit, mutation ID
+    // included. A 30 s timeout keeps the ping thread quiet for the test.
     let cluster = StubCluster::answering(Answers {
         timeout_ms: 30_000,
         ..Answers::default()
@@ -414,11 +385,9 @@ fn an_attached_handle_commits_like_an_owner() {
 
 #[test]
 fn attaching_to_a_transaction_that_is_gone_is_a_clear_error() {
-    // The timeout read is what fails — before any handle exists, so no ping
-    // thread is left behind pinging a transaction that is not there. The
-    // error must name the operation and the id itself, because the cluster's
-    // answer does not always do either: a garbage id earns `Unknown cell tag
-    // 0` on a real cluster, with no id and no mention of a transaction in it.
+    // The timeout read fails before any handle exists, so no ping thread is
+    // left behind. The error names the operation and the id, since the
+    // cluster may not: a garbage id earns `Unknown cell tag 0`.
     let cluster = StubCluster::answering(Answers {
         missing: true,
         ..Answers::default()
@@ -446,10 +415,9 @@ fn attaching_to_a_transaction_that_is_gone_is_a_clear_error() {
 
 #[test]
 fn finishing_someone_elses_transaction_takes_only_the_id() {
-    // The by-id triple: what a process that holds nothing but the id sends.
-    // All three are POSTs to the v4 names, all three carry the id they were
-    // given, and the commit — the one that is not idempotent — carries a
-    // mutation id whose *presence* is asserted, never its spelling.
+    // The by-id commands a process holding only the id sends: POSTs to the v4
+    // names, carrying the id. The commit, not idempotent, carries a mutation
+    // id whose presence is asserted, never its spelling.
     let cluster = StubCluster::answering(Answers::default());
     let client = Client::new(&cluster.url()).with_retries(RetryPolicy::none());
 
@@ -483,14 +451,9 @@ fn finishing_someone_elses_transaction_takes_only_the_id() {
         "a by-id commit must ride under a mutation id:\n{commit}"
     );
 
-    // And the other two must *not*, which is the half nothing asserted: a
-    // mutation ID is what makes a retry the same request, and neither of these
-    // wants that. A ping says "still here" and saying it twice says it twice;
-    // an abort is forgiving — aborting a transaction that is already gone
-    // answers `{}` — so a retried abort is the same shrug. Tagging either
-    // would spend an id per request and make the cluster remember them, for a
-    // guarantee neither command needs. `retry` rides with the id, so its
-    // absence is the same assertion from the other side.
+    // Ping and abort carry no mutation ID (nor `retry`, which goes with it):
+    // a repeated ping is harmless, and aborting a transaction already gone
+    // answers `{}`, so neither needs the cluster to remember an id.
     for freely in ["ping_transaction", "abort_transaction"] {
         let head = &cluster.heads_for(freely)[0];
         assert!(
@@ -510,16 +473,14 @@ fn finishing_someone_elses_transaction_takes_only_the_id() {
 struct Answers {
     /// What `get #<id>/@timeout` answers, in milliseconds.
     timeout_ms: i64,
-    /// How long a ping is held before it is answered — how a ping is kept
-    /// reliably in flight while the test does something else.
+    /// How long a ping is held before it is answered, to keep it in flight.
     ping_delay: Duration,
     /// Whether the transaction is gone: `get` then answers the resolve error
     /// a local cluster gives for an id that names nothing.
     missing: bool,
-    /// Whether a *ping* is refused with `No such transaction` — the answer a
-    /// transaction that expired, or that somebody else finished, earns. The
-    /// object may still resolve, so this is deliberately separate from
-    /// `missing`.
+    /// Whether a ping is refused with `No such transaction`, as for a
+    /// transaction that expired or that somebody else finished. Separate from
+    /// `missing`: the object may still resolve.
     ping_gone: bool,
 }
 
@@ -632,8 +593,8 @@ fn serve(mut stream: std::net::TcpStream, answers: &Answers, seen: &Arc<Mutex<Ve
             return;
         }
 
-        // The whole request before any answer — head *and* body — or `ureq`
-        // reports a broken pipe instead of the reply on a Linux runner.
+        // Head and body before any answer, or `ureq` reports a broken pipe on
+        // a Linux runner.
         if let Some(length) = content_length(&head) {
             let mut body = vec![0_u8; length];
             if reader.read_exact(&mut body).is_err() {
@@ -643,8 +604,7 @@ fn serve(mut stream: std::net::TcpStream, answers: &Answers, seen: &Arc<Mutex<Ve
             drain_chunked(&mut reader);
         }
 
-        // Recorded before the answer is computed, so a test can see a ping
-        // *arrive* and act while the stub is still holding the reply.
+        // Recorded on arrival, so a test can act while a reply is held.
         seen.lock()
             .expect("nothing panicked holding it")
             .push(head.clone());
@@ -667,19 +627,16 @@ fn ok(body: &[u8]) -> Vec<u8> {
     reply
 }
 
-/// What a local cluster answers `get #<gone>/@timeout` with, captured verbatim
-/// (noise attributes trimmed): HTTP 200 carrying the structured error in
-/// `X-YT-Error`, the resolve error outside, `No such object` inside — **not**
-/// `No such transaction`, which is what a ping of the same id earns.
+/// A local cluster's answer to `get #<gone>/@timeout`, captured (noise
+/// attributes trimmed): HTTP 200, `X-YT-Error` with the resolve error outside
+/// and `No such object` inside, not the `No such transaction` a ping earns.
 fn resolve_error() -> Vec<u8> {
     let document = r#"{"code":500,"message":"Error resolving path #0-0-0-1/@timeout","inner_errors":[{"code":500,"message":"No such object 0-0-0-1","attributes":{"missing_object_id":"0-0-0-1"}}]}"#;
     format!("HTTP/1.1 200 OK\r\nX-YT-Error: {document}\r\nContent-Length: 0\r\n\r\n").into_bytes()
 }
 
-/// What a cluster answers a ping of a transaction that is no longer there
-/// with: code 11000, `NoSuchTransaction`. Not the same error as the resolve
-/// one above — that is what *addressing the object* earns — and the client
-/// recognises both, which is why the stub can tell them apart too.
+/// A cluster's answer to a ping of a transaction that is gone: code 11000,
+/// `NoSuchTransaction`. The client recognises both this and the resolve error.
 fn no_such_transaction() -> Vec<u8> {
     let document = format!(
         r#"{{"code":11000,"message":"No such transaction {TX}","attributes":{{"transaction_id":"{TX}"}}}}"#
@@ -712,9 +669,9 @@ fn drain_chunked(reader: &mut BufReader<std::net::TcpStream>) {
 
 /// The `X-YT-Parameters` document of a request head, decoded.
 ///
-/// Decoded rather than matched as text, because the spelling of a *generated*
-/// value is not stable: the text YSON writer quotes a string or not depending
-/// on its first byte, so a mutation ID goes on the wire bare two runs in five.
+/// Decoded, not matched as text: the text YSON writer quotes a string or not
+/// depending on its first byte, so a mutation ID goes on the wire bare two
+/// runs in five.
 fn params_of(head: &str) -> YsonValue {
     let line = head
         .lines()

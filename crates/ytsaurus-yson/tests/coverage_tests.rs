@@ -44,9 +44,8 @@ mod coverage_tests {
         let list: Vec<i64> = from_slice(b"[1; // one\n 2]", YsonFormat::Text).unwrap();
         assert_eq!(list, vec![1, 2]);
 
-        // These inputs used to be written as `10 // comment \n 20` and to
-        // assert 10 — which passed only because the trailing `20` was dropped
-        // in silence. A document holding two values is not one value.
+        // A document holding two values is not one value: the trailing `20`
+        // must be refused, not dropped in silence.
         let two = from_slice::<i64>(b"10 // comment \n 20", YsonFormat::Text);
         assert!(two.is_err(), "a second value must be refused, not ignored");
     }

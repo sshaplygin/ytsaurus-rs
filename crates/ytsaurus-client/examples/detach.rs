@@ -1,4 +1,4 @@
-//! `detach` — hand a live transaction to another client.
+//! `detach`: hand a live transaction to another client.
 //!
 //! One client starts a transaction, creates a table only it can see, and
 //! detaches: the handle is gone and the transaction is not. A second client —
@@ -75,9 +75,9 @@ fn run() -> Result<(), ClientError> {
         HELD.as_secs()
     ));
     std::thread::sleep(HELD);
-    // Nothing in this function pinged anything. If the attached handle's
-    // thread were not doing it, the transaction would have expired seconds
-    // ago and the commit below would fail with `No such transaction`.
+    // Nothing here pings: if the attached handle's thread did not, the
+    // transaction would have expired and the commit below would fail with
+    // `No such transaction`.
     attached.commit()?;
     check(
         &format!(

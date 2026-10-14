@@ -669,7 +669,7 @@ fn control_records_inside_a_group_do_not_split_it() {
     );
 }
 
-// ------------------------------------------------------- reduce keys (#2)
+// ------------------------------------------------------------ reduce keys
 
 #[test]
 fn groups_by_decodes_the_reduce_key() {
@@ -801,7 +801,7 @@ fn keys_survive_being_split_across_reads() {
     }
 }
 
-// --------------------------------------------- error classification (#1)
+// --------------------------------------------------- error classification
 
 /// A job that quarantines bad rows needs a cheap, stable reason and a way to
 /// tell "this row is bad" from "the stream is bad".

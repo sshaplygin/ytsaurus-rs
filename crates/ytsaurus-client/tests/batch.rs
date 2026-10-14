@@ -1,18 +1,13 @@
 //! What `execute_batch` puts on the wire, and what it makes of the answer.
 //!
-//! A cluster is too forgiving to notice most of what matters here: it merges
-//! parameters from the header and the body, generates a mutation id when none
-//! is sent, and answers a well-formed batch the same way however the request
-//! was dressed. These tests serve the request from a socket in-process and
-//! read the bytes the client sent — the verb, where the parts travelled, the
-//! mutation id that must repeat across a retry and the one that must not be
-//! there at all — and script answers a live cluster gave, including the one
-//! where a part fails and the rest do not.
+//! A cluster merges header and body parameters, generates a missing mutation
+//! id, and answers a well-formed batch however it was sent, so these tests
+//! read the bytes the client sent (the verb, where the parts travelled, which
+//! mutation id is sent and repeated) and script answers a live cluster gave,
+//! including one where a part fails and the rest do not.
 //!
-//! The rule from `tests::sent_parameters` applies throughout: never assert on
-//! the rendered text of a *generated* value. A mutation id goes on the wire
-//! bare or quoted depending on its first hex digit, so every assertion here
-//! decodes the YSON and compares values.
+//! A mutation id goes on the wire bare or quoted depending on its first hex
+//! digit, so every assertion decodes the YSON and compares values.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -28,13 +23,11 @@ type Seen = (String, Vec<u8>);
 /// A stand-in proxy that answers from a script and remembers what it was
 /// asked.
 ///
-/// Every response is sent only after the **whole** request has been read —
-/// head and body — because replying to a body still being written closes the
-/// connection under `ureq`, which then reports a broken pipe instead of the
-/// request under test; `request_shape.rs` learned that the hard way. When the
-/// script runs out, the last entry keeps answering, so a client that sends
-/// more requests than the test expects is caught by counting rather than by a
-/// hang.
+/// Every response is sent only after the **whole** request has been read,
+/// head and body: replying to a body still being written closes the
+/// connection under `ureq`, which then reports a broken pipe. When the script
+/// runs out, the last entry keeps answering, so an extra request is caught by
+/// counting rather than by a hang.
 struct Stub {
     address: std::net::SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -130,15 +123,10 @@ fn serve(
 ///
 /// `None` means the connection died mid-body and there is nothing to answer.
 ///
-/// Both framings, though `execute_batch` only ever sends the first: it renders
-/// the whole batch before sending, so the body is always `Payload::Bytes` and
-/// always declares a `Content-Length`. Reading only that one would make a
-/// chunked body silently arrive empty and be answered early — the failure the
-/// type-level comment says closes the connection under `ureq` and reports a
-/// broken pipe instead of the request under test. The proxy takes a chunked
-/// body (see *Streaming table I/O* in docs/protocol-reference.md), so this is
-/// the shape a future batch could grow, and a stub that could not read it
-/// would fail confusingly rather than usefully.
+/// `execute_batch` always sends a `Content-Length` (`Payload::Bytes`), but the
+/// proxy takes a chunked body too (*Streaming table I/O* in
+/// docs/protocol-reference.md); a chunked body read as empty would be answered
+/// early, a broken pipe.
 fn read_body(head: &str, reader: &mut impl BufRead) -> Option<Vec<u8>> {
     if header(head, "transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
@@ -225,11 +213,8 @@ fn once(stub: &Stub) -> Client {
 
 #[test]
 fn the_stub_reads_a_body_however_it_is_framed() {
-    // The stub answers only once the whole request is in, and until now
-    // "whole" meant whatever `Content-Length` said. `execute_batch` always
-    // sends that shape, so a chunked body would have arrived empty and been
-    // answered early — a broken pipe in place of the request under test.
-    // Neither framing is guessed at now, and this is what proves it.
+    // The stub must read a whole body, declared by `Content-Length` or
+    // chunked, before it answers.
     let head = "POST /api/v4/execute_batch HTTP/1.1\r\nContent-Length: 5\r\n";
     assert_eq!(
         read_body(head, &mut &b"hello and then some"[..]),
@@ -263,10 +248,8 @@ fn a_batch_is_one_post_with_its_parts_in_the_body() {
     assert_eq!(seen.len(), 1, "a batch is the round trip it saves");
     let (head, body) = &seen[0];
 
-    // Volatile in the cluster's registry, so a POST — and a bare command
-    // path, with the parts in the body rather than the parameter header,
-    // which is where the C++ client puts them and where a batch's size
-    // cannot outgrow a header.
+    // Volatile in the registry, so a POST, with the parts in the body as the
+    // C++ client sends them, where a batch cannot outgrow a header.
     assert!(
         head.starts_with("POST /api/v4/execute_batch HTTP/1.1"),
         "{head}"
@@ -304,8 +287,7 @@ fn a_batch_is_one_post_with_its_parts_in_the_body() {
         Some("exists")
     );
 
-    // Nothing the caller did not say: no concurrency was set, so none is
-    // sent and the cluster's own default applies.
+    // No concurrency was set, so none is sent.
     assert!(
         field(&sent, "concurrency").is_none(),
         "concurrency appeared from nowhere"
@@ -314,9 +296,8 @@ fn a_batch_is_one_post_with_its_parts_in_the_body() {
 
 #[test]
 fn a_mutating_batch_carries_a_mutation_id_and_a_read_only_one_does_not() {
-    // The mutating half: the id in the header, the parts in the body, merged
-    // by the proxy into one parameter set — and `retry=%false` on a first
-    // attempt.
+    // A mutating batch: the id in the header, the parts in the body, and
+    // `retry=%false` on a first attempt.
     let stub = Stub::serving(vec![results(&[r#"{"output"={"node_id"="1-2-3-4"}}"#])]);
     let mut mutating = BatchRequest::new();
     mutating.create("table", "//tmp/t");
@@ -336,9 +317,7 @@ fn a_mutating_batch_carries_a_mutation_id_and_a_read_only_one_does_not() {
         "{head}"
     );
 
-    // The read-only half: such a batch mutates nothing — "mutating if the
-    // set includes mutating commands" — so there is nothing for an id to
-    // deduplicate and none is sent.
+    // A batch is mutating only if a part is, so a read-only one sends no id.
     let stub = Stub::serving(vec![results(&[
         r#"{"output"={"value"=%true}}"#,
         r#"{"output"={"value"={}}}"#,
@@ -355,10 +334,9 @@ fn a_mutating_batch_carries_a_mutation_id_and_a_read_only_one_does_not() {
 
 #[test]
 fn one_part_fails_and_the_rest_succeed_in_order() {
-    // The answer a local cluster actually gave to a four-part batch —
-    // create over an existing node, set with input, get, remove of nothing —
-    // trimmed of its timestamps. A batch's parts fail individually, and the
-    // vector must keep both the sides and the order.
+    // A local cluster's answer to a four-part batch (create over an existing
+    // node, set with input, get, remove of nothing), timestamps trimmed. Parts
+    // fail individually; the vector keeps each outcome in order.
     let stub = Stub::serving(vec![results(&[
         r#"{"error"={"code"=501;"message"="Node //tmp/impl-batch-a already exists";"attributes"={"host"="localhost"}}}"#,
         r#"{"output"={}}"#,
@@ -403,9 +381,7 @@ fn one_part_fails_and_the_rest_succeed_in_order() {
         "{last:?}"
     );
 
-    // And the set's input travelled in the part, not in the request body's
-    // own stream: `set` is a structured-input command, so its value is the
-    // part's `input` field.
+    // `set` takes structured input, so its value is the part's `input` field.
     let (_, body) = &stub.seen()[0];
     let requests = requests_of(&body_document(body));
     assert_eq!(
@@ -420,11 +396,9 @@ fn one_part_fails_and_the_rest_succeed_in_order() {
 
 #[test]
 fn a_retried_batch_keeps_its_mutation_id_and_admits_to_the_replay() {
-    // What makes the retry safe is the cluster spreading the batch's id over
-    // the volatile parts, and that only works if the replay carries the same
-    // id — so the id must not change between attempts, and the second must
-    // say `retry=%true`. The values are compared decoded, never as text: a
-    // mutation id renders bare or quoted depending on its first hex digit.
+    // The cluster spreads the batch's id over the volatile parts, so a retry
+    // is safe only with the same id, and the second attempt says
+    // `retry=%true`.
     let stub = Stub::serving(vec![
         (503, Vec::new()),
         results(&[r#"{"output"={"node_id"="1-2-3-4"}}"#]),
@@ -470,10 +444,9 @@ fn a_retried_batch_keeps_its_mutation_id_and_admits_to_the_replay() {
 
 #[test]
 fn a_batch_with_a_raw_part_is_sent_once_whatever_the_policy_says() {
-    // A raw part may name a command no mutation cache covers, so a replay
-    // could apply it twice. The stub would happily serve a second request —
-    // the script repeats its last entry — so a retried batch shows up as a
-    // second record, not as a hang.
+    // A raw part may name a command no mutation cache covers, so the batch is
+    // sent once. The script repeats its last entry, so a retry would show as
+    // a second record.
     let stub = Stub::serving(vec![(503, Vec::new())]);
 
     let mut batch = BatchRequest::new();
@@ -501,18 +474,16 @@ fn a_batch_with_a_raw_part_is_sent_once_whatever_the_policy_says() {
         "a batch this client cannot classify must not be replayed"
     );
 
-    // And no mutation id: an id would promise a deduplication nobody checked.
+    // No mutation id: nothing checked that the command deduplicates.
     let sent = header_parameters(&stub.seen()[0].0);
     assert!(field(&sent, "mutation_id").is_none());
 }
 
 #[test]
 fn a_bound_transaction_reaches_the_parts_and_not_the_envelope() {
-    // The envelope has no transaction to be in — a local cluster drops an
-    // outer transaction_id in silence, and the part then lands outside the
-    // transaction. So the id must be on every part that can take one, and
-    // not on the envelope, where it would only dress the request up in a
-    // parameter known to mean nothing.
+    // A local cluster silently drops an envelope `transaction_id`, and the
+    // part lands outside the transaction, so the id goes on every part that
+    // takes one and not on the envelope.
     let stub = Stub::serving(vec![results(&[
         r#"{"output"={"node_id"="1-2-3-4"}}"#,
         r#"{"output"={"value"=%true}}"#,
@@ -529,7 +500,7 @@ fn a_bound_transaction_reaches_the_parts_and_not_the_envelope() {
     let (head, body) = &stub.seen()[0];
     for request in requests_of(&body_document(body)) {
         let parameters = field(&request, "parameters").expect("every part has parameters");
-        // A fixed literal, so comparing the value is comparing the spelling.
+        // A fixed literal, so its spelling may be compared.
         assert_eq!(
             field(parameters, "transaction_id").and_then(YsonValue::as_str),
             Some("3-5d231-10001-db88"),
@@ -546,10 +517,9 @@ fn a_bound_transaction_reaches_the_parts_and_not_the_envelope() {
 
 #[test]
 fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
-    // Five parts, at most two per request: the C++ client's BatchPartMaxSize
-    // behaviour. Three requests, each carrying the concurrency the caller
-    // set, each under its own mutation id — and one vector back, in part
-    // order, as if nothing had been split.
+    // Five parts, at most two per request, as the C++ client's
+    // BatchPartMaxSize splits: three requests, each with the caller's
+    // concurrency and its own mutation id, and one vector back in part order.
     let stub = Stub::serving(vec![
         results(&[
             r#"{"output"={"node_id"="0-0-0-0"}}"#,
@@ -587,9 +557,8 @@ fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
         );
     }
 
-    // Each request is its own replayable unit, so the ids must differ —
-    // one id across two different part sets would deduplicate the second
-    // request into the first's answer.
+    // A shared id would deduplicate a later request into an earlier one's
+    // answer, so every id differs.
     let ids: Vec<String> = seen
         .iter()
         .map(|(head, _)| {
@@ -601,13 +570,9 @@ fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
         .collect();
     assert_ne!(ids[0], ids[1]);
     assert_ne!(ids[1], ids[2]);
-    // Pairwise-adjacent is not distinct: three ids of A, B, A would pass the
-    // two above and still deduplicate the third request into the first's
-    // answer.
+    // A, B, A passes the two above.
     assert_ne!(ids[0], ids[2]);
-    // And the property stated once, over all of them, so that no single
-    // deleted line can take the guarantee with it: an A,B,A recycling
-    // implementation has to fail here too.
+    // And over all of them at once.
     let distinct: std::collections::HashSet<&String> = ids.iter().collect();
     assert_eq!(
         distinct.len(),
@@ -631,11 +596,9 @@ fn a_big_batch_is_split_and_the_results_stitched_back_in_order() {
 
 #[test]
 fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
-    // The failure the split makes possible and no rollback undoes: chunk one
-    // commits, chunk two exhausts itself on a 503. Reporting only the 503
-    // would tell the caller nothing about the two tables that now exist —
-    // and re-running the batch is not a recovery, because a second execution
-    // mints fresh mutation ids and the parts land a second time.
+    // Chunk one commits, chunk two fails on a 503, and nothing rolls back.
+    // The error carries the answered prefix: re-running the batch mints fresh
+    // mutation ids, so its parts would land a second time.
     let stub = Stub::serving(vec![
         results(&[
             r#"{"output"={"node_id"="0-0-0-0"}}"#,
@@ -675,15 +638,13 @@ fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
         matches!(**cause, ClientError::Http { status: 503, .. }),
         "{cause:?}"
     );
-    // The message says both halves: where it stopped, and why.
+    // The message says where it stopped, and why.
     let said = error.to_string();
     assert!(said.contains("2 of 5"), "{said}");
     assert!(said.contains("503"), "{said}");
-    // And it must not claim the count is a line the cluster honours. This is
-    // the sentence that reaches a log and an unwrap() panic, and `answered`
-    // holds Err entries that applied nothing while the request that failed
-    // ran every part it never answered for. A message asserting the prefix is
-    // "already applied" is the one that gets a caller to corrupt state.
+    // It must not call the prefix "already applied": `answered` holds Err
+    // entries that applied nothing, and the failed request may have run
+    // parts it never answered for.
     assert!(
         !said.contains("already applied"),
         "the one-liner must not claim the answered prefix is what applied: {said}"
@@ -693,11 +654,10 @@ fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
         "the one-liner must say what the count is and is not: {said}"
     );
 
-    // The third request was never sent — this is a stop, not a skip.
+    // The third request was never sent: a stop, not a skip.
     assert_eq!(stub.seen().len(), 2);
 
-    // And a batch that fits one request keeps the plain error: there is no
-    // prefix to report, so there is nothing to wrap.
+    // A batch that fits one request keeps the plain error.
     let stub = Stub::serving(vec![(503, Vec::new())]);
     let mut single = BatchRequest::new();
     single.create("table", "//tmp/t");
@@ -712,13 +672,9 @@ fn a_split_batch_that_stops_hands_back_the_parts_that_already_applied() {
 
 #[test]
 fn every_request_of_a_split_batch_gets_its_own_mutation_id() {
-    // Stated on its own, over more chunks than the split test uses, because
-    // the property had exactly one assertion covering it: an implementation
-    // that recycled ids as A,B,A passed the whole workspace with that single
-    // line deleted. Recycling any id across requests would have the cluster
-    // answer the later request with the earlier request's results — the
-    // per-part ids are derived by incrementing the batch's, so a repeat is a
-    // collision across every part of both.
+    // Over five chunks. Per-part ids are derived by incrementing the batch's,
+    // so a repeated id across requests collides on every part, and the
+    // cluster answers the later request with the earlier one's results.
     let answers = vec![r#"{"output"={"node_id"="0-0-0-0"}}"#; 2];
     let stub = Stub::serving(vec![results(&answers); 5]);
 
@@ -751,10 +707,8 @@ fn every_request_of_a_split_batch_gets_its_own_mutation_id() {
 
 #[test]
 fn a_dozen_creates_are_one_request() {
-    // The example's headline claim — "a dozen tables in one round trip" — is
-    // a wire fact, and a program on a cluster cannot see it. This can: the
-    // default part size is the C++ client's concurrency × 5, so a dozen parts
-    // are nowhere near a split, and the stub counts what arrived.
+    // The example's "a dozen tables in one round trip", counted on the wire:
+    // the default part size is the C++ client's concurrency × 5.
     let answers = vec![r#"{"output"={"node_id"="0-0-0-0"}}"#; 12];
     let stub = Stub::serving(vec![results(&answers)]);
 
@@ -773,9 +727,8 @@ fn a_dozen_creates_are_one_request() {
 
 #[test]
 fn a_caller_supplied_mutation_id_is_the_one_that_goes_out() {
-    // The crash-replay guarantee, expressible through the batch API rather
-    // than only through `raw_command_with`: persist the id, and the replay is
-    // deduplicated against the send that may already have landed.
+    // A persisted id makes a replay after a crash deduplicate against the
+    // send that may already have landed.
     let stub = Stub::serving(vec![results(&[r#"{"output"={"node_id"="1-2-3-4"}}"#])]);
 
     let mut batch = BatchRequest::new();
@@ -799,8 +752,8 @@ fn a_caller_supplied_mutation_id_is_the_one_that_goes_out() {
             "the caller's id is what went on the wire:\n{head}"
         );
     }
-    // The first send is not a replay and the second says that it is — an
-    // unmarked duplicate is refused rather than deduplicated.
+    // The second send says it is a replay; an unmarked duplicate is refused
+    // rather than deduplicated.
     assert_eq!(
         field(&header_parameters(&seen[0].0), "retry").map(|v| &v.node),
         Some(&YsonNode::Boolean(false))
@@ -810,10 +763,8 @@ fn a_caller_supplied_mutation_id_is_the_one_that_goes_out() {
         Some(&YsonNode::Boolean(true))
     );
 
-    // An id would be a lie across a split: the cluster derives each part's id
-    // by incrementing the batch's, so a second request under the same id
-    // collides with the first request's parts. Refused before anything is
-    // sent — nothing listens on this address.
+    // Each part's id increments the batch's, so one id over two requests
+    // collides. Refused before sending: nothing listens on this address.
     let mut split = BatchRequest::new().with_max_part_size(1);
     split.create("table", "//tmp/a").create("table", "//tmp/b");
     let error = Client::new("http://127.0.0.1:1")
@@ -826,12 +777,9 @@ fn a_caller_supplied_mutation_id_is_the_one_that_goes_out() {
 
 #[test]
 fn a_raw_read_a_caller_vouches_for_leaves_the_batch_retriable() {
-    // `raw` alone means send-once, and one raw part decides the whole batch —
-    // so an all-read batch with a `check_permission` in it was demoted to a
-    // single attempt. A caller who knows the command's registry bits says so,
-    // and the batch is retried like the reads it is made of. The 503 here is
-    // retriable, so a send-once batch shows up as one request and a `Freely`
-    // one as two.
+    // A `raw` part makes the whole batch send-once; `raw_with` and
+    // `Repeatable::Freely` keep a read batch retriable. The 503 is retriable,
+    // so a send-once batch shows one request and this one two.
     let stub = Stub::serving(vec![
         (503, Vec::new()),
         results(&[
@@ -864,17 +812,15 @@ fn a_raw_read_a_caller_vouches_for_leaves_the_batch_retriable() {
 
     assert_eq!(stub.seen().len(), 2, "the batch is a read and was retried");
 
-    // Still no mutation id: nothing here mutates, so there is nothing for one
-    // to deduplicate.
+    // Nothing here mutates, so no mutation id.
     let sent = header_parameters(&stub.seen()[0].0);
     assert!(field(&sent, "mutation_id").is_none());
 }
 
 #[test]
 fn an_empty_batch_is_refused_before_anything_is_sent() {
-    // Nothing listens on this address, so a Config error is proof the check
-    // ran first. The cluster would answer an empty batch with 200 and no
-    // results, which is a no-op reported as work done.
+    // A cluster answers an empty batch 200 with no results. Nothing listens on
+    // this address, so a Config error shows the check ran first.
     let client = Client::new("http://127.0.0.1:1").with_retries(RetryPolicy::none());
     let error = client
         .execute_batch(&BatchRequest::new())
@@ -884,10 +830,9 @@ fn an_empty_batch_is_refused_before_anything_is_sent() {
 
 #[test]
 fn an_answer_shaped_like_nothing_known_fails_the_call_loudly() {
-    // The envelope traps documented in docs/protocol-reference.md — `exists` under `value`,
-    // the file cache answering a bare string — earn the batch parser its
-    // paranoia: a shape it does not recognise is refused, not read as an
-    // empty success.
+    // Answer envelopes vary (`exists` answers under `value`, the file cache a
+    // bare string), so a shape the parser does not recognise is refused, not
+    // read as an empty success.
     let stub = Stub::serving(vec![(200, br#"{"results"=[{"outcome"={}}]}"#.to_vec())]);
 
     let mut batch = BatchRequest::new();

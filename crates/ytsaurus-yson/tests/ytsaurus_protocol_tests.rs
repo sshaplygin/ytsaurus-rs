@@ -462,9 +462,9 @@ fn malformed_binary_input_errors_without_panicking() {
     }
 }
 
-/// Regression: a `/` that opens neither a `//` nor a `/*` comment used to spin
-/// forever in `skip_ignored`, because no branch advanced the cursor. Any text
-/// input containing such a byte would hang the parser rather than fail it.
+/// Text input holding a `/` that opens no comment, or an unterminated `/*`,
+/// makes the parser return rather than hang. If no branch of `skip_ignored`
+/// advanced the cursor past such a byte, the parser would spin forever.
 ///
 /// Guarded by a worker thread so a regression fails the test instead of hanging CI.
 #[test]
@@ -494,7 +494,8 @@ fn stray_slash_in_text_input_errors_instead_of_hanging() {
     );
 }
 
-/// Comments are still skipped correctly after the fix above.
+/// `//` and `/* */` comments are skipped around a value: leading, trailing,
+/// and several in a row.
 #[test]
 fn text_comments_are_still_skipped() {
     let cases: [(&[u8], i64); 4] = [

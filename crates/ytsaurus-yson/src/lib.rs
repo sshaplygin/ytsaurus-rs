@@ -61,9 +61,9 @@ fn is_binary(format: YsonFormat) -> bool {
 /// - The input data has invalid YSON syntax.
 /// - The input contains invalid UTF-8 sequences (when in text mode).
 /// - The data structure does not match the requirements of the target type `T`.
-/// - Anything but insignificant whitespace follows the value. `42 garbage`
-///   used to answer `Ok(42)`, which read a corrupt or concatenated document
-///   as a healthy one; a sequence of values is [`StreamDeserializer`]'s job.
+/// - Anything but insignificant whitespace follows the value: `42 garbage`
+///   is an error, not `Ok(42)`, so a corrupt or concatenated document is not
+///   read as a healthy one. A sequence of values is [`StreamDeserializer`]'s job.
 pub fn from_slice<'a, T>(bytes: &'a [u8], format: YsonFormat) -> Result<T, YsonError>
 where
     T: Deserialize<'a>,

@@ -1,15 +1,11 @@
-//! `idempotent` — proves a repeated `start_operation` starts one operation.
+//! `idempotent`: a repeated `start_operation` starts one operation.
 //!
-//! This is what makes a retry safe. Every mutating command the client sends
-//! carries a `mutation_id`; when a request is repeated, the cluster recognises
-//! the ID and hands back the first response instead of applying the change
-//! twice. Without it, a transient 503 on the way *back* from a successful
-//! `start_operation` would leave the retry starting a second operation over the
-//! same tables.
-//!
-//! Here the duplicate is forced rather than waited for: the same
-//! [`MutationId`] is used twice, which is exactly what a retry does on the
-//! wire.
+//! Every mutating command the client sends carries a `mutation_id`; when a
+//! request is repeated, the cluster recognises the ID and returns the first
+//! response instead of applying the change twice. Without it, a 503 on the way
+//! back from a successful `start_operation` would make the retry start a second
+//! operation. The duplicate is forced here by sending the same [`MutationId`]
+//! twice, as a retry does on the wire.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -53,8 +49,7 @@ fn run() -> Result<(), ClientError> {
     }
 
     step("Preparing Cypress");
-    // These are mutating commands too, so they are already carrying mutation
-    // IDs of their own — if the cluster disliked the format, this would fail.
+    // These mutating commands already carry mutation IDs of their own.
     client.remove_tree(BASE)?;
     client.create("map_node", BASE)?;
     client.create("table", &format!("{BASE}/input"))?;
@@ -73,17 +68,17 @@ fn run() -> Result<(), ClientError> {
     let first = client.start_operation_with(OperationType::Map, &spec, &mutation)?;
     done(&format!("first  -> {first}"));
 
-    // Byte for byte the request a retry would send — including the `retry`
-    // flag, without which the cluster refuses the duplicate rather than
-    // deduplicating it: `Duplicate request is not marked as "retry"`.
+    // The request a retry would send, including the `retry` flag; without it
+    // the cluster refuses the duplicate: `Duplicate request is not marked as
+    // "retry"`.
     let second = client.start_operation_with(OperationType::Map, &spec, &mutation.as_retry())?;
     done(&format!("second -> {second}"));
 
     check("both calls returned the same operation", first == second)?;
 
     step("And a different ID really does start another one");
-    // Its own output table: two operations writing one table would queue on an
-    // exclusive lock, which would say nothing about mutation IDs.
+    // Its own output table: on the first one's, it would queue on an
+    // exclusive lock, which says nothing about mutation IDs.
     let control = identity_map("control_output");
     let other = client.start_operation_with(OperationType::Map, &control, &MutationId::new())?;
     check(
@@ -114,8 +109,7 @@ fn identity_map(output: &str) -> ytsaurus_yson::YsonValue {
     .to_yson()
 }
 
-/// A row of the input table. `write_table_rows` serialises these, so the
-/// example never spells out a row's bytes.
+/// A row of the input table, serialised by `write_table_rows`.
 #[derive(Serialize)]
 struct Row {
     key: &'static str,

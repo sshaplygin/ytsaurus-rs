@@ -1,35 +1,23 @@
-//! `client_e2e` — everything `tests/cluster-e2e/run_e2e.sh` checks, with no Python involved.
+//! `client_e2e`: the checks of `tests/cluster-e2e/run_e2e.sh`, through
+//! [`Client`] instead of the Python `yt` CLI.
 //!
-//! The shell script needs the `yt` CLI, which means a Python installation, which
-//! is the one thing this stack exists to avoid. Every command it sends has a
-//! method on [`Client`] — `remove --recursive --force` is `remove_tree`,
-//! `create --recursive` is `create`, `write-table --format
-//! '<format=binary>yson'` is `write_table` because binary YSON is the default,
-//! and the two `--spec` fragments that actually matter
-//! (`enable_input_table_index`, and `enable_key_switch` under **`reduce_job_io`**
-//! rather than `job_io`) are modelled on the spec builders. So this is that
-//! script, in the language of the thing it is testing.
+//! Each command the script sends has a method here: `remove --recursive
+//! --force` is `remove_tree`, `create --recursive` is `create`, `write-table
+//! --format '<format=binary>yson'` is `write_table`, and the two `--spec`
+//! fragments (`enable_input_table_index`, and `enable_key_switch` under
+//! `reduce_job_io` rather than `job_io`) are set by the spec builders.
 //!
 //! Three checks, in the order the script runs them:
 //!
-//! 1. **identity** — `cat` as a map, output compared to input byte-for-byte;
-//! 2. **table switching** — two input and two output tables, each pair compared;
-//! 3. **wordcount** — a map-reduce checked against a hand-computed reference.
+//! 1. **identity**: `cat` as a map, output compared to input byte-for-byte;
+//! 2. **table switching**: two input and two output tables, each pair compared;
+//! 3. **wordcount**: a map-reduce checked against a hand-computed reference.
 //!
-//! # Where the bytes come from, and why it matters
-//!
-//! The first two checks upload `tests/cluster-e2e/fixtures/table_rows_*.bin` **as
-//! bytes**, exactly as the script pipes them into `yt write-table`. Those
-//! fixtures are built by `generate_fixtures.py` straight from the binary YSON
-//! specification and *deliberately not* by this project's own encoder — a
-//! payload produced by the code under test would not prove the code under test
-//! is right. Reading the file keeps that property; re-generating the rows here
-//! would quietly throw it away.
-//!
-//! The wordcount input is written with [`Client::write_table_rows`], which does
-//! go through this project's encoder — and that is fine, because what that check
-//! asserts is a set of word counts, not a byte sequence. The distinction is the
-//! point: use the foreign fixture where the claim is about bytes.
+//! The first two upload `tests/cluster-e2e/fixtures/table_rows_*.bin` as bytes.
+//! `generate_fixtures.py` builds those from the binary YSON specification, not
+//! with this project's encoder, so the code under test does not produce its own
+//! input. The wordcount input goes through [`Client::write_table_rows`], since
+//! that check asserts word counts, not bytes.
 //!
 //! ```sh
 //! export YT_PROXY=http://localhost:8000
@@ -37,16 +25,16 @@
 //! cargo run -p ytsaurus-client --example client_e2e
 //! ```
 //!
-//! This binary is a *launcher*: it runs on your machine, built for the host. The
-//! workers it uploads are the static musl builds.
+//! Run from the repository root. This binary is a launcher built for the host;
+//! the workers it uploads are the static musl builds. Tables are left under
+//! `//tmp/ytsaurus_rs_e2e`.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use ytsaurus_client::{Client, ClientError, MapReduceSpec, MapSpec};
 
-/// Where the run keeps its tables. The same default the shell script uses, so
-/// the two cannot both be run and then disagree about whose tree is whose.
+/// Where the run keeps its tables; the shell script uses the same path.
 const BASE: &str = "//tmp/ytsaurus_rs_e2e";
 
 /// The workers, as `scripts/build-worker.sh cat wordcount` leaves them.
@@ -57,9 +45,8 @@ const FIXTURES: &str = "tests/cluster-e2e/fixtures";
 
 /// The sentences the map-reduce counts, and the counts they must produce.
 ///
-/// Small enough to check by hand, which is the only kind of reference worth
-/// comparing against: a total computed by the same code would agree with itself
-/// however wrong it was.
+/// Small enough to check by hand; a total computed by the code under test
+/// would agree with itself.
 const LINES: [&str; 4] = [
     "the quick brown fox",
     "jumps over the lazy dog",
@@ -107,9 +94,7 @@ fn run() -> Result<(), ClientError> {
             )));
         }
     }
-    // Not checked for being an ELF here: `upload_worker` refuses a binary built
-    // for the host, and its message says so better than a check written twice
-    // would.
+    // Not checked for being an ELF here: `upload_worker` refuses a host binary.
     let rows0 = fixture("table_rows_0.bin")?;
     let rows1 = fixture("table_rows_1.bin")?;
     done(&format!(
@@ -143,9 +128,8 @@ fn identity(client: &Client, rows: &[u8]) -> Result<(), ClientError> {
 
     client.create("table", &format!("{BASE}/input"))?;
     client.write_table(format!("{BASE}/input"), rows)?;
-    // The output table has to exist first. `yt map --dst` creates it for you,
-    // and this crate does not: an operation that made its own outputs would
-    // turn a mistyped destination into a stray table rather than an error.
+    // The output table must exist first. `yt map --dst` creates it; this crate
+    // does not, so a mistyped destination is an error, not a stray table.
     client.create("table", &format!("{BASE}/output"))?;
 
     let spec = MapSpec::new(
@@ -161,10 +145,9 @@ fn identity(client: &Client, rows: &[u8]) -> Result<(), ClientError> {
     done(&format!("operation {id} finished"));
 
     step("Comparing input and output byte-for-byte");
-    // Both sides are read back through the same path. Comparing the output
-    // against the *uploaded file* instead would fail for a reason that has
-    // nothing to do with the job: the cluster re-encodes rows on ingest, and
-    // 309 676 bytes came back as 309 688.
+    // Both sides are read back through the same path: the cluster re-encodes
+    // rows on ingest (309 676 bytes came back as 309 688), so the uploaded file
+    // is not the reference.
     let before = client.read_table(format!("{BASE}/input"))?;
     let after = client.read_table(format!("{BASE}/output"))?;
 
@@ -188,9 +171,7 @@ fn table_switching(client: &Client, rows0: &[u8], rows1: &[u8]) -> Result<(), Cl
 
     // `with_input_table_index` is `enable_input_table_index=%true` on the
     // mapper. Without it every row arrives as table 0 and `cat --tables 2`
-    // would send the whole input to one output — which the comparison below
-    // would catch, but only as "table 1 diverged" rather than as the missing
-    // spec option it is.
+    // sends the whole input to one output.
     let spec = MapSpec::new(
         "./cat --tables 2",
         [format!("{BASE}/in0"), format!("{BASE}/in1")],
@@ -226,11 +207,10 @@ fn wordcount(client: &Client) -> Result<(), ClientError> {
     )?;
     client.create("table", &format!("{BASE}/counts"))?;
 
-    // `enable_key_switch` is not passed here because the builder already sends
-    // it, and — the part that is easy to get wrong — under `reduce_job_io`
-    // rather than `job_io`. A map-reduce gives each job type its own I/O
-    // section; `job_io` is accepted, silently ignored, and the reducer then
-    // receives the whole input as one group, summing every word together.
+    // The builder already sends `enable_key_switch`, under `reduce_job_io`.
+    // A map-reduce gives each job type its own I/O section; `job_io` is
+    // accepted and silently ignored, and the reducer then receives the whole
+    // input as one group.
     let spec = MapReduceSpec::new(
         "./wordcount reduce",
         [format!("{BASE}/lines")],
@@ -245,13 +225,9 @@ fn wordcount(client: &Client) -> Result<(), ClientError> {
     client.wait_for_operation(&id)?;
     done(&format!("operation {id} finished"));
 
-    // Read as typed rows: the shell script goes through `--format json` and a
-    // Python one-liner to get here, and JSON is a format this crate has no need
-    // of when serde can take the YSON straight into a struct.
-    //
-    // `word` as `String` is safe *here* because these are the ASCII sentences
-    // written above; a YTsaurus string column holds arbitrary bytes, which is
-    // why the worker itself reads it as `&[u8]`.
+    // Read as typed rows, where the shell script uses `--format json`. `word`
+    // as `String` is safe for the ASCII sentences above; a YTsaurus string
+    // column holds arbitrary bytes, so the worker reads it as `&[u8]`.
     let counted: BTreeMap<String, i64> = client
         .read_table_rows::<Total>(format!("{BASE}/counts"))?
         .into_iter()

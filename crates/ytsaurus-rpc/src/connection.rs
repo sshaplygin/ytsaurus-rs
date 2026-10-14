@@ -860,9 +860,8 @@ mod tests {
         let connection = Connection::connect(&stub.address, None).await.unwrap();
 
         // Bounded well above the 50 ms deadline under test. Without this, a
-        // regression in that deadline makes the test hang instead of fail —
-        // which in CI is indistinguishable from a stuck runner, and is the
-        // exact shape this suite has already been caught in twice.
+        // regression in that deadline makes the test hang instead of fail,
+        // which in CI is indistinguishable from a stuck runner.
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             connection.invoke::<proto::api::TRspPingTransaction>(
@@ -1379,8 +1378,8 @@ mod tests {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(50), &mut call).await;
         });
 
-        // Dropped here, on a plain thread with no runtime entered: the case
-        // that used to abort the process through a panic in `Drop`.
+        // Dropped here, on a plain thread with no runtime entered. A panic in
+        // `Drop` in this case would abort the process.
         drop(call);
         drop(connection);
         drop(stub);
