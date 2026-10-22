@@ -539,10 +539,17 @@ mod tests {
             command: "lookup_rows".to_owned(),
             reason: "malformed row".to_owned(),
         };
-        let mapped = map_error("lookup_rows", decode);
-        assert!(
-            matches!(mapped, ytsaurus_api::Error::Transport { .. }),
-            "{mapped:?}"
-        );
+        let timeout = ClientError::Transport {
+            command: "lookup_rows".to_owned(),
+            source: Box::new(ureq::Error::Timeout(ureq::Timeout::Global)),
+        };
+        let config = ClientError::Config("no tls in this build".to_owned());
+        for error in [decode, timeout, config] {
+            let mapped = map_error("lookup_rows", error);
+            assert!(
+                matches!(mapped, ytsaurus_api::Error::Transport { .. }),
+                "{mapped:?}"
+            );
+        }
     }
 }
