@@ -226,7 +226,7 @@ It is `example-tls`, not `tls`, because `ytsaurus-job` has no HTTP.
 ## Build and test
 
 ```sh
-cargo test --workspace          # 940 tests
+cargo test --workspace          # 945 tests
 ./scripts/build-worker.sh       # static musl worker binaries
 cargo bench -p ytsaurus-job     # job-path throughput
 ```

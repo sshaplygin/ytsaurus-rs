@@ -182,6 +182,13 @@ by-id commands.
 - `attach_transaction` always pings, and pings once before returning, which
   neither official client does: no setting
   ([why](protocol-reference.md#handing-a-transaction-to-another-process)).
+- `start_transaction` counts its first ping from when the start was sent, and
+  pings before returning when the start took a ping interval or more, as a
+  retried start can. Neither official client does: C++ pings at a random point
+  within its 5 s interval against a 120 s timeout, Go one 3 s period after
+  `BeginTx` against 15 s. Ours pings every third of the timeout, so a retried
+  start eats a larger share of it: no setting
+  ([why](protocol-reference.md#transactions)).
 - Go's `Tx.Finished()` is pushed; `Transaction::is_lost` is polled: no setting.
 
 ## Dynamic tables, administration, the rest

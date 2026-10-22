@@ -7,6 +7,10 @@
   refused redirect of any of the four now advises a heavy proxy.
 - `BatchRequest::raw` refuses `insert_rows` and `delete_rows` parts, as it
   refuses `write_table`.
+- `start_transaction` counts the first ping from when the start was sent, and
+  pings before returning when a slow or retried start left that ping due. A
+  transaction that expired during the start's retries is now an error, not a
+  handle on nothing.
 
 ## 0.3.1 - 2026-08-16
 
