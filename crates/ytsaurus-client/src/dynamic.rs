@@ -166,18 +166,19 @@ impl Client {
     /// - [`ClientError::Decode`] before anything is sent if a key holds a
     ///   [`Value::Any`] that is not one YSON value, and after the answer if it
     ///   is not a binary YSON list fragment.
-    /// - [`ClientError::Cluster`] if the cluster refuses: the table is missing,
-    ///   static or not mounted, code 1702 ([`TABLET_NOT_MOUNTED`](ytsaurus_api::error::codes::TABLET_NOT_MOUNTED)),
-    ///   a key does not fit the key columns, or the client is bound by
-    ///   [`Client::with_transaction`], code 11000 ([`NO_SUCH_TRANSACTION`](ytsaurus_api::error::codes::NO_SUCH_TRANSACTION));
+    /// - [`ClientError::Cluster`] if the cluster refuses: the table is missing
+    ///   or static (code 1), or not mounted, code 1702 ([`TABLET_NOT_MOUNTED`](ytsaurus_api::error::codes::TABLET_NOT_MOUNTED)),
+    ///   a key does not fit the key columns, or the transaction bound by
+    ///   [`Client::with_transaction`] is not in the answering proxy's sticky
+    ///   pool, as one from [`Client::start_transaction`] never is, code 11000 ([`NO_SUCH_TRANSACTION`](ytsaurus_api::error::codes::NO_SUCH_TRANSACTION));
     ///   [observed codes](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#dynamic-tables-over-http).
     /// - [`ClientError::Transport`] if the connection fails or
     ///   [`Client::with_timeout`] runs out; [`ClientError::Http`] for a non-2xx
     ///   answer without a readable `X-YT-Error`; [`ClientError::Redirected`]
-    ///   for a redirect off the origin carrying a token or keys, or a loop;
-    ///   [`ClientError::ResponseTooLarge`] past 512 MiB; [`ClientError::Config`]
-    ///   for an `https://` address in a build without `tls`, or after
-    ///   `YT_CA_BUNDLE` was refused.
+    ///   for a redirect off the origin carrying a token or keys, or past 10
+    ///   redirects; [`ClientError::ResponseTooLarge`] past 512 MiB;
+    ///   [`ClientError::Config`] for an `https://` address in a build without
+    ///   `tls`, or after `YT_CA_BUNDLE` was refused.
     ///
     /// Through [`TableClient`](ytsaurus_api::TableClient), `Cluster` is
     /// `Error::Cluster`, with its code when the code fits in `i32`; every other
@@ -220,9 +221,9 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// As [`Client::lookup_rows_dynamic`], except that there are no keys, so
-    /// nothing is checked before sending and the cluster refuses none, and a
-    /// redirect off the origin is refused only when a token is set.
+    /// As [`Client::lookup_rows_dynamic`], except that there are no keys, so no
+    /// [`Value::Any`] is checked before sending and no key can be refused, and
+    /// a redirect off the origin is refused only when a token is set.
     /// [`ClientError::Cluster`] also covers a query that does not parse.
     pub fn select_rows_dynamic(&self, query: &str, options: &SelectOptions) -> Result<Vec<Row>> {
         let mut params = vec![

@@ -11,6 +11,8 @@
   pings before returning when a slow or retried start left that ping due. A
   transaction that expired during the start's retries is now an error, not a
   handle on nothing.
+- Documented the errors of the four `*_rows_dynamic` methods, and how
+  `TableClient` reports each.
 
 ## 0.3.1 - 2026-08-16
 
