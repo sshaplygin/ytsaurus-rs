@@ -1476,7 +1476,7 @@ impl Transport {
     /// Why no request can be sent at all, if that was settled before any was.
     ///
     /// Either the crate was built without the `tls` feature and the address is
-    /// `https://`, or [`CA_BUNDLE`] named something that is not root
+    /// `https://`, or `YT_CA_BUNDLE` named something that is not root
     /// certificates. Reported as a sentence naming the cause instead of a
     /// handshake failure. A refused bundle only affects `https://`.
     ///

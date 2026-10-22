@@ -14,7 +14,7 @@
 //!    operations it spawns?
 //!
 //! It exits non-zero when a step of the gate fails. The answers observed on
-//! `ghcr.io/ytsaurus/local:stable`, and the two pragmas in [`PRAGMAS`], are in
+//! `ghcr.io/ytsaurus/local:stable`, and the two pragmas in `PRAGMAS`, are in
 //! `docs/format-comparison.md`, *Driving YQL* and *Phase 0*.
 //!
 //! ```sh
