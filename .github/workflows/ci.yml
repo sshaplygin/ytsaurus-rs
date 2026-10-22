@@ -178,6 +178,39 @@ jobs:
       - name: cargo test (2 GB streaming memory test)
         run: cargo test -p ytsaurus-job --test memory_tests -- --ignored --nocapture
 
+  rustdoc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+
+      # No `init-protos.sh`: documenting the committed bindings does not need
+      # the submodule.
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Private items are documented because their links break as well, and
+      # this mode still rejects a broken public link and a public link to a
+      # private item, so a public-only build would check nothing more. The
+      # examples are compiled code with crate docs of their own. `cargo doc`
+      # has no `--all-targets`; `--lib --bins --examples` covers every library,
+      # the xtask binary and every example.
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --lib --bins --examples --document-private-items
+
+      - name: cargo doc (every feature)
+        run: cargo doc --workspace --no-deps --lib --bins --examples --document-private-items --all-features
+
+      # Items gated on `tls` are absent from this build, so a link to one from
+      # an ungated item resolves above and breaks here. Same build as the
+      # "client without TLS" clippy step.
+      - name: cargo doc (client without TLS)
+        run: cargo doc -p ytsaurus-client --no-deps --lib --examples --document-private-items --no-default-features
+
   musl:
     name: static musl worker build
     runs-on: ubuntu-latest
