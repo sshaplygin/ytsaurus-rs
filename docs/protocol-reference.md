@@ -322,15 +322,14 @@ Observed:
 | --- | --- | --- | --- | --- |
 | missing table | 1 | 1 | 1 | 1 |
 | static table, `is not dynamic` | 1 | 1 | 1 | 1 |
-| unmounted table | 1702 | 1702 | 1, `has no mounted tablets` | 1, same |
+| unmounted table | 1702 | 1702 | 1 at commit, `Error committing transaction` with `has no mounted tablets` inside | 1, same |
 | ordered table | 1, no key column | answered | answered | 1, `is not sorted` |
-| `transaction_id` of a master transaction | 11000 | 11000 | 11000 | 11000 |
-| `transaction_id` of a sticky tablet transaction from the same proxy | answered | answered | answered | answered |
+| `transaction_id` of a non-sticky master transaction | 11000 | 11000 | 11000 | 11000 |
+| `transaction_id` of a tablet transaction started with `sticky=%true` on the same proxy | answered | answered | answered | answered |
 
 - A missing table answers `Error getting mount info`, code 1; the 500 (`RESOLVE_ERROR`) is only in `inner_errors`.
-- A write to an unmounted table fails at commit: `Error committing transaction`, with `has no mounted tablets` inside.
 - A query that does not parse gets code 1, `Error while parsing query`. A wrong-typed insert gets code 1; a wrong-typed lookup key gets 307.
-- The 11000 is the proxy's sticky transaction pool: `TTabletReadCommandBase::GetClientBase` and `TTabletWriteCommandBase::GetTransaction` (`yt/yt/client/driver/command-inl.h`) look `transaction_id` up there and nowhere else, where transactional Cypress commands attach a master transaction. The answer is `Sticky transaction … is not found, this usually means that you use tablet transactions within HTTP API; consider using RPC API instead`. `Client::with_transaction` stamps `transaction_id` on these four commands. `start_transaction` detaches a master transaction and registers any other type in the pool of the proxy that answered it (`transaction_commands.cpp`). So a master transaction id, such as one from `Client::start_transaction`, always misses the pool and gets 11000 on all four; a sticky tablet transaction id is found only on the proxy that started it. Started with `type=tablet; sticky=%true` and bound with `with_transaction`, one was answered by all four on a local cluster.
+- The 11000 (`Sticky transaction … is not found, …; consider using RPC API instead`) comes from the proxy's sticky transaction pool, the only place `TTabletReadCommandBase::GetClientBase` and `TTabletWriteCommandBase::GetTransaction` (`yt/yt/client/driver/command-inl.h`) look `transaction_id` up. `start_transaction` registers a sticky transaction in the pool of the proxy that answered it and detaches any other; every type but master is sticky, a master one only with `sticky=%true` (`transaction_commands.cpp`). `Client::with_transaction` stamps `transaction_id` on all four, and `Client::start_transaction` asks for no `sticky`, so its id always misses. A write under a `transaction_id` the pool holds joins that transaction and does not commit it (`ShouldCommitTransaction`, `command-inl.h`).
 
 ## Cypress: naming and locks
 

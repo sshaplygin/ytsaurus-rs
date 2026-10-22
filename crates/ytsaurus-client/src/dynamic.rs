@@ -167,18 +167,18 @@ impl Client {
     ///   [`Value::Any`] that is not one YSON value, and after the answer if it
     ///   is not a binary YSON list fragment.
     /// - [`ClientError::Cluster`] if the cluster refuses: the table is missing
-    ///   or static (code 1), or not mounted, code 1702 ([`TABLET_NOT_MOUNTED`](ytsaurus_api::error::codes::TABLET_NOT_MOUNTED)),
-    ///   a key does not fit the key columns, or the transaction bound by
+    ///   or static (code 1) or not mounted (1702, `TABLET_NOT_MOUNTED`), a key
+    ///   does not fit the key columns, or the transaction bound by
     ///   [`Client::with_transaction`] is not in the answering proxy's sticky
-    ///   pool, as one from [`Client::start_transaction`] never is, code 11000 ([`NO_SUCH_TRANSACTION`](ytsaurus_api::error::codes::NO_SUCH_TRANSACTION));
+    ///   pool (11000, `NO_SUCH_TRANSACTION`), as a non-sticky master one from
+    ///   [`Client::start_transaction`] never is;
     ///   [observed codes](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#dynamic-tables-over-http).
     /// - [`ClientError::Transport`] if the connection fails or
-    ///   [`Client::with_timeout`] runs out; [`ClientError::Http`] for a non-2xx
-    ///   answer without a readable `X-YT-Error`; [`ClientError::Redirected`]
-    ///   for a redirect off the origin carrying a token or keys, or past 10
-    ///   redirects; [`ClientError::ResponseTooLarge`] past 512 MiB;
-    ///   [`ClientError::Config`] for an `https://` address in a build without
-    ///   `tls`, or after `YT_CA_BUNDLE` was refused.
+    ///   [`Client::with_timeout`] runs out; [`ClientError::Http`] for an answer
+    ///   whose error is unreadable; [`ClientError::Config`] for `https://`
+    ///   without `tls` or after a refused `YT_CA_BUNDLE`;
+    ///   [`ClientError::Redirected`] off the origin with a token or keys, or
+    ///   past 10 redirects; [`ClientError::ResponseTooLarge`] past 512 MiB.
     ///
     /// Through [`TableClient`](ytsaurus_api::TableClient), `Cluster` is
     /// `Error::Cluster`, with its code when the code fits in `i32`; every other
@@ -255,11 +255,13 @@ impl Client {
     /// # Errors
     ///
     /// As [`Client::lookup_rows_dynamic`] for `rows` in place of keys, except
-    /// that the answer is not decoded and a table that is not mounted is
-    /// refused with code 1, `has no mounted tablets`. [`ClientError::Cluster`]
-    /// also covers a row the schema refuses. After a
-    /// [`ClientError::Transport`] the write may have landed. Each call is its
-    /// own tablet transaction: over HTTP,
+    /// that the answer is not decoded and a write to a table that is not
+    /// mounted fails at commit with code 1, `has no mounted tablets`.
+    /// [`ClientError::Cluster`] also covers a row the schema refuses. After a
+    /// [`ClientError::Transport`] the write may have landed. Unless the client
+    /// is bound to a tablet transaction the answering proxy finds, which the
+    /// write joins without committing it, each call is its own tablet
+    /// transaction; over HTTP,
     /// [`TableClient::start_transaction`](ytsaurus_api::TableClient::start_transaction)
     /// returns [`Error::Unsupported`](ytsaurus_api::Error::Unsupported).
     pub fn insert_rows_dynamic(&self, path: &str, rows: &[Row]) -> Result<()> {
