@@ -519,7 +519,7 @@ A larger one fails with `ClientError::ResponseTooLarge`, naming the streaming
 method. The cap is not a process budget: the buffer grows by doubling, so peak
 residency can reach about 1.5× of it. A non-2xx answer to a buffered command or
 an upload is held under the same 512 MiB cap. A non-2xx body of a streaming
-command or of the `/hosts` lookup is read up to 64 KiB and cut there with a
+read or of the `/hosts` lookup is read up to 64 KiB and cut there with a
 note; a `/hosts` answer past 1 MiB fails with `ResponseTooLarge`.
 Measurements: [protocol reference](../../docs/protocol-reference.md#response-size-limits).
 
