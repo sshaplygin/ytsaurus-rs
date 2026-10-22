@@ -13,7 +13,6 @@
   handle on nothing.
 - Documented the errors of the four `*_rows_dynamic` methods, and how
   `TableClient` reports each.
-- A non-2xx body of a streaming command or of `/hosts` is read up to 64 KiB of
 - A non-2xx body of a streaming read or of `/hosts` is read up to 64 KiB of
   decoded bytes and cut there with a note, instead of whole under a 10 MiB wire
   limit that gzip could expand past. A `/hosts` answer past 1 MiB fails with
