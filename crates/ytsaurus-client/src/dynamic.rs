@@ -160,6 +160,29 @@ fn yson_to_value(value: &YsonValue) -> Value {
 impl Client {
     /// Looks rows up by key over HTTP: one answer per key, in order, and
     /// `None` for a key with no row.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Decode`] before anything is sent if a key holds a
+    ///   [`Value::Any`] that is not one YSON value, and after the answer if it
+    ///   is not a binary YSON list fragment.
+    /// - [`ClientError::Cluster`] if the cluster refuses: the table is missing
+    ///   or static (code 1) or not mounted (1702, `TABLET_NOT_MOUNTED`), a key
+    ///   does not fit the key columns, or the transaction bound by
+    ///   [`Client::with_transaction`] is not in the answering proxy's sticky
+    ///   pool (11000, `NO_SUCH_TRANSACTION`), as a non-sticky master one from
+    ///   [`Client::start_transaction`] never is;
+    ///   [observed codes](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#dynamic-tables-over-http).
+    /// - [`ClientError::Transport`] if the connection fails or
+    ///   [`Client::with_timeout`] runs out; [`ClientError::Http`] for an answer
+    ///   whose error is unreadable; [`ClientError::Config`] for `https://`
+    ///   without `tls` or after a refused `YT_CA_BUNDLE`;
+    ///   [`ClientError::Redirected`] off the origin with a token or keys, or
+    ///   past 10 redirects; [`ClientError::ResponseTooLarge`] past 512 MiB.
+    ///
+    /// Through [`TableClient`](ytsaurus_api::TableClient), `Cluster` is
+    /// `Error::Cluster`, with its code when the code fits in `i32`; every other
+    /// variant, a timeout included, is `Error::Transport`.
     pub fn lookup_rows_dynamic(
         &self,
         path: &str,
@@ -195,6 +218,13 @@ impl Client {
     }
 
     /// Runs a query over HTTP.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::lookup_rows_dynamic`], except that there are no keys, so no
+    /// [`Value::Any`] is checked before sending and no key can be refused, and
+    /// a redirect off the origin is refused only when a token is set.
+    /// [`ClientError::Cluster`] also covers a query that does not parse.
     pub fn select_rows_dynamic(&self, query: &str, options: &SelectOptions) -> Result<Vec<Row>> {
         let mut params = vec![
             ("query", yson_build::string(query)),
@@ -221,11 +251,29 @@ impl Client {
     /// Writes rows over HTTP, to a heavy proxy and sent once: the master's
     /// mutation cache does not cover a tablet write, so a retry could write
     /// twice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::lookup_rows_dynamic`] for `rows` in place of keys, except
+    /// that the answer is not decoded and a write to a table that is not
+    /// mounted fails at commit with code 1, `has no mounted tablets`.
+    /// [`ClientError::Cluster`] also covers a row the schema refuses. After a
+    /// [`ClientError::Transport`] the write may have landed. Unless the client
+    /// is bound to a tablet transaction the answering proxy finds, which the
+    /// write joins without committing it, each call is its own tablet
+    /// transaction; over HTTP,
+    /// [`TableClient::start_transaction`](ytsaurus_api::TableClient::start_transaction)
+    /// returns [`Error::Unsupported`](ytsaurus_api::Error::Unsupported).
     pub fn insert_rows_dynamic(&self, path: &str, rows: &[Row]) -> Result<()> {
         self.modify_rows_dynamic("insert_rows", path, rows)
     }
 
     /// Deletes rows by key over HTTP.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::insert_rows_dynamic`], for keys; [`ClientError::Cluster`]
+    /// also for an ordered table, which has no key to delete by.
     pub fn delete_rows_dynamic(&self, path: &str, keys: &[Row]) -> Result<()> {
         self.modify_rows_dynamic("delete_rows", path, keys)
     }
@@ -428,5 +476,80 @@ mod tests {
         let row = Row::new().with("value", Value::Any(b"not a yson value".to_vec()));
         let error = rows_to_fragment(&[row]).unwrap_err();
         assert!(error.to_string().contains("Value::Any"), "{error}");
+    }
+
+    #[test]
+    fn a_bad_any_value_fails_lookup_insert_and_delete_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Short, so a request that does go out fails here rather than after
+        // the default timeout: nothing answers on this listener.
+        let client = Client::new(&format!("http://{}", listener.local_addr().unwrap()))
+            .with_timeout(std::time::Duration::from_secs(1));
+        let rows = [Row::new().with("key", Value::Any(b"not a yson value".to_vec()))];
+
+        let results = [
+            (
+                "lookup",
+                client
+                    .lookup_rows_dynamic("//t", &rows, &LookupOptions::default())
+                    .err(),
+            ),
+            ("insert", client.insert_rows_dynamic("//t", &rows).err()),
+            ("delete", client.delete_rows_dynamic("//t", &rows).err()),
+        ];
+        for (method, error) in results {
+            assert!(
+                matches!(error, Some(ClientError::Decode { .. })),
+                "{method}: {error:?}"
+            );
+        }
+
+        let accepted = listener.accept().map(|_| ());
+        assert!(
+            matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a request reached the listener: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn the_interface_keeps_cluster_codes_and_reports_the_rest_as_transport() {
+        let cluster = |code| ClientError::Cluster {
+            command: "lookup_rows".to_owned(),
+            code,
+            message: "refused".to_owned(),
+            raw: String::new(),
+        };
+
+        let mapped = map_error("lookup_rows", cluster(1702));
+        assert!(
+            matches!(mapped, ytsaurus_api::Error::Cluster { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.code(), Some(1702));
+
+        let mapped = map_error("lookup_rows", cluster(i64::from(i32::MAX) + 1));
+        assert!(
+            matches!(mapped, ytsaurus_api::Error::Cluster { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(mapped.code(), None);
+
+        let decode = ClientError::Decode {
+            command: "lookup_rows".to_owned(),
+            reason: "malformed row".to_owned(),
+        };
+        let timeout = ClientError::Transport {
+            command: "lookup_rows".to_owned(),
+            source: Box::new(ureq::Error::Timeout(ureq::Timeout::Global)),
+        };
+        let config = ClientError::Config("no tls in this build".to_owned());
+        for error in [decode, timeout, config] {
+            let mapped = map_error("lookup_rows", error);
+            assert!(
+                matches!(mapped, ytsaurus_api::Error::Transport { .. }),
+                "{mapped:?}"
+            );
+        }
     }
 }

@@ -314,6 +314,23 @@ Observed:
 - `ureq` 3.3 exposes no trailers (checked in its source), so the mid-stream `X-YT-Error` trailer is unreadable; `read_table` checks completeness instead, and a truncated stream fails in the decoder.
 - Measured: writing 64 MiB from a generator and streaming it back cost 1.0 MiB of peak RSS; `read_table` on the same table cost 70.9 MiB.
 
+## Dynamic tables over HTTP
+
+`lookup_rows`, `select_rows`, `insert_rows` and `delete_rows`, through `Client::*_rows_dynamic`. Observed on `ghcr.io/ytsaurus/local:stable` 25.4.260522002; the codes are the top-level `X-YT-Error` codes, as `ClientError::Cluster` carries them:
+
+| Case | lookup | select | insert | delete |
+| --- | --- | --- | --- | --- |
+| missing table | 1 | 1 | 1 | 1 |
+| static table, `is not dynamic` | 1 | 1 | 1 | 1 |
+| unmounted table | 1702 | 1702 | 1 at commit, `Error committing transaction` with `has no mounted tablets` inside | 1, same |
+| ordered table | 1, no key column | answered | answered | 1, `is not sorted` |
+| `transaction_id` of a non-sticky master transaction | 11000 | 11000 | 11000 | 11000 |
+| `transaction_id` of a tablet transaction started with `sticky=%true` on the same proxy | answered | answered | answered | answered |
+
+- A missing table answers `Error getting mount info`, code 1; the 500 (`RESOLVE_ERROR`) is only in `inner_errors`.
+- A query that does not parse gets code 1, `Error while parsing query`. A wrong-typed insert gets code 1; a wrong-typed lookup key gets 307.
+- The 11000 (`Sticky transaction … is not found, …; consider using RPC API instead`) comes from the proxy's sticky transaction pool, the only place `TTabletReadCommandBase::GetClientBase` and `TTabletWriteCommandBase::GetTransaction` (`yt/yt/client/driver/command-inl.h`) look `transaction_id` up. `start_transaction` registers a sticky transaction in the pool of the proxy that answered it and detaches any other; every type but master is sticky, a master one only with `sticky=%true` (`transaction_commands.cpp`). `Client::with_transaction` stamps `transaction_id` on all four, and `Client::start_transaction` asks for no `sticky`, so its id always misses. A write under a `transaction_id` the pool holds joins that transaction and does not commit it (`ShouldCommitTransaction`, `command-inl.h`).
+
 ## Cypress: naming and locks
 
 Observed:
