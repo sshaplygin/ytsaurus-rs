@@ -125,6 +125,7 @@ Observed:
 - A wire limit is needed underneath: a chunked stream of empty deflate stored blocks (`00 00 00 ff ff`) decodes to nothing, and `flate2` loops inside one `read`.
 - The wire limit cannot be the memory cap: 4 096 incompressible bytes gzip to 4 119. `http::wire_budget` is zlib's `deflateBound` plus the gzip wrapper.
 - The memory cap is not a process budget: `read_to_end` doubles a `Vec` and copies, so both buffers are resident during a copy (about 1.5× where the allocator cannot extend in place). Measured (release build, local listener): a read of 536 870 911 bytes peaked at 544 178 176 bytes resident, a 600 MiB read refused by the 512 MiB cap at 611 385 344. Quote the cap as what is held, never as what to size a container for.
+- Two smaller caps, counted the same way: a non-2xx body of a streaming read or of `/hosts` is read up to 64 KiB (`ERROR_BODY_LIMIT`) and cut with a note, and a `/hosts` answer past 1 MiB (`HOSTS_LIMIT`) fails with `ResponseTooLarge`. RFC 1035 section 2.3.4 limits a name to 255 octets, 253 characters written out, so 1 MiB holds 4 095 such names as compact JSON without ports, against 79 in the largest answer recorded here. Neither bound was measured on a cluster.
 
 ## Authentication and compression
 

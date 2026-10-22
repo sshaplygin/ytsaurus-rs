@@ -46,6 +46,7 @@ Go. Neither is a superset.
 | Heavy-proxy routing | automatic (`THostManager`) | automatic, plus a 5-minute ban on failure | automatic, random per command, refreshed every minute, constrained by domain; see below |
 | Compression | configurable, off by default | zstd both ways | gzip inbound only |
 | Timeouts | connect and socket separately | 5 min light, none for heavy | one, 120 s by default, `Client::with_timeout` |
+| Response size cap | none; a non-2xx body is not read, `/hosts` is read whole | none; `/hosts` and a non-2xx body are read whole | 512 MiB decoded per buffered response, 2xx or not; 1 MiB for `/hosts`; the first 64 KiB of a non-2xx body of a streaming read or `/hosts`; see [response size limits](protocol-reference.md#response-size-limits) |
 | Batching several commands | `CreateBatchRequest` → futures | `NewBatchRequest` → `BatchResponse[T]` | `BatchRequest` → `Vec<Result<…>>`; no per-part retry (C++ re-queues a retriable part); a split batch that stops reports the prefix it was answered for (C++ throws and loses it) |
 | Retries | three policies by request class | interceptor chain | one policy × `Repeatable` |
 | Client logging | global `ILogger` | `Config.Logger`, structured | optional `tracing` feature, off by default |
@@ -55,6 +56,18 @@ All three send the same W3C `traceparent`, and the cluster records the span.
 Go's `ytjaeger` and `ytotel` adapters read it from an ambient
 `context.Context`; Rust has none, so it is passed to the client, and an
 OpenTelemetry application formats its current span into a `traceparent`.
+
+Neither official client caps a response, so the Rust caps are a deliberate
+departure from both. Read at `ytsaurus/ytsaurus@b335ac7`: Go reads `/hosts` with
+[`io.ReadAll`](https://github.com/ytsaurus/ytsaurus/blob/b335ac71193e69d9e943a4d8d7dc971121331e8c/yt/go/yt/internal/httpclient/client.go#L127)
+and a non-2xx body the same way in
+[`unexpectedStatusCode`](https://github.com/ytsaurus/ytsaurus/blob/b335ac71193e69d9e943a4d8d7dc971121331e8c/yt/go/yt/internal/httpclient/client.go#L311).
+C++ builds the error for anything but 200 and 202 in the
+[`THttpResponse` constructor](https://github.com/ytsaurus/ytsaurus/blob/b335ac71193e69d9e943a4d8d7dc971121331e8c/yt/cpp/mapreduce/http/http.cpp#L793)
+and checks it before any read; `/hosts` goes through
+[`GetResponse`](https://github.com/ytsaurus/ytsaurus/blob/b335ac71193e69d9e943a4d8d7dc971121331e8c/yt/cpp/mapreduce/http/http.cpp#L1116),
+a `ReadAll`, in
+[`host_manager.cpp`](https://github.com/ytsaurus/ytsaurus/blob/b335ac71193e69d9e943a4d8d7dc971121331e8c/yt/cpp/mapreduce/http/host_manager.cpp#L128).
 
 ### Heavy proxies and in-job use
 

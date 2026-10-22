@@ -807,7 +807,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError`] if the request fails, or if `/hosts` does not
-    /// answer with a list of host names. `Ok(None)` means the cluster named no
+    /// answer with a list of host names, and [`ClientError::ResponseTooLarge`]
+    /// if the answer decodes past 1 MiB. `Ok(None)` means the cluster named no
     /// heavy proxy.
     pub fn heavy_proxy(&self) -> Result<Option<String>> {
         // The transport's parser and budget, shared with automatic routing.

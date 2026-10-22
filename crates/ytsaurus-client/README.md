@@ -517,8 +517,10 @@ cannot, so compare its
 `write_table`, their `_with_format` and `_skiff_table` variants, `read_file`).
 A larger one fails with `ClientError::ResponseTooLarge`, naming the streaming
 method. The cap is not a process budget: the buffer grows by doubling, so peak
-residency can reach about 1.5× of it. Two error paths, the non-2xx branch of a
-streaming open and the `/hosts` lookup, are bounded only on the wire.
+residency can reach about 1.5× of it. A non-2xx answer to a buffered command or
+an upload is held under the same 512 MiB cap. A non-2xx body of a streaming
+read or of the `/hosts` lookup is read up to 64 KiB and cut there with a
+note; a `/hosts` answer past 1 MiB fails with `ResponseTooLarge`.
 Measurements: [protocol reference](../../docs/protocol-reference.md#response-size-limits).
 
 ## A command this crate does not model

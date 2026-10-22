@@ -392,11 +392,17 @@ pub(crate) fn truncate(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_owned();
     }
-    let mut end = limit;
+    format!("{}… ({} bytes total)", prefix(s, limit), s.len())
+}
+
+/// The longest start of `s` that is at most `limit` bytes and ends on a
+/// character boundary.
+pub(crate) fn prefix(s: &str, limit: usize) -> &str {
+    let mut end = limit.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}… ({} bytes total)", &s[..end], s.len())
+    &s[..end]
 }
 
 /// Keeps the last `limit` bytes of `s`, saying what was dropped: a job's
