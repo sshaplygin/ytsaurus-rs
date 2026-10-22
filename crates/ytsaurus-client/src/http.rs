@@ -78,7 +78,7 @@ const ERROR_BODY_LIMIT: u64 = 64 * 1024;
 /// decompression: 1 MiB.
 ///
 /// The answer is a JSON list of bare host names. Written compactly and without
-/// ports, the cap holds 4 096 entries of the longest a DNS name can be;
+/// ports, the cap holds 4 095 entries of the longest a DNS name can be;
 /// spacing or a port in each entry means fewer ([response size
 /// limits](https://github.com/sshaplygin/ytsaurus-rs/blob/main/docs/protocol-reference.md#response-size-limits)).
 /// A larger answer fails with [`ClientError::ResponseTooLarge`].
