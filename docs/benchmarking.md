@@ -13,7 +13,7 @@ Undecided. For the pilot job, decoding is 10.6 % of the job's `time/exec` on
 the local Docker cluster (§3) and 36.2 % on a production cluster (§4), against
 the ~30 % threshold. Both readings scatter by about 2× across rounds, and
 neither has been repeated enough to record a spread rather than a number. A
-spread from repeated production runs is still needed (#70). Do not quote the
+spread from repeated production runs is still needed. Do not quote the
 10 % alone.
 
 The format comparison (§5) did not decide it: the comparison that would, typed
