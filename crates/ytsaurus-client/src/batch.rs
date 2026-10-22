@@ -363,8 +363,9 @@ impl BatchRequest {
     ///   `tabular` or `binary`, or its input type `binary`, as for `select_rows`
     ///   and `lookup_rows`. The list is one cluster's registry, so the cluster
     ///   may still refuse a name it lacks;
-    /// - `command` moves bulk data, such as `write_table`: the cluster takes it,
-    ///   but its input would travel inline in the batch body to a light proxy.
+    /// - `command` moves bulk data, such as `write_table` or `insert_rows`: the
+    ///   cluster takes it, but its input would travel inline in the batch body
+    ///   to a light proxy.
     pub fn raw_with(
         &mut self,
         command: &str,
@@ -391,9 +392,8 @@ impl BatchRequest {
             return Err(ClientError::Config(format!(
                 "{command} moves bulk data, and a batch part carries its input \
                  inline in the batch body to a light proxy — which is not where \
-                 this crate sends table or file data. The refusal is this \
-                 crate's, not the cluster's: a {command} part was measured \
-                 being accepted and applied. Send it with \
+                 this crate sends table, file or row data. The refusal is this \
+                 crate's, not the cluster's, which accepts such a part. Send it with \
                  Client::raw_command_streaming or Client::raw_command_upload, \
                  outside the batch."
             )));
@@ -962,6 +962,8 @@ mod tests {
             "alter_query",
             "read_journal",
             "write_file_fragment",
+            "insert_rows",
+            "delete_rows",
         ] {
             let mut batch = BatchRequest::new();
             let error = batch

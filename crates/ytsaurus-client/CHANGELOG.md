@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `insert_rows_dynamic` and `delete_rows_dynamic` go to a heavy proxy, as the
+  lookup and select methods do; a control proxy answers them with 503. A
+  refused redirect of any of the four now advises a heavy proxy.
+- `BatchRequest::raw` refuses `insert_rows` and `delete_rows` parts, as it
+  refuses `write_table`.
+
 ## 0.3.1 - 2026-08-16
 
 No changes to this crate beyond the version, which tracks the workspace.

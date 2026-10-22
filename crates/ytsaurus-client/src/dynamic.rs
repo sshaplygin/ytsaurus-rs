@@ -5,7 +5,10 @@
 //!
 //! All four are heavy in the driver's registration table
 //! (`yt/yt/client/driver/driver.cpp`); only `select_rows` takes no input, and
-//! only `insert_rows` and `delete_rows` mutate. Rows travel as a binary YSON
+//! only `insert_rows` and `delete_rows` mutate. All four go to a heavy proxy
+//! and are sent once, as `THttpRawClient` in
+//! `yt/cpp/mapreduce/http_client/raw_client.cpp` sends them (`IsHeavy = true`,
+//! `RequestWithoutRetry`). Rows travel as a binary YSON
 //! list fragment, one map per row, as in [`Client::write_table_rows`], and the
 //! format is named on every request.
 
@@ -215,8 +218,9 @@ impl Client {
         Ok(fragment_to_rows(&body)?.into_iter().flatten().collect())
     }
 
-    /// Writes rows over HTTP, sent once: the master's mutation cache does not
-    /// cover a tablet write, so a retry could write twice.
+    /// Writes rows over HTTP, to a heavy proxy and sent once: the master's
+    /// mutation cache does not cover a tablet write, so a retry could write
+    /// twice.
     pub fn insert_rows_dynamic(&self, path: &str, rows: &[Row]) -> Result<()> {
         self.modify_rows_dynamic("insert_rows", path, rows)
     }
@@ -237,7 +241,7 @@ impl Client {
             command,
             &params,
             Some(&body),
-            Repeatable::Never,
+            Repeatable::Heavy,
             None,
         )?;
         Ok(())
